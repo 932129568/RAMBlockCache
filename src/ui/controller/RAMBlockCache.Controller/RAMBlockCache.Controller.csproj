@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>RAMBlockCache.Controller</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- [P3] 版本统一为机器版本串（common/version.h 的 10.3.4.19）；
+         旧值 10.4.3（发布名）与旧 WPF csproj 的 10.3.4.19 互相矛盾。 -->
+    <Version>10.3.4.19</Version>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <Resource Include="app.ico" />
+  </ItemGroup>
+</Project>

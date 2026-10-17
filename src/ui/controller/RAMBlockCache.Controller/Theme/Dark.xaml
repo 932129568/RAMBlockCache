@@ -1,0 +1,179 @@
+﻿<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+    <!-- =====================================================================
+         RAMBlockCache 设计令牌 V1.0（来源：deliverables/design/02-design-system.md
+         + 02b-charts-motion.md，与 final/RAMBlockCache-UI-prototype.html 同源）
+
+        旧令牌 BgBrush/CardBrush/FgBrush/DimBrush/AccentBrush 全部保留为别名
+        （存量 XAML 绑定不破坏），新代码一律使用 Rbc* 语义键。
+        ===================================================================== -->
+
+    <!-- ===== 背景 ===== -->
+    <SolidColorBrush x:Key="RbcBgApp"          Color="#FF0E0E11"/>
+    <SolidColorBrush x:Key="RbcBgSurface"      Color="#FF17171C"/>
+    <SolidColorBrush x:Key="RbcBgSurfaceHover" Color="#FF1E1E24"/>
+    <SolidColorBrush x:Key="RbcBorder"         Color="#FF26262E"/>
+    <SolidColorBrush x:Key="RbcBorderStrong"   Color="#FF3A3A45"/>
+
+    <!-- ===== 文本 ===== -->
+    <SolidColorBrush x:Key="RbcTextPrimary"    Color="#FFEDEDF2"/>
+    <SolidColorBrush x:Key="RbcTextSecondary"  Color="#FF9A9AA5"/>
+    <SolidColorBrush x:Key="RbcTextTertiary"   Color="#FF6F6F7A"/>
+
+    <!-- ===== 强调 / 语义五色（WCAG AA，暗底） ===== -->
+    <SolidColorBrush x:Key="RbcAccent"         Color="#FF4CC2FF"/>
+    <SolidColorBrush x:Key="RbcSuccessFg"      Color="#FF63D6A0"/>
+    <SolidColorBrush x:Key="RbcWarningFg"      Color="#FFF2B84B"/>
+    <SolidColorBrush x:Key="RbcDangerFg"       Color="#FFF27A72"/>
+    <SolidColorBrush x:Key="RbcInfoFg"         Color="#FF6FB4F5"/>
+    <SolidColorBrush x:Key="RbcNeutralFg"      Color="#FFA6A6B0"/>
+
+    <!-- ===== 语义色底（徽标/卡片的低透明填充） ===== -->
+    <SolidColorBrush x:Key="RbcSuccessBg"      Color="#FF04342C"/>
+    <SolidColorBrush x:Key="RbcWarningBg"      Color="#FF412402"/>
+    <SolidColorBrush x:Key="RbcDangerBg"       Color="#FF501313"/>
+    <SolidColorBrush x:Key="RbcInfoBg"         Color="#FF042C53"/>
+    <SolidColorBrush x:Key="RbcNeutralBg"      Color="#FF2C2C2A"/>
+
+    <!-- ===== 危险按钮（熔断等确认操作） ===== -->
+    <SolidColorBrush x:Key="RbcDangerBtn"      Color="#FF7A2020"/>
+    <SolidColorBrush x:Key="RbcDangerBtnHover" Color="#FFA32D2D"/>
+    <SolidColorBrush x:Key="RbcPrimaryBtn"     Color="#FF185FA5"/>
+    <SolidColorBrush x:Key="RbcPrimaryBtnHover" Color="#FF0C447C"/>
+
+    <!-- ===== 动效令牌（02b §B：5 档 + 标准曲线）=====
+         只动 transform/opacity；Duration 以 ms 由代码侧 KeySpline 使用 -->
+    <Duration x:Key="RbcDur90">0:0:0.090</Duration>
+    <Duration x:Key="RbcDur120">0:0:0.120</Duration>
+    <Duration x:Key="RbcDur180">0:0:0.180</Duration>
+    <Duration x:Key="RbcDur240">0:0:0.240</Duration>
+    <Duration x:Key="RbcDur480">0:0:0.480</Duration>
+    <!-- WPF KeySpline 仅支持 ControlPoint1/ControlPoint2 两个 "x,y" 控制点对；
+         语义对齐 CSS cubic-bezier(0.2, 0, 0, 1)（standard easing）。 -->
+    <KeySpline x:Key="RbcEaseStandard" ControlPoint1="0.2,0" ControlPoint2="0,1"/>
+    <!-- 02b §B.1：ease-out 入场 / ease-in 出场（复刻 cubic-bezier(0.16,1,0.3,1)/(0.4,0,1,1)） -->
+    <KeySpline x:Key="RbcEaseOut" ControlPoint1="0.16,1" ControlPoint2="0.3,1"/>
+    <KeySpline x:Key="RbcEaseIn"  ControlPoint1="0.4,0"  ControlPoint2="1,1"/>
+
+    <!-- ===== 图表令牌（02b §A.2：数据系青蓝 2 色 + 语义系 5 色；语义系复用上方 Rbc*Fg）===== -->
+    <SolidColorBrush x:Key="RbcChart2"        Color="#FF2E86D6"/>
+    <SolidColorBrush x:Key="RbcChartGrid"     Color="#FF23232B"/>
+    <SolidColorBrush x:Key="RbcChartAxisText" Color="#FF6B6B76"/>
+    <SolidColorBrush x:Key="RbcChartTrack"    Color="#FF23232B"/>
+    <SolidColorBrush x:Key="RbcChartHeat1"    Color="#FF1E3A4D"/>
+    <SolidColorBrush x:Key="RbcChartHeat2"    Color="#FF2E86D6"/>
+    <SolidColorBrush x:Key="RbcChartHeat3"    Color="#FF4CC2FF"/>
+    <!-- 面积填充：单色 12% 透明度（02b §B.3-1，禁渐变） -->
+    <SolidColorBrush x:Key="RbcChartAreaFill" Color="#1F4CC2FF"/>
+
+    <!-- ===== 骨架（02b §B.3-8：单色低对比 shimmer，禁多彩/高对比扫光）===== -->
+    <SolidColorBrush x:Key="RbcSkeleton"          Color="#FF1B1B21"/>
+    <SolidColorBrush x:Key="RbcSkeletonHighlight" Color="#FF26262E"/>
+
+    <!-- ===== 进度轨道 / 焦点环 ===== -->
+    <SolidColorBrush x:Key="RbcTrackBg"   Color="#FF23232B"/>
+    <SolidColorBrush x:Key="RbcFocusRing" Color="#FF4CC2FF"/>
+
+    <!-- ===== 布局常量（契约 v2 条款 V9）===== -->
+    <sys:Double x:Key="RbcSidebarWidth">216</sys:Double>
+
+    <!-- ===== 存量别名（兼容旧 XAML，勿在新代码中使用） ===== -->
+    <SolidColorBrush x:Key="BgBrush"     Color="#FF0E0E11"/>
+    <SolidColorBrush x:Key="CardBrush"   Color="#FF17171C"/>
+    <SolidColorBrush x:Key="FgBrush"     Color="#FFEDEDF2"/>
+    <SolidColorBrush x:Key="DimBrush"    Color="#FF9A9AA5"/>
+    <SolidColorBrush x:Key="AccentBrush" Color="#FF4CC2FF"/>
+
+    <!-- ===== 徽标样式（六态语义：色对来自状态语义表） ===== -->
+    <Style x:Key="StateBadge" TargetType="Border">
+        <Setter Property="CornerRadius" Value="999"/>
+        <Setter Property="Padding" Value="10,3"/>
+        <Setter Property="BorderThickness" Value="1"/>
+    </Style>
+
+    <!-- ===== 焦点环（02b §B.3-11：2px 外环，键盘焦点始终可见）===== -->
+    <Style x:Key="RbcFocusRingStyle" TargetType="Control">
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate>
+                    <Rectangle Stroke="{StaticResource RbcFocusRing}" StrokeThickness="2"
+                               RadiusX="4" RadiusY="4" SnapsToDevicePixels="True" Margin="-2"/>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ===== 按钮：主 / 次 / 危险（契约：危险按钮不做默认焦点） ===== -->
+    <Style x:Key="BtnBase" TargetType="Button">
+        <Setter Property="Foreground" Value="{StaticResource RbcTextPrimary}"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Padding" Value="13,7"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="bd" Background="{TemplateBinding Background}"
+                            CornerRadius="6" Padding="{TemplateBinding Padding}"
+                            RenderTransformOrigin="0.5,0.5">
+                        <Border.RenderTransform>
+                            <TranslateTransform x:Name="press" Y="0"/>
+                        </Border.RenderTransform>
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="bd" Property="Opacity" Value="0.88"/>
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <!-- 02b 允许特效：按钮按下位移 1px（只动 transform）。
+                                 Trigger Setter 无法定向属性元素内的命名 transform（MC4111），
+                                 改走 EnterActions/ExitActions + Storyboard.TargetName 动画。 -->
+                            <Trigger.EnterActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <DoubleAnimation Storyboard.TargetName="press" Storyboard.TargetProperty="Y"
+                                                         To="1" Duration="0:0:0.090"/>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </Trigger.EnterActions>
+                            <Trigger.ExitActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <DoubleAnimation Storyboard.TargetName="press" Storyboard.TargetProperty="Y"
+                                                         To="0" Duration="0:0:0.090"/>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </Trigger.ExitActions>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="bd" Property="Opacity" Value="0.45"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+    <Style x:Key="BtnPrimary" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+        <Setter Property="Background" Value="{StaticResource RbcPrimaryBtn}"/>
+        <Style.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter Property="Background" Value="{StaticResource RbcPrimaryBtnHover}"/>
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+    <Style x:Key="BtnSecondary" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+        <Setter Property="Background" Value="{StaticResource RbcBgSurfaceHover}"/>
+    </Style>
+    <Style x:Key="BtnDanger" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+        <Setter Property="Background" Value="{StaticResource RbcDangerBtn}"/>
+        <Setter Property="Focusable" Value="False"/>
+        <Style.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter Property="Background" Value="{StaticResource RbcDangerBtnHover}"/>
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+</ResourceDictionary>

@@ -1,0 +1,187 @@
+<UserControl x:Class="RamBoostFS.Wpf.Views.MemoryView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:RamBoostFS.Wpf.Controls"
+             mc:Ignorable="d" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             d:DesignHeight="600" d:DesignWidth="900">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- 模式选择 -->
+        <Border Grid.Row="0" Style="{StaticResource Card}" Margin="0,0,0,14">
+            <StackPanel>
+                <TextBlock Text="内存预算模式" Style="{StaticResource SubtitleText}" Margin="0,0,0,12"/>
+                <UniformGrid Columns="2">
+                    <Border x:Name="autoModeCard" Padding="16" CornerRadius="10" Margin="0,0,7,0"
+                            Background="{StaticResource AccentSoftBrush}" BorderBrush="{StaticResource AccentBrush}" BorderThickness="1.5">
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <RadioButton x:Name="autoRadio" IsChecked="True" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <TextBlock Text="自动 (动态)" Style="{StaticResource SubtitleText}" Margin="8,0,0,0"/>
+                            </StackPanel>
+                            <TextBlock Text="不预占、不锁定、不预留整块内存；缓存随实际读写按需增长，随系统压力自动收缩。" Style="{StaticResource BodyText}" Margin="26,8,0,0"/>
+                        </StackPanel>
+                    </Border>
+                    <Border x:Name="manualModeCard" Padding="16" CornerRadius="10" Margin="7,0,0,0"
+                            Background="{StaticResource LayerCardStrongBrush}" BorderBrush="{StaticResource LayerStrokeBrush}" BorderThickness="1">
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <RadioButton x:Name="manualRadio" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <TextBlock Text="手动 (固定上限)" Style="{StaticResource SubtitleText}" Margin="8,0,0,0"/>
+                            </StackPanel>
+                            <TextBlock Text="指定一个固定缓存上限 (MB)。超出后按 LRU 淘汰，不再动态调整。" Style="{StaticResource BodyText}" Margin="26,8,0,0"/>
+                        </StackPanel>
+                    </Border>
+                </UniformGrid>
+            </StackPanel>
+        </Border>
+
+        <!-- 自动模式详情 -->
+        <Border x:Name="autoPanel" Grid.Row="1" Style="{StaticResource Card}" Margin="0,0,0,14">
+            <StackPanel>
+                <TextBlock Text="动态内存实时状态" Style="{StaticResource SubtitleText}" Margin="0,0,0,12"/>
+                <UniformGrid Columns="4">
+                    <StackPanel Margin="0,0,12,0">
+                        <TextBlock Text="当前实际占用" Style="{StaticResource CaptionText}"/>
+                        <TextBlock x:Name="autoCurText" Text="--" Style="{StaticResource MetricValueText}"/>
+                    </StackPanel>
+                    <StackPanel Margin="0,0,12,0">
+                        <TextBlock Text="动态上限" Style="{StaticResource CaptionText}"/>
+                        <TextBlock x:Name="autoLimitText" Text="--" Style="{StaticResource MetricValueText}"/>
+                    </StackPanel>
+                    <StackPanel Margin="0,0,12,0">
+                        <TextBlock Text="系统保留" Style="{StaticResource CaptionText}"/>
+                        <TextBlock x:Name="autoReserveText" Text="--" Style="{StaticResource MetricValueText}"/>
+                    </StackPanel>
+                    <StackPanel>
+                        <TextBlock Text="可用物理内存" Style="{StaticResource CaptionText}"/>
+                        <TextBlock x:Name="autoAvailText" Text="--" Style="{StaticResource MetricValueText}"/>
+                    </StackPanel>
+                </UniformGrid>
+
+                <!-- 占用条 -->
+                <Border Background="{StaticResource LayerCardStrongBrush}" CornerRadius="6" Height="10" Margin="0,16,0,6">
+                    <Border x:Name="usageBar" Background="{StaticResource AccentBrush}" CornerRadius="6" HorizontalAlignment="Left" Width="0"/>
+                </Border>
+                <TextBlock x:Name="usagePctText" Text="占用率 --" Style="{StaticResource CaptionText}"/>
+
+                <!-- 动态内存占用曲线 -->
+                <StackPanel Margin="0,14,0,0">
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                        <TextBlock Text="动态内存占用曲线 (MB)" Style="{StaticResource CaptionText}"/>
+                        <TextBlock Text="近 60 秒 · 随读写增长 / 随压力收缩" Style="{StaticResource CaptionText}" Margin="12,0,0,0"/>
+                    </StackPanel>
+                    <Border Background="{StaticResource LayerCardStrongBrush}" CornerRadius="8" Padding="8" Height="150">
+                        <controls:LineChart Series="{Binding CacheHistoryMB}"/>
+                    </Border>
+                </StackPanel>
+
+                <Border Background="#220F9D58" CornerRadius="8" Padding="12,10" Margin="0,14,0,0">
+                    <TextBlock Text="自动模式绝不一次性占满当前空闲内存；动态上限 = (可用内存 − 系统保留) × 可用占比。" Style="{StaticResource CaptionText}"/>
+                </Border>
+            </StackPanel>
+        </Border>
+
+        <!-- 参数 -->
+        <Border Grid.Row="2" Style="{StaticResource Card}">
+            <StackPanel>
+                <TextBlock Text="参数" Style="{StaticResource SubtitleText}" Margin="0,0,0,12"/>
+
+                <Grid Margin="0,0,0,12">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="220"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel VerticalAlignment="Center">
+                        <TextBlock Text="系统保留 MemReserveMB" Style="{StaticResource BodyText}"/>
+                        <TextBlock Text="给系统和其它程序保留的内存 (MB)，0=内置默认 4096" Style="{StaticResource CaptionText}"/>
+                    </StackPanel>
+                    <TextBox x:Name="reserveBox" Grid.Column="1" Text="4096" VerticalAlignment="Center"/>
+                </Grid>
+
+                <Grid Margin="0,0,0,12">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="220"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel VerticalAlignment="Center">
+                        <TextBlock Text="可用占比 AutoUsePct" Style="{StaticResource BodyText}"/>
+                        <TextBlock Text="允许使用&quot;当前可用内存&quot;的百分比，0→默认 80" Style="{StaticResource CaptionText}"/>
+                    </StackPanel>
+                    <TextBox x:Name="autoPctBox" Grid.Column="1" Text="80" VerticalAlignment="Center"/>
+                </Grid>
+
+                <Grid x:Name="manualRow" Margin="0,0,0,12" Visibility="Collapsed">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="220"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel VerticalAlignment="Center">
+                        <TextBlock Text="手动缓存上限 (MB)" Style="{StaticResource BodyText}"/>
+                        <TextBlock Text="例如 16384 = 16 GB。0 即回到自动模式。" Style="{StaticResource CaptionText}"/>
+                    </StackPanel>
+                    <TextBox x:Name="manualMbBox" Grid.Column="1" Text="8192" VerticalAlignment="Center"/>
+                </Grid>
+
+                <Grid Margin="0,0,0,16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="220"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel VerticalAlignment="Center">
+                        <TextBlock Text="加速颗粒度 (缓存块大小)" Style="{StaticResource BodyText}"/>
+                        <TextBlock Text="块越大元数据开销越小、顺序吞吐越高；块越小随机命中越细。默认 4K。" Style="{StaticResource CaptionText}"/>
+                    </StackPanel>
+                    <ComboBox x:Name="blockSizeBox" Grid.Column="1" VerticalAlignment="Center" SelectedIndex="0"
+                              SelectionChanged="BlockSize_SelectionChanged">
+                        <ComboBoxItem Content="4K  (4096 B)"/>
+                        <ComboBoxItem Content="8K  (8192 B)"/>
+                        <ComboBoxItem Content="16K (16384 B)"/>
+                        <ComboBoxItem Content="32K (32768 B)"/>
+                        <ComboBoxItem Content="64K (65536 B)"/>
+                        <ComboBoxItem Content="128K (131072 B)"/>
+                    </ComboBox>
+                </Grid>
+
+                <Border Background="#22FFB900" CornerRadius="8" Padding="12,10" Margin="0,0,0,12">
+                    <TextBlock Text="⚠ 块大小在驱动启动时确定，不能即时热切换：选择并应用后，请卸载并重新加载驱动（或重启电脑）使其生效；新几何不会复用旧缓存数据。这不是异常。"
+                               Style="{StaticResource CaptionText}" Foreground="{StaticResource WarningBrush}" TextWrapping="Wrap"/>
+                </Border>
+
+                <Grid Margin="0,0,0,12">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="220"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel VerticalAlignment="Center">
+                        <TextBlock Text="回写延时" Style="{StaticResource BodyText}"/>
+                        <TextBlock Text="脏数据在内存里等待多久才落盘。越短越安全、写吞吐略低。" Style="{StaticResource CaptionText}"/>
+                    </StackPanel>
+                    <ComboBox x:Name="flushBox" Grid.Column="1" VerticalAlignment="Center" SelectedIndex="0"
+                              SelectionChanged="FlushBox_SelectionChanged">
+                        <ComboBoxItem Content="60 秒"/>
+                        <ComboBoxItem Content="120 秒"/>
+                        <ComboBoxItem Content="300 秒 (5 分钟)"/>
+                        <ComboBoxItem Content="无限 (仅紧急时回写)"/>
+                    </ComboBox>
+                </Grid>
+
+                <Border x:Name="flushWarn" Background="#22FFB900" CornerRadius="8" Padding="12,10" Margin="0,0,0,12" Visibility="Collapsed">
+                    <TextBlock Text="⚠ 回写延时设为「无限」时，脏数据只在内存压力/关机时才落盘——断电或蓝屏可能丢失最近写入。"
+                               Style="{StaticResource CaptionText}" Foreground="{StaticResource WarningBrush}" TextWrapping="Wrap"/>
+                </Border>
+
+                <Button x:Name="applyBtn" Content="应用并回读确认" Style="{StaticResource AccentButton}"
+                        HorizontalAlignment="Right" Click="Apply_Click"/>
+                <TextBlock x:Name="applyResult" Text="" Style="{StaticResource CaptionText}" Margin="0,8,0,0"/>
+            </StackPanel>
+        </Border>
+    </Grid>
+    </ScrollViewer>
+</UserControl>

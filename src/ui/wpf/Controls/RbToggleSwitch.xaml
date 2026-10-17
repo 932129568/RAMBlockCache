@@ -1,0 +1,22 @@
+<UserControl x:Class="RamBoostFS.Wpf.Controls.RbToggleSwitch"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             mc:Ignorable="d" d:DesignHeight="32" d:DesignWidth="52">
+    <Grid Background="Transparent" MouseLeftButtonUp="OnClick" Cursor="Hand">
+        <Border x:Name="track" Width="44" Height="22" CornerRadius="11"
+                Background="{StaticResource LayerStrokeStrongBrush}"
+                HorizontalAlignment="Center" VerticalAlignment="Center">
+            <Border.RenderTransform>
+                <TranslateTransform x:Name="thumbTransform" X="-10"/>
+            </Border.RenderTransform>
+            <Ellipse x:Name="thumb" Width="18" Height="18" Fill="White"
+                     HorizontalAlignment="Left" Margin="4,0,0,0">
+                <Ellipse.RenderTransform>
+                    <TranslateTransform x:Name="thumbKnob" X="0"/>
+                </Ellipse.RenderTransform>
+            </Ellipse>
+        </Border>
+    </Grid>
+</UserControl>

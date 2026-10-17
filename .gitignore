@@ -1,0 +1,18 @@
+# Build artifacts
+*.obj
+*.err
+*.out
+*.log
+*.pdb
+[Bb]in/
+[Oo]bj/
+x64/
+.vs/
+*_wpftmp*
+
+# Local tooling / memory
+.workbuddy/
+
+# OS junk
+Thumbs.db
+Desktop.ini

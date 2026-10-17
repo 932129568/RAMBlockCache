@@ -1,0 +1,23 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "RAMBlockCache.Controller/10.3.4.19": {
+        "runtime": {
+          "RAMBlockCache.Controller.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "RAMBlockCache.Controller/10.3.4.19": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

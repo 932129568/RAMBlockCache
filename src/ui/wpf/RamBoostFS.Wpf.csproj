@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>RamBoostFS.Wpf</RootNamespace>
+    <AssemblyName>RamBoostFS.Wpf</AssemblyName>
+    <ApplicationIcon></ApplicationIcon>
+    <Version>10.3.4.19</Version>
+    <Product>RAMBoostFS Console</Product>
+    <Description>Native WPF control console for RAMBoostFS kernel minifilter cache.</Description>
+    <ApplicationManifest>Properties\app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+</Project>

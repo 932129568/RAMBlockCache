@@ -1,0 +1,93 @@
+<UserControl x:Class="RamBoostFS.Wpf.Views.VolumesView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:RamBoostFS.Wpf.Controls"
+             mc:Ignorable="d" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             d:DesignHeight="600" d:DesignWidth="900">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0" Margin="0,0,0,14">
+            <StackPanel>
+                <TextBlock Text="本机卷 · 块层绑定与热加速" Style="{StaticResource SubtitleText}"/>
+                <TextBlock Text="Bound = 块过滤驱动已绑定到该卷栈；Attached = 当前热加速中。每卷可独立选择写模式，免重启。" Style="{StaticResource CaptionText}" Margin="0,4,0,0"/>
+            </StackPanel>
+            <Button x:Name="refreshBtn" Content="刷新卷列表" Style="{StaticResource PillButton}" HorizontalAlignment="Right" Click="Refresh_Click"/>
+        </Grid>
+
+        <ItemsControl x:Name="volumeList" Grid.Row="1" HorizontalContentAlignment="Stretch">
+            <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                    <Border Style="{StaticResource Card}" Margin="0,0,0,10">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="60"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+
+                            <Border Grid.Column="0" Width="44" Height="44" CornerRadius="10"
+                                    Background="{StaticResource LayerCardStrongBrush}" VerticalAlignment="Top">
+                                <TextBlock Text="{Binding LetterLabel}" FontSize="18" FontWeight="SemiBold"
+                                           Foreground="{StaticResource AccentBrush}"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Border>
+
+                            <StackPanel Grid.Column="1" Margin="16,0,0,0">
+                                <!-- 标题 + 徽标行: 系统卷 / 已绑定 / 已加速 -->
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="{Binding Title}" Style="{StaticResource SubtitleText}"/>
+                                    <Border Background="#22FFB900" CornerRadius="4" Padding="6,1" Margin="10,0,0,0"
+                                            Visibility="{Binding IsSystemVis}">
+                                        <TextBlock Text="系统卷" Style="{StaticResource CaptionText}" Foreground="{StaticResource WarningBrush}"/>
+                                    </Border>
+                                    <!-- Bound: 绑定状态 -->
+                                    <Border Background="#224FC3F7" CornerRadius="4" Padding="6,1" Margin="6,0,0,0">
+                                        <TextBlock Text="{Binding BoundLabel}" Style="{StaticResource CaptionText}" Foreground="#FF4FC3F7"/>
+                                    </Border>
+                                    <!-- Attached: 加速状态 -->
+                                    <Border Background="#220F9D58" CornerRadius="4" Padding="6,1" Margin="6,0,0,0"
+                                            Visibility="{Binding AttachedBadgeVis}">
+                                        <TextBlock Text="{Binding AttachedLabel}" Style="{StaticResource CaptionText}" Foreground="{StaticResource OkBrush}"/>
+                                    </Border>
+                                </StackPanel>
+
+                                <TextBlock Text="{Binding CapacityText}" Style="{StaticResource CaptionText}" Margin="0,4,0,0"/>
+                                <TextBlock Text="{Binding SectorText}" Style="{StaticResource CaptionText}" Margin="0,2,0,10"/>
+
+                                <!-- 控制行: 读/写开关 + 写模式 + 附加按钮 -->
+                                <StackPanel Orientation="Horizontal">
+                                    <StackPanel Margin="0,0,20,0">
+                                        <TextBlock Text="读缓存" Style="{StaticResource CaptionText}" Margin="0,0,0,4"/>
+                                        <controls:RbToggleSwitch IsOn="{Binding ReadOn, Mode=TwoWay}" Toggled="Read_Toggled" Tag="{Binding LetterChar}"/>
+                                    </StackPanel>
+                                    <StackPanel Margin="0,0,20,0">
+                                        <TextBlock Text="写缓存" Style="{StaticResource CaptionText}" Margin="0,0,0,4"/>
+                                        <controls:RbToggleSwitch IsOn="{Binding WriteOn, Mode=TwoWay}" Toggled="Write_Toggled" Tag="{Binding LetterChar}"/>
+                                    </StackPanel>
+                                    <StackPanel Margin="0,0,20,0" Width="150">
+                                        <TextBlock Text="写模式" Style="{StaticResource CaptionText}" Margin="0,0,0,4"/>
+                                        <ComboBox SelectedIndex="{Binding WriteModeIndex, Mode=TwoWay}" SelectionChanged="WriteMode_Changed"
+                                                  Tag="{Binding LetterChar}" SelectedValuePath="Tag">
+                                            <ComboBoxItem Content="直写 (write-through)"/>
+                                            <ComboBoxItem Content="回写 (write-back)"/>
+                                            <ComboBoxItem Content="跟随全局"/>
+                                        </ComboBox>
+                                    </StackPanel>
+                                    <Button x:Name="attachBtn" Content="{Binding AttachBtnText}"
+                                            Style="{StaticResource PillButton}" Click="Attach_Click" Tag="{Binding LetterChar}"
+                                            VerticalAlignment="Bottom" Margin="0,0,0,2"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Grid>
+                    </Border>
+                </DataTemplate>
+            </ItemsControl.ItemTemplate>
+        </ItemsControl>
+    </Grid>
+    </ScrollViewer>
+</UserControl>

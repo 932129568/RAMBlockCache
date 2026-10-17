@@ -1,0 +1,1 @@
+BASE=C:\Users\?\Doubao\chats\2026-1~2\NEW-CH~1\v6work\RAMBOO~2 SYS=C:\Users\?\Doubao\chats\2026-1~2\NEW-CH~1\v6work\RAMBOO~2\driver\x64\Release\RAMBLO~1.SYS SCR=C:\Users\?\Doubao\chats\2026-1~2\NEW-CH~1\v6work\RAMBOO~2\setup\SIGN_D~1.PS1

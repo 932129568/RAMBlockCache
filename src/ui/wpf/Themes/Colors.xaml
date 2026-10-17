@@ -1,0 +1,52 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- ===== Fluent 调色板 (Win11) ===== -->
+    <!-- 主题色: 翡翠绿, 对标 PrimoCache 的质感 -->
+    <Color x:Key="AccentColor">#FF0F9D58</Color>
+    <Color x:Key="AccentColorHover">#FF10B366</Color>
+    <Color x:Key="AccentColorPressed">#FF0C8047</Color>
+    <Color x:Key="AccentSoftColor">#330F9D58</Color>
+
+    <Color x:Key="DangerColor">#FFE81123</Color>
+    <Color x:Key="WarningColor">#FFFFB900</Color>
+    <Color x:Key="OkColor">#FF0F9D58</Color>
+
+    <!-- 深色 Mica 玻璃面板 -->
+    <Color x:Key="LayerBaseColor">#FF202020</Color>
+    <Color x:Key="LayerCardColor">#332B2B2B</Color>
+    <Color x:Key="LayerCardStrongColor">#442B2B2B</Color>
+    <Color x:Key="LayerStrokeColor">#33FFFFFF</Color>
+    <Color x:Key="LayerStrokeStrongColor">#55FFFFFF</Color>
+
+    <Color x:Key="TextPrimaryColor">#FFE6E6E6</Color>
+    <Color x:Key="TextSecondaryColor">#FFA0A0A0</Color>
+    <Color x:Key="TextTertiaryColor">#FF737373</Color>
+
+    <!-- Brushes -->
+    <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AccentColor}" />
+    <SolidColorBrush x:Key="AccentBrushHover" Color="{StaticResource AccentColorHover}" />
+    <SolidColorBrush x:Key="AccentBrushPressed" Color="{StaticResource AccentColorPressed}" />
+    <SolidColorBrush x:Key="AccentSoftBrush" Color="{StaticResource AccentSoftColor}" />
+
+    <SolidColorBrush x:Key="DangerBrush" Color="{StaticResource DangerColor}" />
+    <SolidColorBrush x:Key="WarningBrush" Color="{StaticResource WarningColor}" />
+    <SolidColorBrush x:Key="OkBrush" Color="{StaticResource OkColor}" />
+
+    <SolidColorBrush x:Key="LayerBaseBrush" Color="{StaticResource LayerBaseColor}" />
+    <SolidColorBrush x:Key="LayerCardBrush" Color="{StaticResource LayerCardColor}" />
+    <SolidColorBrush x:Key="LayerCardStrongBrush" Color="{StaticResource LayerCardStrongColor}" />
+    <SolidColorBrush x:Key="LayerStrokeBrush" Color="{StaticResource LayerStrokeColor}" />
+    <SolidColorBrush x:Key="LayerStrokeStrongBrush" Color="{StaticResource LayerStrokeStrongColor}" />
+
+    <SolidColorBrush x:Key="TextPrimaryBrush" Color="{StaticResource TextPrimaryColor}" />
+    <SolidColorBrush x:Key="TextSecondaryBrush" Color="{StaticResource TextSecondaryColor}" />
+    <SolidColorBrush x:Key="TextTertiaryBrush" Color="{StaticResource TextTertiaryColor}" />
+
+    <!-- 压力指示灯颜色 -->
+    <SolidColorBrush x:Key="PressureNormalBrush" Color="#FF0F9D58" />
+    <SolidColorBrush x:Key="PressureMediumBrush" Color="#FFFFB900" />
+    <SolidColorBrush x:Key="PressureHighBrush" Color="#FFFF8C00" />
+    <SolidColorBrush x:Key="PressureUrgentBrush" Color="#FFE81123" />
+
+</ResourceDictionary>

@@ -1,0 +1,568 @@
+﻿<Window x:Class="RAMBlockCache.Controller.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ctl="clr-namespace:RAMBlockCache.Controller.Controls"
+        xmlns:services="clr-namespace:RAMBlockCache.Controller.Services"
+        Title="RAMBlockCache 控制器" Height="780" Width="1180" MinHeight="600" MinWidth="900"
+        Background="{DynamicResource BgBrush}" Foreground="{DynamicResource FgBrush}"
+        FontFamily="Segoe UI Variable, Segoe UI, Microsoft YaHei" FontSize="13">
+    <Window.Resources>
+        <!-- 导航项样式：圆角、选中高亮（色彩全部走语义令牌，无硬编码） -->
+        <Style x:Key="NavItemStyle" TargetType="ListBoxItem">
+            <Setter Property="Padding" Value="18,13"/>
+            <Setter Property="Margin" Value="10,2,10,2"/>
+            <Setter Property="Foreground" Value="{StaticResource RbcTextSecondary}"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ListBoxItem">
+                        <Border x:Name="bd" Background="Transparent" CornerRadius="8" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="{StaticResource RbcBgSurface}"/>
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="{StaticResource RbcBgSurfaceHover}"/>
+                                <Setter Property="Foreground" Value="{StaticResource RbcTextPrimary}"/>
+                                <Setter Property="FontWeight" Value="SemiBold"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- 页面切换 DataTrigger 模板（Visibility 结构不动；入场动画见 MainWindow.xaml.cs） -->
+        <Style x:Key="PageVisible" TargetType="Border">
+            <Setter Property="Visibility" Value="Collapsed"/>
+        </Style>
+
+        <!-- Toast 模板（02b §B.3-9：进 180ms ease-out / 出 120ms ease-in，位移 8px） -->
+        <DataTemplate x:Key="ToastTemplate" DataType="{x:Type services:ToastItem}">
+            <DataTemplate.Resources>
+                <Style TargetType="Border">
+                    <Setter Property="Background" Value="{StaticResource RbcBgSurface}"/>
+                    <Setter Property="BorderBrush" Value="{StaticResource RbcBorder}"/>
+                    <Setter Property="BorderThickness" Value="1"/>
+                    <Setter Property="CornerRadius" Value="8"/>
+                    <Setter Property="Padding" Value="14,10"/>
+                    <Setter Property="Margin" Value="0,0,0,8"/>
+                    <Setter Property="MaxWidth" Value="380"/>
+                    <Setter Property="RenderTransform">
+                        <Setter.Value>
+                            <TranslateTransform Y="8"/>
+                        </Setter.Value>
+                    </Setter>
+                    <Setter Property="Opacity" Value="0"/>
+                    <Style.Triggers>
+                        <DataTrigger Binding="{Binding Kind}" Value="Success">
+                            <Setter Property="BorderBrush" Value="{StaticResource RbcSuccessFg}"/>
+                        </DataTrigger>
+                        <DataTrigger Binding="{Binding Kind}" Value="Warning">
+                            <Setter Property="BorderBrush" Value="{StaticResource RbcWarningFg}"/>
+                        </DataTrigger>
+                        <DataTrigger Binding="{Binding Kind}" Value="Danger">
+                            <Setter Property="BorderBrush" Value="{StaticResource RbcDangerFg}"/>
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+            </DataTemplate.Resources>
+            <Border>
+                <StackPanel Orientation="Horizontal">
+                    <Ellipse Width="8" Height="8" VerticalAlignment="Center" Margin="0,0,10,0">
+                        <Ellipse.Style>
+                            <Style TargetType="Ellipse">
+                                <Setter Property="Fill" Value="{StaticResource RbcInfoFg}"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding Kind}" Value="Success">
+                                        <Setter Property="Fill" Value="{StaticResource RbcSuccessFg}"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding Kind}" Value="Warning">
+                                        <Setter Property="Fill" Value="{StaticResource RbcWarningFg}"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding Kind}" Value="Danger">
+                                        <Setter Property="Fill" Value="{StaticResource RbcDangerFg}"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Ellipse.Style>
+                    </Ellipse>
+                    <TextBlock Text="{Binding Message}" Foreground="{StaticResource RbcTextPrimary}"
+                               TextWrapping="Wrap" MaxWidth="330"/>
+                </StackPanel>
+                <Border.Triggers>
+                    <!-- 入场：Loaded 即播（180ms ease-out，Y 8→0 + 0→1；禁弹跳/过冲） -->
+                    <EventTrigger RoutedEvent="Loaded">
+                        <BeginStoryboard>
+                            <Storyboard>
+                                <DoubleAnimation Storyboard.TargetProperty="Opacity" To="1" Duration="0:0:0.180">
+                                    <DoubleAnimation.EasingFunction>
+                                        <CubicEase EasingMode="EaseOut"/>
+                                    </DoubleAnimation.EasingFunction>
+                                </DoubleAnimation>
+                                <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(TranslateTransform.Y)"
+                                                 From="8" To="0" Duration="0:0:0.180">
+                                    <DoubleAnimation.EasingFunction>
+                                        <CubicEase EasingMode="EaseOut"/>
+                                    </DoubleAnimation.EasingFunction>
+                                </DoubleAnimation>
+                            </Storyboard>
+                        </BeginStoryboard>
+                    </EventTrigger>
+                    <!-- 出场：IsClosing 置位即播（120ms ease-in，Y 0→8 + 1→0） -->
+                    <DataTrigger Binding="{Binding IsClosing}" Value="True">
+                        <DataTrigger.EnterActions>
+                            <BeginStoryboard>
+                                <Storyboard>
+                                    <DoubleAnimation Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.120"/>
+                                    <DoubleAnimation Storyboard.TargetProperty="RenderTransform.(TranslateTransform.Y)"
+                                                     From="0" To="8" Duration="0:0:0.120"/>
+                                </Storyboard>
+                            </BeginStoryboard>
+                        </DataTrigger.EnterActions>
+                    </DataTrigger>
+                </Border.Triggers>
+            </Border>
+        </DataTemplate>
+    </Window.Resources>
+
+    <!-- 最外层 Grid：内容 DockPanel + 右上角 Toast 叠加层 -->
+    <Grid>
+        <DockPanel>
+            <!-- [契约 V9] 常驻四段状态条：驱动 / 挂栈 / 加速 / 风险（异常段变色可点击） -->
+            <ctl:StateBar DockPanel.Dock="Top" x:Name="StateBarCtl"/>
+
+            <!-- 顶部警告条 -->
+            <Border DockPanel.Dock="Top" Background="{StaticResource RbcDangerBg}" Padding="16,10"
+                    Visibility="{Binding BannerVisible, Converter={StaticResource BoolToVis}}">
+                <TextBlock Text="{Binding Banner}" Foreground="{StaticResource RbcDangerFg}" TextWrapping="Wrap" FontWeight="SemiBold"/>
+            </Border>
+
+            <!-- 左侧导航 -->
+            <Border DockPanel.Dock="Left" Width="216" Background="{StaticResource RbcBgApp}" Margin="0,0,1,0">
+                <DockPanel>
+                    <StackPanel DockPanel.Dock="Top" Margin="18,18,0,6">
+                        <TextBlock Text="RAMBlockCache" FontSize="17" FontWeight="SemiBold" Foreground="{StaticResource RbcTextPrimary}"/>
+                        <TextBlock Text="{Binding TitleExtra}" Foreground="{StaticResource RbcTextSecondary}" FontSize="11" Margin="0,2,0,0"/>
+                    </StackPanel>
+                    <ListBox ItemsSource="{Binding NavItems}" SelectedItem="{Binding SelectedPage, Mode=TwoWay}"
+                              Background="Transparent" BorderThickness="0" Margin="0,8,0,0"
+                              ItemContainerStyle="{StaticResource NavItemStyle}"/>
+                </DockPanel>
+            </Border>
+
+            <!-- 内容区 -->
+            <Grid Margin="18,16,18,16">
+
+                <!-- ============ 总览 ============ -->
+                <Border x:Name="PageOverview">
+                    <Border.Style>
+                        <Style TargetType="Border" BasedOn="{StaticResource PageVisible}">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding SelectedPage}" Value="总览">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel>
+                            <Grid>
+                                <TextBlock Text="系统总览" FontSize="22" FontWeight="SemiBold" HorizontalAlignment="Left"/>
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                    <Button Content="全部挂载" Command="{Binding MountAllCommand}" Margin="0,0,8,0" Style="{StaticResource BtnSecondary}"/>
+                                    <Button Content="全部卸载" Command="{Binding UnmountAllCommand}" Margin="0,0,8,0" Style="{StaticResource BtnSecondary}"/>
+                                    <!-- [P1-10] 安全功能入口：此前 UI 完全不可达，只能改注册表/命令行 -->
+                                    <Button Content="拉取驱动日志" Command="{Binding PullDriverLogCommand}" Margin="0,0,8,0" Style="{StaticResource BtnSecondary}"
+                                            ToolTip="GET_LOG：拉取驱动环形错误日志到日志页"/>
+                                    <Button Content="退出安全模式" Command="{Binding ExitSafeModeCommand}" Margin="0,0,8,0" Style="{StaticResource BtnSecondary}"
+                                            ToolTip="EXIT_SAFE_MODE：上次异常退出后的强制直写状态解除"/>
+                                    <Button Content="解除熔断" Command="{Binding PanicClearCommand}" Margin="0,0,8,0" Style="{StaticResource BtnSecondary}"
+                                            ToolTip="PANIC_CLEAR：驱动确认缓存自愈完成后恢复（未完成会被拒绝）"/>
+                                    <Button Content="一键熔断" Command="{Binding PanicCommand}" Style="{StaticResource BtnDanger}"
+                                            ToolTip="PANIC：全局透传保数据（盘面异常时使用）"/>
+                                </StackPanel>
+                            </Grid>
+
+                            <UniformGrid Columns="3" Margin="0,16,0,0">
+                                <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                        CornerRadius="12" Padding="20" Margin="0,0,10,0" ctl:CardHover.IsEnabled="True">
+                                    <StackPanel>
+                                        <TextBlock Text="已挂载卷" Foreground="{StaticResource RbcTextSecondary}"/>
+                                        <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                            <TextBlock ctl:NumberRoller.Value="{Binding MountedCount}" ctl:NumberRoller.Format="F0"
+                                                       FontSize="34" FontWeight="SemiBold" Foreground="{StaticResource RbcAccent}"/>
+                                            <TextBlock Text=" / " Foreground="{StaticResource RbcTextSecondary}" FontSize="20" VerticalAlignment="Bottom" Margin="4,0,0,4"/>
+                                            <TextBlock Text="{Binding TotalVolumes}" FontSize="20" Foreground="{StaticResource RbcTextSecondary}" VerticalAlignment="Bottom" Margin="0,0,0,4"/>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Border>
+                                <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                        CornerRadius="12" Padding="20" Margin="5,0,5,0" ctl:CardHover.IsEnabled="True">
+                                    <StackPanel>
+                                        <TextBlock Text="平均命中率" Foreground="{StaticResource RbcTextSecondary}"/>
+                                        <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                            <TextBlock ctl:NumberRoller.Value="{Binding AvgHit}" ctl:NumberRoller.Format="F1"
+                                                       FontSize="34" FontWeight="SemiBold" Foreground="{StaticResource RbcAccent}"/>
+                                            <TextBlock Text=" %" FontSize="16" Foreground="{StaticResource RbcTextSecondary}" VerticalAlignment="Bottom" Margin="2,0,0,6"/>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Border>
+                                <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                        CornerRadius="12" Padding="20" Margin="10,0,0,0" ctl:CardHover.IsEnabled="True">
+                                    <StackPanel>
+                                        <TextBlock Text="缓存占用" Foreground="{StaticResource RbcTextSecondary}"/>
+                                        <TextBlock Text="{Binding CacheText}" FontSize="34" FontWeight="SemiBold" Foreground="{StaticResource RbcSuccessFg}" Margin="0,6,0,0"/>
+                                    </StackPanel>
+                                </Border>
+                            </UniformGrid>
+
+                            <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                    CornerRadius="12" Padding="20" Margin="0,16,0,0" ctl:CardHover.IsEnabled="True">
+                                <StackPanel>
+                                    <TextBlock Text="状态" FontWeight="SemiBold" Foreground="{StaticResource RbcTextPrimary}" Margin="0,0,0,8"/>
+                                    <TextBlock Foreground="{StaticResource RbcTextSecondary}" LineHeight="22">
+                                        <Run Text="协议 9 · IOCTL 0x222000 · 设备按盘符 · 结构体 Pack=8" /><LineBreak/>
+                                        <Run Text="缓存块 4K 对齐 · 读写全进内存 · 动态内存自适应（有多少用多少、不写死上限）" /><LineBreak/>
+                                        <Run Text="系统卷/引导关键卷硬排除 · panic 熔断自动旁路" />
+                                    </TextBlock>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </ScrollViewer>
+                </Border>
+
+                <!-- ============ 磁盘 ============ -->
+                <Border x:Name="PageDisks">
+                    <Border.Style>
+                        <Style TargetType="Border" BasedOn="{StaticResource PageVisible}">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding SelectedPage}" Value="磁盘">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <DockPanel>
+                        <TextBlock DockPanel.Dock="Top" Text="磁盘缓存" FontSize="22" FontWeight="SemiBold" Margin="0,0,0,12"/>
+                        <ListBox ItemsSource="{Binding Drives}" Background="Transparent" BorderThickness="0"
+                                 ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                            CornerRadius="10" Padding="14" Margin="0,0,0,10" ctl:CardHover.IsEnabled="True">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="220"/><ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Grid.Column="0" Margin="0,0,14,0" VerticalAlignment="Center">
+                                                <TextBlock Text="{Binding DriveLetter}" FontSize="26" FontWeight="SemiBold"/>
+                                                <TextBlock Text="{Binding VolumeLabel}" Foreground="{StaticResource RbcTextSecondary}"/>
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                                <TextBlock Text="{Binding StatusText}" Foreground="{StaticResource RbcAccent}"/>
+                                                <!-- [M1/FR-BL-06] 每卷加速/旁路 + 原因码（VOLSTATUS 0x905） -->
+                                                <TextBlock Text="{Binding AccelText}" Foreground="{StaticResource RbcTextSecondary}" Margin="0,2,0,0"/>
+                                                <TextBlock Text="{Binding UsedText}" Foreground="{StaticResource RbcTextSecondary}" Margin="0,2,0,6"/>
+                                                <ctl:SmoothProgressBar Value="{Binding UsedPct, Mode=OneWay}" Maximum="100" Height="6"/>
+                                                <TextBlock Text="配额 (MB)" Foreground="{StaticResource RbcTextSecondary}" Margin="0,8,0,2"/>
+                                                <Slider Minimum="64" Maximum="4096" TickFrequency="64" IsSnapToTickEnabled="True"
+                                                        Value="{Binding QuotaMB, Mode=TwoWay}"/>
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="2" VerticalAlignment="Center">
+                                                <ctl:Sparkline Height="48" Value="{Binding ReadMbps, Mode=OneWay}"/>
+                                                <TextBlock Foreground="{StaticResource RbcTextSecondary}" Margin="0,4,0,0">
+                                                    <Run Text="读 "/><Run Text="{Binding ReadMbps, Mode=OneWay, StringFormat=F1}"/><Run Text=" MB/s   命中 "/>
+                                                    <Run Text="{Binding HitPct, Mode=OneWay, StringFormat=F1}"/><Run Text="%"/>
+                                                </TextBlock>
+                                                <!-- [BUG3] 缓存证据行：本次开机累计缓存读取量（"缓存在工作"的可见证明） -->
+                                                <TextBlock Text="{Binding ServedText}" Foreground="{StaticResource RbcTextSecondary}" Margin="0,2,0,0"/>
+                                                <ctl:Sparkline Height="48" Value="{Binding WriteMbps, Mode=OneWay}" Stroke="{StaticResource RbcSuccessFg}"/>
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="3" VerticalAlignment="Center" Margin="14,0,0,0">
+                                                <!-- [契约 消息#6 SET_VOLUME] 写模式控件（P1-11：默认直写，回写需知情）
+                                                     SelectedIndex: 0=直写 1=回写（经 DriveItemViewModel.ModeIndex 桥接 uint Mode） -->
+                                                <TextBlock Text="写模式" Foreground="{StaticResource RbcTextSecondary}" Margin="0,0,0,2"/>
+                                                <ComboBox Width="126" Margin="0,0,0,6"
+                                                          SelectedIndex="{Binding ModeIndex, Mode=TwoWay}">
+                                                    <ComboBoxItem Content="直写（最安全）"/>
+                                                    <ComboBoxItem Content="回写（更快·有风险）"/>
+                                                </ComboBox>
+                                                <Button Content="挂载"   Command="{Binding MountCommand}"   Margin="0,0,0,6" Width="126" Style="{StaticResource BtnPrimary}"/>
+                                                <Button Content="卸载"   Command="{Binding UnmountCommand}" Margin="0,0,0,6" Width="126" Style="{StaticResource BtnSecondary}"/>
+                                                <Button Content="立即回写" Command="{Binding FlushCommand}" Margin="0,0,0,6" Width="126" Style="{StaticResource BtnSecondary}"/>
+                                                <Button Content="暂停/恢复" Command="{Binding PauseResumeCommand}" Width="126" Style="{StaticResource BtnSecondary}"/>
+                                            </StackPanel>
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </DockPanel>
+                </Border>
+
+                <!-- ============ 缓存 ============ -->
+                <Border x:Name="PageCache">
+                    <Border.Style>
+                        <Style TargetType="Border" BasedOn="{StaticResource PageVisible}">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding SelectedPage}" Value="缓存">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <DockPanel>
+                        <TextBlock DockPanel.Dock="Top" Text="缓存" FontSize="22" FontWeight="SemiBold" Margin="0,0,0,12"/>
+                        <ScrollViewer DockPanel.Dock="Top" VerticalScrollBarVisibility="Auto">
+                            <StackPanel>
+                                <!-- L2 持久缓存（FR-L2-03 配置面 / FR-L2-06 统计） -->
+                                <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                        CornerRadius="12" Padding="20" Margin="0,0,0,14" ctl:CardHover.IsEnabled="True">
+                                    <StackPanel>
+                                        <Grid>
+                                            <TextBlock Text="L2 持久缓存" FontWeight="SemiBold" Foreground="{StaticResource RbcTextPrimary}" FontSize="15"/>
+                                            <TextBlock Text="{Binding L2StateText}" HorizontalAlignment="Right" Foreground="{StaticResource RbcTextSecondary}"/>
+                                        </Grid>
+                                        <TextBlock Foreground="{StaticResource RbcTextSecondary}" Margin="0,6,0,12" TextWrapping="Wrap"
+                                                   Text="掉电重启后仍保留的热数据（“开机即热”）。启用后驱动在选中卷创建容器文件 RAMBoostL2.bin，该空间被缓存专用；删除缓存 = 删除该文件。"/>
+                                        <Grid Margin="0,0,0,10">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="190"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,18,0">
+                                                <TextBlock Text="容器盘符" Foreground="{StaticResource RbcTextSecondary}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                                <ComboBox Width="90" ItemsSource="{Binding L2LetterOptions}" SelectedItem="{Binding L2Letter, Mode=TwoWay}"/>
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,18,0">
+                                                <TextBlock Foreground="{StaticResource RbcTextSecondary}" Margin="0,0,0,2">
+                                                    <Run Text="容量 "/><Run Text="{Binding L2SizeGB, Mode=OneWay, StringFormat=F0}"/><Run Text=" GB（1–128，缺省 32）"/>
+                                                </TextBlock>
+                                                <Slider Minimum="1" Maximum="128" TickFrequency="1" IsSnapToTickEnabled="True"
+                                                        Value="{Binding L2SizeGB, Mode=TwoWay}"/>
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="2" VerticalAlignment="Center" Margin="0,0,18,0">
+                                                <TextBlock Text="{Binding L2SpaceHint}" Foreground="{StaticResource RbcTextSecondary}" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
+                                                <Button Content="启用 L2" Command="{Binding EnableL2Command}" Style="{StaticResource BtnPrimary}" Margin="0,0,8,0"/>
+                                                <Button Content="关闭 L2" Command="{Binding DisableL2Command}" Style="{StaticResource BtnSecondary}"/>
+                                            </StackPanel>
+                                        </Grid>
+                                        <TextBlock Text="{Binding L2CountersText}" Foreground="{StaticResource RbcTextSecondary}"/>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- 顺序读预取（FR-PF-01 总开关 / FR-PF-03 温度护栏 / FR-PF-04 统计） -->
+                                <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                        CornerRadius="12" Padding="20" Margin="0,0,0,14" ctl:CardHover.IsEnabled="True">
+                                    <StackPanel>
+                                        <Grid>
+                                            <TextBlock Text="顺序读预取" FontWeight="SemiBold" Foreground="{StaticResource RbcTextPrimary}" FontSize="15"/>
+                                            <CheckBox Content="启用预取" IsChecked="{Binding PrefetchEnabled, Mode=TwoWay}"
+                                                      HorizontalAlignment="Right" Foreground="{StaticResource RbcTextPrimary}"/>
+                                        </Grid>
+                                        <TextBlock Foreground="{StaticResource RbcTextSecondary}" Margin="0,6,0,12" TextWrapping="Wrap"
+                                                   Text="顺序读时按窗口提前把后续数据读入缓存（部署默认关闭；仅建议在已验证加速的 SSD 数据卷开启）。每卷预读窗口见下方列表。"/>
+                                        <TextBlock Text="{Binding PrefetchCountersText}" Foreground="{StaticResource RbcTextSecondary}"/>
+                                        <TextBlock Text="{Binding ThermalText}" Foreground="{StaticResource RbcTextSecondary}" Margin="0,4,0,0"/>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- 回写周期（BUG2：用户可配回写间隔；0=无限，仅立即回写/卸载/关机落盘） -->
+                                <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                        CornerRadius="12" Padding="20" Margin="0,0,0,14" ctl:CardHover.IsEnabled="True">
+                                    <StackPanel>
+                                        <Grid>
+                                            <TextBlock Text="回写周期" FontWeight="SemiBold" Foreground="{StaticResource RbcTextPrimary}" FontSize="15"/>
+                                            <TextBlock Text="{Binding FlushIntervalText}" HorizontalAlignment="Right" Foreground="{StaticResource RbcTextSecondary}"/>
+                                        </Grid>
+                                        <TextBlock Foreground="{StaticResource RbcTextSecondary}" Margin="0,6,0,12" TextWrapping="Wrap"
+                                                   Text="回写模式下，脏数据每隔该时间自动写入磁盘（写更快；掉电或异常退出可能丢失未落盘数据）。设为“无限”仅保留三种落盘时机：点击“立即回写”、卸载、关机。直写模式不产生脏数据，本项不生效。"/>
+                                        <ComboBox Width="240" HorizontalAlignment="Left"
+                                                  SelectedIndex="{Binding FlushIntervalIndex, Mode=TwoWay}">
+                                            <ComboBoxItem Content="10 秒"/>
+                                            <ComboBoxItem Content="30 秒"/>
+                                            <ComboBoxItem Content="60 秒（默认）"/>
+                                            <ComboBoxItem Content="5 分钟"/>
+                                            <ComboBoxItem Content="无限（关闭自动回写）"/>
+                                        </ComboBox>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- 每卷占用 + 预读窗口（FR-PF-02） -->
+                                <ListBox ItemsSource="{Binding Drives}" Background="Transparent" BorderThickness="0"
+                                         ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                    <ListBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                                    CornerRadius="10" Padding="16" Margin="0,0,0,10" ctl:CardHover.IsEnabled="True">
+                                                <StackPanel>
+                                                    <Grid>
+                                                        <TextBlock Text="{Binding DriveLetter}" FontWeight="SemiBold" FontSize="15"/>
+                                                        <TextBlock Text="{Binding UsedText}" Foreground="{StaticResource RbcTextSecondary}"
+                                                                   HorizontalAlignment="Right"/>
+                                                    </Grid>
+                                                    <ctl:SmoothProgressBar Value="{Binding UsedPct, Mode=OneWay}" Maximum="100" Height="8" Margin="0,8,0,0"/>
+                                                    <Grid Margin="0,10,0,0">
+                                                        <TextBlock Text="预读窗口" Foreground="{StaticResource RbcTextSecondary}" VerticalAlignment="Center"/>
+                                                        <ComboBox Width="120" HorizontalAlignment="Right"
+                                                                  SelectedIndex="{Binding ReadAheadIndex, Mode=TwoWay}">
+                                                            <ComboBoxItem Content="关闭"/>
+                                                            <ComboBoxItem Content="8 MB"/>
+                                                            <ComboBoxItem Content="16 MB"/>
+                                                            <ComboBoxItem Content="32 MB"/>
+                                                            <ComboBoxItem Content="64 MB"/>
+                                                        </ComboBox>
+                                                    </Grid>
+                                                </StackPanel>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ListBox.ItemTemplate>
+                                </ListBox>
+                            </StackPanel>
+                        </ScrollViewer>
+                    </DockPanel>
+                </Border>
+
+                <!-- ============ 日志 ============ -->
+                <Border x:Name="PageLog">
+                    <Border.Style>
+                        <Style TargetType="Border" BasedOn="{StaticResource PageVisible}">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding SelectedPage}" Value="日志">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <DockPanel>
+                        <TextBlock DockPanel.Dock="Top" Text="运行日志" FontSize="22" FontWeight="SemiBold" Margin="0,0,0,12"/>
+                        <Border Background="{StaticResource RbcBgApp}" CornerRadius="8" Padding="10">
+                            <ListBox ItemsSource="{Binding LogLines}" FontFamily="Consolas" FontSize="12"
+                                     Background="Transparent" BorderThickness="0"
+                                     Foreground="{StaticResource RbcTextSecondary}" ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
+                        </Border>
+                    </DockPanel>
+                </Border>
+
+                <!-- ============ 设置 ============ -->
+                <Border x:Name="PageSettings">
+                    <Border.Style>
+                        <Style TargetType="Border" BasedOn="{StaticResource PageVisible}">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding SelectedPage}" Value="设置">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel>
+                            <TextBlock Text="设置" FontSize="22" FontWeight="SemiBold" Margin="0,0,0,16"/>
+                            <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                    CornerRadius="12" Padding="20" ctl:CardHover.IsEnabled="True">
+                                <StackPanel>
+                                    <CheckBox Content="开机自动随卷挂载（跳过系统盘 C:）" IsChecked="{Binding AutoStart}"
+                                              Foreground="{StaticResource RbcTextPrimary}" FontSize="14"/>
+                                    <CheckBox Content="随 Windows 启动本控制台" IsChecked="{Binding LaunchOnBoot}"
+                                              Foreground="{StaticResource RbcTextPrimary}" FontSize="14" Margin="0,10,0,0"/>
+                                </StackPanel>
+                            </Border>
+                            <!-- [M1/FR-BL-03] 进程准入排除产品化 -->
+                            <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                    CornerRadius="12" Padding="20" Margin="0,14,0,0" ctl:CardHover.IsEnabled="True">
+                                <StackPanel>
+                                    <TextBlock Text="进程准入排除" FontWeight="SemiBold" Foreground="{StaticResource RbcTextPrimary}" Margin="0,0,0,8"/>
+                                    <TextBlock Foreground="{StaticResource RbcTextSecondary}" TextWrapping="Wrap" Margin="0,0,0,10"
+                                               Text="命中名单的进程，其 I/O 不进缓存（直通）。碎片整理/备份/杀毒类工具运行期与缓存互相干扰，建议排除。支持 * ? 通配、大小写不敏感；最多 32 条、每条最多 15 字符。"/>
+                                    <CheckBox Content="启用内置排除名单（defrag / dfrgui / wbengine / vssadmin / msmpeng）"
+                                              IsChecked="{Binding UseDefaultExcl, Mode=TwoWay}"
+                                              Foreground="{StaticResource RbcTextPrimary}" FontSize="14"/>
+                                    <TextBlock Text="自定义名单（每行一个进程镜像名，保存后立即生效）" Foreground="{StaticResource RbcTextSecondary}" Margin="0,14,0,4"/>
+                                    <TextBox Text="{Binding ExcludeText, Mode=TwoWay}" Height="96" AcceptsReturn="True"
+                                             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                                             Background="{StaticResource RbcBgApp}" Foreground="{StaticResource RbcTextPrimary}"
+                                             BorderBrush="{StaticResource RbcBorder}" Padding="8" FontFamily="Consolas"/>
+                                    <Grid Margin="0,10,0,0">
+                                        <TextBlock Text="{Binding AdmitRejectsText}" Foreground="{StaticResource RbcTextSecondary}" VerticalAlignment="Center"/>
+                                        <Button Content="保存名单" Command="{Binding SaveExcludeCommand}" Style="{StaticResource BtnPrimary}"
+                                                HorizontalAlignment="Right"/>
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+                            <!-- [W1–W4] 预留功能与实验面（接口契约 + Noop 占位 + 错误路径可演示） -->
+                            <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                    CornerRadius="12" Padding="20" Margin="0,14,0,0" ctl:CardHover.IsEnabled="True">
+                                <StackPanel>
+                                    <TextBlock Text="预留功能与实验" FontWeight="SemiBold" Foreground="{StaticResource RbcTextPrimary}" Margin="0,0,0,4"/>
+                                    <TextBlock Foreground="{StaticResource RbcTextSecondary}" TextWrapping="Wrap" Margin="0,0,0,14"
+                                               Text="迭代计划 W1–W4 波次的能力接口占位：契约、错误码与错误路径已就位并可演示；实现随对应波次交付。"/>
+                                    <Grid Margin="0,0,0,14">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel Grid.Column="0" Margin="0,0,20,0">
+                                            <CheckBox Content="匿名使用遥测（W1-1：默认关、匿名、一键可关）"
+                                                      IsChecked="{Binding TelemetryOptIn, Mode=TwoWay}"
+                                                      Foreground="{StaticResource RbcTextPrimary}" FontSize="14"/>
+                                            <TextBlock Text="{Binding TelemetryStatusText}" Foreground="{StaticResource RbcTextSecondary}"
+                                                       FontSize="12" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="1">
+                                            <TextBlock Text="减少动效（可访问性降级）" Foreground="{StaticResource RbcTextPrimary}" FontSize="14" Margin="0,0,0,6"/>
+                                            <ComboBox Width="200" HorizontalAlignment="Left"
+                                                      SelectedIndex="{Binding ReduceMotionIndex, Mode=TwoWay}">
+                                                <ComboBoxItem Content="跟随系统设置（默认）"/>
+                                                <ComboBoxItem Content="始终开启动效"/>
+                                                <ComboBoxItem Content="减少动效"/>
+                                            </ComboBox>
+                                        </StackPanel>
+                                    </Grid>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,16,0">
+                                            <TextBlock Text="{Binding LicenseStatusText}" Foreground="{StaticResource RbcTextSecondary}" FontSize="12"/>
+                                        </StackPanel>
+                                        <Button Grid.Column="1" Content="重跑首次向导（W1-4）" Command="{Binding RerunWizardCommand}"
+                                                Style="{StaticResource BtnSecondary}" Margin="0,0,8,0"/>
+                                        <Button Grid.Column="2" Content="激活许可（W4-3）" Command="{Binding ActivateLicenseCommand}"
+                                                Style="{StaticResource BtnSecondary}"/>
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+                            <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}" BorderThickness="1"
+                                    CornerRadius="12" Padding="20" Margin="0,14,0,0" ctl:CardHover.IsEnabled="True">
+                                <StackPanel>
+                                    <TextBlock Text="关于" FontWeight="SemiBold" Foreground="{StaticResource RbcTextPrimary}" Margin="0,0,0,8"/>
+                                    <TextBlock Foreground="{StaticResource RbcTextSecondary}" LineHeight="22">
+                                        <!-- [P2-10] 版本串改为绑定（gen_version.ps1 → Version.cs 单一事实源），不再硬编码 -->
+                                        <Run Text="RAMBlockCache " /><Run Text="{Binding ProductVersion, Mode=OneWay}" /><Run Text=" · Protocol 9" /><LineBreak/>
+                                        <Run Text="4K 块缓存 · 读写全进内存 · 动态内存自适应（设置 0 = 用完全部剩余可用内存）" /><LineBreak/>
+                                        <Run Text="热加载/热卸载免重启 · panic 熔断自动旁路 · 系统卷硬排除" />
+                                    </TextBlock>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </ScrollViewer>
+                </Border>
+
+            </Grid>
+        </DockPanel>
+
+        <!-- Toast 叠加层（右下；点击不拦截——IsHitTestVisible=False） -->
+        <ItemsControl ItemsSource="{Binding Source={x:Static services:ToastService.Instance}, Path=Toasts}"
+                      ItemTemplate="{StaticResource ToastTemplate}"
+                      HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                      Margin="0,0,18,18" IsHitTestVisible="False"/>
+    </Grid>
+</Window>

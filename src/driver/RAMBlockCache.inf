@@ -1,0 +1,79 @@
+; RAMBlockCache 安装文件（V10：BUG-001 整改 —— 恢复"挂载前挂卷栈"）
+; 目标：Windows 11 26H2 (x64)
+;
+; V10 关键变更（P0）：
+;   - 恢复标准卷类 UpperFilters（{71a27cdd-...}，与 volsnap 同类，append 不破坏原值）；
+;     过滤设备在文件系统挂载【之前】进入卷栈 —— NTFS paging I/O 必经路径。
+;   - 引导关键卷由驱动内三重闸门在 AddDevice 拒绝（0x7B 防线不变）。
+;   - 数据卷挂栈后默认透传，ATTACH 热开关免重启；首次注册过滤器需一次重启。
+;
+; 注意：驱动自签名（testsigning on）。
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Volume
+ClassGuid   = {71a27cdd-812a-11d0-bec7-08002be2092f}
+Provider    = %ProviderName%
+DriverVer   = 10/13/2026,10.3.4.19
+CatalogFile = RAMBlockCache.cat
+
+[DestinationDirs]
+DefaultDestDir     = 12                 ; %SystemRoot%\system32\drivers
+RAMBlockCache.Files = 12
+
+; ---------------- 安装（x64） ----------------
+[DefaultInstall.NTamd64]
+CopyFiles = RAMBlockCache.Files
+AddReg    = RAMBlockCache.AddReg
+AddService= RAMBlockCache, 2, RAMBlockCache.Service, RAMBlockCache.EventLog
+
+[RAMBlockCache.Files]
+RAMBlockCache.sys
+
+[RAMBlockCache.AddReg]
+HKLM, "SYSTEM\CurrentControlSet\Services\RAMBlockCache", "DisplayName",  0x00000000, %ServiceDescription%
+HKLM, "SYSTEM\CurrentControlSet\Services\RAMBlockCache", "Description",  0x00000000, %ServiceDescription%
+; [V10][BUG-001] 向标准卷类 UpperFilters【追加】RAMBlockCache（0x00010008 =
+; REG_MULTI_SZ + Append；已存在则不重复；volsnap 原值保留）
+HKLM, "SYSTEM\CurrentControlSet\Control\Class\{71a27cdd-812a-11d0-bec7-08002be2092f}", "UpperFilters", 0x00010008, "RAMBlockCache"
+
+; ---------------- 服务定义（V10.2：BOOT_START；卷挂载前由 winload 加载） ----------------
+; 根因：DEMAND_START 驱动无法在引导卷挂载前进栈，卷类 UpperFilters 引用 boot 阶段
+;       不可加载的驱动 -> 0x7B。改 BOOT_START(0) 由 winload 提前加载。
+; ErrorControl=1 (SERVICE_ERROR_NORMAL)：加载失败只记日志，绝不阻止系统启动；
+;       绝不使用 3 (SERVICE_ERROR_CRITICAL)。
+[RAMBlockCache.Service]
+DisplayName    = %ServiceDescription%
+Description    = %ServiceDescription%
+ServiceType    = 1                       ; SERVICE_KERNEL_DRIVER
+StartType      = 0                       ; SERVICE_BOOT_START (V10.2)
+ErrorControl   = 1                       ; SERVICE_ERROR_NORMAL
+LoadOrderGroup = "System Bus Extender"  ; 在 volmgr 之后、卷挂载之前
+ServiceBinary  = %12%\RAMBlockCache.sys
+AddReg         = RAMBlockCache.Service.AddReg
+
+[RAMBlockCache.Service.AddReg]
+HKR, "Parameters", "CacheSizeMB",        0x00010001, 0        ; 0=动态按需增长
+HKR, "Parameters", "WriteBack",          0x00010001, 0        ; [BUG-003] 默认 write-through
+HKR, "Parameters", "SystemVolumeCached", 0x00010001, 0
+HKR, "Parameters", "FlushIntervalMs",    0x00010001, 60000
+HKR, "Parameters", "DirtyHighPct",       0x00010001, 60
+HKR, "Parameters", "DirtyLowPct",        0x00010001, 40
+
+[RAMBlockCache.EventLog]
+AddReg = RAMBlockCache.EventLog.AddReg
+
+[RAMBlockCache.EventLog.AddReg]
+HKR, "EventLog\System\RAMBlockCache", "EventMessageFile", 0x00020000, "%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR, "EventLog\System\RAMBlockCache", "TypesSupported",   0x00010001, 7
+
+; ---------------- 卸载 ----------------
+; [V10] DelReg 刻意【不碰】UpperFilters（会把 volsnap 一并删掉，危险）。
+; UpperFilters 的精细摘除由 scripts\uninstall.ps1 负责（读-改-写，保留 volsnap）。
+[DefaultUninstall.NTamd64]
+DelService = RAMBlockCache, 0x200
+DelFiles   = RAMBlockCache.Files
+
+[Strings]
+ProviderName       = "RAMBlockCache"
+ServiceDescription = "RAMBlockCache RAM Disk Cache"

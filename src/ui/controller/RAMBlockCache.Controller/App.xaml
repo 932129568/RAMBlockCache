@@ -1,0 +1,70 @@
+﻿<Application x:Class="RAMBlockCache.Controller.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:helpers="clr-namespace:RAMBlockCache.Controller.Helpers"
+             xmlns:ctl="clr-namespace:RAMBlockCache.Controller.Controls"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="Theme/Dark.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+            <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+            <helpers:ProgressRatioConverter x:Key="RbcProgressRatio"/>
+
+            <!-- ============ 全局 ProgressBar 隐式样式（02b §B.2/D9）============
+                 scaleX 驱动：只动 transform，不动画 width。
+                 部件名刻意不用 PART_* —— 避开框架对 PART_Indicator 的直接写 Width，
+                 渲染控制权完全交给 scaleX 绑定（ProgressRatioConverter）
+                 + SmoothProgressBar 的 Value 插值（180ms standard）。 -->
+            <Style TargetType="ProgressBar">
+                <Setter Property="Height" Value="8"/>
+                <Setter Property="Background" Value="{StaticResource RbcTrackBg}"/>
+                <Setter Property="Foreground" Value="{StaticResource RbcAccent}"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="ProgressBar">
+                            <Border Background="{TemplateBinding Background}" CornerRadius="4"
+                                    ClipToBounds="True" SnapsToDevicePixels="True">
+                                <Border x:Name="RbcBar" Background="{TemplateBinding Foreground}" CornerRadius="4"
+                                        RenderTransformOrigin="0,0.5">
+                                    <Border.RenderTransform>
+                                        <ScaleTransform ScaleX="{Binding RelativeSource={RelativeSource TemplatedParent},
+                                            Converter={StaticResource RbcProgressRatio}}"/>
+                                    </Border.RenderTransform>
+                                </Border>
+                            </Border>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <!-- ============ 平滑进度条（02b §B.2「进度条·确定态」180ms）============
+                 BasedOn 上面的 ProgressBar 隐式样式：SmoothProgressBar 是 ProgressBar
+                 子类，隐式样式不自动继承，此处显式 BasedOn 保持同一 scaleX 模板；
+                 数值平滑由 SmoothProgressBar.OnValueChanged 的 Value 插值完成。 -->
+            <Style TargetType="{x:Type ctl:SmoothProgressBar}" BasedOn="{StaticResource {x:Type ProgressBar}}"/>
+
+            <!-- ============ 交互控件焦点环（02b §B.3-11）============
+                 BasedOn 保住各控件默认主题模板，仅覆盖焦点环。 -->
+            <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+                <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
+            </Style>
+            <Style TargetType="ComboBox" BasedOn="{StaticResource {x:Type ComboBox}}">
+                <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
+            </Style>
+            <Style TargetType="CheckBox" BasedOn="{StaticResource {x:Type CheckBox}}">
+                <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
+            </Style>
+            <Style TargetType="Slider" BasedOn="{StaticResource {x:Type Slider}}">
+                <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
+            </Style>
+            <Style TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
+                <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
+            </Style>
+            <Style TargetType="ListBoxItem" BasedOn="{StaticResource {x:Type ListBoxItem}}">
+                <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

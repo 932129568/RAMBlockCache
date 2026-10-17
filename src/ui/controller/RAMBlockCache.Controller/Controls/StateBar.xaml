@@ -1,0 +1,51 @@
+<UserControl x:Class="RAMBlockCache.Controller.Controls.StateBar"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!-- 常驻四段状态条（契约 §1 / 体验架构 §4.2）
+         段：驱动 · 挂栈 · 加速 · 风险；异常段变色，Click 事件由 MainViewModel 路由到处置页 -->
+    <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}"
+            BorderThickness="0,0,0,1" Padding="16,8">
+        <StackPanel Orientation="Horizontal">
+            <!-- 段模板：圆点 + 标签 + 值；各段颜色由代码按 UiState 绑定 -->
+            <Border x:Name="SegDriver" CornerRadius="999" Padding="12,4" Margin="0,0,8,0"
+                    Background="{StaticResource RbcNeutralBg}" Cursor="Hand"
+                    MouseLeftButtonUp="SegDriver_Click">
+                <StackPanel Orientation="Horizontal">
+                    <Ellipse Width="8" Height="8" Margin="0,0,6,0" x:Name="DotDriver"/>
+                    <TextBlock Text="驱动" Foreground="{StaticResource RbcTextSecondary}" FontSize="12"/>
+                    <TextBlock x:Name="ValDriver" Margin="6,0,0,0" FontSize="12" Foreground="{StaticResource RbcTextPrimary}"/>
+                </StackPanel>
+            </Border>
+
+            <Border x:Name="SegStack" CornerRadius="999" Padding="12,4" Margin="0,0,8,0"
+                    Background="{StaticResource RbcNeutralBg}" Cursor="Hand"
+                    MouseLeftButtonUp="SegStack_Click">
+                <StackPanel Orientation="Horizontal">
+                    <Ellipse Width="8" Height="8" Margin="0,0,6,0" x:Name="DotStack"/>
+                    <TextBlock Text="挂栈" Foreground="{StaticResource RbcTextSecondary}" FontSize="12"/>
+                    <TextBlock x:Name="ValStack" Margin="6,0,0,0" FontSize="12" Foreground="{StaticResource RbcTextPrimary}"/>
+                </StackPanel>
+            </Border>
+
+            <Border x:Name="SegAccel" CornerRadius="999" Padding="12,4" Margin="0,0,8,0"
+                    Background="{StaticResource RbcNeutralBg}" Cursor="Hand"
+                    MouseLeftButtonUp="SegAccel_Click">
+                <StackPanel Orientation="Horizontal">
+                    <Ellipse Width="8" Height="8" Margin="0,0,6,0" x:Name="DotAccel"/>
+                    <TextBlock Text="加速" Foreground="{StaticResource RbcTextSecondary}" FontSize="12"/>
+                    <TextBlock x:Name="ValAccel" Margin="6,0,0,0" FontSize="12" Foreground="{StaticResource RbcTextPrimary}"/>
+                </StackPanel>
+            </Border>
+
+            <Border x:Name="SegRisk" CornerRadius="999" Padding="12,4"
+                    Background="{StaticResource RbcNeutralBg}" Cursor="Hand"
+                    MouseLeftButtonUp="SegRisk_Click">
+                <StackPanel Orientation="Horizontal">
+                    <Ellipse Width="8" Height="8" Margin="0,0,6,0" x:Name="DotRisk"/>
+                    <TextBlock Text="风险" Foreground="{StaticResource RbcTextSecondary}" FontSize="12"/>
+                    <TextBlock x:Name="ValRisk" Margin="6,0,0,0" FontSize="12" Foreground="{StaticResource RbcTextPrimary}"/>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </Border>
+</UserControl>

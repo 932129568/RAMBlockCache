@@ -55,7 +55,14 @@ public sealed class AsyncRelayCommand : ICommand
     private bool _busy;
     public AsyncRelayCommand(Func<Task> exec, Func<bool>? can = null) { _exec = exec; _can = can; }
     public bool CanExecute(object? p) => !_busy && (_can?.Invoke() ?? true);
-    public async void Execute(object? p)
+    /// <summary>
+    /// [FIX 严重-2 2026-10-18] 可等待执行：调用方（如 UnmountAll 的 Task.WaitAll）
+    /// 能真正等到内部 Task 完成再继续——async void Execute 只到第一个 await 即返回，
+    /// 造成"等待全部完成"形同虚设（Telemetry 提前上报、关窗时卸载未完成）。
+    /// </summary>
+    public Task ExecuteAsync(object? p) => RunAsync(p);
+    public async void Execute(object? p) => await RunAsync(p);
+    private async Task RunAsync(object? p)
     {
         if (!CanExecute(p)) return;
         _busy = true; CommandManager.InvalidateRequerySuggested();

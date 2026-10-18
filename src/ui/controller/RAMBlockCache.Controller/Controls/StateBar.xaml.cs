@@ -27,8 +27,6 @@ public partial class StateBar : UserControl
 
     private void ColorSeg(Border seg, Ellipse dot, SolidColorBrush fg)
     {
-        // 240ms 颜色过渡（允许特效：状态色切换）
-        var dur = (TryFindResource("RbcDur240") as Duration?) ?? new Duration(TimeSpan.FromMilliseconds(240));
         An(seg, fg);
         An(dot, fg);
 
@@ -37,14 +35,17 @@ public partial class StateBar : UserControl
             if (target is Border b) AnimBackground(b, to);
             if (target is Ellipse e) AnimFill(e, to);
         }
+        // [FIX 严重-3 2026-10-18] 原实现只播 1→1 空透明度动画，语义色参数从未应用
+        // （_ = dur 死变量）——四段胶囊底色恒为中性色，异常态仅剩圆点可辨。
+        // 现按 02b「低透明语义底」规范直接应用 ~12% 语义色底（无动画即无 reduced-motion 分支）。
         void AnimBackground(Border b, Brush to)
         {
-            // 背景只做透明度微调（低透明语义底），不做渐变
-            var d = (TryFindResource("RbcDur180") as Duration?) ?? new Duration(TimeSpan.FromMilliseconds(180));
-            b.BeginAnimation(OpacityProperty, new DoubleAnimation(1, duration: d));
+            var c = (to as SolidColorBrush)?.Color ?? Colors.Gray;
+            var tint = new SolidColorBrush(Color.FromArgb(0x1E, c.R, c.G, c.B));   // ~12% 语义底
+            tint.Freeze();
+            b.Background = tint;
         }
         void AnimFill(Ellipse e, Brush to) { e.Fill = to; }
-        _ = dur;
     }
 
     /// <summary>[动效 02b §B.2] 等待态圆点脉冲：1200ms opacity 1→0.45→1 循环。

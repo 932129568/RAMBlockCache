@@ -168,14 +168,19 @@ public sealed class DriveItemViewModel : ObservableObject
         UnmountCommand   = new AsyncRelayCommand(() => Task.Run(() => DoUnmount()));
         FlushCommand     = new AsyncRelayCommand(() => Task.Run(() =>
         {
+            // [FIX 警告-4 2026-10-18] MSG_FLUSH 是全局 Flush（协议消息不带 DeviceKey），
+            // 驱动对全部脏块落盘——原日志"{盘符} 已下发 Flush"误导排查定位。
             DriverService.Instance.Flush(DeviceKey);
-            LogService.Info($"{DriveLetter} 已下发 Flush");
+            LogService.Info($"[全局] 已下发 Flush（驱动对全部卷脏数据落盘；由 {DriveLetter} 卡片触发）");
         }));
+        // [FIX 警告-3 2026-10-18] 暂停/恢复：驱动侧 Pause/Resume 仅打 WARN 不实现（不支持），
+        // 点击后 UI 闪"已暂停"1 秒被采样打回——误导。按钮置灰（canExecute 恒 false），
+        // 待驱动实现 Pause/Resume 后恢复。
         PauseResumeCommand = new AsyncRelayCommand(() => Task.Run(() =>
         {
             if (Paused) { DriverService.Instance.Resume(DeviceKey); Paused = false; }
             else        { DriverService.Instance.Pause(DeviceKey);  Paused = true;  }
-        }));
+        }), can: () => false);
 
         StatsService.Instance.Sampled += OnSample;
     }

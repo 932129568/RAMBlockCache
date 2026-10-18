@@ -229,7 +229,8 @@ function Invoke-Rollback {
             $ec = if ($null -ne $backup.SvcError -and $errorMap.ContainsKey([int]$backup.SvcError)) { $errorMap[[int]$backup.SvcError] } else { 'normal' }
             $ty = if ($null -ne $backup.SvcType  -and $typeMap.ContainsKey([int]$backup.SvcType))   { $typeMap[[int]$backup.SvcType] }   else { 'kernel' }
             & sc.exe config RAMBlockCache start= $st error= $ec type= $ty | Out-Null
-            if ($backup.SvcGroup) { & sc.exe config RAMBlockCache group= $backup.SvcGroup | Out-Null }
+            # [FIX 建议-2 2026-10-18] 组名含空格（System Bus Extender）需整参数传递，否则 sc.exe 拆词回滚失败
+            if ($backup.SvcGroup) { & sc.exe config RAMBlockCache "group=$($backup.SvcGroup)" | Out-Null }
         } catch { $errors += "service: $($_.Exception.Message)" }
     }
     # Parameters (armed baseline)

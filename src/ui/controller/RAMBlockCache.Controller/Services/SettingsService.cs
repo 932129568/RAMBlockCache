@@ -46,10 +46,19 @@ public static class SettingsService
         catch { return new(); }
     }
 
-    /// <summary>写回 settings.json（自动创建目录）。</summary>
+    /// <summary>写回 settings.json（自动创建目录）。
+    /// [FIX 警告-5 2026-10-18] 原无异常保护：磁盘/权限失败直接抛进 setter，
+    /// 被全局 handler 吞掉 → UI 已翻转但持久化静默失败。现失败记日志。</summary>
     public static void Save(AppSettings s)
     {
-        Directory.CreateDirectory(_dir);
-        System.IO.File.WriteAllText(_file, JsonSerializer.Serialize(s, _opt));
+        try
+        {
+            Directory.CreateDirectory(_dir);
+            System.IO.File.WriteAllText(_file, JsonSerializer.Serialize(s, _opt));
+        }
+        catch (Exception ex)
+        {
+            LogService.Error($"settings.json 写入失败（UI 状态未持久化）：{ex.Message}");
+        }
     }
 }

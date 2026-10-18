@@ -23,10 +23,11 @@ param(
 #   2 = usage error (missing -Volume)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+$repoRoot = Split-Path -Parent $root   # [FIX 建议-7] 包根（dist\ 在包根，与 deploy.ps1 同源修正）
 
 function Find-First($cands){ foreach($c in $cands){ if($c -and (Test-Path $c)){ return $c } } return $null }
 $ctl = Find-First @(
-    (Join-Path $root 'dist\ramboostctl.exe'),
+    (Join-Path $repoRoot 'dist\ramboostctl.exe'),
     (Join-Path $root 'ctl\ramboostctl.exe')
 )
 if(-not $ctl){ Write-Host "[!] ramboostctl.exe not found." -ForegroundColor Red; exit 1 }
@@ -63,7 +64,8 @@ switch($Action){
         if(-not $Yes){
             Write-Host "About to attach volume ${L}: to RAMBlockCache (runtime, no reboot)." -ForegroundColor Yellow
             $a = Read-Host "Type the drive letter again to confirm"
-            if(($a.TrimEnd(':').Substring(0,1).ToUpper()) -ne $L){ Write-Host "Aborted."; exit 1 }
+            # [FIX 建议-8 2026-10-18] 空输入 Substring 抛异常被全局吞 → 干净 Aborted
+            if([string]::IsNullOrWhiteSpace($a) -or ($a.TrimEnd(':').Substring(0,1).ToUpper()) -ne $L){ Write-Host "Aborted."; exit 1 }
         }
         & $ctl attach $L
         exit $LASTEXITCODE

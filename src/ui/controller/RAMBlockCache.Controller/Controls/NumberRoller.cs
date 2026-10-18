@@ -42,21 +42,21 @@ public static class NumberRoller
         if (double.IsNaN(to)) return;
         string fmt = GetFormat(d);
 
-        // 动画中间帧：只写文本，不再起动画（防递归）
+        // [FIX B27 2026-10-18] 起点统一取依赖属性当前值：动画在飞时 GetValue 返回
+        // 当前动画帧值 → 新目标到达即以呈现值为起点重启动画（连续衔接无抖动）。
+        // 原实现"滚动中只写文本"与在飞动画互相覆盖（文本在新旧目标间跳变）。
+        double from;
         if (GetRolling(d))
-        {
-            tb.Text = to.ToString(fmt, CultureInfo.InvariantCulture);
-            return;
-        }
+            from = (double)d.GetValue(ValueProperty);          // 在飞：当前帧衔接
+        else if (e.OldValue is double old && !double.IsNaN(old))
+            from = old;                                        // 常规：旧值起步
+        else
+            from = to;                                         // 首次：直达
         if (Motion.IsReducedMotion)
         {
             tb.Text = to.ToString(fmt, CultureInfo.InvariantCulture);
             return;
         }
-
-        // 起点：优先取当前文本已显示值（连续滚动衔接），取不到则直接到位
-        double from = to;
-        if (e.OldValue is double old && !double.IsNaN(old) && old != to) from = old;
 
         if (Math.Abs(from - to) < 1e-9)
         {

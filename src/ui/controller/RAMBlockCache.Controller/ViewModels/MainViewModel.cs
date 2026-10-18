@@ -143,13 +143,19 @@ public sealed class MainViewModel : ObservableObject
         // 与 RefreshDrives 并发可抛 InvalidOperationException → 命令静默失败）
         // [FIX R2-U3] UnmountAll 改为等待全部完成（原 async void Execute 点火不等待：
         // 防重入失效、可同卷并发卸载）；快照仅含 Mounted 卷
-        var mountSnapshot = Drives.ToArray();
-        MountAllCommand   = new AsyncRelayCommand(() => Task.Run(() =>
-            Task.WhenAll(mountSnapshot.Select(d => d.MountAsync((uint)Math.Min(d.QuotaBytes, uint.MaxValue))))));
-        var unmountSnapshot = Drives.Where(d => d.Mounted).ToArray();
+        // [FIX 致命-2 2026-10-18] 快照采集移入执行体：原在构造函数采集（此刻 Drives
+        // 为空集合），闭包捕获空数组永不更新 → "全部挂载/全部卸载"100% 静默空转。
+        // Task.Run 内即后台线程，枚举安全；UnmountAll 改用 ExecuteAsync 真等待卸载完成
+        // （[FIX 严重-2] async void Execute 同步段即返回，Telemetry 提前上报）。
+        MountAllCommand = new AsyncRelayCommand(() => Task.Run(() =>
+            Task.WhenAll(Drives.ToArray().Select(d => d.MountAsync((uint)Math.Min(d.QuotaBytes, uint.MaxValue))))));
         UnmountAllCommand = new AsyncRelayCommand(() => Task.Run(() =>
         {
-            Task.WaitAll(unmountSnapshot.Select(d => Task.Run(() => d.UnmountCommand.Execute(null))).ToArray());
+            var targets = Drives.Where(d => d.Mounted).ToArray();
+            if (targets.Length == 0) { LogService.Info("UnmountAll：当前无已挂载卷，无需操作"); return Task.CompletedTask; }
+            Task.WaitAll(targets.Select(d => Task.Run(() =>
+                ((Helpers.AsyncRelayCommand)d.UnmountCommand).ExecuteAsync(null))).ToArray());
+            LogService.Info($"UnmountAll：{targets.Length} 卷卸载流程全部完成");
             Telemetry(TelemetryEvent.UnmountCompleted);
             return Task.CompletedTask;
         }));
@@ -242,7 +248,17 @@ public sealed class MainViewModel : ObservableObject
         // 每秒统计采样后刷新总览汇总 + 状态条 + 特性层（L2/预取/准入/原因码）
         // [FIX M23] 原 218 行重复订阅同一事件再调一次 UpdateStateBar（每秒 IOCTL 翻倍），已删；
         // 状态条渲染仍经 Controls/StateBar.Update → UiStateView 单一出口（契约 §2）
-        StatsService.Instance.Sampled += _ => { Post(UpdateStateBar); RefreshFeatureLayer(); };
+        // [FIX 警告-1 2026-10-18] Sampled 在 StatsService 卷循环内每卷 Invoke（N 卷=每秒 N 次），
+        // 原 handler 每次都调 RefreshFeatureLayer（每次 2 个 IOCTL）→ N 倍放大且跑在轮询线程，
+        // 驱动挂死时整个采样循环被卡死。改为 1s 节流闸门：N 次采样合并为每秒至多一次特性层刷新。
+        StatsService.Instance.Sampled += _ =>
+        {
+            Post(UpdateStateBar);
+            var now = Environment.TickCount64;
+            if (now - Interlocked.Read(ref _lastFeatRefreshTick) < 1000) return;
+            Interlocked.Exchange(ref _lastFeatRefreshTick, now);
+            RefreshFeatureLayer();
+        };
 
         // [B7] 轮询死亡 watchdog：连续 3 轮全部卷采样失败 → Banner 呈现
         // "统计暂不可用（原因）"（契约 RD.5：统计不可用必须给原因，
@@ -307,6 +323,17 @@ public sealed class MainViewModel : ObservableObject
                     dirtyBytes: 0, dirtyWarnThreshold: 500UL * 1048576,
                     driverVersion: "—"));
             }
+            catch (Exception ex)
+            {
+                // [FIX 警告-2 2026-10-18] 兜底：其他异常逃逸会使状态条静默停更（过期值当正常数据）。
+                LogService.Error($"UpdateStateBar 非驱动异常，降级呈现：{ex.GetType().Name}：{ex.Message}");
+                Post(() => StateBarCtl?.Update(
+                    connected: false, accessDenied: false, protocolMismatch: false,
+                    panic: false, healing: false, safeMode: false,
+                    boundCount: 0, attachedCount: 0, backCount: 0,
+                    dirtyBytes: 0, dirtyWarnThreshold: 500UL * 1048576,
+                    driverVersion: "—"));
+            }
             finally
             {
                 Interlocked.Exchange(ref _stateBarInFlight, 0);   /* [FIX R2-U4] 闸门释放 */
@@ -314,6 +341,7 @@ public sealed class MainViewModel : ObservableObject
         });
     }
     private int _stateBarInFlight;   /* [FIX R2-U4] UpdateStateBar 并发闸门（0=空闲） */
+    private long _lastFeatRefreshTick;   /* [FIX 警告-1] 特性层刷新 1s 节流（Sampled 每卷 Invoke） */
     private bool _panicHealing;   // PANIC_CLEAR 被拒（0xC00000A3）后置 true，自愈完成复位
 
     /// <summary>[P1-10] 安全功能命令统一包装：失败给 Banner 提示而不是裸异常。
@@ -653,28 +681,40 @@ public sealed class MainViewModel : ObservableObject
     /// <summary>采样 tick 驱动的特性层刷新（STATS2 + VOLSTATUS；驱动不可达时置离线并清空计数）。</summary>
     private void RefreshFeatureLayer()
     {
-            try
-            {
-                var s = DriverService.Instance.QueryFeatureStats();
-                var vols = DriverService.Instance.QueryVolumeAccel();
-                Post(() =>
-                {
-                    _featStats = s;
-                    FeatureOnline = true;
-                    RaiseFeatureChanged();
-                    foreach (var d in Drives) d.UpdateAccel(vols);
-                });
-            }
-        catch (DriverException)
+        try
         {
+            var s = DriverService.Instance.QueryFeatureStats();
+            var vols = DriverService.Instance.QueryVolumeAccel();
             Post(() =>
             {
-                _featStats = null;
-                FeatureOnline = false;
+                _featStats = s;
+                FeatureOnline = true;
                 RaiseFeatureChanged();
-                foreach (var d in Drives) d.UpdateAccel(null);
+                foreach (var d in Drives) d.UpdateAccel(vols);
             });
         }
+        catch (DriverException)
+        {
+            DegradeFeatureLayer();
+        }
+        catch (Exception ex)
+        {
+            // [FIX 警告-2 2026-10-18] 原只捕 DriverException：其他异常逃逸到采样线程
+            // → 特性层静默停更且不触发降级（违反"禁止把过期值当正常数据"契约）。
+            LogService.Error($"RefreshFeatureLayer 非驱动异常，降级处理：{ex.GetType().Name}：{ex.Message}");
+            DegradeFeatureLayer();
+        }
+    }
+
+    private void DegradeFeatureLayer()
+    {
+        Post(() =>
+        {
+            _featStats = null;
+            FeatureOnline = false;
+            RaiseFeatureChanged();
+            foreach (var d in Drives) d.UpdateAccel(null);
+        });
     }
 
     private void RaiseFeatureChanged()

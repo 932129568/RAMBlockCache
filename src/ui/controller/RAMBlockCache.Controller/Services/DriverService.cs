@@ -212,6 +212,12 @@ public sealed class DriverService : IDisposable
             Marshal.Copy(new byte[sz], 0, p + 16, sz);
             Marshal.StructureToPtr(payload, p + 16, false);
         }
+        else
+        {
+            // [FIX 警告-6 2026-10-18] payload==null 的查询：原样把 AllocHGlobal 未初始化
+            // 堆内存当输入送进驱动（C8 只清零了 payload!=null 分支）。清零整个输入区。
+            Marshal.Copy(new byte[BufSize - 16], 0, p + 16, BufSize - 16);
+        }
         bool ok = DeviceIoControl(Handle, IOCTL_RB_REQUEST, p, (uint)BufSize, p, (uint)BufSize, out _, IntPtr.Zero);
         int st = Marshal.ReadInt32(p, 8);
         /* [P2-14] 统一应答 Status 语义：驱动在 RB_MSG.Status(偏移8) 回填 NTSTATUS，

@@ -18,7 +18,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-$exe = Join-Path $PSScriptRoot 'rbfeatctl.exe'
+# [FIX 建议-9 2026-10-18] exe 在 src\ctl\，不在 scripts\（原路径恒落空，守卫空转）
+$exe = Join-Path $PSScriptRoot '..\ctl\rbfeatctl.exe'
 if (-not (Test-Path $exe)) {
     Write-Error "rbfeatctl.exe not found next to this script: $exe  (build ctl/rbfeatctl first)"
     exit 1

@@ -26,6 +26,17 @@ Install-DriverBinary
 #   ③ 补 armed 基线（FilterArmed=1 + BootFailCount=0），与 deploy.ps1 第 3 步
 #      一致，让 boot_guard.ps1 的回滚护栏在本路径同样生效。
 #   权威安装入口 = ramboostsetup / deploy.ps1；本脚本仅 legacy 开发调试用。
+# [FIX 回归B 2026-10-18 复审] 验签必须在停服/删服之前（与 ramboostsetup.c 严重-1
+# 同型纪律：验签失败时机器保持原状，不做任何破坏性动作——原修复把验签放在了
+# Stop-Service + sc delete 之后，失败路径仍会拆掉旧安装）。
+$sysPath = Join-Path $env:SystemRoot 'System32\drivers\RAMBlockCache.sys'
+$sig = Get-AuthenticodeSignature -LiteralPath $sysPath -ErrorAction Stop
+if ($sig.Status -ne 'Valid') { throw "驱动签名校验失败（$($sig.Status)）——拒绝安装。请先签名（见 README 签名节）。" }
+$st = $Script:SignTool
+& $st verify /pa $sysPath 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "signtool verify /pa 失败——拒绝安装（exit=$LASTEXITCODE）" }
+Write-Host "[ok] 驱动签名校验通过（$($sig.SignerCertificate.Subject)）"
+
 $svc = Get-Service $Script:ServiceName -ErrorAction SilentlyContinue
 if ($svc -and $svc.Status -ne 'Stopped') {
     Write-Host "[..] 停止运行中的 $Script:ServiceName（最多 15s）..."
@@ -40,15 +51,6 @@ if ($svc -and $svc.Status -ne 'Stopped') {
 }
 sc.exe delete $Script:ServiceName | Out-Null
 if ($LASTEXITCODE -notin @(0, 1060)) { throw "sc.exe delete 失败（exit=$LASTEXITCODE）" }
-
-# [FIX 致命-3] 签名门禁：未签名/验签失败的 sys 绝不进入引导路径（0x7B 整改 A3 同款）
-$sysPath = Join-Path $env:SystemRoot 'System32\drivers\RAMBlockCache.sys'
-$sig = Get-AuthenticodeSignature -LiteralPath $sysPath -ErrorAction Stop
-if ($sig.Status -ne 'Valid') { throw "驱动签名校验失败（$($sig.Status)）——拒绝安装。请先签名（见 README 签名节）。" }
-$st = $Script:SignTool
-& $st verify /pa $sysPath 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "signtool verify /pa 失败——拒绝安装（exit=$LASTEXITCODE）" }
-Write-Host "[ok] 驱动签名校验通过（$($sig.SignerCertificate.Subject)）"
 
 sc.exe create $Script:ServiceName `
     type= kernel start= demand error= normal `

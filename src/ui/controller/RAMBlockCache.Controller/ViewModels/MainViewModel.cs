@@ -139,26 +139,34 @@ public sealed class MainViewModel : ObservableObject
         }
 
         // [FIX M24] Select 的同步段（MountAsync 入口 IOCTL）移出 UI 线程
-        // [FIX R2-U2] UI 线程先快照 Drives，后台只碰数组（原后台枚举 ObservableCollection
+        // [FIX R2-U2] UI 线程先快照 Drives，后台只碰数组（后台枚举 ObservableCollection
         // 与 RefreshDrives 并发可抛 InvalidOperationException → 命令静默失败）
         // [FIX R2-U3] UnmountAll 改为等待全部完成（原 async void Execute 点火不等待：
         // 防重入失效、可同卷并发卸载）；快照仅含 Mounted 卷
         // [FIX 致命-2 2026-10-18] 快照采集移入执行体：原在构造函数采集（此刻 Drives
         // 为空集合），闭包捕获空数组永不更新 → "全部挂载/全部卸载"100% 静默空转。
-        // Task.Run 内即后台线程，枚举安全；UnmountAll 改用 ExecuteAsync 真等待卸载完成
-        // （[FIX 严重-2] async void Execute 同步段即返回，Telemetry 提前上报）。
-        MountAllCommand = new AsyncRelayCommand(() => Task.Run(() =>
-            Task.WhenAll(Drives.ToArray().Select(d => d.MountAsync((uint)Math.Min(d.QuotaBytes, uint.MaxValue))))));
-        UnmountAllCommand = new AsyncRelayCommand(() => Task.Run(() =>
+        // [FIX 回归A 2026-10-18 复审] 采集放在命令 lambda 的同步段（UI 线程，Execute
+        // 入口即跑），Task.Run 只消费数组——兼顾致命-2（每次执行实时采集）与 R2-U2
+        // （后台不枚举活集合）。UnmountAll 用 ExecuteAsync 真等待（[FIX 严重-2]）。
+        MountAllCommand = new AsyncRelayCommand(() =>
         {
-            var targets = Drives.Where(d => d.Mounted).ToArray();
+            var snap = Drives.ToArray();                                   // UI 线程采集
+            if (snap.Length == 0) { LogService.Info("MountAll：当前无可挂载卷"); return Task.CompletedTask; }
+            return Task.Run(() => Task.WhenAll(snap.Select(d =>
+                d.MountAsync((uint)Math.Min(d.QuotaBytes, uint.MaxValue)))));
+        });
+        UnmountAllCommand = new AsyncRelayCommand(() =>
+        {
+            var targets = Drives.Where(d => d.Mounted).ToArray();          // UI 线程采集
             if (targets.Length == 0) { LogService.Info("UnmountAll：当前无已挂载卷，无需操作"); return Task.CompletedTask; }
-            Task.WaitAll(targets.Select(d => Task.Run(() =>
-                ((Helpers.AsyncRelayCommand)d.UnmountCommand).ExecuteAsync(null))).ToArray());
-            LogService.Info($"UnmountAll：{targets.Length} 卷卸载流程全部完成");
-            Telemetry(TelemetryEvent.UnmountCompleted);
-            return Task.CompletedTask;
-        }));
+            return Task.Run(() =>
+            {
+                Task.WaitAll(targets.Select(d => Task.Run(() =>
+                    ((Helpers.AsyncRelayCommand)d.UnmountCommand).ExecuteAsync(null))).ToArray());
+                LogService.Info($"UnmountAll：{targets.Length} 卷卸载流程全部完成");
+                Telemetry(TelemetryEvent.UnmountCompleted);
+            });
+        });
         PanicCommand        = new RelayCommand(() => Guard(() =>
         {
             DriverService.Instance.Panic();

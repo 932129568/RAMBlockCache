@@ -6,11 +6,15 @@ if %errorlevel% neq 0 (
   exit /b
 )
 cd /d "%~dp0"
-REM [P1-7] 入口修正：旧链 install.cmd -> install_auto2.ps1 -> 无条件 exit 1
-REM （install_auto2.ps1 是刻意废弃的占位脚本），用户双击只得到报错窗口。
-REM 现指向 scripts\install.ps1（与 deploy.ps1 哈希门禁同模型的权威安装入口：
-REM 编译->签名->注册服务->Volume UpperFilters->重枚举）。
+REM [FIX S-12] REM comments English-ized (batch encoding discipline).
+REM [P1-7] Entry fix: the old chain install.cmd -> install_auto2.ps1 exited 1
+REM unconditionally (install_auto2.ps1 is a deliberately retired placeholder
+REM script), so a double-click only produced an error window.
+REM Now points at scripts\install.ps1 (the authoritative install entry with the
+REM same hash-gate model as deploy.ps1: compile -> sign -> register service ->
+REM Volume UpperFilters -> re-enumerate).
 echo [elevated] running install.ps1 ...
-REM [P3] 去掉 -NoExit：install.ps1 末尾已有 Read-Host 保持窗口，
-REM -NoExit 只会在脚本结束后多留一个空 powershell 窗口。
+REM [P3] Dropped -NoExit: install.ps1 already ends with Read-Host to keep the
+REM window open; -NoExit would only leave an extra empty powershell window
+REM after the script finishes.
 powershell -NoProfile -ExecutionPolicy Bypass -File "install.ps1"

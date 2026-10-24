@@ -288,7 +288,7 @@ def main():
     msgs = {}
     for m in re.finditer(r"#define\s+RB_MSG_(\w+)\s+(\d+)", read(PROTO_H)):
         msgs[m.group(1)] = int(m.group(2))
-    for n in range(1, 13):
+    for n in range(1, 14):   # [V10.6/B-5] 消息 13 = RB_MSG_INVALIDATE_RANGE（末尾追加）
         if n not in msgs.values():
             fails.append(f"rb_proto.h 缺消息号 {n}")
     ioctl = ((consts.get("RB_IOCTL_TYPE", 0) << 16)
@@ -396,12 +396,13 @@ def main():
         have = set()
         for m in re.finditer(r"(?:RB_MSG_|MSG_)?(GET_STATS|SET_CONFIG|FLUSH|GET_CONFIG|"
                              r"EXIT_SAFE_MODE|SET_VOLUME|GET_VOLUMES|ATTACH_VOLUME|"
-                             r"GET_LOG|GET_VERSION|PANIC|PANIC_CLEAR)\s*=\s*(\d+)", s):
+                             r"GET_LOG|GET_VERSION|PANIC|PANIC_CLEAR|INVALIDATE_RANGE)\s*=\s*(\d+)", s):
             have.add((m.group(1), int(m.group(2))))
         expect_msgs = {("GET_STATS", 1), ("SET_CONFIG", 2), ("FLUSH", 3), ("GET_CONFIG", 4),
                        ("EXIT_SAFE_MODE", 5), ("SET_VOLUME", 6), ("GET_VOLUMES", 7),
                        ("ATTACH_VOLUME", 8), ("GET_LOG", 9), ("GET_VERSION", 10),
-                       ("PANIC", 11), ("PANIC_CLEAR", 12)}
+                       ("PANIC", 11), ("PANIC_CLEAR", 12),
+                       ("INVALIDATE_RANGE", 13)}   # [V10.6/B-5] 末尾追加
         extra = {x for x in have if x not in expect_msgs}
         if extra:
             fails.append(f"{label} 消息号越界: {sorted(extra)}")
@@ -431,7 +432,7 @@ def main():
     if DRVSVC_CS.exists():
         s = read(DRVSVC_CS)
         have = {int(m.group(1)) for m in re.finditer(r"MSG_\w+\s*=\s*(\d+)", s)}
-        for n in range(1, 13):
+        for n in range(1, 14):   # [V10.6/B-5] 消息 13 = MSG_INVALIDATE_RANGE
             if n not in have:
                 fails.append(f"DriverService.cs 缺消息号 {n}")
 
@@ -450,8 +451,8 @@ def main():
     rd = read(README) if README.exists() else ""
     if machine not in rd:
         fails.append(f"README.txt 未见机器版本串 {machine}")
-    if "V10.4.3 Build 19" not in rd:
-        fails.append("README.txt 未见发布名 V10.4.3 Build 19")
+    if "V10.5.0 Build 19" not in rd:
+        fails.append("README.txt 未见发布名 V10.5.0 Build 19")
 
     vc = read(VERSION_CS) if VERSION_CS.exists() else ""
     if vc:
@@ -459,8 +460,8 @@ def main():
         if not m or m.group(1) != machine:
             fails.append(f"Version.cs AppInfo.Version={m.group(1) if m else '缺失'} != {machine}")
         m = re.search(r'ReleaseName\s*=\s*"([^"]+)"', vc)
-        if not m or m.group(1) != "V10.4.3 Build 19":
-            fails.append(f"Version.cs ReleaseName={m.group(1) if m else '缺失'} != V10.4.3 Build 19")
+        if not m or m.group(1) != "V10.5.0 Build 19":
+            fails.append(f"Version.cs ReleaseName={m.group(1) if m else '缺失'} != V10.5.0 Build 19")
 
     cp = read(CSPROJ) if CSPROJ.exists() else ""
     if cp:
@@ -490,7 +491,7 @@ def main():
     # XAML 硬编码版本文本残留（P2-10 应收敛到绑定）
     for xaml in (SRC / "ui" / "controller").rglob("*.xaml"):
         s = read(xaml)
-        if "V10.4.3 Build 19" in s:
+        if "V10.5.0 Build 19" in s:
             warns.append(f"{xaml.relative_to(SRC)} 仍含硬编码发布名"
                          f"（应收敛到 ProductVersion 绑定）")
 

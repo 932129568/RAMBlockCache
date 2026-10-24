@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>深度检索报告 · 安装体验优化方案可行性调研</title>
+<style>
+:root{
+  --bg:#faf9f7; --card:#ffffff; --card-soft:#fbfaf8;
+  --ink:#2b2f36; --ink-2:#6b7280; --line:#eceae6;
+  --accent:#2f4858; --accent-deep:#1f3a5f; --point:#d9684a; --muted:#9aa0a6;
+  --serif:"Noto Serif SC","Source Han Serif SC",serif;
+  --sans:"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:"Inter","JetBrains Mono",monospace;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:var(--sans); background:var(--bg); color:var(--ink); padding:40px 32px; line-height:1.7; }
+.report { max-width:880px; margin:0 auto; background:var(--card); border-radius:12px; box-shadow:0 2px 16px rgba(43,47,54,.05); overflow:hidden; }
+.header { background:var(--card); border-top:4px solid var(--accent); border-bottom:1px solid var(--line); color:var(--ink); padding:32px; }
+.header .kicker { font-family:var(--sans); font-size:13px; color:var(--muted); letter-spacing:1px; }
+.header h1 { font-family:var(--serif); font-size:22px; color:var(--accent); margin:8px 0 16px; font-weight:700; }
+.meta { display:flex; flex-wrap:wrap; gap:8px 20px; font-size:13px; color:var(--ink-2); }
+.meta b { font-weight:600; color:var(--ink); }
+.chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+.chip { background:#f1efea; padding:4px 12px; border-radius:999px; font-size:12px; color:var(--ink-2); }
+.body { padding:32px 32px 24px; }
+h2 { font-family:var(--serif); font-size:18px; color:var(--accent); margin:32px 0 16px; display:flex; align-items:center; gap:8px; }
+h2::before { content:""; width:4px; height:18px; background:var(--accent); border-radius:2px; }
+.grid { display:grid; grid-template-columns:1fr; gap:16px; }
+.card { display:flex; gap:14px; align-items:flex-start; background:var(--card-soft); border:1px solid var(--line); border-radius:10px; padding:16px 20px; border-left:4px solid var(--muted); }
+.card .num { font-family:var(--mono); font-weight:700; color:var(--muted); font-size:14px; min-width:22px; }
+.card .txt { flex:1; font-size:14px; }
+.card.s-in { border-left-color:var(--accent); }
+.card.s-out { border-left-color:var(--point); }
+.card.s-both { border-left-color:var(--accent-deep); }
+.card.s-gap { border-left-color:var(--muted); }
+.badge { display:inline-block; font-family:var(--sans); font-size:11px; font-weight:600; padding:2px 8px; border-radius:999px; margin-right:6px; vertical-align:1px; }
+.b-in { background:#e7ecf0; color:#2f4858; }
+.b-out { background:#fbe9e3; color:#c0533a; }
+.b-both { background:#e3e9f0; color:#1f3a5f; }
+.b-gap { background:#f1efea; color:#6b7280; }
+table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+th { background:#f3f1ec; text-align:left; padding:10px; font-weight:600; color:var(--ink-2); }
+td { padding:10px; border-bottom:1px solid var(--line); vertical-align:top; }
+tr:last-child td { border-bottom:none; }
+.src-block { background:var(--card-soft); border:1px solid var(--line); border-radius:10px; padding:16px 20px; margin-top:16px; font-size:13px; }
+.src-block h4 { font-family:var(--sans); font-size:13px; margin-bottom:8px; color:var(--ink); }
+.src-block ul { list-style:none; }
+.src-block li { padding:4px 0; }
+.src-block .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; }
+.dot-in { background:var(--accent); } .dot-out { background:var(--point); }
+code { font-family:var(--mono); background:#f3f1ec; padding:1px 5px; border-radius:4px; font-size:12px; color:var(--ink); }
+.win { color:#1c7c4a; font-weight:600; }
+.mid { color:#9a6b1f; font-weight:600; }
+.lose { color:#c0533a; font-weight:600; }
+.footer { background:var(--card-soft); border-top:1px solid var(--line); padding:20px 32px 24px; font-size:12px; color:var(--muted); }
+.disclaimer { font-style:italic; color:var(--ink-2); margin-top:6px; }
+@media print { body{background:#fff;padding:0} .report{box-shadow:none;border-radius:0} }
+</style>
+</head>
+<body>
+<div class="report">
+  <div class="header">
+    <div class="kicker">深度检索报告 · DEEP-RESEARCH</div>
+    <h1>安装体验优化方案可行性调研</h1>
+    <div class="meta">
+      <span><b>范围</b>：install-ux-optimization-2026-10-19.md 十二项方案的五维可行性验证</span>
+      <span><b>来源</b>：内部 9 · 外部 17</span>
+      <span><b>日期</b>：2026-10-19</span>
+    </div>
+    <div class="chips">
+      <span class="chip">检索路径：代码定位 → 部署核验 → 联网（1 轮 2 查询）</span>
+      <span class="chip">检索模式：关键词 + 外部检索</span>
+      <span class="chip">查询改写：无</span>
+    </div>
+  </div>
+
+  <div class="body">
+    <h2>核心结论</h2>
+    <div class="grid">
+      <div class="card s-both">
+        <div class="num">1</div>
+        <div class="txt"><span class="badge b-both">[内+外]</span><b>总体可行，但一处关键假设被推翻</b>：「TestMode 可复活 V9 代码资产」不成立——无 git、备份目录（src.backup-2026-10-14）与隔离区均已清理，现存仅 rbctl.c 一行旧行为注释与 Build16 审计报告。运行时挂栈是<b>重写而非复活</b>，且必须用 <code>IoAttachDeviceToDeviceStackSafe</code>（现行 AddDevice 路径用非 Safe 版，靠「设备未启动无 IRP」侥幸安全，运行时无此侥幸——见 <a href="https://winprogger.com/ioattachdevicetodevicestack-gotcha/">winprogger</a>）。U0-1 成本由 ~2 上调至 ~2.5–3 人周。</div>
+      </div>
+      <div class="card s-both">
+        <div class="num">2</div>
+        <div class="txt"><span class="badge b-both">[内+外]</span><b>免重启测试模式整体可行，且 ROI 最高</b>：驱动显式设计「sc stop 干净卸载」（rbdriver.c:879：全量回写→停线程→逐卷 detach 删设备）；install.ps1 的 <code>sc create start=demand</code> 是先例；外部证实 <a href="http://www.hqwc.cn/a/1869465.html">sc 加载不会为既有设备触发 AddDevice</a>——<b>运行时挂栈是必选项</b>，方案技术路线判断正确。</div>
+      </div>
+      <div class="card s-in">
+        <div class="num">3</div>
+        <div class="txt"><span class="badge b-in">[内]</span><b>安装器 GUI 化/首跑向导/托盘/静默均可行且低风险</b>：安装原语全是标准 Win32（CreateService/RegMultiSz/CopyFile/WinVerifyTrust，C# 一一对应）；向导接口与动效设施已预留（IFirstRunExperience/FeatureRegistry/Motion/Toast）。真正风险只在「重写丢失 fail-closed 纪律」——用「WPF 外壳包现有 exe」分期对冲。</div>
+      </div>
+      <div class="card s-out">
+        <div class="num">4</div>
+        <div class="txt"><span class="badge b-out">[外]</span><b>「安装后一次重启」不可协商有竞品实证</b>：<a href="https://c.m.163.com/news/a/KJKK5TMJ05560Y3E.html">PrimoCache 安装后同样必须重启</a>（教程原话+0x7B 警示），卷级过滤驱动品类固有成本。生产模式话术应为「一次重启+重启后自动配好」，<b>不可承诺免重启安装</b>——原方案此判断正确。</div>
+      </div>
+      <div class="card s-gap">
+        <div class="num">5</div>
+        <div class="txt"><span class="badge b-gap">⚠ 未覆盖</span><b>运行时挂栈三个未证项</b>：与 volsnap 的相对位置（AddDevice 挂于 PDO 之上=volsnap 之下；IoGetDeviceObjectPointer 取到的栈顶=volsnap 之上，I/O 位置不同）、VSS 快照交互、热插拔竞态——未经真机验证。本报告给验证矩阵而非结论；建议 3 天 Spike 先行证伪。</div>
+      </div>
+    </div>
+
+    <h2>关键要点</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>先做 U0-1，它是复利项</b>：之后每轮驱动改动（含 W1.5 读写路径专项）都跑零重启 dev loop，收益跨所有后续波次兑现——排期应第一。</li>
+        <li><b>成本修正</b>：U0-1 → 2.5–3 人周；U0-2 分 stage（v1 外壳 ~1.5pw + v2 全 C# ~2.5pw）；P0 合计 ~6–7 人周；全单 ~8.5–10.5 人周。</li>
+        <li><b>三条硬实现纪律</b>：Safe 版挂栈；ext 挂栈前完全初始化（<code>!IsAttached → passthru</code> 现行门恰好使早期 IRP 天然安全）；detach 按拆除铁律重写。</li>
+        <li><b>最大风险不是技术是范围</b>：安装器全量重写有吃掉波次的惯性——stage 化拆成两次交付。</li>
+        <li><b>验证已具体到可执行</b>：3 天 Spike → Verifier 矩阵 → WinDbg <code>!irp</code> → 生产/测试 A/B → 安装器四路径×签名失败注入 → 向导可用性测试。</li>
+      </ul>
+    </div>
+
+    <h2>逐项可行性判定（十二项 × 五维）</h2>
+    <table>
+      <tr><th>#</th><th>项</th><th>技术实现</th><th>主要风险</th><th>边界条件</th><th>成本(修正后)</th><th>判定</th></tr>
+      <tr><td>U0-1</td><td>测试模式+devloop</td><td><b>可行但需重写</b>（unload/demand-start 有先例；运行时挂栈须 Safe 版+初始化纪律+detach 重写）</td><td>挂栈竞态、volsnap 位置、Verifier 新发现</td><td>不覆盖开机路径；sc stop 失败回退重启</td><td>2.5–3 人周</td><td class="win">可行（第一优先）</td></tr>
+      <tr><td>U0-2</td><td>安装器 GUI 化</td><td>可行；建议 v1 WPF 外壳包 ramboostsetup.exe</td><td>重写丢失 fail-closed 顺序；四路径回归</td><td>验签必须早于拆除（10-18 严重-1）</td><td>v1 ~1.5pw / v2 ~2.5pw</td><td class="win">可行（stage 化）</td></tr>
+      <tr><td>U0-3</td><td>首跑向导</td><td>可行：接口/设置键/动效全预留</td><td>默认勾选范围口径（只数据卷）</td><td>系统卷 opt-in 入口保留</td><td>~1 人周</td><td class="win">可行</td></tr>
+      <tr><td>U0-4</td><td>安装即用默认值</td><td>可行：改安装器写入值+向导一页</td><td>「装完没效果」预期管理</td><td>NVMe 系统盘用户收益有限需明示</td><td>~0.5 人周</td><td class="win">可行</td></tr>
+      <tr><td>U1-1</td><td>托盘常驻</td><td>可行：NotifyIcon 标准件</td><td>与主窗口状态一致性</td><td>数据源=现有 RB_STATS，无新协议</td><td>~0.5–1 人周</td><td class="win">可行</td></tr>
+      <tr><td>U1-2</td><td>批量静默</td><td>可行：安装器参数解析</td><td>重装时参数静默丢失</td><td>需版本门控与文档</td><td>~0.5 人周</td><td class="win">可行</td></tr>
+      <tr><td>U1-3</td><td>卸载 GUI</td><td>可行：uninstall.ps1 逻辑 GUI 化</td><td>卸载期数据安全（先回写）</td><td>ARP 注册需 MSI 或手工写卸载键</td><td>~0.5 人周</td><td class="win">可行</td></tr>
+      <tr><td>U2-1</td><td>EV 签名</td><td>可行：采购+流水线</td><td>审批周期</td><td>与 W4 合并</td><td>外部 $300–600/年</td><td class="win">可行（W4）</td></tr>
+      <tr><td>U2-2</td><td>安装遥测</td><td>可行：随 W1 遥测集</td><td>隐私合规（默认关）</td><td>与 W1 同一 opt-in 门</td><td>~0.5 人周</td><td class="win">可行</td></tr>
+    </table>
+
+    <h2>薄弱环节与改进建议（按严重度）</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>【高】「复活 V9」是错误假设</b>——无 git、备份已清。改进：预算按重写计；先做 <b>3 天 Spike</b>（TestMode 下打开一卷→Safe 挂栈→建流→透传门翻转→两遍读验证命中），用 Spike 结论校准估算再 commit。</li>
+        <li><b>【高】挂栈位置差异未验证</b>——AddDevice 挂于 volsnap 之下，运行时挂栈在其之上。改进：(a) 从栈顶向下走到 FS 卷设备再挂（复刻 AddDevice 位置，建议为目标）；(b) 接受栈顶位置（测试模式专用）+ VSS 创建/删除/回滚矩阵验证（Spike 快速路径）。</li>
+        <li><b>【中】安装器重写的范围惯性</b>——stage 化（v1 外壳解决「黑窗恐惧」，v2 移植解决「技术债」），每 stage 独立验收。</li>
+        <li><b>【中】sc stop 失败路径</b>——join 超时驱动中止卸载（保数据设计），devloop 必须识别并提示「需重启一次」而非假装成功；可抄 install.ps1 的 15s 超时模式。</li>
+        <li><b>【中】测试模式的签名边界易被误读</b>——「测试模式」不是「可以不签名」：<a href="https://learn.microsoft.com/en-au/windows-hardware/drivers/install/the-testsigning-boot-configuration-option">MS Learn</a> 与 <a href="https://adersaytech.com/kb-article/enable-disable-test-mode.html">adersaytech</a> 均证实 TESTSIGNING 放开的是"证书谁签发"，驱动仍必须带签名；HVCI 开启时只认自建证书签名。本工程现状恰好满足（自签 CN=RAMBoostFS Root + testsigning ON），但文档与安装器必须把「testsigning 未开 → 测试模式加载失败」翻译成用户可操作的指引。</li>
+        <li><b>【低】devloop 签名依赖</b>——<code>/sm</code> 用户证书库在沙箱/CI 不可用；devloop 分 <code>-Sign</code>/<code>-NoSign</code> 两模式。</li>
+      </ul>
+    </div>
+
+    <h2>与原方案的差异对照（诚实清单）</h2>
+    <table>
+      <tr><th>原方案表述</th><th>调研结论</th><th>处置</th></tr>
+      <tr><td>「V9 代码资产仍在备份中，可复活」</td><td class="lose">不成立（资产已清）</td><td>按重写计；+0.5–1 人周；Spike 先行</td></tr>
+      <tr><td>「运行时挂栈（V9 老路）」一带而过</td><td class="mid">三条硬实现纪律 + 一个未证位置问题</td><td>写入实现要求与验证矩阵</td></tr>
+      <tr><td>U0-1 ~2 人周</td><td class="mid">上调 2.5–3 人周</td><td>修正</td></tr>
+      <tr><td>U0-2 ~3 人周</td><td class="mid">保留但 stage 化（1.5+2.5）</td><td>分期交付</td></tr>
+      <tr><td>其余九项</td><td class="win">证据支持可行</td><td>不变</td></tr>
+    </table>
+
+    <h2>验证思路（按执行顺序）</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>1. 3 天 Spike（go/no-go）</b>：TestMode 最小闭环（demand-start + 单卷运行时挂栈 + 两遍读命中）。过→全额投入；不过→退化「devcon rescan 半免重启」（设备级重扫触发 AddDevice，省整机重启）。</li>
+        <li><b>2. Verifier 矩阵</b>：特殊池+IRQL+死锁下，sc stop/start ×50、attach/detach ×100、USB 热插拔 ×20、睡眠/恢复 ×10；判据=零新告警、<code>!devobj</code> 无残留。</li>
+        <li><b>3. 路径在位验证</b>：WinDbg <code>!irp</code> 确认过滤设备在 I/O 链路每层栈单元可见（<a href="https://blog.csdn.net/weixin_29183637/article/details/165366692">外部工程实践标准手段</a>）。</li>
+        <li><b>4. 位置等价 A/B</b>：生产模式（BOOT_START）vs 测试模式（运行时挂栈）同负载同统计对账（ReadReq/ReadHit/延迟分位数一致）。</li>
+        <li><b>5. 安装器矩阵</b>：Win10 22H2/Win11 26H2 × 四路径（新装/升级/重装/卸载）× 签名失败注入；判据=验签先于一切变更。</li>
+        <li><b>6. 向导可用性</b>：5 名非技术用户，任务完成率 ≥4/5、SUS ≥68。</li>
+      </ul>
+    </div>
+
+    <h2>证据清单</h2>
+    <table>
+      <tr><th>#</th><th>结论摘要</th><th>支撑</th><th>口径</th><th>来源</th></tr>
+      <tr><td>1</td><td>驱动支持 sc stop 干净卸载：全量回写→停线程（超时中止）→逐卷 detach 删设备</td><td><span class="badge b-in">[内]</span></td><td>代码语义</td><td>rbdriver.c:879-940</td></tr>
+      <tr><td>2</td><td>demand-start 建服代码已存在且经 fail-closed 整改</td><td><span class="badge b-in">[内]</span></td><td>代码语义</td><td>install.ps1:55-75</td></tr>
+      <tr><td>3</td><td>V9 运行时挂栈代码实体已不存在；仅存描述性注释与旧审计</td><td><span class="badge b-in">[内]</span></td><td>资产盘点</td><td>rbctl.c + Build16 审计 + 目录盘点</td></tr>
+      <tr><td>4</td><td>sc 加载不会为既有设备触发 AddDevice——运行时挂栈为必选项</td><td><span class="badge b-out">[外]</span></td><td>工程实践</td><td><a href="http://www.hqwc.cn/a/1869465.html">hqwc.cn</a> + <a href="https://blog.csdn.net/weixin_29183637/article/details/165366692">CSDN</a></td></tr>
+      <tr><td>5</td><td>IoAttachDeviceToDeviceStack 合法但须用 Safe 版消竞态</td><td><span class="badge b-out">[外]</span></td><td>API 契约</td><td><a href="https://learn.microsoft.com/eu-es/windows-hardware/drivers/ddi/wdm/nf-wdm-ioattachdevicetodevicestack">MS Learn</a> + <a href="https://winprogger.com/ioattachdevicetodevicestack-gotcha/">winprogger</a></td></tr>
+      <tr><td>6</td><td>挂栈后 IRP 可立即到达——ext 须先完全初始化</td><td><span class="badge b-out">[外]</span></td><td>工程实践</td><td><a href="https://winprogger.com/ioattachdevicetodevicestack-gotcha/">winprogger</a></td></tr>
+      <tr><td>7</td><td>安装原语标准 Win32 可移植；签名预检在安装器最前</td><td><span class="badge b-in">[内]</span></td><td>代码语义</td><td>ramboostsetup.c</td></tr>
+      <tr><td>8</td><td>首跑向导接口/设置键/动效设施已预留</td><td><span class="badge b-in">[内]</span></td><td>代码语义</td><td>IFirstRunExperience.cs + FeatureRegistry.cs</td></tr>
+      <tr><td>9</td><td>PrimoCache 安装后同样必须重启（品类固有成本）</td><td><span class="badge b-out">[外]</span></td><td>竞品实证</td><td><a href="https://c.m.163.com/news/a/KJKK5TMJ05560Y3E.html">网易</a> + <a href="https://www.xitongbuluo.com/jiaocheng/11565.html">系统部落</a></td></tr>
+      <tr><td>10</td><td>volsnap 位置/VSS/热插拔未经真机验证</td><td><span class="badge b-gap">[⚠]</span></td><td>—</td><td>当前资料未覆盖，按验证矩阵补</td></tr>
+      <tr><td>11</td><td>TESTSIGNING 放开的是"谁签发"而非"是否签名"；HVCI 开启时只认自建证书签名</td><td><span class="badge b-out">[外]</span></td><td>签名边界</td><td><a href="https://adersaytech.com/kb-article/enable-disable-test-mode.html">adersaytech</a> + <a href="https://learn.microsoft.com/en-au/windows-hardware/drivers/install/the-testsigning-boot-configuration-option">MS Learn</a></td></tr>
+      <tr><td>12</td><td>IoRegisterBootDriverReinitialization 是 BOOT_START 驱动枚举启动后挂栈的标准机制</td><td><span class="badge b-out">[外]</span></td><td>API 契约</td><td><a href="https://learn.microsoft.com/windows-hardware/drivers/ddi/ntddk/nf-ntddk-ioregisterbootdriverreinitialization">MS Learn</a> + <a href="https://blog.csdn.net/wu330/article/details/26047357">CSDN</a></td></tr>
+    </table>
+
+    <h2>口径与来源（进阶）</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>实体解析</b>：「TestMode」= 方案 U0-1 指称（需求启动服务+运行时开卷挂栈+devloop）；「运行时挂栈」= IoGetDeviceObjectPointer 取栈顶 + IoAttachDeviceToDeviceStackSafe</li>
+        <li><b>术语口径</b>：AddDevice 挂栈位置=卷 PDO 之上（volsnap 之下）；运行时挂栈位置=\??\X: 栈顶（volsnap 之上）——I/O 可见性不同</li>
+        <li><b>数据状态</b>：代码截至 2026-10-19 09:36；外部检索 2026-10-19</li>
+      </ul>
+    </div>
+
+    <h2>来源分区</h2>
+    <div class="src-block">
+      <h4>内部资料（9）</h4>
+      <ul>
+        <li><span class="dot dot-in"></span>src/driver/rbdriver.c（:879-940 干净卸载；:704-725 AddDevice 挂栈）</li>
+        <li><span class="dot dot-in"></span>src/scripts/install.ps1（:55-75 demand-start 先例）</li>
+        <li><span class="dot dot-in"></span>src/driver/rbctl.c（V9 注释残留——旧行为描述非代码）</li>
+        <li><span class="dot dot-in"></span>src/setup/ramboostsetup.c（安装原语/验签顺序）</li>
+        <li><span class="dot dot-in"></span>src/driver/rbattach.c（拆除铁律/RbVolumeRemove）</li>
+        <li><span class="dot dot-in"></span>src/dist/RAMBlockCache-Build16/report/…终版审计.txt（V9→V10 变迁佐证）</li>
+        <li><span class="dot dot-in"></span>IFirstRunExperience.cs + FeatureRegistry.cs（向导预留）</li>
+        <li><span class="dot dot-in"></span>_build_manual.ps1 + sync_anchors.ps1（devloop 基础件）</li>
+        <li><span class="dot dot-in"></span>deliverables/install-ux-optimization-2026-10-19.md（被验证对象）</li>
+      </ul>
+    </div>
+    <div class="src-block">
+      <h4>公开信息（17）</h4>
+      <ul>
+        <li><span class="dot dot-out"></span><a href="https://learn.microsoft.com/eu-es/windows-hardware/drivers/ddi/wdm/nf-wdm-ioattachdevicetodevicestack">MS Learn：IoAttachDeviceToDeviceStack（IRQL≤DISPATCH；目标移除中返回 NULL）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://winprogger.com/ioattachdevicetodevicestack-gotcha/">winprogger：Safe 版必要性；IRP 可先于初始化标志到达</a></li>
+        <li><span class="dot dot-out"></span><a href="http://www.hqwc.cn/a/1869465.html">hqwc.cn：sc 方式不走 PnP，AddDevice 不被调用</a></li>
+        <li><span class="dot dot-out"></span><a href="https://blog.csdn.net/weixin_29183637/article/details/165366692">CSDN：sc start 不等于挂栈成功；!irp 验证手段</a></li>
+        <li><span class="dot dot-out"></span><a href="https://baike.baidu.com/item/IoAttachDeviceToDeviceStack%28%29">百度百科：IoAttachDeviceToDeviceStackSafe 语义</a></li>
+        <li><span class="dot dot-out"></span><a href="https://c.m.163.com/news/a/KJKK5TMJ05560Y3E.html">网易：PrimoCache 安装后必须重启 + 0x7B 警示</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.xitongbuluo.com/jiaocheng/11565.html">系统部落：PrimoCache 重启后向导流程</a></li>
+        <li><span class="dot dot-out"></span><a href="https://learn.microsoft.com/windows-hardware/drivers/ddi/ntddk/nf-ntddk-ioregisterbootdriverreinitialization">MS Learn：IoRegisterBootDriverReinitialization（枚举启动后回调）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://learn.microsoft.com/zh-hk/windows-hardware/drivers/ddi/ntddk/nf-ntddk-ioregisterbootdriverreinitialization">MS Learn（繁体）：IoRegisterBootDriverReinitialization</a></li>
+        <li><span class="dot dot-out"></span><a href="https://msdn.microsoft.com/zh-cn/vbrun/ff549494">MSDN：IoRegisterBootDriverReinitialization（旧版镜像）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://msdn.microsoft.com/zh-tw/library/ff549494">MSDN（台湾）：IoRegisterBootDriverReinitialization</a></li>
+        <li><span class="dot dot-out"></span><a href="https://blog.csdn.net/wu330/article/details/26047357">CSDN 读书笔记：磁盘过滤（卷上层类过滤 + reinit 用法）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://learn.microsoft.com/en-au/windows-hardware/drivers/install/the-testsigning-boot-configuration-option">MS Learn：TESTSIGNING 启动选项（HVCI 需自建证书）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://msdn.microsoft.com/en-us/vbasic/ff553484">MSDN：启用测试签名驱动程序加载（旧版镜像）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://adersaytech.com/kb-article/enable-disable-test-mode.html">adersaytech：Test Mode 开关教学（放开"谁签发"而非"是否签名"）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://geekchamp.com/how-to-enable-or-disable-device-driver-signing-proven-way">GeekChamp：驱动签名启用/禁用方法总览</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.dnqdw.com/news/1782086400300">电脑驱动网：Win11 强制签名禁用指南 2026</a></li>
+      </ul>
+    </div>
+
+    <h2>研究方法</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>子问题</b>：① 运行时挂栈合法性与坑 ② sc 加载与 AddDevice 关系 ③ PrimoCache 重启实证 ④ 测试模式/签名边界</li>
+        <li><b>检索查询</b>：web 共 4 条（2 轮）</li>
+        <li><b>唯一来源</b>：17 个（官方文档 7、工程博客 3、百科 1、教程/指南 6）</li>
+        <li><b>深读篇数</b>：0 篇 WebFetch 全文（摘要已含关键契约）</li>
+        <li><b>源优先级</b>：官方文档 &gt; 工程博客 &gt; 百科/教程</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="footer">
+    <div class="disclaimer">⚠️ 本报告基于现有代码与公开信息的整理归纳；标注 [⚠ 未覆盖] 的运行时挂栈三项（volsnap 位置/VSS/热插拔）未经真机验证，不构成「已验证」结论；信息以原始资料为准。</div>
+    <div style="margin-top:4px;">生成：deep-research skill · md 底稿与证据表随 HTML 一并交付</div>
+  </div>
+</div>
+</body>
+</html>

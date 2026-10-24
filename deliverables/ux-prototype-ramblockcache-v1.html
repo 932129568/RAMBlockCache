@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>RAMBlockCache 体验架构原型 V1.0</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0E0E11;color:#EDEDF2;font:13px/1.6 "Segoe UI","Microsoft YaHei",sans-serif;height:100vh;overflow:hidden}
+  .app{display:flex;height:100vh}
+  .side{width:210px;background:#121216;border-right:1px solid #22222A;display:flex;flex-direction:column;flex:none}
+  .brand{padding:18px 18px 10px}
+  .brand b{font-size:16px}
+  .brand div{color:#9A9AA5;font-size:11px;margin-top:2px}
+  .nav{padding:6px 10px;overflow:auto}
+  .nav button{width:100%;text-align:left;background:transparent;color:#9A9AA5;border:0;padding:11px 14px;border-radius:8px;font:inherit;cursor:pointer;margin-bottom:2px}
+  .nav button:hover{background:#1B1B21}
+  .nav button.on{background:#2B2B33;color:#fff;font-weight:500}
+  .nav .sec{color:#5F5E5A;font-size:11px;padding:14px 14px 6px}
+  .side .foot{margin-top:auto;padding:12px 14px;border-top:1px solid #22222A;color:#5F5E5A;font-size:11px}
+  .main{flex:1;display:flex;flex-direction:column;min-width:0}
+  .bar{display:flex;gap:10px;padding:10px 16px;background:#14141A;border-bottom:1px solid #22222A;flex-wrap:wrap;align-items:center}
+  .seg{border:1px solid #2B2B33;border-radius:999px;padding:4px 12px;font-size:12px;color:#9A9AA5;cursor:pointer}
+  .seg b{font-weight:500}
+  .seg.ok{color:#9FE1CB;border-color:#0F6E56}
+  .seg.warn{color:#FAC775;border-color:#854F0B}
+  .seg.bad{color:#F7C1C1;border-color:#A32D2D}
+  .seg.mut{color:#888780}
+  .body{flex:1;overflow:auto;padding:18px 20px 40px}
+  h1{font-size:20px;font-weight:500;margin-bottom:14px}
+  h2{font-size:14px;font-weight:500;margin:18px 0 8px}
+  .cards{display:flex;gap:12px;flex-wrap:wrap}
+  .card{background:#1E1E24;border:1px solid #26262E;border-radius:12px;padding:14px 16px;flex:1;min-width:180px}
+  .card .k{color:#9A9AA5;font-size:12px}
+  .card .v{font-size:22px;font-weight:500;margin-top:6px}
+  .card .s{color:#5F5E5A;font-size:11px;margin-top:4px}
+  .vol{display:flex;align-items:center;gap:14px;background:#1E1E24;border:1px solid #26262E;border-radius:12px;padding:14px 16px;margin-bottom:10px;flex-wrap:wrap}
+  .vol .id{font-size:16px;font-weight:500;min-width:120px}
+  .badge{border-radius:999px;padding:3px 10px;font-size:12px;border:1px solid}
+  .b-green{color:#9FE1CB;border-color:#0F6E56;background:#04342C}
+  .b-blue{color:#B5D4F4;border-color:#185FA5;background:#042C53}
+  .b-amber{color:#FAC775;border-color:#854F0B;background:#412402}
+  .b-red{color:#F7C1C1;border-color:#A32D2D;background:#501313}
+  .b-gray{color:#D3D1C7;border-color:#5F5E5A;background:#2C2C2A}
+  .btn{background:#2B2B33;color:#EDEDF2;border:0;border-radius:6px;padding:7px 13px;font:inherit;cursor:pointer}
+  .btn:hover{background:#3A3A45}
+  .btn.pri{background:#185FA5}
+  .btn.pri:hover{background:#0C447C}
+  .btn.danger{background:#7A2020}
+  .btn.danger:hover{background:#A32D2D}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .hint{color:#9A9AA5;font-size:12px;margin-top:8px}
+  .warnbox{background:#412402;border:1px solid #854F0B;color:#FAC775;border-radius:10px;padding:12px 14px;margin:12px 0;font-size:12.5px}
+  .dangerbox{background:#501313;border:1px solid #A32D2D;color:#F7C1C1;border-radius:10px;padding:12px 14px;margin:12px 0;font-size:12.5px}
+  .step{display:flex;gap:12px;background:#1E1E24;border:1px solid #26262E;border-radius:12px;padding:14px;margin-bottom:10px}
+  .step .n{width:26px;height:26px;border-radius:50%;background:#185FA5;color:#fff;display:flex;align-items:center;justify-content:center;flex:none;font-size:12px}
+  .bp{border-left:3px solid #A32D2D;background:#1B1416;color:#F7C1C1;padding:8px 12px;border-radius:0 8px 8px 0;font-size:12px;margin:8px 0 14px}
+  .hide{display:none}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #22222A;vertical-align:top}
+  th{color:#9A9AA5;font-weight:500}
+  select{background:#2B2B33;color:#EDEDF2;border:1px solid #3A3A45;border-radius:6px;padding:6px 10px;font:inherit}
+  .mask{position:absolute;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;padding:20px}
+  .modal{background:#1E1E24;border:1px solid #3A3A45;border-radius:14px;max-width:560px;width:100%;padding:20px}
+  .modal h3{font-size:15px;font-weight:500;margin-bottom:10px}
+  .modal .row{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+  .kv{color:#9A9AA5;font-size:12.5px;margin:6px 0}
+  .kv b{color:#EDEDF2;font-weight:500}
+  .toggle{margin-left:auto;color:#9A9AA5;font-size:12px;cursor:pointer;user-select:none}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand"><b>RAMBlockCache</b><div id="verline">V10.4.3 Build 19（10.3.4.19）</div></div>
+    <nav class="nav" id="nav"></nav>
+    <div class="foot">原型：体验架构 V1.0<br>点顶部状态段可跳转处置页</div>
+  </aside>
+  <div class="main">
+    <div class="bar" id="bar"></div>
+    <div class="body" id="page"></div>
+  </div>
+</div>
+<script>
+var S = { installed:true, bound:2, attached:2, mode:{'D:':0,'F:':1}, safeMode:false, panic:false, settle:true, dirty:620, lost:0, hit:0.742, savedGB:31.4, cacheGB:3.2, wiz:false };
+
+function userState(){
+  if(!S.installed) return 'notinstalled';
+  if(S.panic) return S.settle?'panic':'panicSettle';
+  if(S.safeMode) return 'safemode';
+  if(S.attached===0) return S.bound? 'ready':'bound';
+  return 'accel';
+}
+var STATE = {
+  notinstalled:{t:'未安装', c:'mut',  one:'未检测到 RAMBlockCache 驱动', act:'运行安装向导'},
+  bound:       {t:'已就绪未挂栈', c:'blue', one:'驱动已就绪，尚未挂到任何卷', act:'运行首次向导'},
+  ready:       {t:'就绪未加速', c:'blue', one:'已挂栈，未开启加速', act:'开启加速'},
+  accel:       {t:'正在加速', c:'ok',   one:'缓存正常工作', act:'查看收益'},
+  safemode:    {t:'降级 · 安全模式', c:'warn', one:'上次未正常退出，已强制直写保护数据', act:'确认数据无误'},
+  panic:       {t:'熔断 · 全局透传', c:'bad', one:'所有读写直接到盘，缓存暂停', act:'解除熔断'},
+  panicSettle: {t:'熔断 · 自愈中', c:'bad', one:'正在把未落盘数据写完，暂不可解除', act:'等待自愈完成'}
+};
+var PAGES=[['状态','state'],['加速','boost'],['收益','gain'],['诊断','diag'],['应急','rescue'],['设置','settings']];
+var cur='state', showBP=true, modal=null;
+
+function riskSeg(){
+  if(S.panic) return ['bad','风险','熔断中'];
+  if(S.safeMode) return ['warn','风险','安全模式'];
+  if(S.dirty>500) return ['warn','风险','未落盘 '+S.dirty+' MB'];
+  return ['ok','风险','无'];
+}
+function render(){
+  var st=STATE[userState()], r=riskSeg();
+  document.getElementById('bar').innerHTML =
+    '<span class="seg '+(S.installed?'ok':'bad')+'" onclick="go(\''+(S.installed?'diag':'state')+'\')">驱动 <b>'+(S.installed?'已连接':'未连接')+'</b></span>'+
+    '<span class="seg '+(S.bound?'ok':'mut')+'" onclick="go(\'boost\')">挂栈 <b>'+(S.bound?('已挂 '+S.bound+' 卷'):'未挂栈')+'</b></span>'+
+    '<span class="seg '+st.c+'" onclick="go(\'state\')">加速 <b>'+st.t+'</b></span>'+
+    '<span class="seg '+r[0]+'" onclick="go(\'rescue\')">'+r[1]+' <b>'+r[2]+'</b></span>'+
+    '<span class="toggle" onclick="showBP=!showBP;render()">'+(showBP?'隐藏':'显示')+'原断点对照</span>';
+  document.getElementById('nav').innerHTML = '<div class="sec">任务</div>'+
+    PAGES.map(function(p){return '<button class="'+(cur===p[1]?'on':'')+'" onclick="go(\''+p[1]+'\')">'+p[0]+'</button>';}).join('')+
+    '<div class="sec">引导</div><button onclick="S.wiz=true;render()">首次配置向导</button>';
+  document.getElementById('page').innerHTML = ({
+    state:pgState, boost:pgBoost, gain:pgGain, diag:pgDiag, rescue:pgRescue, settings:pgSettings
+  }[cur]||pgState)() + (modal?modalHTML():'') + (S.wiz?wizHTML():'');
+}
+function go(p){cur=p;modal=null;render();}
+function bp(txt){return showBP?'<div class="bp">原断点：'+txt+'</div>':'';}
+function badge(t,c){return '<span class="badge b-'+c+'">'+t+'</span>';}
+
+function pgState(){
+  var st=STATE[userState()];
+  var h='<h1>状态</h1>';
+  if(S.panic) h+='<div class="dangerbox"><b>缓存已熔断（全局透传）</b><br>'+
+    (S.settle?'所有读写直接到盘，缓存暂停，数据最安全但速度最慢。未落盘数据已写完，可以解除熔断。'
+             :'正在把未落盘数据写完（自愈中），此时解除会被驱动拒绝。')+
+    '</div>'+bp('熔断入口此前完全不可达（P1-10），且解除熔断无同步保护（P0-3）。');
+  if(S.safeMode) h+='<div class="warnbox"><b>安全模式</b>：上次未正常退出，写缓存已关闭（直写）。确认数据无误后可退出安全模式。</div>';
+  h+='<div class="cards">'+
+     '<div class="card"><div class="k">读命中率</div><div class="v">'+Math.round(S.hit*100)+'%</div><div class="s">近 5 分钟</div></div>'+
+     '<div class="card"><div class="k">省下磁盘读</div><div class="v">'+S.savedGB.toFixed(1)+' GB</div><div class="s">累计</div></div>'+
+     '<div class="card"><div class="k">缓存占用</div><div class="v">'+S.cacheGB.toFixed(1)+' GB</div><div class="s">未落盘 '+S.dirty+' MB</div></div>'+
+     '</div><h2>卷</h2>';
+  h+=volRow('D:','数据盘',0)+volRow('F:','游戏盘',1);
+  if(userState()!=='accel') h+='<div class="hint">当前状态：'+st.one+' → 建议动作：'+st.act+'</div>';
+  h+=bp('挂栈/加速/写模式/安全模式/熔断五个状态散落，无法一眼判断（B2）。');
+  return h;
+}
+function volRow(letter,label,mode){
+  var accel=S.attached>0, md=S.mode[letter];
+  var st = !accel? badge('已挂栈 · 未加速','blue')
+        : (md===1? badge('正在加速 · 回写','amber') : badge('正在加速 · 直写','green'));
+  return '<div class="vol"><span class="id">'+letter+'</span><span>'+label+'</span>'+st+
+    '<span class="hint" style="margin:0">写模式：'+(md===1?'回写（异常退出可能丢未落盘数据）':'直写（最安全）')+'</span>'+
+    '<span style="margin-left:auto;display:flex;gap:8px">'+
+    '<button class="btn" onclick="toggleAccel(\''+letter+'\')">'+(accel?'停止加速':'开启加速')+'</button>'+
+    '<button class="btn" onclick="flushAll()">立即回写</button></span></div>';
+}
+function pgBoost(){
+  var h='<h1>加速</h1>'+bp('UI 无写模式切换控件，用户无法选择直写/回写（B3）。');
+  h+='<h2>写模式</h2><div class="vol"><span class="id">D:</span>'+
+     '<select onchange="setMode(\'D:\',this.value)">'+
+     '<option value="0"'+(S.mode['D:']===0?' selected':'')+'>直写（推荐 · 最安全）</option>'+
+     '<option value="1"'+(S.mode['D:']===1?' selected':'')+'>回写（更快 · 异常退出可能丢未落盘数据）</option>'+
+     '</select><span class="hint" style="margin:0">切换立即生效，无需重启</span></div>';
+  h+='<div class="vol"><span class="id">F:</span>'+
+     '<select onchange="setMode(\'F:\',this.value)">'+
+     '<option value="0"'+(S.mode['F:']===0?' selected':'')+'>直写（推荐 · 最安全）</option>'+
+     '<option value="1"'+(S.mode['F:']===1?' selected':'')+'>回写（更快 · 异常退出可能丢未落盘数据）</option>'+
+     '</select><span class="hint" style="margin:0">当前：'+(S.mode['F:']===1?'回写':'直写')+'</span></div>';
+  h+='<h2>挂载即验证</h2><div class="hint">点击开启后 3 秒内卡片必须给出结论（已加速 · 命中率 xx%），而不是让用户自己去统计页找。</div>'+
+     bp('挂载后无任何生效反馈，用户误以为没成功（B5）。');
+  return h;
+}
+function pgGain(){
+  var h='<h1>收益</h1>'+bp('首页只有"已挂载 N/平均命中率"，无价值反馈（B5）。');
+  h+='<div class="cards"><div class="card"><div class="k">读命中率</div><div class="v">'+Math.round(S.hit*100)+'%</div></div>'+
+     '<div class="card"><div class="k">省下磁盘读</div><div class="v">'+S.savedGB.toFixed(1)+' GB</div></div>'+
+     '<div class="card"><div class="k">回写总量</div><div class="v">72.0 GB</div></div></div>';
+  h+='<h2>明细（默认折叠）</h2><table><tr><th>指标</th><th>值</th><th>面向用户含义</th></tr>'+
+     '<tr><td>未落盘数据</td><td>'+S.dirty+' MB</td><td>掉电可能丢失的上界</td></tr>'+
+     '<tr><td>已确认丢失</td><td>'+S.lost+' MB</td><td>回写失败且无法恢复的字节</td></tr>'+
+     '<tr><td>淘汰字节</td><td>11.0 GB</td><td>因容量不足被清出的缓存</td></tr></table>';
+  return h;
+}
+function pgDiag(){
+  var h='<h1>诊断</h1>'+bp('日志需用户手动"拉取"；版本三轨显示（1.1 Build19 / 10.3.4.19 / V10.4.3）（B8）。');
+  h+='<h2>自检</h2><table><tr><th>项</th><th>结果</th></tr>'+
+     '<tr><td>驱动连接</td><td>'+(S.installed?'正常':'未检测到（错误 2）')+'</td></tr>'+
+     '<tr><td>协议版本</td><td>9（与控制台一致）</td></tr>'+
+     '<tr><td>卷过滤链（UpperFilters）</td><td>volsnap, RAMBlockCache</td></tr>'+
+     '<tr><td>安全模式</td><td>'+(S.safeMode?'是':'否')+'</td></tr></table>';
+  h+='<h2>版本</h2><div class="kv">产品：<b>V10.4.3 Build 19（10.3.4.19）</b></div>'+
+     '<div class="kv">驱动内部版本：<b>1.1 Build19</b> <span class="hint" style="margin:0">（仅供支持排查）</span></div>';
+  h+='<h2>驱动日志（自动拉取）</h2><div class="card" style="font-family:Consolas,monospace;font-size:12px">'+
+     '[INFO] 驱动已加载，控制设备就绪<br>[INFO] 卷 D: 已挂栈，开启加速（直写）<br>[WARN] 卷 F: 回写延迟偏高 314ms<br>'+
+     '[ERR ] 脏数据回写超时，已降级为直写</div><button class="btn" style="margin-top:10px">导出诊断包</button>';
+  return h;
+}
+function pgRescue(){
+  var h='<h1>应急</h1>'+bp('危险操作无影响说明与确认；0x7B 回滚脚本用户在无网环境找不到（B4/B6）。');
+  h+='<h2>熔断</h2><div class="card"><div class="kv">作用：所有读写直接到盘，缓存暂停，用于磁盘异常时保住数据。</div>'+
+     '<div class="kv">代价：加速效果消失，速度回落到物理盘水平。</div>'+
+     '<div class="kv">撤销：解除熔断（需等自愈完成）。</div>'+
+     '<button class="btn '+(S.panic?'':'danger')+'" style="margin-top:8px" onclick="'+(S.panic?'clearPanic()':'askPanic()')+'" '+
+     ((S.panic&&!S.settle)?'disabled':'')+'>'+(S.panic?(S.settle?'解除熔断':'解除熔断（自愈中，暂不可用）'):'一键熔断')+'</button>'+
+     (S.panic&&!S.settle?'<div class="hint">原因：驱动正在把未落盘数据写完。下一步：等待风险段变为「无」后重试。</div>':'')+
+     '</div>';
+  h+='<h2>安全模式</h2><div class="card"><div class="kv">'+(S.safeMode?'当前处于安全模式（写缓存已关闭）。':'当前未处于安全模式。')+'</div>'+
+     '<button class="btn" onclick="exitSafe()" '+(S.safeMode?'':'disabled')+'>确认数据无误，退出安全模式</button></div>';
+  h+='<h2>开机失败（0x7B）回滚指引</h2>'+
+     '<div class="step"><span class="n">1</span><div>用 Windows 安装介质启动，进入 <b>疑难解答 → 高级选项 → 命令提示符</b>（WinRE）。</div></div>'+
+     '<div class="step"><span class="n">2</span><div>确认系统盘位置（WinRE 中通常不是 C:），必要时修改脚本内 <b>SYSROOT</b>。</div></div>'+
+     '<div class="step"><span class="n">3</span><div>运行 <b>offline_rollback.cmd</b>：它会探测实际引导的 ControlSet，并<b>只摘除 RAMBlockCache</b>，保留其他卷过滤器（如 volsnap 与第三方）。</div></div>'+
+     '<button class="btn pri" onclick="exportCard()">导出救援卡（救援说明.txt）</button><div class="hint" id="cardmsg"></div>';
+  return h;
+}
+function pgSettings(){
+  return '<h1>设置</h1>'+bp('"随 Windows 启动"曾是死 UI；默认写模式曾为回写（P1-11/P1-12）。')+
+  '<div class="cards"><div class="card"><div class="k">全局启用</div><div class="v">开</div></div>'+
+  '<div class="card"><div class="k">内存预算</div><div class="v">自动 80%</div><div class="s">保留 4096 MB</div></div>'+
+  '<div class="card"><div class="k">回写间隔</div><div class="v">60 s</div></div></div>'+
+  '<h2>启动</h2><div class="card"><div class="kv">开机自动随卷挂载（跳过系统盘 C:）：<b>开</b></div>'+
+  '<div class="kv">随 Windows 启动本控制台：<b>开</b>（已写入注册表 Run 键）</div></div>'+
+  '<h2>卸载</h2><div class="card"><div class="kv">将停止加速、回写全部未落盘数据、从卷过滤链移除 RAMBlockCache，<b>保留其他过滤器</b>，并提示重启。</div>'+
+  '<button class="btn danger" style="margin-top:8px">卸载并回滚</button></div>';
+}
+function modalHTML(){
+  if(modal==='panic') return '<div class="mask"><div class="modal"><h3>确认一键熔断？</h3>'+
+    '<div class="kv"><b>将发生什么：</b>所有读写直接到盘，缓存暂停；后台把未落盘数据写完。</div>'+
+    '<div class="kv"><b>影响与风险：</b>加速效果消失、速度回落；数据安全性最高。</div>'+
+    '<div class="kv"><b>如何撤销：</b>在应急页点「解除熔断」（需自愈完成）。</div>'+
+    '<div class="row"><button class="btn" onclick="modal=null;render()">取消</button>'+
+    '<button class="btn danger" onclick="doPanic()">确认熔断</button></div></div></div>';
+  return '';
+}
+function wizHTML(){
+  return '<div class="mask"><div class="modal"><h3>首次配置向导 · 1/3 环境自检</h3>'+
+  '<div class="kv">管理员权限：<b>已具备</b></div><div class="kv">驱动状态：<b>'+(S.installed?'已安装':'未安装')+'</b></div>'+
+  '<div class="kv">卷过滤链：<b>volsnap, RAMBlockCache</b>（未发现残留）</div>'+
+  '<div class="kv">是否需要重启挂栈：<b>'+(S.bound?'否（已挂 '+S.bound+' 卷）':'是（标准模式需一次重启）')+'</b></div>'+
+  '<div class="hint">下一步：选择安装模式（标准 / 保守），二者差异与回滚方式会一并说明。</div>'+
+  '<div class="row"><button class="btn" onclick="S.wiz=false;render()">稍后</button>'+
+  '<button class="btn pri" onclick="S.wiz=false;go(\'boost\')">进入加速配置</button></div></div></div>';
+}
+function toggleAccel(l){ S.attached = S.attached>0?0:2; render(); }
+function setMode(l,v){ S.mode[l]=parseInt(v,10); render(); }
+function flushAll(){ S.dirty=0; render(); }
+function askPanic(){ modal='panic'; render(); }
+function doPanic(){ S.panic=true; S.settle=false; modal=null; cur='rescue'; render();
+  setTimeout(function(){ S.settle=true; render(); },2200); }
+function clearPanic(){ S.panic=false; S.settle=true; S.dirty=0; render(); }
+function exitSafe(){ S.safeMode=false; render(); }
+function exportCard(){ document.getElementById('cardmsg').textContent='已导出 救援说明.txt（含 WinRE 步骤与 offline_rollback.cmd 路径）'; }
+render();
+</script>
+</body>
+</html>

@@ -33,6 +33,15 @@
 #define RB_BUF_ALIGN       4096
 #define RB_MAX_RANGES      32      /* 单次读 miss / 写 direct 区间上限 */
 
+/* ---- [W1.5] 大块 IO 缓存门（MaxCacheIoKB，KB 单位；rbio.c 分发门消费）----
+ * 8192=8MB 历史门（回滚档：注册表改此值即回到 W1.5 前行为，无需重编）；
+ * 65536=64MB 默认（覆盖 AS SSD Seq 16MB 块，4x 头寸；PRD Q3 口径）；
+ * 131072=128MB 上界（与读侧 staging 32MB 分片的最坏非分页峰值绑定）。
+ * 非法值钳位不回默认（<MIN→MIN，>MAX→MAX），保留用户边界意图。 */
+#define RB_MAX_CACHE_IO_KB_MIN   8192
+#define RB_MAX_CACHE_IO_KB_DEF   65536
+#define RB_MAX_CACHE_IO_KB_MAX   131072
+
 /* ---- V8.1 多核（第二/三轮合并） ---- */
 #define RB_IO_WORKERS_MAX  32      /* I/O worker 池上限（按逻辑 CPU 数截断，含超线程） */
 #define RB_FLUSH_WORKERS   4       /* zone 并行回写线程数 */
@@ -90,6 +99,13 @@ typedef struct _RB_DEV_EXT {
      * 盘符易主后持旧字母挂错卷」（实测两个不同卷同显 D:）。无锁读写：
      * 纯 PASSIVE 控制路径，最坏多刷新/少刷新一轮，不影响正确性。 */
     LARGE_INTEGER  LetterAt;
+    /* ---- [U0-1 2026-10-19] 测试模式运行时挂栈标记（末尾纯追加）---- */
+    BOOLEAN          RuntimeAttached;  /* TRUE=本 ext 由 ATTACH 运行时开卷挂栈创建（非 AddDevice）；
+                                        * detach 走完整拆除铁律（RbVolumeRemove），而非保留设备 */
+    /* ---- [FIX R6-01] 卷身份（L2 容器键的卷维度；几何探测时计算一次）---- */
+    ULONG64          VolId;            /* 存储设备序列号哈希（不可得时回落 几何组合哈希）。
+                                        * L2 记录/索引/容器身份均带此值——跨卷/换盘的
+                                        * 数据一律 MISS（索引键仅 LBA 无卷标识的根治）。 */
 } RB_DEV_EXT, *PRB_DEV_EXT;
 
 /* 一条被拦截、转投 worker 的 IRP 上下文 */
@@ -184,7 +200,11 @@ typedef struct _RB_GLOB {
     /* ---- [V10.1] failsafe 增量（末尾纯追加） ---- */
     volatile LONG   PanicPassthrough;   /* 1=全局熔断：READ/WRITE 一律透传 */
     ULONG           BootFailCount;      /* 连续非干净启动计数 */
-    BOOLEAN         BootLoopGuard;      /* >=2 次：本轮引导拒绝挂载一切卷 */
+    BOOLEAN         BootLoopGuard;      /* >=2 次非干净启动：本轮引导拒绝挂载一切卷。
+                                          * [FIX A-8/R6C-01] 消费点=rbattach.c 三处挂载入口
+                                          * （RbAttachVolumeByLetter/RbAttachVolumeRuntime/
+                                          * 自动挂载经前者）+ panic-clear 清零（rbctl.c）。
+                                          * 原只置 SafeMode 直写=第三道 0x7B 防线空转。 */
     ULONG           DirtySnapshotMB;    /* 最近一次脏量快照（MB） */
     KBUGCHECK_REASON_CALLBACK_RECORD BugCheckRecord;  /* 蓝屏取证回调记录 */
     LIST_ENTRY      ZombieList;         /* 僵尸 ext 链 */
@@ -195,6 +215,53 @@ typedef struct _RB_GLOB {
     volatile LONG   PanicSettleEpoch;   /* 已完成"flush 净脏 + 丢弃视图"自愈的世代号 */
     /* ---- [P2-3] 配置读写串行化 ---- */
     FAST_MUTEX      CfgLock;            /* 保护 g_Rb.Config 整体赋值 vs 并发读（防撕裂） */
+    /* ---- [U0-1 2026-10-19] 测试模式总门（末尾纯追加；默认关）---- */
+    volatile LONG   TestMode;           /* 注册表 TestMode=1 才允许 ATTACH 运行时开卷挂栈；
+                                        * 生产安装（BOOT_START）不写该项 → 新路径不可达 */
+    /* ---- [W1.5] 大块 IO 缓存门 + 同步 IO 上下文池（末尾纯追加）---- */
+    volatile ULONG   MaxCacheIoKB;      /* 单块 IO 缓存门（KB）：DriverEntry 读注册表
+                                        * MaxCacheIoKB 钳位后写一次（早于任何 IRP 可达），
+                                        * 之后只读；缺省 65536(64MB)。热路径每 IRP 一次
+                                        * volatile 读 + shift，与 TestMode/PanicPassthrough
+                                        * 同款成本；非协议面（RB_CONFIG 才是） */
+    NPAGED_LOOKASIDE_LIST SyncCtxLa;   /* [W1.5] RB_SYNCCTX 非分页旁视池（CTX-1 IoCtxLa
+                                         * 先例）：RbSyncIo 每 IO 的上下文分配/释放替代。
+                                         * 生命周期挂点见 rbdriver.c：Init 紧随 IoCtxLa；
+                                         * Delete 必须晚于 rb_engine_destroy——引擎销毁内
+                                         * force flush 驱动 writeback 回调 → RbSyncIo，
+                                         * 提前删=UAF（RbUnload 注释有详述） */
+    /* ---- [D3] 当前处理器亲和派发表（末尾纯追加；只读内部表，无注册表项）----
+     * CPU 号 → IoWorkers 下标+1；0 = 该 CPU 无 worker（>64 逻辑 CPU 组外 /
+     * 目标 worker 已死 / 未选入拓扑）→ RbSubmitIo 回退轮询（IoRR）。
+     * 由 RbStartIoWorkers 在 worker 创建后一次性填充（双来源：AuxValid 组亲和
+     * 的单核目标 / CpuIndex 逐逻辑核）；仅覆盖第 0 处理器组。
+     * 热路径每 IO 一次 O(1) 查表（KeGetCurrentProcessorNumberEx 任意 IRQL
+     * 合法、无锁无分配）；非协议面（不进 RB_CONFIG/RB_STATS）。 */
+    UCHAR           IoWorkerByCpu[64];
+    /* ---- [V10.6/B-6] 驱动签名态缓存（末尾纯追加；RB_VERSION.TestSigned/Signer 数据源）----
+     * DriverEntry 从 HKLM\...\Parameters 读一次（TestSigned 缺省 1=测试签名/未知，
+     * 保守默认：反作弊警示照弹——09 移交报告 §3 B-6 有意的安全默认）；CLI
+     * `signature` 把 WinVerifyTrust 实测结果写同一注册表项，下次加载生效。
+     * 非协议面热数据：只读内部缓存，GET_VERSION 回包时组装进 RB_VERSION。 */
+    ULONG           DriverTestSigned;
+    WCHAR           DriverSigner[RB_SIGNER_LEN];
+    /* ---- [V10.6/B-12] 读延迟 EWMA 测量（末尾纯追加；RB_STATS.CacheReadLatencyUs/
+     * DiskReadLatencyUs 数据源；单位微秒，0=尚无样本）。热路径每 IO 一次
+     * InterlockedIncrement + 1/64 命中才 2×KeQueryPerformanceCounter
+     * （~40ns/64 笔，可忽略）；EWMA 1/8 权重非锁更新（读多写少，最坏一次
+     * 撕裂读无害）。QpcFreq 由 RbLatCalibrate 在 RbStartIoWorkers 内一次性
+     * 校准（KeStall 50ms 实测）；校准失败=0 → 采样整体跳过（不产假数据）。 */
+    volatile LONG   ReadLatSeq;         /* 读采样序号（&63==0 命中采样） */
+    volatile LONG   ReadLatEwmaUs[2];   /* [0]=全命中读 [1]=含 miss 下盘读 */
+    LONG            QpcFreq;            /* QPC 频率（次/秒；0=未校准=不采样） */
+    /* ---- [V10.6/B-7] 操作进度事件环（末尾纯追加；RB_MSG_GET_EVENTS 数据源）----
+     * 非分页内存固定环（RB_EVENT_MAX 条）+ 单调 Seq；发布方任意 IRQL 可调
+     * RbEvPublish（Interlocked 占位 + 拷贝；无锁无分配）。轮询方经 GET_EVENTS
+     * 带游标增量取；环满覆盖最旧（游标已消费的仍可重取未消费的）。
+     * 当前发布点：卸载回写（rbattach.c detach：start/排空/回写/done）；
+     * L2 重建（B-8）待 W2 路径就绪后在重建循环发布（Phase 字段已备）。 */
+    RB_EVENT_REC    EvRing[RB_EVENT_MAX];
+    volatile LONG   EvSeq;              /* 已发布事件的最大 Seq（0=无） */
 } RB_GLOB;
 
 extern RB_GLOB g_Rb;
@@ -235,8 +302,17 @@ int      RbReadbackCb(void *ctx, rb_u64 file_id, rb_u64 off, void *buf, size_t l
 /* FIX[多核] 池启停（Stop 仅 Teardown 保留路径；常驻驱动正常运行不调用） */
 void  RbStartIoWorkers(VOID);
 NTSTATUS RbStopIoWorkers(VOID);
+/* [FIX S7-13] 卸载中止后重启已终止的池线程（禁半死服役）；仍在途者不动。 */
+VOID     RbRestartDeadIoWorkers(VOID);
 void  RbStartFlushers(VOID);
 NTSTATUS RbStopFlushers(VOID);
+/* [V10.6/B-7] 操作进度事件发布（rbio.c；任意 IRQL、无锁无分配、可持锁调用）。
+ * opType/phase 合法值见 rb_proto.h 的 RB_OP_ 与 RB_PHASE_ 系列；percent 0-100
+ * （不确定阶段置 0 + 阶段文案说明）。 */
+void  RbEvPublish(ULONG opType, ULONG percent, ULONG cancelable, ULONG phase,
+                  ULONG64 recoveredBytes, const WCHAR *stageText);
+/* [FIX S7-13] 卸载中止后重启已终止的 flusher（禁回写退串行）；仍在途者不动。 */
+VOID     RbRestartDeadFlushers(VOID);
 /* [BUG3] 动态内存预算统一入口（PASSIVE）：周期回写线程每轮调用 +
  * 引擎创建时立即调用一次（消除首个 tick 前 DynamicLimitMB=0 的显示/策略空窗） */
 VOID     RbRefreshMemoryBudget(VOID);
@@ -271,6 +347,11 @@ DRIVER_UNLOAD RbUnload;                /* 干净卸载：支持 sc stop / 免重
 /* ---- V9 rbattach.c：运行时定向附加 / 硬排除 / 全卷枚举 ---- */
 NTSTATUS RbEnsureEngine(VOID);
 NTSTATUS RbAttachVolumeByLetter(WCHAR letter);
+/* [FIX B-U0-8] TestMode 运行时挂栈卷孤儿巡检（Rb2Tick 周期调）：卷意外消失
+ * （USB 拔出/盘符易主，无 REMOVE IRP 到达）→ 强制重解析失败超 30s 即完整拆除。 */
+VOID     RbJanitorSweepRuntimeAttached(VOID);
+/* [FIX B-U0-8] 强制重解析单卷盘符（巡检/诊断用；PASSIVE，内部自持 DevListLock）。 */
+VOID     RbForceResolveLetter(PRB_DEV_EXT ext);
 NTSTATUS RbDetachVolumeByLetter(WCHAR letter);
 BOOLEAN  RbIsBootCriticalPdo(PDEVICE_OBJECT pdo);
 VOID     RbVolumeEnumerateAll(RB_VOLUME_LIST *out);
@@ -278,6 +359,11 @@ VOID     RbVolumeRemove(PRB_DEV_EXT ext, LONG SelfRefs);   /* SelfRefs=调用方
 VOID     RbRefreshVolumeGeometry(PRB_DEV_EXT ext);
 NTSTATUS RbPnpStartComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID ctx);
 NTSTATUS RbPnpRemoveComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID ctx);
+
+/* ---- [U0-1 2026-10-19] 测试模式：运行时开卷挂栈（V9 语义重写；TestMode 门控）---- */
+NTSTATUS RbAttachVolumeRuntime(WCHAR letter);
+static __inline BOOLEAN RbTestModeEnabled(VOID)   /* 热路径内联版：一次 volatile 读 */
+{ return (BOOLEAN)g_Rb.TestMode; }
 
 /* ---- [V10.1] failsafe 接口（实现见 rbdriver.c / rbio.c） ---- */
 VOID    RbSetPanic(PCWSTR reason);                 /* 任意 IRQL：原子置位 + 唤醒 flush 线程 */
@@ -298,5 +384,13 @@ NTSTATUS RbSendSyncIoctl(PDEVICE_OBJECT target, ULONG ioctl,
                          PULONG returned);   /* rbattach.c：rbthermal 复用 */
 PVOID   RbCtxAlloc(VOID);                 /* rbio.c：RB_IOCTX 旁视池分配 */
 VOID    RbCtxFree(PVOID p);               /* rbio.c：RB_IOCTX 旁视池归还 */
+/* ---- [W1.5] RB_SYNCCTX 同步盘 IO 上下文池（实现见 rbio.c；与 RbCtxAlloc/Free 对偶）----
+ * RB_SYNCCTX 定义在 rbio.c，故 Init/Delete 走函数封装（对齐 RbLogInit 先例）。 */
+VOID    RbSyncCtxPoolInit(VOID);          /* DriverEntry：紧随 IoCtxLa 初始化调用 */
+VOID    RbSyncCtxPoolDelete(VOID);        /* RbUnload：必须 rb_engine_destroy【之后】调用
+                                             （引擎销毁内 force flush → RbWritebackCb → RbSyncIo
+                                              仍在途；提前删=UAF。详见 rbdriver.c RbUnload 注释） */
+PVOID   RbSyncCtxAlloc(VOID);             /* RbSyncIo 入口（PASSIVE；同步函数内严格配对） */
+VOID    RbSyncCtxFree(PVOID p);           /* RbSyncIo 出口 */
 
 #endif /* RB_COMMON_H */

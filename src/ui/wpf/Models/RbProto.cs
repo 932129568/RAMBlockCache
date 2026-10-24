@@ -38,9 +38,20 @@ public static class RbProtoDefs
     public const uint RB_MSG_PANIC = 11;         // 一键熔断：全局透传（脏数据后台落盘）
     public const uint RB_MSG_PANIC_CLEAR = 12;   // 清除熔断 + 引导循环防护（epoch 握手）
 
+    /* [V10.6/B-5] 末尾追加（ctl/rb_proto.h RB_MSG_INVALIDATE_RANGE，消息号不复用） */
+    public const uint RB_MSG_INVALIDATE_RANGE = 13; // 缓存范围失效（FlushFileRange）
+
+    /* [V10.6/B-7] 末尾追加（ctl/rb_proto.h RB_MSG_GET_EVENTS，消息号不复用） */
+    public const uint RB_MSG_GET_EVENTS = 14;       // 操作进度事件轮询（游标增量，同 GET_LOG）
+
     public const int RB_LOG_MAX = 64;
     public const int RB_LOG_TEXT_MAX = 48;
     public const int RB_NAME_LEN = 16;
+    /* [V10.6/B-6] 驱动签名者名上限（wchar_t；与 RB_SIGNER_LEN 一致） */
+    public const int RB_SIGNER_LEN = 32;
+    /* [V10.6/B-7] 事件环容量 + 阶段文案上限（与 RB_EVENT_MAX/RB_EVENT_TEXT 一致） */
+    public const int RB_EVENT_MAX = 64;
+    public const int RB_EVENT_TEXT = 48;
     public const uint RB_PROTOCOL_VERSION = 9;   // [V10.1] 8->9: 纯追加契约
 
     /* ---- V8 每卷写模式 (rb_proto.h RB_WRITEMODE_*) ---- */
@@ -189,6 +200,9 @@ public struct RbStats
     public uint PanicActive;        // 1=全局熔断中, 一切 I/O 直通盘
     public uint BootFails;          // 连续非干净启动计数
     public uint DirtySnapshotMB;    // 异常关机时"可能丢失数据量"的上界快照
+    /* ---- [V10.6/B-12] 读延迟 EWMA（微秒；末尾纯追加；0=尚无样本） ---- */
+    public uint CacheReadLatencyUs; // 全命中读 EWMA（采样 1/64，1/8 权重）
+    public uint DiskReadLatencyUs;  // 含 miss 下盘读 EWMA（同采样）
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 8)]
@@ -241,8 +255,58 @@ public struct RbVersion
     [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbProtoDefs.RB_NAME_LEN)]
     public ushort[] Name;
 
+    /* [V10.6/B-6] 驱动签名态（rb_proto.h RB_VERSION_T 末尾纯追加；三副本同步） */
+    public uint TestSigned;         // 1 = 测试签名/未知（保守默认）
+    public uint Reserved2;          // 对齐保留
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbProtoDefs.RB_SIGNER_LEN)]
+    public ushort[] Signer;
+
     public string NameStr => Name == null ? "" : new string(Array.ConvertAll(Name, c => (char)c)).TrimEnd('\0');
+    public string SignerStr => Signer == null ? "" : new string(Array.ConvertAll(Signer, c => (char)c)).TrimEnd('\0');
     public string VersionText => $"{Major}.{Minor}.{Build} (proto {ProtocolVersion})";
+}
+
+/* ---- 缓存范围失效（RB_MSG_INVALIDATE_RANGE = 13；[V10.6/B-5]）---- */
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbInvalidateRange
+{
+    public ushort Letter;
+    public uint Reserved;
+    public ulong Offset;
+    public ulong Length;
+}
+
+/* ---- 操作进度事件（RB_MSG_GET_EVENTS = 14；[V10.6/B-7]）---- */
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbEventRec
+{
+    public ulong Seq;
+    public uint OpType;      // 1=benchmark 2=preset-apply 3=unmount 4=l2-rebuild
+    public uint Percent;     // 0-100；不确定阶段置 0
+    public uint Cancelable;  // 1=可取消
+    public uint Phase;       // B-8：1=start 2=progress 3=done（其他=0）
+    public ulong RecoveredBytes; // B-8 重建已恢复字节（其他=0）
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbProtoDefs.RB_EVENT_TEXT)]
+    public ushort[] StageText;
+
+    public string StageTextStr => StageText == null ? "" : new string(Array.ConvertAll(StageText, c => (char)c)).TrimEnd('\0');
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbEventQuery
+{
+    public ulong Cursor;     // 上次消费到的 Seq；0=从环内最早开始
+    public uint MaxCount;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbEventList
+{
+    public ulong Cursor;     // 新消费游标（无事件=入参原值）
+    public uint Count;
+    public uint Reserved;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbProtoDefs.RB_EVENT_MAX)]
+    public RbEventRec[] Items;
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 8)]

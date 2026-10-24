@@ -312,7 +312,9 @@ VOID RbBootFailLoad(VOID)
         grace = TRUE;
         RbRegSetDW(L"DeployAck", depSeq);                /* 一次性消费宽限 */
     } else {
-        fails += 1;
+        /* [FIX S7-08] 回绕钳位：注册表损坏值 0xFFFFFFFF +1 回绕为 0 →
+         * BootLoopGuard/self-disable 永久失效（畸形配置面）。封顶 1000。 */
+        if (fails < 1000) fails += 1; else fails = 1000;
     }
     RbRegSetDW(L"BootFailCount", fails);
 
@@ -328,7 +330,10 @@ VOID RbBootFailLoad(VOID)
     }
     if (g_Rb.BootLoopGuard) {
         g_Rb.SafeMode = 1;           /* 保守：全程 write-through */
-        RbLog(2, __LINE__, 0, L"BOOT-LOOP GUARD: attach refused this boot");
+        /* [FIX A-8/R6C-01] 日志改如实语义：原文案宣称"拒绝挂载"，实际当时只置
+         * SafeMode（挂载路径零消费）——误导现场排查。拒绝闸门现由 rbattach.c
+         * 三处挂载入口落地（见 rb_common.h BootLoopGuard 注释）。 */
+        RbLog(2, __LINE__, 0, L"BOOT-LOOP GUARD: safe mode (write-through); attach refused this boot");
     }
     if (grace) {
         RbLog(1, __LINE__, 0, L"first boot after deploy: grace, fail not counted");
@@ -545,15 +550,29 @@ static VOID RbTryResolveLetter(PRB_DEV_EXT e, BOOLEAN force)
     if (NT_SUCCESS(IoVolumeDeviceToDosName(e->Pdo, &dos)) &&
         dos.Length >= sizeof(WCHAR)) {
         WCHAR nl = dos.Buffer[0];
+        /* [FIX A-10] Letter/IsSystem 写入纳入 DevListLock：轮询(FALSE)与 attach
+         * 强制刷新(TRUE)可对同一 ext 并发无锁写（成功/失败分支组合出
+         * "Letter=X 但 IsSystem=1"的错配态）。PnP 查询仍在锁外（可阻塞）。 */
+        ExAcquireFastMutex(&g_Rb.DevListLock);
         e->Letter    = nl;
         e->IsSystem  = (nl == g_Rb.SystemDriveLetter) ? 1 : 0;   /* 每次重算，不只变更时 */
+        ExReleaseFastMutex(&g_Rb.DevListLock);
         RtlFreeUnicodeString(&dos);
         KeQuerySystemTimePrecise(&e->LetterAt);
     } else if (force && e->Letter) {
-        /* 强制路径问不到当前盘符：缓存字母已不可信，清除 */
+        /* 强制路径问不到当前盘符：缓存字母已不可信，清除（同款持锁） */
+        ExAcquireFastMutex(&g_Rb.DevListLock);
         e->Letter   = 0;
         e->IsSystem = 0;
+        ExReleaseFastMutex(&g_Rb.DevListLock);
     }
+}
+
+/* [FIX B-U0-8] 强制重解析单卷盘符（rbattach.c 孤儿巡检用；RbTryResolveLetter
+ * 是本文件 static，经此包装暴露）。force=TRUE：问不到当前盘符即清缓存。 */
+VOID RbForceResolveLetter(PRB_DEV_EXT ext)
+{
+    if (ext) RbTryResolveLetter(ext, TRUE);
 }
 
 /* GET_VOLUMES / ATTACH 入口先调：快照各 ext（加引用），锁外解析全部盘符。 */
@@ -586,17 +605,32 @@ VOID RbResolveAllLetters(VOID)
  * 调用方用完必须 RbDerefExt。消除与 REMOVE 竞态的 UAF。 */
 PRB_DEV_EXT RbFindExtByLetter(WCHAR letter)
 {
-    PRB_DEV_EXT snap[RB_MAX_VOLUMES];
+    PRB_DEV_EXT stack_snap[RB_MAX_VOLUMES];
+    PRB_DEV_EXT *snap = stack_snap;    /* 指向指针数组（栈或堆） */
+    PRB_DEV_EXT heap_snap = NULL;
     PLIST_ENTRY link;
-    ULONG n = 0, k;
+    ULONG n = 0, k, cap = RB_MAX_VOLUMES;
     PRB_DEV_EXT found = NULL;
 
     PAGED_CODE();
+    /* [FIX S7-10] >8 卷机器：原固定 8 槽快照使第 9+ 卷永远找不到
+     * （ATTACH/SET_VOLUME 恒 NOT_FOUND，链表序相关）。先计数，
+     * 超出则堆分配（PASSIVE 控制路径，分配失败退化为前 8 槽=既有行为）。 */
+    ExAcquireFastMutex(&g_Rb.DevListLock);
+    for (link = g_Rb.DevList.Flink; link != &g_Rb.DevList; link = link->Flink) n++;
+    ExReleaseFastMutex(&g_Rb.DevListLock);
+    if (n > cap) {
+        heap_snap = (PRB_DEV_EXT)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                                 (SIZE_T)n * sizeof(PRB_DEV_EXT), RB_POOL_TAG);
+        if (heap_snap) { snap = heap_snap; cap = n; }
+        else n = cap;
+    }
     /* C4：持锁快照并加引用（详见函数头注释）；Letter 解析放在锁外，
      * 因为 IoVolumeDeviceToDosName 可能阻塞，不能在 FastMutex(APC_LEVEL) 内调用 */
     ExAcquireFastMutex(&g_Rb.DevListLock);
+    n = 0;
     for (link = g_Rb.DevList.Flink;
-         link != &g_Rb.DevList && n < RB_MAX_VOLUMES; link = link->Flink) {
+         link != &g_Rb.DevList && n < cap; link = link->Flink) {
         PRB_DEV_EXT e = CONTAINING_RECORD(link, RB_DEV_EXT, ListEntry);
         if (e->Removed) continue;
         InterlockedIncrement(&e->Refs);
@@ -615,6 +649,7 @@ PRB_DEV_EXT RbFindExtByLetter(WCHAR letter)
     for (k = 0; k < n; k++) {
         if (snap[k] != found) RbDerefExt(snap[k]);
     }
+    if (heap_snap) ExFreePoolWithTag(heap_snap, RB_POOL_TAG);
     return found;
 }
 
@@ -701,6 +736,24 @@ NTSTATUS RbAddDevice(PDRIVER_OBJECT drv, PDEVICE_OBJECT pdo)
         return STATUS_SUCCESS;
     }
 
+    /* [U0-1 2026-10-19] 防重复挂栈：TestMode 运行时挂栈可能已为同一 PDO 建过
+     * 过滤设备（devcon rescan / PnP 重枚举会再次触发 AddDevice）——双过滤 =
+     * 两个缓存视图读同一数据 = 静默损坏。持 DevListLock 扫描（表内 ext 的 Pdo
+     * 均持引用有效；摘除发生在同锁内，不会读到半拆项），命中即跳过。 */
+    {
+        PLIST_ENTRY le; BOOLEAN dup = FALSE;
+        ExAcquireFastMutex(&g_Rb.DevListLock);
+        for (le = g_Rb.DevList.Flink; le != &g_Rb.DevList; le = le->Flink) {
+            PRB_DEV_EXT e = CONTAINING_RECORD(le, RB_DEV_EXT, ListEntry);
+            if (e->Pdo == pdo) { dup = TRUE; break; }
+        }
+        ExReleaseFastMutex(&g_Rb.DevListLock);
+        if (dup) {
+            RbLog(0, __LINE__, 0, L"AddDevice: PDO already filtered (runtime attach), skip duplicate");
+            return STATUS_SUCCESS;
+        }
+    }
+
     st = IoCreateDevice(drv, sizeof(RB_DEV_EXT), NULL,
                         FILE_DEVICE_DISK, FILE_DEVICE_SECURE_OPEN, FALSE, &dev);
     if (!NT_SUCCESS(st)) return st;
@@ -746,11 +799,30 @@ NTSTATUS RbAddDevice(PDRIVER_OBJECT drv, PDEVICE_OBJECT pdo)
     dev->Flags &= ~DO_DEVICE_INITIALIZING;
 
     /* 持 DevListLock 完成"插入 + DevCount++"的原子发布：防枚举方
-     * （RbFindExtByLetter/RbVolumeEnumerateAll）看到半链接节点 */
+     * （RbFindExtByLetter/RbVolumeEnumerateAll）看到半链接节点。
+     * [FIX U0-4] 发布段 PDO 复检：堵"入口查重后、发布前"运行时挂栈插入的
+     * TOCTOU 窗口（否则同一卷栈双过滤 = 两个缓存视图静默损坏）。命中时
+     * 本设备自拆撤场（PnP 语义=AddDevice 成功但未挂过滤，栈形态不变）。 */
     ExAcquireFastMutex(&g_Rb.DevListLock);
-    InsertTailList(&g_Rb.DevList, &ext->ListEntry);
-    InterlockedIncrement(&g_Rb.DevCount);
-    ExReleaseFastMutex(&g_Rb.DevListLock);
+    {
+        PLIST_ENTRY le; BOOLEAN dup = FALSE;
+        for (le = g_Rb.DevList.Flink; le != &g_Rb.DevList; le = le->Flink) {
+            PRB_DEV_EXT e = CONTAINING_RECORD(le, RB_DEV_EXT, ListEntry);
+            if (e->Pdo == pdo) { dup = TRUE; break; }
+        }
+        if (!dup) {
+            InsertTailList(&g_Rb.DevList, &ext->ListEntry);
+            InterlockedIncrement(&g_Rb.DevCount);
+        }
+        ExReleaseFastMutex(&g_Rb.DevListLock);
+        if (dup) {
+            RbLog(0, __LINE__, 0, L"AddDevice: PDO filtered concurrently (runtime attach), detach duplicate");
+            IoDetachDevice(dev);
+            ObDereferenceObject(pdo);
+            IoDeleteDevice(dev);
+            return STATUS_SUCCESS;
+        }
+    }
 
     RbLog(0, __LINE__, 0, L"AddDevice: filter on volume stack, passthrough by default");
     return STATUS_SUCCESS;
@@ -897,16 +969,37 @@ VOID RbUnload(PDRIVER_OBJECT drv)
      * 保留驱动加载（宁泄漏勿崩溃），与僵尸未清空的既有策略一致。 */
     if (!NT_SUCCESS(RbStopFlushThread())) {
         RbLog(2, __LINE__, 0, L"unload aborted: flush thread join timeout");
+        /* [FIX D6-04] 恢复周期服务，禁半死服役：join 超时后 flush 线程可能已观测
+         * FlushStop 退出——驱动继续服役但无周期回写/无 panic 自愈/无僵尸回收，
+         * 且 FlushStop 闩锁保持置位使下次卸载"秒过"（join 已终止线程立即成功）
+         * 掩盖真实状态。已终止则清理后重启；仍在途则清闩放行继续服务。 */
+        if (g_Rb.FlushThread) {
+            NTSTATUS tl = KeWaitForSingleObject(g_Rb.FlushThread, Executive, KernelMode, FALSE, NULL);
+            if (tl == STATUS_SUCCESS) {          /* 线程已终止：引用清理后可重建 */
+                ObDereferenceObject(g_Rb.FlushThread);
+                g_Rb.FlushThread = NULL;
+                g_Rb.FlushRunning = 0;
+            }
+        }
+        KeClearEvent(&g_Rb.FlushStop);
+        if (!g_Rb.FlushRunning) {
+            if (NT_SUCCESS(RbStartFlushThread()))
+                RbLog(1, __LINE__, 0, L"flush thread restarted after aborted unload");
+            else
+                RbLog(2, __LINE__, 0, L"flush thread restart FAILED - periodic writeback degraded");
+        }
         g_Rb.Unloading = FALSE;   /* [FIX R2-W5] 中止即恢复数据路径，禁哑服役 */
         return;
     }
     if (!NT_SUCCESS(RbStopFlushers())) {
         RbLog(2, __LINE__, 0, L"unload aborted: flusher join timeout");
+        RbRestartDeadFlushers();   /* [FIX S7-13] 重启已终止者：禁半死服役（回写退串行） */
         g_Rb.Unloading = FALSE;   /* [FIX R2-W5] */
         return;
     }
     if (!NT_SUCCESS(RbStopIoWorkers())) {
         RbLog(2, __LINE__, 0, L"unload aborted: io worker join timeout");
+        RbRestartDeadIoWorkers();   /* [FIX S7-13] 重启已终止者：禁半死服役（I/O 退系统队列） */
         g_Rb.Unloading = FALSE;   /* [FIX R2-W5] */
         return;
     }
@@ -1010,6 +1103,18 @@ VOID RbUnload(PDRIVER_OBJECT drv)
     /* 5) 销毁缓存引擎 */
     if (g_Rb.Engine) { rb_engine_destroy(g_Rb.Engine); g_Rb.Engine = NULL; }
 
+    /* [W1.5] RB_SYNCCTX 池删除：必须在 rb_engine_destroy【之后】——
+     * rb_engine_destroy 内部 rb_engine_flush(eng,1)（cache.c）驱动 writeback
+     * 回调 RbWritebackCb → RbSyncIo 使用 SyncCtxLa；若与 IoCtxLa 同步提前删除，
+     * 卸载末段在途的 RbSyncIo 会向已删除的 lookaside 归还内存（UAF/0xC4）。
+     * 故本池比 IoCtxLa（上方 :1037）活得更久——此顺序差异是刻意设计，
+     * 请勿"对齐整理"提前删除。此刻引擎已销毁、所有调用方（I/O worker、
+     * flusher、特性池、引擎回调）已全部停止，池必为空（RbSyncIo 是严格
+     * 同步函数：分配→等待→释放在一次调用内，池非空的唯一可能是在途调用）。
+     * 卸载中止路径（join 超时等上方 return 处）不删池——与 IoCtxLa 既有
+     * 语义一致：驱动保留服役，池继续在途。 */
+    RbSyncCtxPoolDelete();
+
     /* 6) 释放系统卷 PDO 引用（RegPath.Buffer 为驱动自有静态缓冲 [FIX W1]，不释放） */
     if (g_Rb.SystemVolumePdo) {
         ObDereferenceObject(g_Rb.SystemVolumePdo);
@@ -1106,6 +1211,54 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
      * 自动路径只覆盖数据卷：系统卷/引导关键卷由 RbGeoWorkRoutine 显式排除，
      * 手动 GUI attach 仍允许任何卷（用户显式知情，三重回滚兜底）。 */
     g_Rb.AutoAttach = RbRegGetDW(L"AutoAttach", 1);
+    /* [U0-1 2026-10-19] 测试模式总门（默认关=0）：仅安装器 /TestMode（DEMAND_START
+     * 安装）置 1。开启后 ATTACH 对无 ext 的既有卷走"运行时开卷→Safe 挂栈→建流"
+     * 路径（零重启 dev loop）；生产安装不写该项 → 路径不可达，行为零变化。 */
+    g_Rb.TestMode = RbRegGetDW(L"TestMode", 0);
+
+    /* ===== [V10.6/B-6] 驱动签名态（注册表缓存；CLI signature / 安装器写入）=====
+     * TestSigned 缺省 1（测试签名/未知）= 保守：前端取不到签名态时按测试签名处理，
+     * 反作弊警示照弹——"读不到"绝不被静默成"正式签名"（口碑毁灭级误放行）。
+     * Signer 取不到=空串。生效留证：GET_VERSION 回包 TestSigned/Signer（B-6 前端
+     * 契约 {testSigned, signer} 的注册表面来源），日志是 QA 确认加载值的免协议通道。 */
+    g_Rb.DriverTestSigned = RbRegGetDW(L"TestSigned", 1);
+    g_Rb.DriverSigner[0] = L'\0';
+    {
+        UNICODE_STRING path = RTL_CONSTANT_STRING(RB_REG_PARAMS);
+        PVOID data = NULL; ULONG size = 0, type = 0;
+        if (NT_SUCCESS(RbRegQueryValue(&path, L"Signer", &data, &size, &type)) && data) {
+            if (type == REG_SZ && size >= sizeof(WCHAR)) {
+                SIZE_T cch = size / sizeof(WCHAR);
+                if (cch > RB_SIGNER_LEN) cch = RB_SIGNER_LEN;
+                RtlCopyMemory(g_Rb.DriverSigner, data, cch * sizeof(WCHAR));
+                g_Rb.DriverSigner[cch - 1] = L'\0';   /* 无论截断与否，末位强制 NUL */
+            }
+            ExFreePoolWithTag(data, RB_POOL_TAG);
+        }
+        RbLog(0, __LINE__, (LONG)g_Rb.DriverTestSigned,
+              L"driver signature state loaded (TestSigned=1 means test/unknown)");
+    }
+
+    /* ===== [W1.5] 大块 IO 缓存门（MaxCacheIoKB，REG_DWORD，单位 KB）=====
+     * 经既有 RbRegGetDW 原语读一次（[Commit4] 唯一注册表面纪律）；钳位不回默认：
+     * <8192（含 0）→8192、>131072→131072——保留用户边界意图（8192=8MB 历史门，
+     * 即"改小回滚"旋钮；0 不会被打成"关闭大块缓存"的危险误读）。
+     * 生效留证：RB_CONFIG/RB_STATS 协议冻结不能加字段，日志是 QA 确认生效值的
+     * 唯一免协议通道（与 AutoAttach/TestMode 同款 PASSIVE 加载期读一次）。 */
+    {
+        ULONG v = RbRegGetDW(L"MaxCacheIoKB", RB_MAX_CACHE_IO_KB_DEF);
+        if (v < RB_MAX_CACHE_IO_KB_MIN) v = RB_MAX_CACHE_IO_KB_MIN;
+        if (v > RB_MAX_CACHE_IO_KB_MAX) v = RB_MAX_CACHE_IO_KB_MAX;
+        g_Rb.MaxCacheIoKB = v;
+        RbLog(0, __LINE__, (LONG)v, L"MaxCacheIoKB effective KB");
+    }
+
+    /* ===== [D3] 派发模式留证（与 MaxCacheIoKB 同款免协议生效留证）=====
+     * 本构建 RbSubmitIo 采用"当前处理器亲和优先 + 轮询兜底"派发（IoWorkerByCpu
+     * 只读内部表，首次 attach 惰性建池时填充）。无注册表开关——回退轮询需
+     * 源码级 revert rbio.c 的 RbSubmitIo 亲和分支。生效细节见
+     * "io worker affinity table filled (current-cpu dispatch)"。 */
+    RbLog(0, __LINE__, 0, L"io worker dispatch: current-cpu affinity");
 
     /* ===== [V10.1] 兜底 1：引导循环防护 =====
      * 连续 2 次非干净启动 → 本轮拒绝挂载任何卷（含数据卷）。
@@ -1127,6 +1280,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     /* ===== [Build15] CTX-1：RB_IOCTX 非分页旁视池 ===== */
     ExInitializeNPagedLookasideList(&g_Rb.IoCtxLa, NULL, NULL, 0,
                                     sizeof(RB_IOCTX), RB_POOL_TAG, 0);
+    /* [W1.5] RB_SYNCCTX 池：紧随 IoCtxLa 初始化（同族 NPAGED lookaside 先例）。
+     * 实现见 rbio.c RbSyncCtxPoolInit（RB_SYNCCTX 定义在 rbio.c，函数封装）。 */
+    RbSyncCtxPoolInit();
 
     /* 仅创建控制设备；引擎与工作线程在首次 attach 时惰性创建 */
     st = RbCreateControlDevice();
@@ -1137,6 +1293,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
          * 二次蓝屏且取证指向无关模块 */
         RbDeregisterCrashHooks();
         ExDeleteNPagedLookasideList(&g_Rb.IoCtxLa);
+        RbSyncCtxPoolDelete();   /* [W1.5] 与 IoCtxLa 对称：DriverEntry 内失败即删 */
         return st;
     }
 

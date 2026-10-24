@@ -375,7 +375,9 @@ static void test_m17_cap(void)
       rb_read(s, CHUNK, buf, CHUNK, miss, &mc, 16);
       k_miss(s, CHUNK, buf, CHUNK, miss, mc); }
     st = eng_stats(eng);
-    CHECK(st.chunk_count <= 1, "M17 超限回填不建块（count=%llu）",
+    /* [FIX #5.3] 精确边界：原 <=1 容忍"chunk0 也被误拒"的假绿（hard=91KB 时
+     * chunk0=64KB 必然可建）。=1 同时证明"该建必建、该拒必拒"。 */
+    CHECK(st.chunk_count == 1, "M17 超限回填不建块且 chunk0 保留（count=%llu，应=1）",
           (unsigned long long)st.chunk_count);
 
     rb_stream_flush(s, 1);
@@ -469,6 +471,56 @@ static void test_w19_guards(void)
     rb_engine_destroy(eng);
 }
 
+/* ============ 用例2d：R6C-01 恢复失败销毁后 LRU 链表完整性 ============ */
+/* 缺陷形态：恢复失败分支清脏位后直接 chunk_destroy——chunk 实际仍在脏链表上，
+ * unlink 按 c->dirty==0 走 lru_remove，把脏链表节点的陈旧 lru 链写进 LRU
+ * 头/尾 → 该分片全部干净块对 evict_select 不可见（淘汰饥饿）。
+ * 2c 因单 chunk 恰好掩盖；本用例用多 chunk + 事后淘汰验证链表仍可用。 */
+static void test_c7_restore_fail_lru(void)
+{
+    rb_config cfg; rb_engine *eng; rb_stream *s;
+    static unsigned char big[CHUNK * 4];
+    rb_direct_range d[8]; int dc = 0;
+    rb_stats st; rb_u64 before;
+
+    printf("== 用例2d: R6C-01 恢复失败销毁后 LRU 完整性 ==\n");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.max_bytes = 4ull * 1024 * 1024;
+    cfg.writeback = wb_fn; cfg.readback = fail_rb_fn;   /* 坏盘：readback 恒失败 */
+    eng = rb_engine_create(&cfg);
+    s = rb_stream_create(eng, 0xAAu);
+
+    /* 铺 3 个干净 chunk（同 chain 分片，互为 LRU 邻居） */
+    fill_pattern(big, sizeof(big), 0x100);
+    { int i; for (i = 0; i < 3; i++) rb_write(s, (rb_u64)i * CHUNK, big, CHUNK, d, &dc, 8); }
+    rb_stream_flush(s, 1);                       /* 全部回写干净 → 进 LRU */
+    st = eng_stats(eng);
+    CHECK(st.chunk_count == 3, "3 个干净 chunk 在册（got %llu）",
+          (unsigned long long)st.chunk_count);
+
+    /* 触发恢复失败销毁：对 chunk#1 的中部做混合子块失效（readback 恒失败） */
+    { unsigned char wr[SUB]; fill_pattern(wr, SUB, 0x200);
+      rb_write(s, CHUNK + SUB / 2, wr, SUB, d, &dc, 8); }
+    rb_stream_invalidate_range_ex(s, CHUNK + SUB / 2, SUB, 0, NULL, 0, 0, NULL);
+    st = eng_stats(eng);
+    CHECK(st.lost_dirty_bytes >= SUB, "恢复失败已记账（lost=%llu）",
+          (unsigned long long)st.lost_dirty_bytes);
+
+    /* 关键断言：销毁发生后同分片干净块仍可被淘汰（LRU 头/尾未被污染）。
+     * evict_select 走 lru_tail→lru_prev 链；若修复前把脏链表节点的陈旧 lru
+     * 链写进 LRU 头/尾，该分片干净块对淘汰不可见 → 插入无法回收 → cur_bytes
+     * 无界增长超过预算。构造超预算写入（70×64KB > 4MB 预算）逼出淘汰。 */
+    { int i;
+      for (i = 3; i < 70; i++) rb_write(s, (rb_u64)i * CHUNK, big, CHUNK, d, &dc, 8); }
+    st = eng_stats(eng);
+    CHECK(st.cur_bytes <= cfg.max_bytes,
+          "淘汰仍工作：cur=%llu <= 预算=%llu（LRU 链表完好，超预算写入被回收）",
+          (unsigned long long)st.cur_bytes, (unsigned long long)cfg.max_bytes);
+
+    rb_stream_destroy(s);
+    rb_engine_destroy(eng);
+}
+
 int main(void)
 {
     g_disk = (unsigned char *)malloc(DISK_SIZE);
@@ -478,6 +530,7 @@ int main(void)
     test_c7_restore();
     test_c7_restore_race();
     test_c7_restore_fail();
+    test_c7_restore_fail_lru();
     test_m17_cap();
     test_w17_lru();
     test_w19_guards();

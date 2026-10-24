@@ -11,6 +11,8 @@
             </ResourceDictionary.MergedDictionaries>
             <BooleanToVisibilityConverter x:Key="BoolToVis"/>
             <helpers:ProgressRatioConverter x:Key="RbcProgressRatio"/>
+            <helpers:InvertBoolConverter x:Key="InvertBool"/>
+            <helpers:BenchStateVisConverter x:Key="BenchStateVis"/>
 
             <!-- ============ 全局 ProgressBar 隐式样式（02b §B.2/D9）============
                  scaleX 驱动：只动 transform，不动画 width。
@@ -50,20 +52,193 @@
             <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
                 <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
             </Style>
-            <Style TargetType="ComboBox" BasedOn="{StaticResource {x:Type ComboBox}}">
-                <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
-            </Style>
-            <Style TargetType="CheckBox" BasedOn="{StaticResource {x:Type CheckBox}}">
-                <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
-            </Style>
-            <Style TargetType="Slider" BasedOn="{StaticResource {x:Type Slider}}">
-                <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
-            </Style>
             <Style TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
                 <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
             </Style>
             <Style TargetType="ListBoxItem" BasedOn="{StaticResource {x:Type ListBoxItem}}">
                 <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
+            </Style>
+
+            <!-- ============ 深色控件模板（04b §8.2/§2.8 转译映射；此前默认亮色 chrome
+                 与暗底直接冲突，是"画面简陋"的直接来源之一）============ -->
+            <Style TargetType="ComboBox">
+                <Setter Property="Foreground" Value="{StaticResource RbcTextPrimary}"/>
+                <Setter Property="Background" Value="{StaticResource RbcBgInput}"/>
+                <Setter Property="BorderBrush" Value="{StaticResource RbcBorderDefault}"/>
+                <Setter Property="BorderThickness" Value="1"/>
+                <Setter Property="Padding" Value="10,6"/>
+                <Setter Property="FontSize" Value="13"/>
+                <Setter Property="Height" Value="28"/>
+                <Setter Property="Cursor" Value="Hand"/>
+                <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
+                <!-- [W1.5 V-3] 下拉浮层微入口挂件（OverlayPop 订阅 DropDownOpened → PlayOverlayEnter） -->
+                <Setter Property="ctl:OverlayPop.IsEnabled" Value="True"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="ComboBox">
+                            <Grid>
+                                <Border x:Name="bd" Background="{TemplateBinding Background}"
+                                        BorderBrush="{TemplateBinding BorderBrush}"
+                                        BorderThickness="{TemplateBinding BorderThickness}"
+                                        CornerRadius="{StaticResource RbcRadiusSm}">
+                                    <Grid>
+                                        <!-- 选中项显示：ComboBox 的 Content 通常为空，必须显式绑 SelectionBoxItem
+                                             （漏绑 = 下拉框永远显示空白，10-20 线上事故） -->
+                                        <ContentPresenter x:Name="cp" Margin="{TemplateBinding Padding}"
+                                                          Content="{TemplateBinding SelectionBoxItem}"
+                                                          ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                                          HorizontalAlignment="Left" VerticalAlignment="Center"
+                                                          IsHitTestVisible="False"/>
+                                        <Path HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0"
+                                              Data="M 0 0 L 4 4 L 8 0 Z" Fill="{StaticResource RbcTextSecondary}"/>
+                                    </Grid>
+                                </Border>
+                                <ToggleButton x:Name="toggle" Focusable="False" ClickMode="Press" Opacity="0"
+                                              IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                                    <ToggleButton.Template>
+                                        <ControlTemplate TargetType="ToggleButton">
+                                            <Border Background="Transparent"/>
+                                        </ControlTemplate>
+                                    </ToggleButton.Template>
+                                </ToggleButton>
+                                <Popup x:Name="popup" Placement="Bottom" PlacementTarget="{Binding ElementName=bd}"
+                                       AllowsTransparency="True" Focusable="False"
+                                       MinWidth="{Binding ActualWidth, ElementName=bd}"
+                                       IsOpen="{TemplateBinding IsDropDownOpen}">
+                                    <!-- [W1.5 V-3] PopupAnimation=None：入场动画单一事实源在 Motion
+                                         （OverlayPop → PlayOverlayEnter：0.98→1 + 淡入 + 8px 位移），防双重淡入 -->
+                                    <Border Background="{StaticResource RbcBgElevated}"
+                                            BorderBrush="{StaticResource RbcBorderStrong}" BorderThickness="1"
+                                            CornerRadius="{StaticResource RbcRadiusSm}" Margin="0,4,0,0" Padding="4">
+                                        <ScrollViewer MaxHeight="220" VerticalScrollBarVisibility="Auto">
+                                            <ItemsPresenter/>
+                                        </ScrollViewer>
+                                    </Border>
+                                </Popup>
+                            </Grid>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource RbcBorderStrong}"/>
+                                </Trigger>
+                                <Trigger Property="IsDropDownOpen" Value="True">
+                                    <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource RbcAccent}"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Opacity" Value="0.5"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+                <Setter Property="ItemContainerStyle">
+                    <Setter.Value>
+                        <Style TargetType="ComboBoxItem">
+                            <Setter Property="Foreground" Value="{StaticResource RbcTextPrimary}"/>
+                            <Setter Property="Padding" Value="10,6"/>
+                            <Setter Property="FontSize" Value="13"/>
+                            <Setter Property="Cursor" Value="Hand"/>
+                            <Setter Property="Template">
+                                <Setter.Value>
+                                    <ControlTemplate TargetType="ComboBoxItem">
+                                        <Border x:Name="bd" Background="Transparent"
+                                                Padding="{TemplateBinding Padding}"
+                                                CornerRadius="{StaticResource RbcRadiusXs}">
+                                            <ContentPresenter VerticalAlignment="Center"/>
+                                        </Border>
+                                        <ControlTemplate.Triggers>
+                                            <Trigger Property="IsMouseOver" Value="True">
+                                                <Setter TargetName="bd" Property="Background" Value="{StaticResource RbcBgSurfaceHover}"/>
+                                            </Trigger>
+                                            <Trigger Property="IsSelected" Value="True">
+                                                <Setter TargetName="bd" Property="Background" Value="{StaticResource RbcAccentSubtle}"/>
+                                            </Trigger>
+                                        </ControlTemplate.Triggers>
+                                    </ControlTemplate>
+                                </Setter.Value>
+                            </Setter>
+                        </Style>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+            <Style TargetType="CheckBox">
+                <Setter Property="Foreground" Value="{StaticResource RbcTextPrimary}"/>
+                <Setter Property="FontSize" Value="13"/>
+                <Setter Property="Cursor" Value="Hand"/>
+                <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="CheckBox">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Border x:Name="box" Grid.Column="0" Width="16" Height="16"
+                                        CornerRadius="{StaticResource RbcRadiusXs}"
+                                        Background="{StaticResource RbcBgInput}"
+                                        BorderBrush="{StaticResource RbcBorderDefault}" BorderThickness="1"
+                                        VerticalAlignment="Center">
+                                    <Path x:Name="check" Stretch="Fill" Width="10" Height="8" Margin="3"
+                                          Data="M 0 4 L 3.5 7.5 L 8 1"
+                                          Stroke="{StaticResource RbcTextOnAccent}" StrokeThickness="1.5"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                          Visibility="Collapsed"/>
+                                </Border>
+                                <ContentPresenter Grid.Column="1" Margin="8,0,0,0" VerticalAlignment="Center"/>
+                            </Grid>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsChecked" Value="True">
+                                    <Setter TargetName="box" Property="Background" Value="{StaticResource RbcAccent}"/>
+                                    <Setter TargetName="box" Property="BorderBrush" Value="{StaticResource RbcAccent}"/>
+                                    <Setter TargetName="check" Property="Visibility" Value="Visible"/>
+                                </Trigger>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="box" Property="BorderBrush" Value="{StaticResource RbcBorderStrong}"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Opacity" Value="0.5"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+            <Style TargetType="Slider">
+                <Setter Property="Height" Value="24"/>
+                <Setter Property="Foreground" Value="{StaticResource RbcAccent}"/>
+                <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Slider">
+                            <Grid VerticalAlignment="Center">
+                                <Border x:Name="track" Height="4" CornerRadius="2"
+                                        Background="{StaticResource RbcTrackBg}"/>
+                                <Track x:Name="PART_Track">
+                                    <Track.Thumb>
+                                        <Thumb Width="14" Height="14" Cursor="Hand" Focusable="False">
+                                            <Thumb.Template>
+                                                <ControlTemplate TargetType="Thumb">
+                                                    <Ellipse x:Name="thumb" Fill="{TemplateBinding Foreground}"/>
+                                                </ControlTemplate>
+                                            </Thumb.Template>
+                                        </Thumb>
+                                    </Track.Thumb>
+                                    <Track.IncreaseRepeatButton>
+                                        <RepeatButton x:Name="inc" Command="Slider.IncreaseLarge" Focusable="False" Opacity="0"/>
+                                    </Track.IncreaseRepeatButton>
+                                    <Track.DecreaseRepeatButton>
+                                        <RepeatButton x:Name="dec" Command="Slider.DecreaseLarge" Focusable="False" Opacity="0"/>
+                                    </Track.DecreaseRepeatButton>
+                                </Track>
+                            </Grid>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Opacity" Value="0.5"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
             </Style>
         </ResourceDictionary>
     </Application.Resources>

@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h>
 
 #define DISK_SIZE (64u * 1024u * 1024u)
 static unsigned char *g_disk;
@@ -348,12 +349,21 @@ static void test_random_consistency(void)
             rb_engine_flush(eng, 0);
     }
     rb_engine_flush(eng, 1);
-    /* 关键验证：全量回写后，磁盘必须等于影子（回写正确性） */
-    size_t chk;
-    for (chk = 0; chk < 256; chk++) {
-        rb_u64 off = (rb_u64)(rand_r(&seed) % (32u * 1024 * 1024));
-        CHECK(memcmp(g_disk + off, shadow + off, 4096) == 0,
-              "全量回写后磁盘与影子一致");
+    /* 关键验证：全量回写后，磁盘必须等于影子（回写正确性）。
+     * [FIX #5.1] 原只随机抽 256x4KB（约 3% 覆盖）——小范围持久错值有约 97%
+     * 概率逃逸（如在途回写旧数据覆写）。改为 32MB 全量比对（ms 级），定位
+     * 循环保留作诊断输出。 */
+    if (memcmp(g_disk, shadow, 32u * 1024 * 1024) != 0) {
+        size_t chk;
+        for (chk = 0; chk < 256; chk++) {
+            rb_u64 off = (rb_u64)(rand_r(&seed) % (32u * 1024 * 1024));
+            if (memcmp(g_disk + off, shadow + off, 4096) != 0)
+                CHECK(0, "全量回写后磁盘与影子一致（首处差异 @%llu）",
+                      (unsigned long long)off);
+        }
+        CHECK(0, "全量回写后磁盘与影子一致（全量比对失败）");
+    } else {
+        CHECK(1, "全量回写后磁盘与影子一致（32MB 全量比对）");
     }
     free(shadow);
     rb_stream_destroy(s); rb_engine_destroy(eng);
@@ -601,6 +611,110 @@ static void test_idle_reclaim(void)
     rb_stream_destroy(s); rb_engine_destroy(eng);
 }
 
+/* [FIX #1b] 确定性"牙齿"用例：hard 填满 + hit-miss-hit-miss 布局 + 计时门控
+ * 桩，杀死 WS-RACE-2 变异体（wb_drain 空转 = 旧 stage 数据可在新镜像之后落盘）。
+ *
+ * 布局（max=4 chunk；hard=95%→3 块可驻留；evict_high 置大=写路径不回收）：
+ *   chunk0 = A0（旧脏数据，在途回调中——污染目标）；
+ *   chunk2 = G（脏，大写时命中——把两个 miss 隔开，防 direct_append 相邻合并）；
+ *   chunk5 = E（脏，第 3 块驻留，填满 hard 上限）；
+ *   大写 R=[0,256KB)=chunk0..3：hit(A0) / miss(chunk1) / hit(G) / miss(chunk3)
+ *   → 两个不相邻 miss → max_direct=1 溢出 → -2。
+ * 时序（为什么不能用事件握手）：被测机制正是 rb_write_ex 出口 drain
+ * （cache.c"if(dcount>0) wb_drain(s)"）——握手式桩会让修复版死等在途 60s
+ * 上界；计时门控（Sleep 50ms）是唯一与修复语义兼容的确定性构造：
+ *   1) wb_fn_slow 回调置 g_staged=1 后 Sleep(50ms) 才落盘（在途窗口 50ms）；
+ *   2) 写 chunk0=A0、chunk2=G、chunk5=E（吸收为脏；3/3 驻留）；
+ *   3) 起 flusher 线程，自旋等 g_staged（A0 已 stage、回调在睡）；
+ *   4) 大写 B：chunk0/chunk2 命中吸收；chunk1 miss(dc=1)、chunk3 miss
+ *      → dc=2>max_direct → -2 →【出口 drain 等 A0 落盘】；
+ *   5) 驱动 P2-1 纪律：整段镜像 B + 整段失效；
+ *   6) 停 flusher、join、force flush，断言 R 的 4 chunk 盘面全为 B。
+ * 修复版：drain 使 A0 先落（旧数据同区间，无害），B 镜像在后 → 盘面=B（PASS）。
+ * 变异体：drain 空转 → -2 即返（t≈1ms）→ B 先镜像 → 失效清脏后 A0 于
+ *   t≈50ms 盖回 → 盘面 chunk0=A0（FAIL=杀死）。50ms vs ~1ms，margin 充分。 */
+static volatile LONG g_staged = 0;
+static int wb_fn_slow(void *ctx, rb_u64 file_id, rb_u64 off, const void *data, size_t len)
+{
+    (void)ctx; (void)file_id;
+    if (off + len > DISK_SIZE) return -1;
+    InterlockedExchange(&g_staged, 1);       /* 已进入回调（数据在途） */
+    Sleep(50);                               /* 在途窗口：旧数据的落盘时刻 */
+    memcpy(g_disk + off, data, len);
+    return 0;
+}
+static volatile LONG g_flush_stop = 0;
+static DWORD WINAPI flush_loop(LPVOID p)
+{
+    rb_stream *s = (rb_stream *)p;
+    while (!InterlockedCompareExchange(&g_flush_stop, 0, 0))
+        rb_stream_flush(s, 1);
+    return 0;
+}
+static void test_wsrace2_tooth(void)
+{
+    enum { CH = 64 * 1024, R4 = 4 * CH };
+    static unsigned char A0[CH], G2[CH], E5[CH], B[R4];
+    rb_config cfg; rb_engine *eng; rb_stream *s;
+    HANDLE th; unsigned i;
+
+    printf("== 用例11: WS-RACE-2 牙齿（hit-miss-hit-miss；修复=PASS 变异=FAIL） ==\n");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.max_bytes   = 4ull * CH;             /* hard=95% → 3 块可驻留 */
+    cfg.evict_high  = 16ull * 1024 * 1024 * 1024;  /* 写路径不触发回收（本用例要纯 miss） */
+    cfg.writeback = wb_fn_slow;
+    eng = rb_engine_create(&cfg);
+    s = rb_stream_create(eng, 1);
+    CHECK(eng && s, "用例11：引擎/流创建");
+    if (!eng || !s) { if (eng) rb_engine_destroy(eng); return; }
+
+    for (i = 0; i < CH; i++)
+    { A0[i] = (unsigned char)(i * 3 + 1); G2[i] = (unsigned char)(i * 17 + 2); E5[i] = (unsigned char)(i * 11 + 5); }
+    for (i = 0; i < R4; i++) B[i] = (unsigned char)(i * 5 + 9);
+
+    /* 2) chunk0=A0、chunk2=G、chunk5=E 吸收为脏（3/3 驻留，脏块不可淘汰） */
+    { rb_direct_range d[8]; int dc = 0;
+      CHECK(rb_write(s, 0, A0, CH, d, &dc, 8) == 0 && dc == 0, "用例11：chunk0 吸收为脏");
+      CHECK(rb_write(s, 2ull * CH, G2, CH, d, &dc, 8) == 0 && dc == 0, "用例11：chunk2 吸收为脏");
+      CHECK(rb_write(s, 5ull * CH, E5, CH, d, &dc, 8) == 0 && dc == 0, "用例11：chunk5 填驻留"); }
+    InterlockedExchange(&g_staged, 0);
+    InterlockedExchange(&g_flush_stop, 0);
+    th = CreateThread(NULL, 0, flush_loop, s, 0, NULL);
+    CHECK(th != NULL, "用例11：flusher 线程创建");
+    /* 3) 自旋等旧数据进入在途回调（回调在睡 50ms） */
+    { int spins = 0;
+      while (!InterlockedCompareExchange(&g_staged, 0, 0) && spins < 5000) { Sleep(1); spins++; } }
+    CHECK(InterlockedCompareExchange(&g_staged, 0, 0) != 0, "用例11：旧数据已进入在途回调");
+    /* 4) 大写 B（max_direct=1 → hit-miss-hit-miss → 双 miss 溢出 → -2 → 出口 drain） */
+    { rb_direct_range d[1]; int dc = 0; rb_write_pre pre; int r;
+      memset(&pre, 0, sizeof(pre));
+      r = rb_write_ex(s, 0, B, R4, d, &dc, 1, &pre);
+      if (r != -2 || dc != 2)
+          printf("  [note] 用例11：大写形态异常（r=%d dc=%d，期望 -2/2）\n", r, dc);
+      CHECK(r == -2 && dc == 2, "用例11：大写触发 -2 溢出（出口 drain 生效点）");
+      /* 5) 驱动 P2-1 纪律：整段镜像新数据 + 整段失效 */
+      memcpy(g_disk, B, R4);
+      rb_stream_invalidate_range(s, 0, R4);
+    }
+    /* 6) 停 flusher 并收尾 */
+    InterlockedExchange(&g_flush_stop, 1);
+    WaitForSingleObject(th, INFINITE);
+    CloseHandle(th);
+    rb_stream_flush(s, 1);
+    CHECK(memcmp(g_disk, B, R4) == 0, "用例11：迟到旧数据被拦（4 chunk 盘面=B）");
+    { int diff = -1;
+      for (i = 0; i < R4; i++) if (g_disk[i] != B[i]) { diff = (int)i; break; }
+      if (diff >= 0)
+      {
+          printf("  [note] 用例11：盘面 @%d got=%u exp=%u（旧数据 A0 落于新镜像之后）\n",
+                 diff, g_disk[diff], B[diff]);
+          CHECK(0, "用例11：迟到旧数据污染盘面");
+      } }
+    fill_pattern(g_disk, DISK_SIZE, 0x1111);
+    rb_stream_destroy(s);
+    rb_engine_destroy(eng);
+}
+
 int main(void)
 {
     g_disk = (unsigned char *)malloc(DISK_SIZE);
@@ -618,6 +732,7 @@ int main(void)
     test_random_consistency();
     test_watermark_flush();
     test_rmw_all_memory_write();
+    test_wsrace2_tooth();
     test_trim_80();
     test_hard_limit_direct();
     test_readback_fail_fallback();

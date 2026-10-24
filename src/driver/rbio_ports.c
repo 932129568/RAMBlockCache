@@ -43,8 +43,14 @@ static NTSTATUS Rb2_PortShrink(ULONG Pct)
     cur = st.cur_bytes;
     if (cur == 0) return STATUS_SUCCESS;
 
-    if (g_Rb.Config.AutoMemory)
-        rb_engine_set_dynamic_limit(g_Rb.Engine, cur - (cur / 100) * Pct);
+    if (g_Rb.Config.AutoMemory) {
+        /* [FIX S7-11] Pct=100 时原式算出 dynamic_limit=0——而 core 把 0 解释为
+         * "无限制"并回落固定 16GB 水位："收缩到 0"反变为"解锁固定上限"。
+         * 钳到 1MB 下限：收缩语义保持（缓存压到最小），不落入 0=无限陷阱。 */
+        ULONG64 lim = cur - (cur / 100) * Pct;
+        if (lim < 1024ULL * 1024ULL) lim = 1024ULL * 1024ULL;
+        rb_engine_set_dynamic_limit(g_Rb.Engine, lim);
+    }
     rb_engine_apply_pressure(g_Rb.Engine, 2);
 
     n = rb_engine_snapshot_streams(g_Rb.Engine, snap, RB_FLUSH_SNAP_MAX, 1);

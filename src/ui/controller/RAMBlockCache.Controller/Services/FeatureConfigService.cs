@@ -112,9 +112,21 @@ public static class FeatureConfigService
         LogService.Info("L2 已关闭（驱动收尾容器并保存索引）");
     }
 
-    /// <summary>预取总开关（Flags PREFETCH 位；部署红线：默认全关，仅用户显式开启）。</summary>
-    public static void SetPrefetchGlobal(bool on)
+    /// <summary>
+    /// 预取总开关（Flags PREFETCH 位；部署红线：默认全关，仅用户显式开启）。
+    /// 【契约 B-11】开启向过预取门（IPrefetchGate：已验证加速卷 / 非系统卷 / 温度正常——
+    /// 温度字段未就绪时该项跳过）；不满足抛 InvalidOperationException（原因文案随异常消息），
+    /// 由调用方经 Guard/预设回滚呈现。关闭向与回滚路径（enforceGate=false）不过门：
+    /// 撤销既有状态不应被门禁二次拦截。
+    /// </summary>
+    public static void SetPrefetchGlobal(bool on, bool enforceGate = true)
     {
+        if (on && enforceGate)
+        {
+            var gate = FeatureRegistry.Get<IPrefetchGate>().Check('\0');
+            if (!gate.Ok)
+                throw new InvalidOperationException($"预取激活被预取门拒绝：{gate.Reason}");
+        }
         uint flags = ReadFlags();
         WriteFlags(on ? flags | Rb2F.Prefetch : flags & ~Rb2F.Prefetch);
         LogService.Info($"预取总开关 → {(on ? "开" : "关")}");
@@ -134,6 +146,20 @@ public static class FeatureConfigService
         WithPolicies(letter, k => k.SetValue("ReadAheadMB", mb, RegistryValueKind.DWord));
         LogService.Info($"Policies\\{letter}\\ReadAheadMB = {mb}（{(mb == 0 ? "该卷预取关" : $"{mb}MB")}）");
         Refresh();
+    }
+
+    /// <summary>
+    /// 【契约 B-10】系统卷显式 opt-in（SET_CONFIG SystemVolumeCached=1；0=恢复默认不加速）。
+    /// 形状出处：deliverables/09-backend-handover-2026-10-21.md §4 B-10 + v106-iface-handoff-ui §2.3。
+    /// 硬规则：**系统卷永不回写**（驱动侧强制直写）——开启后掉电无未落盘风险；
+    /// 用户显式确认 + 确认记录进 UI 日志（诊断包可见）由调用方（FeaturesViewModel.ConfirmOptIn）负责。
+    /// </summary>
+    public static void SetSystemVolumeCached(bool on)
+    {
+        var cfg = DriverService.Instance.GetConfig();
+        cfg.SystemVolumeCached = on ? 1u : 0u;
+        DriverService.Instance.SetConfig(cfg);
+        LogService.Info($"[B-10] 系统卷 opt-in（SystemVolumeCached）→ {(on ? "1（用户显式确认纳入；强制直写，永不回写）" : "0（恢复默认：系统盘不加速）")}");
     }
 
     /// <summary>内置排除名单总开关（UseDefaultExcl；FR-BL-03，缺省开）。</summary>

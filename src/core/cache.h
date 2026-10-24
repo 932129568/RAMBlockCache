@@ -113,6 +113,37 @@ void rb_read_copy_dirty(rb_stream *s, rb_u64 offset, void *buf, size_t len);
 /* [FIX W19] 契约：buf/direct/direct_count 必须非 NULL。违例返回 -2。 */
 int rb_write(rb_stream *s, rb_u64 offset, const void *buf, size_t len,
              rb_direct_range *direct, int *direct_count, int max_direct);
+/* [D1 写路径锁合并] 写前脏态快照载体：
+ *   mask  : bit i = pre_base+i*block_size 子块在【吸收瞬间之前】是否已脏；
+ *   dseq  : 每子块写前脏代（无 chunk 记 0）；可为 NULL（无免账证据→保守记账）；
+ *   max_bits : mask 容量（位）；
+ *   base/bits: OUT——bit0 对应子块基址（block 对齐）/ 实际位数。
+ * 三形态契约（防回归，逐字保持）：
+ *   ① 容量不足（max_bits < nbits）：写【照常吸收成功】，仅 bits=-1，
+ *      调用方回滚走保守记账（无证据当有早期脏）——绝不因快照容量失败一次写；
+ *   ② pre==NULL：rb_write 收壳形态，与旧"先 dirty_mask 再 write"两调用
+ *      序列逐字等价；
+ *   ③ 零窗口记账：快照采集并入 rb_write pass1 的同一持锁期（chunk_lookup
+ *      之后、任何 mutation 之前），C7 回滚记账窗口从"两次锁之间"缩为零
+ *      （只紧不松：绝不变松）。
+ * 驱动契约：8MB 分块 → clen≤8MB → nbits≤2048；pre.bits<0 为不可达防御分支。 */
+typedef struct rb_write_pre {
+    uint8_t  *mask;      /* 调用方缓冲：bit i = pre_base+i*block_size 子块写前是否已脏 */
+    uint32_t *dseq;      /* 调用方缓冲：每子块写前脏代（无 chunk 记 0）；可为 NULL */
+    int       max_bits;  /* mask 容量（位） */
+    rb_u64    base;      /* OUT：bit0 对应子块基址（block 对齐） */
+    int       bits;      /* OUT：实际位数；<0 = 容量不足（写仍成功，回滚走保守记账） */
+} rb_write_pre;
+/* [D1] 写路径锁合并入口：语义与 rb_write 逐字一致（吸收/直写/失效结果不变），
+ * 额外在 pass1 同一持锁期采集写前脏掩码+dseq 到 pre。pre 可为 NULL = 与
+ * rb_write 逐字等价（rb_write 即收壳转调本函数）。 */
+/* [FIX R6-02] 契约显式化：返回 -2 且 *direct_count > max_direct 表示"直写区间
+ * 数超出 direct 数组容量"——此时**严禁遍历 direct 数组**（数组只写入了前
+ * max_direct 项，第 max_direct+1 项从未写入；遍历会越界读）。调用方必须按
+ * 溢出处理（放弃缓存吸收、整段直写下盘+失效），与参数非法(-2)同一出口。 */
+int rb_write_ex(rb_stream *s, rb_u64 offset, const void *buf, size_t len,
+                rb_direct_range *direct, int *direct_count, int max_direct,
+                rb_write_pre *pre);
 /* NEW: drop cached/dirty state covering [offset, offset+len).
  * Used when the original write IRP FAILED so absorbed sub-blocks must be
  * rolled back to disk state (prevents persisting data the app thinks failed).
@@ -149,6 +180,12 @@ int rb_engine_has_dirty(rb_engine *eng);
  * Pair each returned stream with rb_stream_release_io(). */
 int  rb_engine_snapshot_streams(rb_engine *eng, rb_stream **out, int cap, int only_dirty);
 void rb_stream_release_io(rb_stream *s);
+
+/* [FIX R6-D3] 排空在途回写（有界 60s，与 destroy 的 io_users 同款上界）。
+ * 用途：panic 自愈"flush 净 → discard 全部"之间必须排空，否则 flush 完成后
+ * 被 rb_write_ex 吸收的脏写（应用 IRP 已收到 SUCCESS）会随缓存视图一起被
+ * discard——丢数只计入 lost_dirty_bytes，不可恢复。 */
+void rb_stream_drain_writeback(rb_stream *s);
 void rb_engine_note_flush_done(rb_engine *eng);
 void rb_engine_set_max_bytes(rb_engine *eng, rb_u64 max_bytes);
 void rb_engine_reclaim(rb_engine *eng);

@@ -11,7 +11,17 @@ $env:NUGET_PACKAGES = $Script:NugetPkg
 if ($LASTEXITCODE -ne 0) { throw '编译失败' }
 
 # 2) 签名 + 落地
+# [FIX N1 2026-10-19] 验签必须在 Install-DriverBinary（System32 覆盖）之前：
+# 原顺序先覆盖 System32 再验签——验签失败时机器已带着 BOOT_START + UpperFilters
+# + 未验证二进制等待重启 = 0x7B 同型。现对刚签名的构建产物（$Script:SysPath）
+# 双验签，失败即终止且机器零变更；复制后的副本不再重复验签（复制的是已验文件）。
 Sign-Driver
+$sig = Get-AuthenticodeSignature -LiteralPath $Script:SysPath -ErrorAction Stop
+if ($sig.Status -ne 'Valid') { throw "驱动签名校验失败（$($sig.Status)）——拒绝安装。请先签名（见 README 签名节）。" }
+$st = $Script:SignTool
+& $st verify /pa $Script:SysPath 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "signtool verify /pa 失败——拒绝安装（exit=$LASTEXITCODE）" }
+Write-Host "[ok] 驱动签名校验通过（$($sig.SignerCertificate.Subject)）"
 Install-DriverBinary
 
 # 3) 创建 PnP 过滤服务（SERVICE_DEMAND_START，不随开机自动加载）
@@ -21,21 +31,17 @@ Install-DriverBinary
 #      已删除服务。现：先 Stop-Service 并确认停止（15s 上限），每步 sc.exe
 #      检查 $LASTEXITCODE，失败即 throw（fail-closed）。
 #   ② 全文零签名校验：本路径曾经是 0x7B 事故的 fail-open 变体。现补
-#      Get-AuthenticodeSignature + signtool verify /pa 双验签，未签名/验签失败
-#      即终止，绝不写 UpperFilters。
+#      Get-AuthenticodeSignature + signtool verify /pa 双验签（[FIX N1] 已前移到
+#      System32 覆盖之前），未签名/验签失败即终止，绝不写 UpperFilters。
 #   ③ 补 armed 基线（FilterArmed=1 + BootFailCount=0），与 deploy.ps1 第 3 步
 #      一致，让 boot_guard.ps1 的回滚护栏在本路径同样生效。
-#   权威安装入口 = ramboostsetup / deploy.ps1；本脚本仅 legacy 开发调试用。
+# [FIX N-b] 统一入口口径（原与 ramboostsetup.ps1:15-21 互斥）：普通用户=
+#   dist\RAMBlockCache-Setup.exe；开发者/脚本=deploy.ps1；本脚本与
+#   ramboostsetup.ps1 均为 legacy 备选（详见 README"安装"节）。
 # [FIX 回归B 2026-10-18 复审] 验签必须在停服/删服之前（与 ramboostsetup.c 严重-1
 # 同型纪律：验签失败时机器保持原状，不做任何破坏性动作——原修复把验签放在了
 # Stop-Service + sc delete 之后，失败路径仍会拆掉旧安装）。
 $sysPath = Join-Path $env:SystemRoot 'System32\drivers\RAMBlockCache.sys'
-$sig = Get-AuthenticodeSignature -LiteralPath $sysPath -ErrorAction Stop
-if ($sig.Status -ne 'Valid') { throw "驱动签名校验失败（$($sig.Status)）——拒绝安装。请先签名（见 README 签名节）。" }
-$st = $Script:SignTool
-& $st verify /pa $sysPath 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "signtool verify /pa 失败——拒绝安装（exit=$LASTEXITCODE）" }
-Write-Host "[ok] 驱动签名校验通过（$($sig.SignerCertificate.Subject)）"
 
 $svc = Get-Service $Script:ServiceName -ErrorAction SilentlyContinue
 if ($svc -and $svc.Status -ne 'Stopped') {

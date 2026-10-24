@@ -1,93 +1,110 @@
 using System;
 using System.Collections.ObjectModel;
 using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using RAMBlockCache.Controller.Helpers;
 
 namespace RAMBlockCache.Controller.Services;
 
-/// <summary>Toast 类型（语义色对齐 02b §A.2 语义系五色）。</summary>
-public enum ToastKind { Info, Success, Warning, Danger }
+/// <summary>Toast 严重度（决定语义色；颜色之外还有文案，不单靠颜色传意）。</summary>
+public enum ToastLevel { Info, Success, Warning, Danger }
 
-/// <summary>Toast 数据项（IsClosing 驱动出场动画 DataTrigger）。</summary>
+/// <summary>单条 Toast 视图项（进出场动画由宿主容器绑定 <see cref="Closing"/> 播放）。</summary>
 public sealed class ToastItem : ObservableObject
 {
-    public string Message { get; }
-    public ToastKind Kind { get; }
+    public string Text { get; }
+    public ToastLevel Level { get; }
+    public ToastItem(string text, ToastLevel level) { Text = text; Level = level; }
 
-    /// <summary>进入出场动画（模板 DataTrigger 监听；120ms ease-in 后移除）。</summary>
-    public bool IsClosing { get; private set; }
-
-    public ToastItem(string message, ToastKind kind)
-    {
-        Message = message;
-        Kind = kind;
-    }
-
-    public void MarkClosing()
-    {
-        IsClosing = true;
-        RaisePropertyChanged(nameof(IsClosing));
-    }
+    private bool _closing;
+    /// <summary>出场中（宿主据此项播出场动画后移除）。</summary>
+    public bool Closing { get => _closing; set => Set(ref _closing, value); }
 }
 
 /// <summary>
-/// Toast 服务（02b §B.3-9：进 180ms ease-out / 出 120ms ease-in，位移 8px；3.5s 自动消退）。
-/// 命令结果反馈面（W1-2 信任显性化的轻量形态）；同屏最多 3 条，超出挤掉最旧。
+/// [D5/W1-2] Toast 命令反馈面（02b §B.2/B.3-9：进 180ms ease-out / 出 120ms ease-in，位移 8px）。
+/// 纪律：每条 Toast 必须来自真实命令完成事件（禁占位假接线）；UI 线程入队；
+/// reduced-motion 降级时位移归零、仍完整显示（信息不丢）。
 /// </summary>
 public sealed class ToastService
 {
-    /// <summary>显示时长（ms，消退起点）。</summary>
-    private const int ShowMs = 3500;
-    /// <summary>出场动画时长（ms，与 02b §B.2 Toast 出场一致）。</summary>
-    private const int ExitMs = 140;
+    public static readonly ToastService Instance = new();
 
-    public static ToastService Instance { get; } = new();
-
-    /// <summary>UI 绑定源（MainWindow 叠加层 ItemsControl）。</summary>
+    /// <summary>当前 Toast 队列（宿主 ItemsControl 绑定；最多 3 条，超出挤最早）。</summary>
     public ObservableCollection<ToastItem> Toasts { get; } = new();
 
-    /// <summary>弹出一条 Toast（任意线程调用，自动封送 UI 线程）。</summary>
-    public void Show(string message, ToastKind kind = ToastKind.Info)
-    {
-        if (string.IsNullOrWhiteSpace(message)) return;
-        var item = new ToastItem(message, kind);
-        Run(() =>
-        {
-            Toasts.Add(item);
-            while (Toasts.Count > 3) Toasts.RemoveAt(0);
-            DismissLater(item);
-        });
-    }
+    private ToastService() { }
 
-    private static async void DismissLater(ToastItem item)
+    /// <summary>入队一条 Toast（任意线程可调；内部 Post 到 UI）。</summary>
+    public void Show(string text, ToastLevel level = ToastLevel.Info)
     {
-        try
+        var app = Application.Current;
+        if (app?.Dispatcher is not Dispatcher d) return;
+        if (!d.CheckAccess()) { d.BeginInvoke(new Action(() => Show(text, level))); return; }
+        Toasts.Add(new ToastItem(text, level));
+        /* [FIX B22] 挤压最旧项也走出场动画：原 RemoveAt(0) 直接摘除——旧项从可见
+         * 状态瞬闪消失（只有 DismissLater 路径有 Closing→120ms 动画）。这里标记
+         * Closing 让宿启动画，120ms 后同款摘除（摘除失败=已被 DismissLater 摘过）。 */
+        while (Toasts.Count > 3)
         {
-            await System.Threading.Tasks.Task.Delay(ShowMs);
-            Run(() =>
+            var evicted = Toasts[0];
+            if (!evicted.Closing)
             {
-                if (!item.IsClosing) item.MarkClosing();
-                RemoveLater(item);
-            });
+                evicted.Closing = true;
+                _ = System.Threading.Tasks.Task.Run(async () =>
+                {
+                    try
+                    {
+                        await System.Threading.Tasks.Task.Delay(Controls.Motion.Dur120.TimeSpan).ConfigureAwait(true);
+                        Application.Current?.Dispatcher.Invoke(() => Toasts.Remove(evicted));
+                    }
+                    catch { /* Toast 装饰路径：任何失败静默 */ }
+                });
+            }
+            else
+            {
+                Toasts.RemoveAt(0);
+            }
         }
-        catch (InvalidOperationException) { /* 应用关闭期 Dispatcher 已停，忽略 */ }
+        var item = Toasts[^1];
+        DismissLater(item);   /* async void 即发即忘：4s 后自动出场（异常内部兜底不外溢） */
     }
 
-    private static async void RemoveLater(ToastItem item)
+    private async void DismissLater(ToastItem item)
     {
+        // [FIX QA5-UI8] 整段异常保护：关机/注销时 Dispatcher 已停摆，第二个 await
+        // 之后的 Invoke 抛出会沿 async void 逃逸到 fail-fast 全局处理器 → 退出期
+        // 崩溃对话框。异常一律静默吞（Toast 只是装饰，绝不能拖垮退出流程）。
         try
         {
-            await System.Threading.Tasks.Task.Delay(ExitMs);
-            Run(() => Instance.Toasts.Remove(item));
+            try { await System.Threading.Tasks.Task.Delay(4000).ConfigureAwait(true); }
+            catch { return; }
+            if (!item.Closing) item.Closing = true;   // 宿主播出场动画
+            await System.Threading.Tasks.Task.Delay(Controls.Motion.Dur120.TimeSpan).ConfigureAwait(true);
+            var app = Application.Current;
+            if (app?.Dispatcher is Dispatcher d && !d.HasShutdownStarted)
+                d.Invoke(() => Toasts.Remove(item));
         }
-        catch (InvalidOperationException) { }
+        catch { /* Toast 装饰路径：任何失败静默 */ }
     }
 
-    private static void Run(Action a)
+    /// <summary>语义色键（宿主 DataTrigger 用；颜色之外文案承载语义）。</summary>
+    public static string BrushKey(ToastLevel level) => level switch
     {
-        var d = Application.Current?.Dispatcher;
-        if (d is null || d.CheckAccess()) a();
-        else d.BeginInvoke(a, DispatcherPriority.Normal);
-    }
+        ToastLevel.Success => "RbcSuccessFg",
+        ToastLevel.Warning => "RbcWarningFg",
+        ToastLevel.Danger => "RbcDangerFg",
+        _ => "RbcInfoFg"
+    };
+
+    /// <summary>背景色键（语义低透明底）。</summary>
+    public static string BgKey(ToastLevel level) => level switch
+    {
+        ToastLevel.Success => "RbcSuccessBg",
+        ToastLevel.Warning => "RbcWarningBg",
+        ToastLevel.Danger => "RbcDangerBg",
+        _ => "RbcInfoBg"
+    };
 }

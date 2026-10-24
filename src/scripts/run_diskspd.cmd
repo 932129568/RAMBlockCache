@@ -1,4 +1,6 @@
 @echo off
+REM [FIX S-12] chcp 65001: the wrapped .ps1 emits UTF-8 Chinese output.
+chcp 65001 >nul
 REM run_diskspd.cmd - launcher wrapper for run_diskspd.ps1 (self-elevate + invoke).
 REM Error-handling convention (spec D.3):
 REM   * direct path: propagates the wrapped script's exit code (exit /b %errorlevel%).

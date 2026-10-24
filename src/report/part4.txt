@@ -1,0 +1,229 @@
+================================================================================
+第 4 章  Bug 与缺陷台账（P / R / N / C / V 系列）
+================================================================================
+
+编号约定：
+  P 系列 = 第一轮评审发现（P1–P13），磁盘源码已含 FIX[P*]
+  R 系列 = 第二轮评审发现（R1–R8 及多核/安全/持久化专项）
+  N 系列 = 第三轮评审新增（N1–N12）
+  C 系列 = 独立只读审查发现的致命项（C1–C5，含残留 C3b 及回归 C2-r1/C5-r1）
+  V 系列 = 本轮（MainAgent 真机接管）新发现并修复
+等级：Critical（蓝屏/丢数据/安全）> High > Major > Minor > Info
+
+--------------------------------------------------------------------------------
+4.1 P 系列（第一轮，已在磁盘源码修复，列出以备核对）
+--------------------------------------------------------------------------------
+P1  High    miss 区间未整块对齐：非对齐读 miss 后回填无法 full-cover，二次读仍
+           miss（读加速失效）。修复：miss 起点/终点按整子块对齐。
+P2  High    写长度/偏移溢出无兜底：offset+len 回绕可致越界。修复：加 end<offset
+           回绕检测，异常段直写。
+P3  Major  flush 周期/百分比存在"模零/除零"：配置为 0 时除法异常。修复：默认值
+           兜底 + 非零校验。
+P4  Major  可用内存查询/重复分配：大块缓冲重复申请。修复：单次分配循环复用。
+P5  Major  同步事件未自动复位：复用事件时状态残留致漏唤醒。修复：使用
+           自动复位事件或每次显式复位。
+P6  Major  核心未被"喂时钟"：空闲/老化逻辑因无时间戳不成立。修复：驱动周期
+           调用 rb_engine_tick(now_ms)。
+P7  High    destroy 未先摘表：销毁流时仍可被遍历命中 → 竞争。修复：destroy
+           先从流表摘除再等引用归零。
+P8  Major  FLUSH IRP 应答长度/信息不正确：可能引发上层异常。修复：正确设置
+           IoStatus.Information。
+P9  Minor  下层设备对齐/缓冲特性未继承：非缓冲 I/O 参数不匹配。修复：继承下层
+           AlignmentRequirement / SectorSize。
+P10 Minor  透传路径空指针：无缓冲/无上下文时解引用 NULL。修复：空值校验。
+P11 Major  结构体 pack/对齐不一致：驱动与用户态布局错位。修复：统一 Pack=8。
+P12 Major  WriteMode 未钳制：非法写模式进入数据路径。修复：合法域钳制。
+P13 —      第一轮其余小项（随 P1–P12 一并吸收，重复应用无害）。
+
+--------------------------------------------------------------------------------
+4.2 R 系列（第二轮，已合并）
+--------------------------------------------------------------------------------
+R1  Critical 补读失败仍把未初始化数据写入缓存 → 数据损坏。修复：readback 返回
+           非 0（失败）时该段直写兜底，绝不缓存未初始化内容。
+R2  High    补读在 stripe 锁内进行：单次慢盘 I/O（最坏秒级）把 1/64 分片长期
+           独占、串行化全部 I/O。修复：RMW 补读移到锁外（pass1 记账、pass2
+           锁外补读、短锁合并）。
+R3  Minor  日志顺序混乱（旧在前/新在前不一致）。修复：统一为最新在前。
+R4  Major  FreeMB/可用内存口径错误：动态预算偏差。修复：统一可用内存查询口径。
+R5  Major  CLI 修改后无回读：无法确认是否真生效。修复：CLI 改后回读校验。
+R6  Minor  GET_VERSION 硬编码版本号，与源码脱节。修复：版本宏联动。
+R7  —      （并入相邻项）
+R8  Minor  命中统计口径不一致：命中率失真。修复：统一命中判定与计数口径。
+第二轮专项（均已实现）：per-CPU I/O worker 池、zone 并行回写、SafeMode 状态机、
+配置注册表持久化、AutoAttach、双击安装器、CLI 精简。
+
+--------------------------------------------------------------------------------
+4.3 N 系列（第三轮新增，N1–N12）
+--------------------------------------------------------------------------------
+N1  Critical（蓝屏）cache.c rb_engine_flush
+    现象：两段锁之间流表可能被 REMOVE 缩短；第二段只填充了 n<cnt 项，循环却
+          按旧 cnt 迭代，对【未初始化指针】调用 flush_stream → 野指针 → 蓝屏。
+    修复：以实际填充数 n 为准迭代（后续 V1 进一步用 rb_engine_snapshot_streams
+          统一承载该快照模式）。
+
+N2  High    rbio.c 回写池
+    现象：所有 flusher 线程创建失败时，周期回写静默失效，脏数据永不落盘。
+    修复：池全灭时退化为串行 rb_engine_flush 兜底。
+
+N3  Major  rbio.c
+    现象：IdleReclaimEnabled 开关从未被驱动调度（功能死）；P6 喂钟后逻辑才成立。
+    修复：回写线程按阈值调度 rb_stream_idle_reclaim。
+
+N4  Major  rbdriver.c / rbctl.c
+    现象：RbSaveConfig / RbRegSetClean 可能被 IOCTL/Power 路径在 DISPATCH_LEVEL
+          调用，Zw* 注册表操作在 DISPATCH 非法 → 蓝屏。
+    修复：内部加 PASSIVE_LEVEL 守卫。
+
+N5  Major  rbdriver.c
+    现象：RbLoadConfig 不做 clamp，注册表被损坏成巨值 CacheSizeMB → 非分页池
+          膨胀。
+    修复：加载后统一过 RbClampConfig。
+
+N6  Minor  rbctl.c
+    现象：EXIT_SAFE_MODE 误写 LastCleanShutdown=1，会使之后一次真蓝屏漏保护。
+    修复：只清运行期 SafeMode 标志，不写"干净关闭"注册表值。
+
+N7  Minor  rbio.c
+    现象：RbMemAvailableMB 查询失败返回 0 → 动态预算被压成 0，当轮全直写。
+    修复：查询失败轮跳过动态更新（沿用上一预算）。
+
+N8  Minor  rbio.c
+    现象：ObReferenceObjectByHandle 的 ObjectType 传 NULL → 引用必失败 →
+          停线程等待永不生效。
+    修复：ObjectType 传 *PsThreadType。
+
+N9  Minor  cache.c
+    现象：RMW 洞数组按 len/bs+2 堆分配（8MB 请求约 98KB/次），浪费且抖动。
+    数学事实：一次写只有首/尾两个子块可能部分覆盖，中间必然整块覆盖 → 洞上限 2。
+    修复：栈上定长 8（防御），超限直写兜底（见当前 cache.c RB_RMW）。
+
+N10 Minor  rbio.c
+    现象：兜底例程 RbRwWorker 未路由 FLUSH，池不可用时 FLUSH IRP 被当写处理。
+    修复：兜底路径正确路由 FLUSH。
+
+N11 Info   日志统一为最新在前（cli_log）。
+N12 Info   ParallelFlush 开关成为保留位（zone 常开并行），文档说明。
+
+N 系列联动验证（静态）：zone 任务全程被 io_users 覆盖；destroy 先摘表后等引用
+归零 → 无 UAF；FlushJobs 先定总数后提交、失败路径即时扣减 → FlushDone 每轮
+恰好一次；串行 force（flush_active）与 zone（zflush_cnt）互斥由 core 保证。
+
+--------------------------------------------------------------------------------
+4.4 C 系列（独立只读审查，加载前 go/no-go 拦截项）
+--------------------------------------------------------------------------------
+C1  Critical  IOCTL 控制面
+    现象：DEVICE_CONTROL 对输入/输出缓冲长度缺乏严格校验，低权限用户可构造
+          超长/过短请求触发越界读/写。
+    修复：每个消息号按其负载类型校验 InputBufferLength/OutputBufferLength，
+          不足直接 STATUS_INVALID_PARAMETER / STATUS_BUFFER_TOO_SMALL；
+          写类操作要求相应权限；METHOD_BUFFERED 单一系统缓冲，拷贝前钳制长度。
+
+C2  Critical  PnP REMOVE
+    现象：处理 QUERY_REMOVE/REMOVE 时不等待在途 I/O 排空就 detach/删除设备，
+          在途工作项仍引用已释放扩展 → UAF。
+    修复：扩展加引用计数 Refs + RemoveEvent；REMOVE 置 Removed 后等待在途
+          引用归零（带兜底），再 IoDetachDevice / IoDeleteDevice。
+    C2-r1（回归修复）：排空预算原仅 3s 过短，可能在重负载下误判；调整为
+          ≥20s，并在仍有引用时走安全的延迟删除路径。
+
+C3  Critical  TOCTOU（检查时序/使用时序不一致）
+    现象：多处"先检查指针/状态、后在另一上下文使用"，中间对象被并发释放/变更。
+    修复：改为"在同一把锁/同一引用保护内检查并使用"，必要时先取引用再校验。
+    C3b（残留，复审拦截）：FLUSH 路径漏了"先引用后校验"，补加引用获取后再做
+          有效性判断。
+
+C4  Critical  裸指针 UAF
+    现象：工作项/上下文持有裸指针跨阶段传递，对象可能在期间销毁。
+    修复：统一改为引用计数持有（io_users/Refs），生命周期覆盖整个异步使用，
+          完成后释放。
+
+C5  Critical  同步下盘无限等待
+    现象：同步下发下层 IRP 时对完成事件无限等待，下层异常/不返回时永久阻塞
+          （可能卡死系统/关机）。
+    修复：同步等待带超时；超时取消 IRP 并走安全失败路径。
+    C5-r1（回归修复）：超时情况下的同步 IRP 须在堆上构造并保证取消/清理路径
+          完整，避免栈 IRP 在返回后被下层触碰。
+
+审查结论演进：
+  初审 NO-GO（5 Critical）→ 作者修复 → 复审拦 C3b + 2 Major → 三修 →
+  最终复审 GO-WITH-CARE（全部 Critical 闭环；"with-care"指仍需真机首载观察）。
+
+--------------------------------------------------------------------------------
+4.5 V 系列（本轮 MainAgent 真机接管，新发现并修复）
+--------------------------------------------------------------------------------
+V1  Critical（编译失败 + 封装破坏）rbio.c × cache.h
+    现象：cache.h 将 rb_engine / rb_stream 定义为不透明类型（外部只见前置声明），
+          但 rbio.c 的分区刷盘与空闲回收段直接访问内部字段（streams_lock、
+          streams、next、dirty_bytes、io_users、total_dirty、need_flush）并使用
+          内部宏 RB_M_LOCK，导致"未定义结构/联合"编译错误，且破坏封装边界。
+    正确做法：cache.c 内部 rb_engine_flush 本就有"快照所有流 + io_users 引用"
+          的正确模式（符合 N1）。
+    修复：提取 3 个受边界保护的公共 API（cache.h 声明、cache.c 实现）：
+        int  rb_engine_snapshot_streams(eng, out, cap, only_dirty);
+              持流表锁、可只取脏流、每流 io_users++、返回实际填充数；
+        void rb_stream_release_io(s);   /* io_users-- */
+        void rb_engine_note_flush_done(eng); /* total_dirty==0 才清 need_flush */
+          rbio.c 分区刷盘与空闲回收改用这些 API，不再触碰内部字段。
+    验证：用户态 12 测试全过；驱动零错误零警告。
+
+V2  High（链接失败 LNK2019 / C4028）rbio.c
+    现象：手写 extern 声明并调用 KeQueryInterruptTime，链接报 LNK2019 找不到符号；
+          改用 KeQueryInterruptTimePrecise 又报 C4028"形参 1 类型不一致"。
+    根因（查 wdm.h）：x64（_AMD64_）上 KeQueryInterruptTime 是【宏】（读
+          SharedInterruptTime），不是导出函数，手写函数声明调用必然找不到符号；
+          KeQueryInterruptTimePrecise 是真实导出函数，但原型需要一个
+          _Out_ PULONG64 QpcTimeStamp 出参，手写 (VOID) 声明导致形参不符。
+    修复：删除手写声明，使用 wdm.h 原型；新增包装
+          RbInterruptMs(){ ULONG64 qpc=0;
+            return KeQueryInterruptTimePrecise(&qpc)/10000; }
+          喂钟改为 rb_engine_tick(eng, RbInterruptMs())。
+    验证：驱动链接通过、零警告。
+
+V3  High（核心性能 bug：动态内存用不满，"实际没那么快"主因之一）cache.c
+    现象：CacheSizeMB=0（动态）时，max_bytes 在 engine_create/set_max_bytes 被
+          兜底为 16GB，hard_limit 被锁死在约 15.2GB；effective_create_limit 取
+          min(hard_limit, dynamic_limit)，64GB 机 dynamic_limit 可达 40+GB 却被
+          15.2GB 卡住；evict_low 固定约 9.6GB，缓存到 9.6GB 就回收 → 无法用满
+          空闲内存，命中率与写吸收量被人为压低。
+    修复：新增统一容量水位 rb_effective_caps(eng,&hard,&hi,&lo)：
+          动态模式（dynamic_limit>0）hard=dl、hi=dl*90%、lo=dl*75%；
+          固定模式（dl==0）用基于 max_bytes 的配置水位。
+          并把 effective_create_limit、写路径两处水位、读路径 miss 回收、
+          stream_reclaim、rb_engine_reclaim 全部改用该函数，消除水位散落/打架。
+          脏数据水位 high_water 保持保守固定值（后台 flush 异步不阻塞前台写，
+          更安全）。
+    验证：用户态全量回归 12/12 通过；edge_v4 C1–C7（含磁盘满 lost 精确计数）通过。
+
+V4  Major（一键部署）install_auto2.ps1
+    现象：DriverEntry 读 AutoAttach 默认 0，重启后数据卷不自动挂，部署仍需手动。
+    修复：服务创建后写 Parameters\AutoAttach DWORD=1（系统卷仍强制直写），实现
+          重启后数据卷 D/F 自动加速，配合双击启动器完成一键部署。
+
+V5  Minor（测试代码 bug，非产品 bug）usertest/test_v6.c
+    现象：T4 的 readback mock rb_eof_zero 已 memset 零填充成功，却 return 1，
+          被引擎按"非 0=失败"正确判失败而走直写，表现为 T4 四项失败。
+    根因：readback 返回值约定为 0=成功、非 0=失败（与 writeback 一致，成功 mock
+          普遍 return 0、失败 mock return -1）。
+    修复：mock 改为 return 0；T4 全部通过。
+    说明：此为测试自身错误，核心引擎判断本身正确。
+
+V6  Major（安装/挂载相关，早前真机修复，归入本轮核对）
+    - DriverEntry 漏注册 AddDevice → 补 drv->DriverExtension->AddDevice=RbAddDevice；
+    - UpperFilters 设备类 GUID 错误：改为正确的 Volume 类
+      {71a27cdd-812a-11d0-bec7-08002be2092f}，追加 RAMBlockCache 且保留 volsnap；
+    - NtQuerySystemInformation 在裁剪头无原型 → 改 ZwQuerySystemInformation 并手写
+      ULONG 形参声明（类号 SystemPerformanceInformation，AvailablePages 偏移 0x2C）；
+    - KeQueryActiveProcessorCount(ALL_PROCESSOR_GROUPS) 在非 Ex 版非法 →
+      KeQueryActiveProcessorCount(NULL)；
+    - RbFlushIrpWorker 补前向声明；vcxproj NuGet 路径改固定相对路径；
+      去除 DO_POWER_PAGING（与本驱动电源处理不匹配）；
+    - build_all.cmd 控制台步骤改为每次强制重编（旧逻辑"有 exe 就跳过"会使新改动
+      不生效）。
+
+--------------------------------------------------------------------------------
+4.6 历史"引擎丢数据"误报的澄清
+--------------------------------------------------------------------------------
+云端历史中多起"引擎丢数据/越界"最终定位为【压力测试代码自身问题】：审计数组
+过小、memcmp 长度错误、使用绝对偏移越界等，核心引擎并无数据丢失。教训固化为
+流程：任何新测试先自查测试代码的缓冲区大小、同步与偏移合法性，再据此判定引擎。
+

@@ -61,8 +61,15 @@ static VOID RbHotPrewarmJob(PVOID Ctx)
         n = sz / sizeof(RB2_HZ); if (n > 64) n = 64;
         RtlCopyMemory(snap, d, n * sizeof(RB2_HZ));
         for (i = 0; i < n; i++)
-            if (snap[i].Letter == ext->Letter && snap[i].Cnt >= 8)
-                Rb2VolRead(ext, (ULONG64)snap[i].LbaMB << 20, 4 << 20);
+            if (snap[i].Letter == ext->Letter && snap[i].Cnt >= 8) {
+                /* [FIX R6-07] 卷容量边界：HotZones 注册表值与卷容量无绑定，换小容量盘/
+                 * 跨机器镜像时 LbaMB<<20+4MB 可越卷尾——越界同步读浪费 IO 且推高
+                 * ext->IoFailRun（RB_IO_FAIL_PANIC 熔断面）。几何未知时按 2TB 保守上限。 */
+                ULONG64 cap = ext->GeometryValid ? ext->DiskSize : (2ULL << 40);
+                ULONG64 off = (ULONG64)snap[i].LbaMB << 20;
+                if (off + (4ULL << 20) <= cap)
+                    Rb2VolRead(ext, off, 4 << 20);
+            }
     }
     if (d) ExFreePoolWithTag(d, RB_POOL_TAG);
     RbDerefExt(ext);

@@ -26,6 +26,30 @@ REM is a DWORD (0x1/0x2/0x3...) mapping to ControlSet001/002/003.
 REM Legacy script hardcoded ControlSet001: if the machine last booted 002/003
 REM (snapshot restore, dual boot, reinstall leftovers) the rewritten registry
 REM is not the active set -> rollback no-ops and 0x7B continues.
+REM [FIX R6-S1 2026-10-21] Detection MUST run AFTER reg load: the query reads
+REM HKLM\RB_OFFLINE\Select, which only exists once the offline hive is mounted.
+REM Original order queried before loading -> in a clean WinRE session _CSN is
+REM always empty -> unconditional exit 1 (the only 0x7B rescue script was 100%
+REM dead in a clean session). Build16 archive confirms load-then-detect order.
+
+set "SYSROOT=C:\Windows"
+set "HIVE=%SYSROOT%\System32\config\SYSTEM"
+
+if not exist "%HIVE%" (
+  echo [X] Offline SYSTEM hive not found: %HIVE%
+  echo     Edit this script and set SYSROOT= to your Windows drive
+  echo     (try D:, E: ...). Then re-run.
+  exit /b 1
+)
+
+echo [..] Loading offline SYSTEM hive ...
+reg load HKLM\RB_OFFLINE "%HIVE%" >nul
+if errorlevel 1 (
+  echo [X] reg load failed. Is the hive already loaded?
+  echo     Try: reg unload HKLM\RB_OFFLINE   then re-run.
+  exit /b 1
+)
+
 set "CSD="
 for /f "tokens=3" %%D in ('reg query "HKLM\RB_OFFLINE\Select" /v Current 2^>nul ^| findstr /i /c:"Current"') do set "_CSN=%%D"
 if defined _CSN (
@@ -45,27 +69,10 @@ if not defined CSD (
   reg unload HKLM\RB_OFFLINE >nul 2>&1
   exit /b 1
 )
+
 set "CS=SYSTEM\ControlSet%CSD%"
 echo [..] Target ControlSet: %CS%
 set "CLS=%CS%\Control\Class\{71a27cdd-812a-11d0-bec7-08002be2092f}"
-
-set "SYSROOT=C:\Windows"
-set "HIVE=%SYSROOT%\System32\config\SYSTEM"
-
-if not exist "%HIVE%" (
-  echo [X] Offline SYSTEM hive not found: %HIVE%
-  echo     Edit this script and set SYSROOT= to your Windows drive
-  echo     (try D:, E: ...). Then re-run.
-  exit /b 1
-)
-
-echo [..] Loading offline SYSTEM hive ...
-reg load HKLM\RB_OFFLINE "%HIVE%" >nul
-if errorlevel 1 (
-  echo [X] reg load failed. Is the hive already loaded?
-  echo     Try: reg unload HKLM\RB_OFFLINE   then re-run.
-  exit /b 1
-)
 
 echo [..] Removing RAMBlockCache from Volume UpperFilters (keep other filters) ...
 REM [P1-9] Strip only the RAMBlockCache entry; keep every other volume

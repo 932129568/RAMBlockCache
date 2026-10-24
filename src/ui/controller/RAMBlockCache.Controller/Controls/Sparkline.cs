@@ -63,6 +63,10 @@ public sealed class Sparkline : FrameworkElement
     private void Push(double v)
     {
         if (_ring.Length != Math.Max(2, Capacity)) Reset();
+        /* [FIX R6-UI14] NaN 过滤：控件是公共 DP（Value 可为任意 double），NaN 进
+         * 环形缓冲后 OnRender 的 max=NaN → 全部 y=NaN → StreamGeometry 收 NaN 点
+         * （渲染异常路径）。当前绑定源恒有限故不可达，属纪律补齐。 */
+        if (double.IsNaN(v)) v = 0;
         _ring[_head] = v;
         _head = (_head + 1) % _ring.Length;
         _count = Math.Min(_count + 1, _ring.Length);
@@ -71,11 +75,19 @@ public sealed class Sparkline : FrameworkElement
 
     protected override void OnRender(DrawingContext dc)
     {
-        if (_count < 2) return;
         double w = ActualWidth, h = ActualHeight;
+        var stroke = Stroke ?? DefaultStroke;
+        // [设计 v2 2026-10-24] 空态画基线轨道——原 _count<2 直接 return 让卷卡
+        // sparkline 区塌陷成空白（加速页截图实锤），控件应有视觉存在感
+        if (_count < 2)
+        {
+            var trackPen = new Pen(new SolidColorBrush(Color.FromRgb(0x23, 0x23, 0x2B)), 1);   // = RbcChartTrack
+            trackPen.Freeze();
+            dc.DrawLine(trackPen, new Point(0, h - 1), new Point(w, h - 1));
+            return;
+        }
         double max = 1;
         for (int i = 0; i < _count; i++) max = Math.Max(max, _ring[i]);
-        var stroke = Stroke ?? DefaultStroke;
         var brush = stroke.Clone(); brush.Freeze();               // 渲染线程要求冻结画刷
         var pen = new Pen(brush, 1.6);
         pen.Freeze();

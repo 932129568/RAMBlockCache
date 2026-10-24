@@ -62,12 +62,27 @@
 #define RB_MSG_GET_VERSION      10  /* 协议/驱动版本，兼作连通性自检 */
 #define RB_MSG_PANIC            11  /* [V10.1] 一键熔断：全局透传（脏数据后台落盘） */
 #define RB_MSG_PANIC_CLEAR      12  /* [V10.1] 清除熔断 + 引导循环防护 */
+#define RB_MSG_INVALIDATE_RANGE 13  /* [V10.6/B-5] 缓存范围失效（FlushFileRange：第一遍冷读前提） */
+#define RB_MSG_GET_EVENTS      14  /* [V10.6/B-7] 操作进度事件轮询（游标增量，同 GET_LOG 模式） */
 
 /* ---- 常量 ---- */
 #define RB_MAX_VOLUMES          8
 #define RB_VOL_LEN              4   /* [P3] L"C:" 实为 2 字符 + NUL = 3；取 4 留 1 位对齐/扩展余量 */
 #define RB_STRIPES              64  /* 与 core/cache.c RB_NSTRIPES 一致 */
 #define RB_NAME_LEN             16
+#define RB_SIGNER_LEN           32  /* [V10.6/B-6] 驱动签名者名上限（wchar_t；EV 证书主体名） */
+#define RB_EVENT_MAX            64  /* [V10.6/B-7] 事件环容量（旧事件被覆盖，游标防漏读） */
+#define RB_EVENT_TEXT           48  /* [V10.6/B-7] 阶段文案上限（wchar_t） */
+
+/* [V10.6/B-7] 操作类型（OpProgress.OpType 合法值；09 移交报告 §3 B-7） */
+#define RB_OP_BENCHMARK         1   /* 二遍读基准（UI 本地执行，驱动不经此发） */
+#define RB_OP_PRESET_APPLY      2   /* 预设多卷应用（同上） */
+#define RB_OP_UNMOUNT           3   /* 卸载回写（驱动 detach 路径发布） */
+#define RB_OP_L2_REBUILD        4   /* L2 恢复重建（W2 路径就绪后发布；当前无源） */
+/* [V10.6/B-8] L2 重建阶段（Phase 合法值；其他 opType 置 0） */
+#define RB_PHASE_START          1
+#define RB_PHASE_PROGRESS       2
+#define RB_PHASE_DONE           3
 
 /* 每卷写模式（V8 新增；块层下系统卷默认直写更安全，数据盘可选回写） */
 #define RB_WRITEMODE_THROUGH    0   /* write-through：缓存与下盘并行 */
@@ -167,6 +182,12 @@ typedef struct RB_STATS_T {
     uint32_t PanicActive;        /* 1=全局熔断中，一切 I/O 直通盘 */
     uint32_t BootFails;          /* 连续非干净启动计数 */
     uint32_t DirtySnapshotMB;    /* 异常关机时"可能丢失数据量"的上界快照 */
+    /* ---- [V10.6/B-12] 读延迟 EWMA（微秒；末尾纯追加；09 移交报告 §4 B-12）----
+     * CacheReadLatencyUs：全命中读的 EWMA（采样 1/64，1/8 权重）；
+     * DiskReadLatencyUs  ：含 miss 下盘读的 EWMA（同采样）。0=尚无样本。
+     * 前端收益页二级明细消费；无样本不画假值（0=未测）。 */
+    uint32_t CacheReadLatencyUs;
+    uint32_t DiskReadLatencyUs;
 } RB_STATS;
 
 /* ---- 卷枚举（V8 扩展，新字段追加于末尾） ---- */
@@ -209,7 +230,52 @@ typedef struct RB_VERSION_T {
     uint32_t Reserved;
     uint64_t DriverFlags;
     wchar_t Name[RB_NAME_LEN];
+    /* ---- [V10.6/B-6] 驱动签名态（末尾纯追加；09 移交报告 §3 B-6）----
+     * TestSigned=1 表示测试签名/未知（保守默认：反作弊警示照弹）；
+     * Signer 为签名者主体名（空=未提供）。前端取不到时按测试签名保守处理。 */
+    uint32_t TestSigned;
+    uint32_t Reserved2;          /* 对齐保留（8 字节边界） */
+    wchar_t Signer[RB_SIGNER_LEN];
 } RB_VERSION;
+
+/* ---- 缓存范围失效（RB_MSG_INVALIDATE_RANGE；[V10.6/B-5] 末尾纯追加）----
+ * 语义：把指定卷 [Offset, Offset+Length) 字节区间内的缓存块失效，
+ * 使随后的第一遍读真正落到磁盘（冷热二遍读的第一遍冷读前提）。
+ * 偏移/长度均为卷内字节偏移（非 LBA）；调用方负责文件 extents→字节换算。 */
+typedef struct RB_INVALIDATE_RANGE_T {
+    wchar_t Letter;              /* 目标卷盘符 */
+    uint32_t Reserved;           /* 对齐保留 */
+    uint64_t Offset;             /* 卷内字节偏移 */
+    uint64_t Length;             /* 字节长度 */
+} RB_INVALIDATE_RANGE;
+
+/* ---- 操作进度事件（RB_MSG_GET_EVENTS；[V10.6/B-7] 末尾纯追加）----
+ * 游标增量消费（同 GET_LOG 模式）：调用方带上次的 Cursor，驱动回 >=Cursor+1
+ * 的事件与新的 Cursor；环满覆盖最旧（游标防漏读不了被覆盖的——轮询要勤）。
+ * 驱动当前发布点：卸载回写（detach：start/排空/回写/done）；二遍读与预设
+ * 应用在 UI 本地执行（前端本地总线 InProcessOperationProgress）；L2 重建
+ * （B-8）待 W2 路径就绪后在重建循环发布（Phase=start/progress/done）。 */
+typedef struct RB_EVENT_REC_T {
+    uint64_t Seq;                /* 单调序号（驱动侧递增；游标即此值） */
+    uint32_t OpType;             /* RB_OP_* */
+    uint32_t Percent;            /* 0-100；不确定阶段（如排空等待）置 0 + 阶段文案说明 */
+    uint32_t Cancelable;         /* 1=可取消（当前驱动发布点均不可取消=0） */
+    uint32_t Phase;              /* RB_PHASE_*（B-8；其他 opType 置 0） */
+    uint64_t RecoveredBytes;     /* B-8 重建已恢复字节（其他 opType 置 0） */
+    wchar_t  StageText[RB_EVENT_TEXT];
+} RB_EVENT_REC;
+
+typedef struct RB_EVENT_QUERY_T {
+    uint64_t Cursor;             /* 上次消费到的 Seq；0=从当前环内最早开始 */
+    uint32_t MaxCount;           /* 最多返回条数（<=RB_EVENT_MAX） */
+} RB_EVENT_QUERY;
+
+typedef struct RB_EVENT_LIST_T {
+    uint64_t Cursor;             /* 新消费游标（最后一条 Seq；无事件=入参原值） */
+    uint32_t Count;
+    uint32_t Reserved;
+    RB_EVENT_REC Items[RB_EVENT_MAX];
+} RB_EVENT_LIST;
 
 /* ---- 日志（RB_MSG_GET_LOG） ---- */
 #define RB_LOG_MAX       64
@@ -241,6 +307,12 @@ typedef struct RB_MSG_T {
         RB_VOLUME_ATTACH VolumeAttach;
         RB_LOG_LIST    LogList;
         RB_VERSION     Version;
+        /* [V10.6/B-5] 追加成员（远小于 RB_LOG_LIST=7688，union 总大小不变，
+         * sizeof(RB_MSG) 仍为 7704——既有偏移零漂移） */
+        RB_INVALIDATE_RANGE InvalidateRange;
+        /* [V10.6/B-7] 追加成员（RB_EVENT_LIST < RB_LOG_LIST，总大小不变） */
+        RB_EVENT_LIST    EventList;
+        RB_EVENT_QUERY   EventQuery;
     } Data;
 } RB_MSG;
 

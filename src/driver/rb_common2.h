@@ -125,6 +125,14 @@ VOID     RbL2Close(VOID);
 /* [D7] L2 状态查询（统计/CLI 展示）：0=Flags关/未开 1=已打开
  * 2=拒绝-多卷 3=拒绝-块大小 4=拒绝-配置无效。 */
 ULONG    RbL2State(VOID);
+/* [FIX R6-01] attach 入口 L2 冲突预检（fail-closed 前移）：L2 容器已开且
+ * DevList 中已有其他被加速卷时返回 TRUE——调用方必须拒绝本次 attach。
+ * 原防线只有 LazyOpen 的运行期懒复检（300ms 节流削弱），第二卷挂载窗口内
+ * 跨卷 LBA 键碰撞可返回错误卷数据（R6-01 Critical）。
+ * [FIX S7-12] IRQL 契约纠正：内部经 DevListLock（FastMutex，要求 <=APC_LEVEL），
+ * **仅限 PASSIVE_LEVEL 调用**（两个 attach 入口均 PASSIVE 控制路径）。
+ * 原注释"任意 IRQL 安全"与实现相反——DISPATCH 调用方会 0xC4。 */
+BOOLEAN  RbL2AttachBlocked(VOID);
 
 /* ===== BUILD15 新原型 ===== */
 /* 计数槽扩容：s_Cnt[16][SHARD]，新槽 10=WbQueued 11=WbDone 12=WbThrottled 13=ShrinkCalls

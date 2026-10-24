@@ -170,6 +170,8 @@ typedef struct _RB_FLUSH_COUNTERS {
 #endif
 #define RB_NBUCKETS 16384
 #define RB_NSTRIPES 64
+/* [D2] chain 分片数（per-stream 链锁/LRU/dirty 链表分片；详见 chain_of 注释） */
+#define RB_CHAIN_SHARDS 16
 #define RB_SUBS_FIXED 16u                 /* subs per chunk, fixed */
 /* Zone geometry for parallel writeback: 256MB offset zones. */
 #define RB_ZONE_SHIFT 28ull
@@ -219,13 +221,19 @@ struct rb_stream {
     rb_engine *eng;
     rb_u64 file_id;
     struct rb_chunk **buckets;
-    struct rb_chunk *lru_head, *lru_tail;
-    struct rb_chunk *d_head, *d_tail;
+    /* [D2] chain 单锁 → 16 路分片锁 + 分片 LRU/dirty 链表（键 chain_of(start)） */
+    struct rb_chunk *lru_head[RB_CHAIN_SHARDS], *lru_tail[RB_CHAIN_SHARDS];
+    struct rb_chunk *d_head[RB_CHAIN_SHARDS], *d_tail[RB_CHAIN_SHARDS];
     volatile rb_u64 cur_bytes;
     volatile rb_u64 dirty_bytes;
     volatile rb_u32 chunk_count;
     rb_rwlock *stripes;
-    rb_mutex chain;
+    rb_mutex chain[RB_CHAIN_SHARDS];
+    /* [FIX WS-RACE-2] 在途回写计数：flush_pass 的"stage→锁外 writeback"区间
+     * 内 >0。失效路径（rb_stream_invalidate_range_ex）入口先排空——
+     * 直写+失效假设"直写是盘面最终语"，若在途回写其后落盘即以旧数据覆盖
+     * 已镜像新值，且失效已清脏位 → 污染永久化（QA BLOCKER-1 实证）。 */
+    volatile LONG wb_active;
     volatile long flush_active;      /* serial-flush ownership (0/1) */
     volatile long zflush_cnt;        /* active zoned flushers (excluded vs serial) */
     volatile long reclaim_active;    /* reclaim serialization (0/1) */
@@ -286,6 +294,8 @@ struct rb_flushws {
 static void stream_reclaim(rb_stream *s);
 static size_t flush_stream(rb_stream *s, int force);
 static size_t flush_pass(rb_stream *s, int zone_sel, int nzones, rb_flushws *ws);
+static void wb_drain(rb_stream *s);   /* [FIX WS-RACE-2] 排空在途回写（见 invalidate 入口） */
+static int stage_revalidate(rb_stream *s, rb_flushws *ws, size_t nsl);  /* [FIX WS-RACE-2] 落盘前 gen 复检 */
 /* ---- basic helpers ---- */
 static rb_u32 sub_index(const rb_engine *eng, rb_u64 offset)
 { return (rb_u32)((offset & eng->chunk_mask) >> eng->sub_shift); }
@@ -298,6 +308,17 @@ static size_t run_length(const rb_engine *eng, uint16_t b, rb_u32 start)
 static rb_u32 bucket_of(rb_u64 start)
 { rb_u64 h=(start>>16)*2654435761u; return (rb_u32)((h>>20)&(RB_NBUCKETS-1)); }
 static rb_u32 stripe_of(rb_u64 start) { return bucket_of(start) % RB_NSTRIPES; }
+/* [D2] chain 分片键 = stripe_of(start)&15（64 条纹已均匀 → 分片均匀）。
+ * 键由 chunk 自身 start 决定 → 同一 chunk 的所有链操作（LRU/dirty）恒落同一把
+ * 片锁，互斥性保持；并发写只在 1/RB_CHAIN_SHARDS 的面上互撞（旧单链锁 = 每条
+ * 写流每 64KB 必撞一次）。
+ * 锁序不变式：stripe WLOCK → chain 片锁——所有链操作调用点（pass1/pass2、
+ * invalidate、evict_victim、truncate、discard_all、destroy、clean）均已持有
+ * 该 chunk 所在条纹的 WLOCK，临界区内不再取条纹锁；唯一多片持有者是
+ * evict_select（原单链锁全持的对应物）：全片【升序取、逆序放】且不持条纹锁
+ * ——无锁序倒置。d_head/d_tail 脏链表自 W1.5-R2 起无任何消费者（flush 快照
+ * 改走哈希桶扫描，见 flush_pass 快照段注释），随 LRU 一并分片，零行为影响。 */
+static rb_u32 chain_of(rb_u64 start) { return stripe_of(start) & (RB_CHAIN_SHARDS-1); }
 static struct rb_chunk *chunk_lookup(rb_stream *s, rb_u64 start)
 {
     rb_u32 b=bucket_of(start); struct rb_chunk *c=s->buckets[b];
@@ -320,22 +341,28 @@ static void unlock_stripes(rb_stream *s, const rb_u32 *held, int n)
 { int i; for(i=n-1;i>=0;i--)RB_RW_UNLOCK(&s->stripes[held[i]]); }
 #define FOR_EACH_BUCKET_IN_STRIPE(k,b) for((b)=(k);(b)<RB_NBUCKETS;(b)+=RB_NSTRIPES)
 rb_u64 g_dbg_flush=0, g_dbg_flush_chunkvisits=0;
-/* ---- list ops (caller holds chain) ---- */
+/* ---- list ops (caller holds chain[chain_of(c->start)]) ---- */
+/* [D2] 分片链表：head/tail 与锁一同按 chain_of(start) 分片；调用方持该
+ * 片锁（且已持 chunk 所在条纹 WLOCK——锁序 stripe→片锁）。 */
 static void dirty_insert(rb_stream *s, struct rb_chunk *c)
-{ c->d_prev=NULL; c->d_next=s->d_head;
-  if(s->d_head)s->d_head->d_prev=c; else s->d_tail=c;
-  s->d_head=c; }
+{ rb_u32 k=chain_of(c->start);
+  c->d_prev=NULL; c->d_next=s->d_head[k];
+  if(s->d_head[k])s->d_head[k]->d_prev=c; else s->d_tail[k]=c;
+  s->d_head[k]=c; }
 static void dirty_remove(rb_stream *s, struct rb_chunk *c)
-{ if(c->d_prev)c->d_prev->d_next=c->d_next; else s->d_head=c->d_next;
-  if(c->d_next)c->d_next->d_prev=c->d_prev; else s->d_tail=c->d_prev;
+{ rb_u32 k=chain_of(c->start);
+  if(c->d_prev)c->d_prev->d_next=c->d_next; else s->d_head[k]=c->d_next;
+  if(c->d_next)c->d_next->d_prev=c->d_prev; else s->d_tail[k]=c->d_prev;
   c->d_prev=c->d_next=NULL; }
 static void lru_push_front(rb_stream *s, struct rb_chunk *c)
-{ c->lru_prev=NULL; c->lru_next=s->lru_head;
-  if(s->lru_head)s->lru_head->lru_prev=c; else s->lru_tail=c;
-  s->lru_head=c; }
+{ rb_u32 k=chain_of(c->start);
+  c->lru_prev=NULL; c->lru_next=s->lru_head[k];
+  if(s->lru_head[k])s->lru_head[k]->lru_prev=c; else s->lru_tail[k]=c;
+  s->lru_head[k]=c; }
 static void lru_remove(rb_stream *s, struct rb_chunk *c)
-{ if(c->lru_prev)c->lru_prev->lru_next=c->lru_next; else s->lru_head=c->lru_next;
-  if(c->lru_next)c->lru_next->lru_prev=c->lru_prev; else s->lru_tail=c->lru_prev;
+{ rb_u32 k=chain_of(c->start);
+  if(c->lru_prev)c->lru_prev->lru_next=c->lru_next; else s->lru_head[k]=c->lru_next;
+  if(c->lru_next)c->lru_next->lru_prev=c->lru_prev; else s->lru_tail[k]=c->lru_prev;
   c->lru_prev=c->lru_next=NULL; }
 /* ---- flush workspace helpers ---- */
 static rb_flushws *ws_alloc(void)
@@ -425,7 +452,8 @@ static struct rb_chunk *chunk_create(rb_stream *s, rb_u64 start)
     c->epoch=RB_AADD64(&eng->chunk_epoch,1)+1;
     b=bucket_of(start);
     c->hash_next=s->buckets[b]; s->buckets[b]=c;
-    RB_M_LOCK(&s->chain); lru_push_front(s,c); RB_M_UNLOCK(&s->chain);
+    { rb_u32 ck=chain_of(start);   /* [D2] 片锁（持调用方条纹 WLOCK 内取） */
+      RB_M_LOCK(&s->chain[ck]); lru_push_front(s,c); RB_M_UNLOCK(&s->chain[ck]); }
     ev("CR",start,0);
     RB_AADD64(&eng->total_bytes,eng->chunk_size);
     RB_AADD64(&s->cur_bytes,eng->chunk_size);
@@ -451,12 +479,13 @@ static rb_u64 chunk_unlink_account(rb_stream *s, struct rb_chunk *c, int count_l
         RB_AADD64(&eng->total_dirty,-(rb_i64)((rb_u64)nd*eng->block_size));
         RB_AADD64(&s->dirty_bytes,-(rb_i64)((rb_u64)nd*eng->block_size));
     }
-    RB_M_LOCK(&s->chain);
-    { rb_u32 b=bucket_of(c->start); struct rb_chunk **pp=&s->buckets[b];
-      while(*pp){ if(*pp==c){*pp=c->hash_next;break;} pp=&(*pp)->hash_next; }
-      if(c->dirty)dirty_remove(s,c); else lru_remove(s,c);
-    }
-    RB_M_UNLOCK(&s->chain);
+    { rb_u32 ck=chain_of(c->start);   /* [D2] 片锁 */
+      RB_M_LOCK(&s->chain[ck]);
+      { rb_u32 b=bucket_of(c->start); struct rb_chunk **pp=&s->buckets[b];
+        while(*pp){ if(*pp==c){*pp=c->hash_next;break;} pp=&(*pp)->hash_next; }
+        if(c->dirty)dirty_remove(s,c); else lru_remove(s,c);
+      }
+      RB_M_UNLOCK(&s->chain[ck]); }
     RB_AADD64(&eng->total_bytes,-(rb_i64)eng->chunk_size);
     RB_AADD64(&s->cur_bytes,-(rb_i64)eng->chunk_size);
     RB_AADD32(&s->chunk_count,(rb_u32)-1);
@@ -494,9 +523,10 @@ static void chunk_mark_dirty(rb_stream *s, struct rb_chunk *c, uint16_t added)
     int i; size_t n=0;
     for(i=0;i<(int)RB_SUBS_FIXED;i++)
         if(added&(1u<<i)){ c->dseq[i]++; RB_FLUSH_STAT_INC(dseq); if(newly&(1u<<i)) n++; }
-    RB_M_LOCK(&s->chain);
-    if(c->dirty==0){ lru_remove(s,c); dirty_insert(s,c); }
-    RB_M_UNLOCK(&s->chain);
+    { rb_u32 ck=chain_of(c->start);   /* [D2] 片锁：0→1 脏转换时换链 */
+      RB_M_LOCK(&s->chain[ck]);
+      if(c->dirty==0){ lru_remove(s,c); dirty_insert(s,c); }
+      RB_M_UNLOCK(&s->chain[ck]); }
     if(n){ RB_AADD64(&eng->total_dirty,(rb_u64)n*eng->block_size);
            RB_AADD64(&s->dirty_bytes,(rb_i64)((rb_u64)n*eng->block_size)); }
     c->dirty=(uint16_t)(c->dirty|added);
@@ -504,7 +534,10 @@ static void chunk_mark_dirty(rb_stream *s, struct rb_chunk *c, uint16_t added)
     ev("MD",c->start,added);
 }
 /* generation-checked clean of a run (caller holds chunk's stripe WLOCK) */
-static void chunk_clean_run(rb_stream *s, struct rb_chunk *c,
+/* [FIX C-2] 返回本次真正清掉的脏子块数：flush_pass 的 wb 统计改按 clean 实际
+ * 结算（两 flusher 同帧快照同一脏块时，后者的 clean 因 dseq 已进阶清零为空，
+ * 不再对同一份重复落盘的数据双计 wb_bytes/wb_flush）。 */
+static size_t chunk_clean_run(rb_stream *s, struct rb_chunk *c,
                             rb_u32 sub, rb_u32 nsubs, const uint32_t *seq)
 {
     rb_engine *eng=s->eng; rb_u32 i; size_t cleared=0;
@@ -524,15 +557,19 @@ static void chunk_clean_run(rb_stream *s, struct rb_chunk *c,
         RB_AADD64(&eng->total_dirty,-(rb_i64)((rb_u64)cleared*eng->block_size));
         RB_AADD64(&s->dirty_bytes,-(rb_i64)((rb_u64)cleared*eng->block_size));
     }
-    RB_M_LOCK(&s->chain);
-    if(was_dirty && c->dirty==0){ dirty_remove(s,c); lru_push_front(s,c); }
-    RB_M_UNLOCK(&s->chain);
+    { rb_u32 ck=chain_of(c->start);   /* [D2] 片锁 */
+      RB_M_LOCK(&s->chain[ck]);
+      if(was_dirty && c->dirty==0){ dirty_remove(s,c); lru_push_front(s,c); }
+      RB_M_UNLOCK(&s->chain[ck]);
+    }
+    return cleared;
 }
 /* legacy unconditional clean (used by user-mode parallel test path) */
 static void chunk_clean_done(rb_stream *s, struct rb_chunk *c, int from, int cnt)
 {
     rb_engine *eng=s->eng; int q;
-    RB_M_LOCK(&s->chain);
+    rb_u32 ck=chain_of(c->start);   /* [D2] 片锁 */
+    RB_M_LOCK(&s->chain[ck]);
     for(q=from;q<from+cnt;q++){
         if(c->dirty & (uint16_t)(1u<<q)){
             c->dirty &= (uint16_t)~(1u<<q);
@@ -541,7 +578,7 @@ static void chunk_clean_done(rb_stream *s, struct rb_chunk *c, int from, int cnt
         }
     }
     if(c->dirty==0){ dirty_remove(s,c); lru_push_front(s,c); }
-    RB_M_UNLOCK(&s->chain);
+    RB_M_UNLOCK(&s->chain[ck]);
 }
 /* ---- engine ---- */
 rb_engine *rb_engine_create(const rb_config *cfg)
@@ -685,7 +722,7 @@ rb_stream *rb_stream_create(rb_engine *eng, rb_u64 file_id)
     if(!s->stripes){ CORE_FREE(s->buckets); CORE_FREE_LOCK(s); return NULL; }
     memset(s->stripes,0,sizeof(rb_rwlock)*RB_NSTRIPES);
     for(i=0;i<RB_NSTRIPES;i++)RB_RW_INIT(&s->stripes[i]);
-    RB_M_INIT(&s->chain);
+    for(i=0;i<RB_CHAIN_SHARDS;i++)RB_M_INIT(&s->chain[i]);   /* [D2] 16 片锁 */
     s->flush_active=0; s->zflush_cnt=0;
     s->last_read_off=(rb_u64)-1;
     RB_M_LOCK(&eng->streams_lock);
@@ -739,7 +776,7 @@ void rb_stream_destroy(rb_stream *s)
     }
     RB_AADD32(&eng->nstreams,(rb_u32)-1);
     for(k=0;k<RB_NSTRIPES;k++) RB_RW_DESTROY(&s->stripes[k]);
-    RB_M_DELETE(&s->chain);
+    for(k=0;k<RB_CHAIN_SHARDS;k++) RB_M_DELETE(&s->chain[k]);   /* [D2] 16 片锁 */
     if(s->ws) ws_free(s->ws);
     CORE_FREE(s->buckets); CORE_FREE_LOCK(s->stripes); CORE_FREE_LOCK(s);
 }
@@ -798,9 +835,10 @@ void rb_stream_truncate(rb_stream *s, rb_u64 new_size)
                         memset(c->data+((size_t)idx<<eng->sub_shift)+off,0,eng->block_size-off);
                     }
                     if(was_dirty&&c->dirty==0){
-                        RB_M_LOCK(&s->chain);
+                        rb_u32 ck=chain_of(c->start);   /* [D2] 片锁 */
+                        RB_M_LOCK(&s->chain[ck]);
                         dirty_remove(s,c); lru_push_front(s,c);
-                        RB_M_UNLOCK(&s->chain);
+                        RB_M_UNLOCK(&s->chain[ck]);
                     }
                 }
                 c=nxt;
@@ -827,6 +865,13 @@ void rb_stream_discard_all(rb_stream *s)
         RB_RW_UNLOCK(&s->stripes[k]);
     }
 }
+/* [FIX R6-D3] 公开排空入口：包住 static wb_drain（WS-RACE-2 的在途计数）。
+ * 60s 上界内绝不死等；超时即返回（上层按最坏情况处理）。 */
+void rb_stream_drain_writeback(rb_stream *s)
+{
+    if(!s)return;
+    wb_drain(s);
+}
 /* [P0-2] 脏字节数快照（原子读；force flush 后 >0 = 回写未完成） */
 rb_u64 rb_stream_dirty_bytes(rb_stream *s)
 { return s ? (rb_u64)RB_ALOAD64(&s->dirty_bytes) : 0; }
@@ -848,13 +893,13 @@ int rb_stream_has_dirty_range(rb_stream *s, rb_u64 offset, size_t len)
 int rb_read(rb_stream *s, rb_u64 offset, void *buf, size_t len,
             rb_direct_range *miss, int *miss_count, int max_miss)
 {
-    rb_engine *eng=s->eng; rb_u32 held[RB_NSTRIPES]; int nh;
-    rb_u64 end=offset+len, pos; unsigned char *out=(unsigned char *)buf;
+    rb_engine *eng; rb_u32 held[RB_NSTRIPES]; int nh;
+    rb_u64 end, pos; unsigned char *out=(unsigned char *)buf;
     rb_u64 hit_bytes=0; int mcount=0, overflow=0;
-    /* [FIX R2-W13] 守卫顺序修正：s 判空必须在解引用 s->eng 之前；
-     * len==0 时 end=offset，lock_stripes 的 (end-1) 下溢会导致巨量循环。
-     * 两者都是 W19 守卫的存量空档（API 层地雷，驱动侧 len==0 已挡）。 */
+    /* [FIX QA5-3] 判空前置于一切解引用：s==NULL 时返回 -2（契约）而非段错误 */
     if(!s||!buf||!miss||!miss_count)return -2;
+    eng=s->eng;
+    end=offset+len;
     if(len==0){ *miss_count=0; return 0; }
     if(miss_count)*miss_count=0;
     if(max_miss<1)max_miss=1;
@@ -921,9 +966,12 @@ int rb_read(rb_stream *s, rb_u64 offset, void *buf, size_t len,
 }
 void rb_read_copy_dirty(rb_stream *s, rb_u64 offset, void *buf, size_t len)
 {
-    rb_engine *eng=s->eng; rb_u32 held[RB_NSTRIPES]; int nh;
-    rb_u64 end=offset+len, pos=offset; unsigned char *out=(unsigned char *)buf;
+    rb_engine *eng; rb_u32 held[RB_NSTRIPES]; int nh;
+    rb_u64 end, pos=offset; unsigned char *out=(unsigned char *)buf;
+    /* [FIX QA5-3] 判空前置：s==NULL/len==0 时不触碰任何解引用 */
     if(!s||len==0)return;
+    eng=s->eng;
+    end=offset+len;
     nh=lock_stripes(s,offset,end,held,1);
     while(pos<end){
         rb_u64 cs=(pos & ~eng->chunk_mask); rb_u32 idx=sub_index(eng,pos);
@@ -943,10 +991,11 @@ void rb_read_copy_dirty(rb_stream *s, rb_u64 offset, void *buf, size_t len)
 static int can_create(const rb_engine *eng);
 void rb_read_commit(rb_stream *s, rb_u64 offset, const void *buf, size_t len)
 {
-    rb_engine *eng=s->eng; rb_u32 held[RB_NSTRIPES]; int nh;
-    /* [FIX R2-W13] s 判空 + len==0 回绕防护（同 rb_read/rb_write） */
+    rb_engine *eng; rb_u32 held[RB_NSTRIPES]; int nh;
+    /* [FIX QA5-3] 判空前置：s==NULL/len==0 时不触碰任何解引用 */
     if(!s||!buf)return;
     if(len==0)return;
+    eng=s->eng;
     rb_u64 end=offset+len, pos=offset; const unsigned char *in=(const unsigned char *)buf;
     ev("C0",offset,len);
     nh=lock_stripes(s,offset,end,held,0);
@@ -991,6 +1040,11 @@ typedef struct {
 /* ---- write ---- */
 static void direct_append(rb_direct_range *d, int *cnt, int max, rb_u64 off, size_t len)
 {
+    /* [FIX R6-02] 溢出后不再触碰数组：原实现在 *cnt=max+1（溢出标记）之后，
+     * 后续调用的合并检查仍执行 d[*cnt-1] = d[max]——越界读调用方数组
+     * （驱动侧 d[RB_MAX_RANGES] 在内核栈上，即栈越界读；ASan 实测复现）。
+     * 溢出态只保留标记，由调用方按 -2 契约走整段直写兜底。 */
+    if(*cnt>max) return;
     if(*cnt>0&&d[*cnt-1].offset+d[*cnt-1].len==off) d[*cnt-1].len+=len;
     else if(*cnt<max){ d[*cnt].offset=off; d[*cnt].len=len; (*cnt)++; }
     else *cnt=max+1;
@@ -1002,14 +1056,25 @@ static int can_create(const rb_engine *eng)
 /* ---- rb_write pass1（持 stripe 锁）：只做不碰盘的路径；RMW 洞只记账。
  * FIX[R2]: 补读绝不持锁做 —— 否则 1/64 分片被单次盘 IO（最长15s）串行化。
  * 以下为 rb_write 原内联代码的整块搬运：cached/dcount/rmw_n 均以指针
- * 回写，语句与求值顺序逐行一致。 ---- */
+ * 回写，语句与求值顺序逐行一致。
+ * [D1] pre 非 NULL 时，在同一持锁期内、chunk_lookup 之后、任何 mutation
+ * （chunk_create/memcpy/chunk_mark_dirty）之前，逐子块采集写前脏掩码+dseq
+ * ——与旧"先 rb_stream_dirty_mask 再 rb_write"两调用序列逐位同构，但采集
+ * 窗口从"两次锁之间"缩为零（只紧不松）。pass1 每轮循环恰好覆盖一个子块
+ * （pos 每步落在子块边界），故第 i 轮即 pre_base+i*block_size 子块；
+ * 缺 chunk 子块 dseq 无条件写 0（兑现 cache.c:1168-1170 注释原意，旧 API
+ * 缺 chunk 时留调用方缓冲陈旧值，仅靠"陈旧值≠0 证据不成立"兜底）。 ---- */
 static void rb_write_pass1(rb_stream *s, rb_u64 offset, rb_u64 end,
                            const unsigned char *in,
                            RB_RMW *rmw, int *rmw_n,
                            rb_direct_range *direct, int *dcount, int max_direct,
-                           rb_u64 *cached)
+                           rb_u64 *cached, rb_write_pre *pre)
 {
     rb_engine *eng=s->eng; rb_u32 held[RB_NSTRIPES]; int nh; rb_u64 pos=offset;
+    /* [D1] pre->bits>0 由 rb_write_ex 在进入本函数前判定（容量足够且已 memset）；
+     * <=0（含 -1 容量不足）→ 不采集，写照常吸收。 */
+    int pre_ok = (pre && pre->bits > 0);
+    rb_u64 sub_i = 0;   /* 已遍历子块序号（bit i = pre_base+i*block_size） */
     nh=lock_stripes(s,offset,end,held,0);
     while(pos<end){
         rb_u64 cs=(pos & ~eng->chunk_mask); rb_u32 idx=sub_index(eng,pos);
@@ -1018,6 +1083,12 @@ static void rb_write_pass1(rb_stream *s, rb_u64 offset, rb_u64 end,
         rb_u64 remain=end-pos, sr=sub_end-pos;
         size_t n=(size_t)(remain<sr?remain:sr);
         struct rb_chunk *c=chunk_lookup(s,cs);
+        if(pre_ok){
+            /* 写前真值（持排他锁瞬间）；发生在任何 mutation 之前 */
+            if(pre->dseq) pre->dseq[sub_i] = c ? c->dseq[idx] : 0;
+            if(c && (c->dirty&(uint16_t)(1u<<idx)))
+                pre->mask[sub_i>>3] |= (uint8_t)(1u<<(sub_i&7));
+        }
         if(full){
             if(!c && can_create(eng))c=chunk_create(s,cs);
             if(!c){ direct_append(direct,dcount,max_direct,pos,n); }
@@ -1039,7 +1110,7 @@ static void rb_write_pass1(rb_stream *s, rb_u64 offset, rb_u64 end,
         } else {
             direct_append(direct,dcount,max_direct,pos,n);
         }
-        pos+=n;
+        pos+=n; sub_i++;
     }
     unlock_stripes(s,held,nh);
 }
@@ -1080,7 +1151,7 @@ static void rb_write_pass2(rb_stream *s, RB_RMW *rmw, int rmw_n,
                 chunk_mark_dirty(s,c2,(uint16_t)(1u<<it->idx));
                 *cached+=it->n;
                 RB_AADD64((volatile rb_i64*)&eng->stripe_wb[k].v,(rb_i64)it->n);
-            } else if(!c2 && !it->c && can_create(eng) &&
+            } else if(!c2 && can_create(eng) &&
                       (c2=chunk_create(s,it->sub_start & ~eng->chunk_mask))!=NULL){
                 unsigned char *dst=c2->data+((size_t)it->idx<<eng->sub_shift);
                 memcpy(dst,tmp,eng->block_size);
@@ -1089,8 +1160,26 @@ static void rb_write_pass2(rb_stream *s, RB_RMW *rmw, int rmw_n,
                 chunk_mark_dirty(s,c2,(uint16_t)(1u<<it->idx));
                 *cached+=it->n;
                 RB_AADD64((volatile rb_i64*)&eng->stripe_wb[k].v,(rb_i64)it->n);
+            } else if(c2 && !(c2->loaded&(uint16_t)(1u<<it->idx))){
+                /* [FIX WS-RACE] 洞期间块被回收/重建（it->c 失效）或从未存在：
+                 * 该子块未加载 = 缓存无有效数据 → 读盘回填+叠加安全。
+                 * 原实现在此降级【直写】——但直写只更盘不更缓存：洞期间并发
+                 * 读者按写前盘面 rb_read_commit 建块后（miss 区间按子块对齐，
+                 * 边界子块的未发布尾部落入缓存），直写区间在缓存里留下陈旧
+                 * 副本，其后读取命中陈旧副本 = 数据损坏（test_wsconc 实证：
+                 * 盘面已新、缓存仍旧、复读仍不符）。改为吸收：块已存在
+                 * （无新分配），不受容量门限制；与分支2逐行同构。 */
+                unsigned char *dst=c2->data+((size_t)it->idx<<eng->sub_shift);
+                memcpy(dst,tmp,eng->block_size);
+                memcpy(dst+(size_t)(it->pos-it->sub_start),in+it->buf_off,it->n);
+                c2->loaded|=(uint16_t)(1u<<it->idx);
+                chunk_mark_dirty(s,c2,(uint16_t)(1u<<it->idx));
+                *cached+=it->n;
+                RB_AADD64((volatile rb_i64*)&eng->stripe_wb[k].v,(rb_i64)it->n);
             } else {
-                /* epoch 变化/块被回收等竞争态 —— 降级直写，正确性优先 */
+                /* 仅剩：块不存在且容量上限拒建（can_create 失败）→ 降级直写。
+                 * 该路径无并发建块竞态残留：读者 commit 同样受 can_create 约束，
+                 * 且直写区间的未发布字节不会被读者 miss 区间覆盖（见 WS-RACE 论证）。 */
                 direct_append(direct,dcount,max_direct,it->pos,it->n);
             }
             RB_RW_UNLOCK(&s->stripes[k]);
@@ -1102,16 +1191,30 @@ static void rb_write_pass2(rb_stream *s, RB_RMW *rmw, int rmw_n,
         }
     }
 }
-int rb_write(rb_stream *s, rb_u64 offset, const void *buf, size_t len,
-             rb_direct_range *direct, int *direct_count, int max_direct)
+/* [D1] 写路径锁合并：rb_write 的完整体（rb_write 收壳转调本函数，pre=NULL）。
+ * 与旧 rb_write 逐字同构（守卫/统计/回收/直写溢出返回全部原样），唯一增量：
+ * 进入 pass1 前判定快照容量并把 mask/dseq/base/bits 装配进 pre——
+ *   容量不足（max_bits < nbits）→ pre->bits=-1，写照常吸收（回滚保守记账）；
+ *   容量足够 → memset(mask,0,(nbits+7)/8) + bits=nbits + base=block 对齐首子块，
+ *   pass1 内在同一持锁期逐子块采集（见 rb_write_pass1 注释）。
+ * nbits 与旧 rb_stream_dirty_mask 的位集合逐个子块一致：
+ *   首子块 = offset&~(block-1)，尾子块含 [offset,end) 相交的末块，
+ *   nbits = ((end-1-base)>>sub_shift)+1。 */
+int rb_write_ex(rb_stream *s, rb_u64 offset, const void *buf, size_t len,
+                rb_direct_range *direct, int *direct_count, int max_direct,
+                rb_write_pre *pre)
 {
-    rb_engine *eng=s->eng;
-    rb_u64 end=offset+len; const unsigned char *in=(const unsigned char *)buf;
+    rb_engine *eng; rb_u64 end; const unsigned char *in=(const unsigned char *)buf;
     rb_u64 cached=0; int dcount=0;
     RB_RMW rmw[8]; int rmw_n=0;
 
-    /* [FIX R2-W13] 守卫顺序修正（同 rb_read）：s 判空前移 + len==0 回绕防护 */
+    /* [FIX QA5-3] 守卫必须前置于一切解引用：原 `rb_engine *eng=s->eng;` 在
+     * 判空前执行——s==NULL 时契约承诺的"返回 -2"退化为段错误（驱动侧传入空
+     * 流句柄即 BSOD）。判空后再初始化（end 依赖 len，同样不能前置计算）。 */
     if(!s||!buf||!direct||!direct_count)return -2;
+    eng=s->eng;
+    end=offset+len;
+    if(pre){ pre->bits=0; pre->base=0; }   /* 默认：无快照（保守） */
     if(len==0){ *direct_count=0; return 0; }
     if(direct_count)*direct_count=0;
     if(max_direct<1)max_direct=1;
@@ -1128,7 +1231,22 @@ int rb_write(rb_stream *s, rb_u64 offset, const void *buf, size_t len,
           stream_reclaim(s);
       } }
 
-    rb_write_pass1(s,offset,end,in,rmw,&rmw_n,direct,&dcount,max_direct,&cached);
+    /* [D1] 快照容量判定：nbits 前置计算（与旧 rb_stream_dirty_mask 同公式）。
+     * max_bits 不足 → bits=-1（写仍成功；驱动/调用方走保守记账防御分支）。
+     * mask==NULL 视为 0 容量（无快照可采）——契约可预测，不引入半真快照。 */
+    if(pre){
+        rb_u64 base = offset & ~((rb_u64)eng->block_size-1);
+        rb_u64 nbits = ((end-1-base) >> eng->sub_shift) + 1;
+        if(!pre->mask || nbits > (rb_u64)pre->max_bits){
+            pre->bits = -1;   /* 容量不足：绝不因快照失败一次写 */
+        }else{
+            pre->bits = (int)nbits;
+            pre->base = base;
+            memset(pre->mask, 0, (size_t)((nbits+7)/8));
+        }
+    }
+
+    rb_write_pass1(s,offset,end,in,rmw,&rmw_n,direct,&dcount,max_direct,&cached,pre);
     rb_write_pass2(s,rmw,rmw_n,in,direct,&dcount,max_direct,&cached);
 
     if(direct_count)*direct_count=dcount;
@@ -1137,7 +1255,22 @@ int rb_write(rb_stream *s, rb_u64 offset, const void *buf, size_t len,
         RB_ASTORE32(&eng->need_flush,1);
     { rb_u64 ch_,hi_,lo_; rb_effective_caps(eng,&ch_,&hi_,&lo_);
       if(RB_ALOAD64(&eng->total_bytes)>=hi_) stream_reclaim(s); }
+    /* [FIX WS-RACE-2] 单一收口点：有 direct 区间（含 -2 溢出的 dcount=161）
+     * 时，在【任何可能新起在途回写的动作（含上方 reclaim 的 flush_pass）之后、
+     * 返回之前】统一排空。调用方随后会把 direct 区间（P2-1 路径为含已吸收子块
+     * 的整块）镜像落盘并宣称"直写=盘面最终语"；若在途回写在镜像之后落盘，会以
+     * 旧 stage 数据覆盖已镜像新值（gen 复检查缓存侧变化，镜像只改盘面——查不到，
+     * 排空是唯一闭合点）。置于末尾保证 reclaim 新起的段也在等待集合内。
+     * 仅 direct 路径付此代价（本就承担同步盘 IO 时延）；dc=0 全吸收不镜像、
+     * 无盘面最终语宣称，无需排空（调用契约，README §四 已披露）；无持锁等待。 */
+    if(dcount > 0) wb_drain(s);
     return dcount>max_direct?-2:0;
+}
+/* 收壳：pre=NULL = 与旧"先 dirty_mask 再 write"两调用序列逐字等价。 */
+int rb_write(rb_stream *s, rb_u64 offset, const void *buf, size_t len,
+             rb_direct_range *direct, int *direct_count, int max_direct)
+{
+    return rb_write_ex(s,offset,buf,len,direct,direct_count,max_direct,NULL);
 }
 /* NEW: rollback absorbed range when the original write IRP failed */
 /* [FIX C7] 写前脏掩码快照：bit i = 覆盖 pre_base+i*block_size 的子块在快照时刻是否已脏。
@@ -1200,6 +1333,11 @@ void rb_stream_invalidate_range_ex(rb_stream *s, rb_u64 offset, rb_u64 len,
     if(!s||len==0)return;
     end=offset+len; if(end<offset)return;
     eng=s->eng;
+    /* [FIX WS-RACE-2] 先排空在途回写：本函数的 superseded=1 语义（直写数据为
+     * 盘面最终语）要求"清脏位"时没有握着旧 stage 数据的回写在飞——否则回写
+     * 落盘会以旧数据覆盖已镜像的新值，且脏位已清 → 污染永久（QA BLOCKER-1）。
+     * 调用方全在写路径（PASSIVE，本就承担同步盘 I/O 时延）；无持锁等待。 */
+    wb_drain(s);
     nh=lock_stripes(s,offset,end,held,0);
     pos=offset;
     while(pos<end){
@@ -1236,6 +1374,9 @@ void rb_stream_invalidate_range_ex(rb_stream *s, rb_u64 offset, rb_u64 len,
                            c->dseq[idx]==(rb_u32)pre_dseq[bit]+1) evidence=1;
                     }
                     c->dirty=(uint16_t)(c->dirty & ~(1u<<idx));
+                    /* [FIX WS-RACE-2] 升脏代：使 stage 之后到来的本次失效对
+                     * 在途回写可见（落盘前 gen 复检会弃写该 run，见 flush_pass）。 */
+                    c->dseq[idx]++;
                     RB_AADD64(&eng->total_dirty,-(rb_i64)eng->block_size);
                     RB_AADD64(&s->dirty_bytes,-(rb_i64)eng->block_size);
                     if(!superseded && (pre || !evidence))
@@ -1245,9 +1386,10 @@ void rb_stream_invalidate_range_ex(rb_stream *s, rb_u64 offset, rb_u64 len,
             if(!keep){
                 c->loaded=(uint16_t)(c->loaded & ~(1u<<idx));
                 if(was_dirty && c->dirty==0){
-                    RB_M_LOCK(&s->chain);
+                    rb_u32 ck=chain_of(c->start);   /* [D2] 片锁 */
+                    RB_M_LOCK(&s->chain[ck]);
                     dirty_remove(s,c); lru_push_front(s,c);
-                    RB_M_UNLOCK(&s->chain);
+                    RB_M_UNLOCK(&s->chain[ck]);
                 }
                 if(c->loaded==0 && c->dirty==0){
                     chunk_destroy(s,c,0);   /* 脏字节已在上方逐位记账 */
@@ -1278,19 +1420,34 @@ void rb_stream_invalidate_range_ex(rb_stream *s, rb_u64 offset, rb_u64 len,
                  * 盘上内容即恢复源，原子换入被覆盖段；dirty 保留待回写
                  * （组合数据 = 未覆盖段早期 ack + 覆盖段盘面内容） */
                 memcpy(c->data+(size_t)(rst[i].seg_off-rst[i].cs),tmp,(size_t)rst[i].seg_len);
+                /* [FIX WS-RACE-2] 数据已改：升脏代使在途回写落盘前复检弃写 */
+                c->dseq[rst[i].idx]++;
             }else if(tmp && rr==0){
                 /* [FIX R2-M5(c)] 窗口内他人已重写该子块（dseq 不符）：
                  * 缓存以新写为权威，绝不 memcpy 旧盘数据压垮已 ack 字节 */
             }else{
                 /* 恢复失败（readback 错/无内存）：丢该子块，如实记账。
                  * 摘链/销毁统一走 chunk_destroy（内部含 hash/lru/dirty 摘链） */
+                int was_dirty = (c->dirty != 0);   /* [FIX R6C-01] 迁移前捕获链表成员身份 */
                 if(c->dirty&m){
                     c->dirty=(uint16_t)(c->dirty & ~m);
+                    c->dseq[rst[i].idx]++;   /* [FIX WS-RACE-2] 状态已变：升代 */
                     RB_AADD64(&eng->total_dirty,-(rb_i64)eng->block_size);
                     RB_AADD64(&s->dirty_bytes,-(rb_i64)eng->block_size);
                     RB_AADD64(&eng->stats.lost_dirty_bytes,(rb_i64)eng->block_size);
                 }
                 c->loaded=(uint16_t)(c->loaded & ~m);
+                /* [FIX R6C-01] dirty→0 必须同步做 dirty→LRU 链表迁移（与同函数
+                 * 1370-1376 兄弟分支/chunk_clean_run 同款纪律）：原实现直接清脏位
+                 * 后调 chunk_destroy，unlink 按 c->dirty==0 走 lru_remove——而
+                 * chunk 实际仍在脏链表上，其陈旧 lru 链被写进 LRU 头/尾 → 该分片
+                 * 全部干净块对 evict_select 不可见（淘汰饥饿）。 */
+                if(was_dirty && c->dirty==0){
+                    rb_u32 ck=chain_of(c->start);   /* [D2] 片锁 */
+                    RB_M_LOCK(&s->chain[ck]);
+                    dirty_remove(s,c); lru_push_front(s,c);
+                    RB_M_UNLOCK(&s->chain[ck]);
+                }
                 if(c->loaded==0 && c->dirty==0) chunk_destroy(s,c,0);
             }
         }
@@ -1324,7 +1481,23 @@ static void runs_sort(rb_frun *a, rb_frun *tmp, size_t n)
     }
     if(src!=a) memcpy(a,src,n*sizeof(*a));
 }
-/* stage one run into ws->stage[dst_off..) under ONLY this chunk's stripe lock */
+/* stage one run into ws->stage[dst_off..) under ONLY this chunk's stripe lock
+ * [T1 W1.5-R2 同款 RLOCK 论证] WLOCK→RLOCK：本函数对流的操作全是读——
+ * chunk_lookup 走 hash_next 链遍历、memcpy 从 c->data 拷出、读 c->epoch/
+ * c->dseq；唯一"写"的是 ws->stage / ws->slots（flusher 私有 workspace，
+ * 不涉流结构；且 ws_grow_stage 在加锁前完成）。所有结构性修改
+ * （chunk 插入/摘除/脏位转换/释放：write_pass1/2、invalidate、
+ * evict_victim、clean_slot、truncate/discard/destroy）全部持 WLOCK
+ * （lock_stripes shared=0 或直接 WLOCK）——故 RLOCK 下不存在并发结构
+ * 写者，链遍历与字段读取安全（与已部署的 flush 快照扫描 RLOCK 修复
+ * 同一论证，见 flush_pass 快照段注释）。
+ * 动因：回写模式下 flusher 的 stage 段每 chunk 一次 WLOCK，ERESOURCE
+ * 写者优先下回写器持续排他持锁 → 同条纹读者（RLOCK）排队饿死；脏数据
+ * 越多回写越忙，读者越惨——即 4K 读跑分连跑不稳（3379→587）的残余
+ * convoy 根因。RLOCK 后 stage 与读者共享条纹，convoy 消除。
+ * 代价（已评估可接受）：stage 读到的是加锁瞬间的快照；其后被并发写
+ * 改写过的子块由 clean 期 gen 校验（c->dseq==快照 seq）挡下——不匹配
+ * 即本帧跳过、脏位保留、下帧重刷，绝不会把旧内容当新内容落盘。 */
 static int stage_run(rb_stream *s, const rb_frun *run, rb_flushws *ws,
                      size_t dst_off, size_t *nsl)
 {
@@ -1334,9 +1507,23 @@ static int stage_run(rb_stream *s, const rb_frun *run, rb_flushws *ws,
     struct rb_chunk *c; rb_fslot *sl; rb_u32 q; size_t bytes;
     bytes=(size_t)run->nsubs<<eng->sub_shift;
     if(dst_off+bytes>ws->stage_cap && !ws_grow_stage(ws,dst_off+bytes,dst_off)) return 0;
-    RB_RW_WLOCK(&s->stripes[k]);
+    RB_RW_RLOCK(&s->stripes[k]);
     c=chunk_lookup(s,cs);
     if(!c){ RB_RW_UNLOCK(&s->stripes[k]); return 0; }
+    /* [FIX R9-13] stage 时复核快照脏位（与下方 memcpy 同锁内原子，WLOCK 写者
+     * 被排斥）：run 来自 flush_pass 早先的快照，快照与该 stage 之间，本块可能
+     * 已被失效清脏（superseded 数据已由直写镜像落盘、脏位已清）甚至销毁并在
+     * 同起点重建。原实现只按 start 找块即拷数据——块被重建时会把新块从未
+     * 写入的零数据当脏数据落盘（overlap-p21 实测：chunk 边界起 5 子块全零被
+     * 回写覆盖正确盘面；stage_revalidate/clean 校验的是新块身份+dseq，天然
+     * 匹配故全放行；新块空脏位使 clean 无所清 → 静默写坏且零记账）。
+     * 复核不通过（run 覆盖子块未全部仍脏）→ 跳过本 run：真正还脏的子块由
+     * 下一帧快照拾取（force 路径循环至净帧，不丢数据）。 */
+    {
+        uint16_t want=0; rb_u32 q;
+        for(q=0;q<run->nsubs;q++) want|=(uint16_t)(1u<<(run->sub+q));
+        if((c->dirty & want)!=want){ RB_RW_UNLOCK(&s->stripes[k]); return 0; }
+    }
     memcpy(ws->stage+dst_off, c->data+((size_t)run->sub<<eng->sub_shift), bytes);
     if(*nsl>=ws->slots_cap){ RB_RW_UNLOCK(&s->stripes[k]); return 0; }
     sl=&ws->slots[(*nsl)++];
@@ -1346,20 +1533,35 @@ static int stage_run(rb_stream *s, const rb_frun *run, rb_flushws *ws,
     RB_RW_UNLOCK(&s->stripes[k]);
     return 1;
 }
-/* clean one staged run after successful disk write (generation-checked) */
-static void clean_slot(rb_stream *s, const rb_fslot *sl)
+/* [T2] clean one staged run after successful disk write (generation-checked) ——
+ * 持锁版：调用方必须已持有 sl->start 所在条纹的 WLOCK（同一把锁内连续清理
+ * 多个槽时用，避免每槽一次排他锁放大 convoy）。逻辑与原 clean_slot 逐字
+ * 一致：chunk_lookup 后 c==sl->c && c->epoch==sl->epoch 的 gen 校验 +
+ * chunk_clean_run + eng->cfg.write_release && c->dirty==0 的 chunk_destroy
+ * 分支。对本函数而言调用方持锁期间无并发结构写者（RLOCK/WLOCK 语义保证），
+ * 与单槽版的安全性相同。 */
+/* [FIX C-2] 返回本槽真正清掉的脏子块数（0=已被并发清洁/已被覆写取代）。 */
+static size_t clean_slot_locked(rb_stream *s, const rb_fslot *sl)
 {
     rb_engine *eng=s->eng;
-    rb_u32 k=stripe_of(sl->start);
     struct rb_chunk *c;
-    RB_RW_WLOCK(&s->stripes[k]);
+    size_t cleared=0;
     c=chunk_lookup(s,sl->start);
     if(c && c==sl->c && c->epoch==sl->epoch){
-        chunk_clean_run(s,c,sl->sub,sl->nsubs,sl->seq);
+        cleared=chunk_clean_run(s,c,sl->sub,sl->nsubs,sl->seq);
         if(eng->cfg.write_release && c->dirty==0){
             chunk_destroy(s,c,0);
         }
     }
+    return cleared;
+}
+/* 原 clean_slot（单槽版）保留供其他调用方：自行按条纹取/放 WLOCK，
+ * 体内转为 clean_slot_locked（语义不变）。 */
+static void clean_slot(rb_stream *s, const rb_fslot *sl)
+{
+    rb_u32 k=stripe_of(sl->start);
+    RB_RW_WLOCK(&s->stripes[k]);
+    clean_slot_locked(s,sl);
     RB_RW_UNLOCK(&s->stripes[k]);
 }
 static size_t flush_pass(rb_stream *s, int zone_sel, int nzones, rb_flushws *ws)
@@ -1373,8 +1575,31 @@ static size_t flush_pass(rb_stream *s, int zone_sel, int nzones, rb_flushws *ws)
      * The d_list can drift (a chunk ends up dirty but unlinked), so we do NOT
      * rely solely on d_head -- scan buckets so no dirty chunk is ever missed. */
     { rb_u32 b,k;
+      /* [D5] ents 锁外预扩容（QA O3）：RLOCK 区内不再做 malloc+memcpy+free
+       * （该条纹读者曾被分配时长拖住）。预估 = nent + 单条纹最坏增量上界：
+       * 本流脏子块数与 chunk 数取小（脏块数 ≤ 脏子块数、≤ chunk 数，原子读），
+       * 单条纹增量不超过它。每趟 RLOCK 之前（锁外）检查余量并预扩；预扩失败
+       * （超 RB_FLUSH_ENT_MAX 等）不阻断——锁内防御分支按需扩容（原行为逐字
+       * 保留，覆盖"并发写抬高脏量越过预估"的意外超限）。 */
+      size_t worst = (size_t)(RB_ALOAD64(&s->dirty_bytes) / eng->block_size);
+      { rb_u64 cc = RB_ALOAD32(&s->chunk_count);
+        if(worst > (size_t)cc) worst = (size_t)cc; }
+      worst += 1;
       for(k=0;k<RB_NSTRIPES;k++){
-        RB_RW_WLOCK(&s->stripes[k]);
+        if(ws->ents_cap < nent + worst)
+            (void)ws_grow_ents(ws, nent + worst, nent);   /* 失败：锁内防御兜底 */
+        /* [W1.5-R2] 快照扫描 WLOCK→RLOCK：本循环体对流结构纯只读（走 hash_next、
+         * 读 dirty/restoring/start，写只进 ws->ents），而所有结构性修改
+         * （chunk 插入/摘除/脏位转换：write_pass1/2、invalidate、evict、
+         * clean_slot、truncate/discard/destroy）全部持 WLOCK——故 RLOCK 下
+         * 不存在并发结构写者，链遍历与脏位读取安全。
+         * 动因：回写模式下 flusher 持续对本扫描持 WLOCK，大缓存（数万块/条纹）
+         * 单条纹扫描 ~1-2ms，读者（RLOCK）在相同条纹上排队 → 4K 读吞吐暴跌
+         * （3132→655 MB/s 实测回归）。RLOCK 后扫描与读者共享条纹，convoy 消除。
+         * 代价（已评估可接受）：两 flusher 可能同帧快照同一脏块 → 重复落盘
+         * 相同数据（zone 分区下罕见；gen-checked clean_slot 保正确）；
+         * 扫描后变脏的块本帧漏扫、下帧补扫（force 路径循环至净帧，收敛）。 */
+        RB_RW_RLOCK(&s->stripes[k]);
         FOR_EACH_BUCKET_IN_STRIPE(k,b){ c=s->buckets[b];
           while(c){
             /* FIX[P3]: 串行 flush 以 (zone_sel=-1, nzones=0) 进入。
@@ -1389,6 +1614,9 @@ static size_t flush_pass(rb_stream *s, int zone_sel, int nzones, rb_flushws *ws)
                  (rb_u32)(zone_of(c->start)%(rb_u32)nzones)!=(rb_u32)zone_sel){
                 c=c->hash_next; continue;
               }
+              /* [D5] 锁内防御分支（不可达为主）：锁外预扩容已覆盖预估内的
+               * 增量；此处仅兜底"并发写抬高脏量越过预估"的意外超限。
+               * 语义与原行为逐字保留（失败即放弃本趟快照）。 */
               if(nent>=ws->ents_cap && !ws_grow_ents(ws,nent+1,nent)){ RB_RW_UNLOCK(&s->stripes[k]); goto snapdone; }
               ws->ents[nent].start=c->start; ws->ents[nent].dm=dm; nent++;
               if(nent>=RB_FLUSH_ENT_MAX){ RB_RW_UNLOCK(&s->stripes[k]); goto snapdone; }
@@ -1422,7 +1650,11 @@ expand_done:
     i=0;
     while(i<nrun){
         size_t nsl=0; rb_u64 seg_base; size_t seg_len;
-        if(!stage_run(s,&ws->runs[i],ws,0,&nsl)){ i++; continue; }
+        /* [FIX WS-RACE-2] 在途标记先于 stage：失效路径按 wb_active 排空，
+         * 确保"清脏位"不与握着旧 stage 数据的回写交错（QA BLOCKER-1）。 */
+        InterlockedIncrement((volatile LONG*)&s->wb_active);
+        if(!stage_run(s,&ws->runs[i],ws,0,&nsl)){
+            InterlockedDecrement((volatile LONG*)&s->wb_active); i++; continue; }
         seg_base=ws->runs[i].off;
         seg_len=(size_t)ws->runs[i].nsubs<<eng->sub_shift;
         j=i+1;
@@ -1435,26 +1667,118 @@ expand_done:
         }
         {
             int teardown = eng->teardown_discard;
+            /* [FIX WS-RACE-2] 落盘前 gen 复检：stage 与锁外 writeback 之间缓存
+             * 可能已被并发写/失效改动（吸收升 dseq / 直写后失效升 dseq / 恢复
+             * 改写 / 块被回收重建）。任一字块代次或块身份不符 → 弃写整个 run
+             * （不 clean：数据未落盘；脏位仍在的下帧重来，已被直写+失效取代的
+             * 以直写数据为盘面最终语）。gen 校验原只保护 clean 不错清、保护不了
+             * 已发出的磁盘写——QA BLOCKER-1 的根洞在此。无盘 IO 持锁（R2 纪律）。 */
             int ok = teardown ? 1
-                 : (eng->cfg.writeback &&
+                 : (eng->cfg.writeback && stage_revalidate(s,ws,nsl) &&
                     eng->cfg.writeback(eng->cfg.user_ctx,s->file_id,
                                        seg_base,ws->stage,seg_len)==0);
             if(ok){
-                size_t q;
+                rb_u32 st[RB_NSTRIPES]; int nst=0, si; size_t q; size_t cleared_seg=0;
                 if(teardown){
                     /* [P0-4] 拆除期丢弃路径：旧代码把"丢弃"当"写成功"且零记账，
-                     * 丢失量不可见。此处如实将本段计入 lost_dirty_bytes 上界。 */
+                     * 丢失量不可见。此处如实将本段计入 lost_dirty_bytes 上界。
+                     * [FIX C-1] 拆除期无盘 IO 发生：wb_flush/wb_bytes 绝不再计数
+                     * （原按 seg_len 无条件累加=把丢弃计入"已回写"，双口径失真）。 */
                     RB_AADD64(&eng->stats.lost_dirty_bytes,(rb_i64)seg_len);
                 }
                 written+=seg_len;
-                RB_AADD64(&eng->stats.wb_flush,1);
-                RB_AADD64(&eng->stats.wb_bytes,seg_len);
-                for(q=0;q<nsl;q++) clean_slot(s,&ws->slots[q]);
+                /* [FIX C-2] wb 统计下沉到 clean 实际结算（见下方 cleaned_seg 汇总）：
+                 * 原在落盘后无条件按 seg_len 计一笔——两 flusher 同帧快照同一
+                 * 脏块时后者 clean 清零为空，仍双计一份从不存在的"回写"。 */
+                /* [T2] 按条纹批量持锁清理：原每槽一次 WLOCK+chunk_lookup
+                 * （16MB 段≈16–256 槽 → 每槽一次排他锁+哈希查找）。ERESOURCE
+                 * 写者优先：回写器持续持 WLOCK 时读者（RLOCK）排队饿死——
+                 * 脏数据越多回写越忙、读者越惨（跑分1 好/跑分2 崩的残余
+                 * convoy 根因之一）。改为：把本段 slots[0..nsl) 按
+                 * stripe_of(sl->start) 分组（收集去重后的条纹号，≤64），
+                 * 排序后逐条纹一次 WLOCK，在该锁内把属于它的所有槽清完。
+                 * 每段加锁次数从 O(槽数) 降到 O(跨条纹数≤64)。语义逐字
+                 * 保持：clean_slot_locked 与原 clean_slot 相同（gen 校验
+                 * + chunk_clean_run + write_release 销毁分支）；槽内先前
+                 * 干净/被摘除时 lookup 失败即跳过，与原行为一致。 */
+                for(q=0;q<nsl;q++){
+                    rb_u32 k=stripe_of(ws->slots[q].start);
+                    for(si=0;si<nst;si++) if(st[si]==k) break;
+                    if(si==nst && nst<RB_NSTRIPES) st[nst++]=k;
+                }
+                for(si=1;si<nst;si++){ rb_u32 key=st[si]; int jj=si;
+                    while(jj>0&&st[jj-1]>key){st[jj]=st[jj-1];jj--;} st[jj]=key; }
+                for(si=0;si<nst;si++){
+                    RB_RW_WLOCK(&s->stripes[st[si]]);
+                    for(q=0;q<nsl;q++)
+                        if(stripe_of(ws->slots[q].start)==st[si])
+                            cleared_seg+=clean_slot_locked(s,&ws->slots[q]);
+                    RB_RW_UNLOCK(&s->stripes[st[si]]);
+                }
+                /* [FIX C-1/C-2] clean 结算后才计 wb 统计：teardown 丢弃段不计
+                 * （无盘 IO）；正常回写按**实际清掉的脏子块**计——gen 校验后
+                 * 被并发覆写/重复快照取代的部分不虚报。 */
+                if(!teardown && cleared_seg){
+                    RB_AADD64(&eng->stats.wb_flush,1);
+                    RB_AADD64(&eng->stats.wb_bytes,(rb_i64)((rb_u64)cleared_seg*eng->block_size));
+                }
             }
         }
+        InterlockedDecrement((volatile LONG*)&s->wb_active);   /* [FIX WS-RACE-2] 在途标记解除 */
         i=j;
     }
     return written;
+}
+/* [FIX WS-RACE-2] 落盘前 gen 复检：对本次段已 stage 的 slots 重新落条纹 RLOCK
+ * （升序，与 clean 批量持锁同序），逐槽校验块身份（指针+epoch）与每子块脏代
+ * （stage 时捕获的 seq）。任一不符 → 返回 0，调用方弃写整个 run。
+ * 为什么需要：R2 的 gen 校验只挂在 clean 上（"不错清"），而 stage 与锁外
+ * writeback 之间并发吸收/失效会改缓存——旧 stage 数据落盘即以旧盖新，若其间
+ * 失效又清了脏位（直写路径），污染永久化（QA BLOCKER-1 实证：盘面也旧）。
+ * 锁代价：≤64 个 RLOCK + 每槽 nsubs 次比较（微秒级），无盘 IO 持锁。 */
+static int stage_revalidate(rb_stream *s, rb_flushws *ws, size_t nsl)
+{
+    rb_u32 st[RB_NSTRIPES]; int nst=0, si; size_t q;
+    if(nsl==0) return 0;
+    for(q=0;q<nsl;q++){
+        rb_u32 k=stripe_of(ws->slots[q].start);
+        for(si=0;si<nst;si++) if(st[si]==k) break;
+        if(si==nst && nst<RB_NSTRIPES) st[nst++]=k;
+    }
+    for(si=1;si<nst;si++){ rb_u32 key=st[si]; int jj=si;
+        while(jj>0&&st[jj-1]>key){st[jj]=st[jj-1];jj--;} st[jj]=key; }
+    for(si=0;si<nst;si++) RB_RW_RLOCK(&s->stripes[st[si]]);
+    { int ok=1;
+      for(q=0;q<nsl && ok;q++){
+        rb_fslot *sl=&ws->slots[q];
+        struct rb_chunk *c=chunk_lookup(s,sl->start);
+        rb_u32 r;
+        if(!c || c!=sl->c || c->epoch!=sl->epoch){ ok=0; break; }
+        for(r=0;r<sl->nsubs;r++)
+            if(c->dseq[sl->sub+r]!=sl->seq[r]){ ok=0; break; }
+      }
+      for(si=nst-1;si>=0;si--) RB_RW_UNLOCK(&s->stripes[st[si]]);
+      return ok; }
+}
+/* [FIX WS-RACE-2] 排空在途回写：失效路径（清脏位/改写数据）入口调用。
+ * 在途 = 已 stage 尚未完成 writeback（wb_active>0）。等待期间不持任何锁；
+ * 回写段时长有界（一次盘 IO），调用方全在写路径（本就承担同步盘 IO 时延）。
+ * 步进：内核 KeDelayExecutionThread(1ms)；用户态必须 Sleep(1)——Sleep(0)
+ * 不让 CPU（无同优先级就绪线程即立即返回），60000 次空转 ~ms 即放弃，
+ * "有界等待"形同虚设（用户态测试曾因此漏排空）。 */
+static void wb_drain(rb_stream *s)
+{
+    unsigned long spin=0;
+    while(InterlockedCompareExchange((volatile LONG*)&s->wb_active,0,0)!=0){
+        if(++spin > 60000UL) return;   /* 与 destroy 的 io_users 同款 60s 上界：绝不无限挂死 */
+#ifdef RB_KERNEL_BUILD
+        { LARGE_INTEGER d; d.QuadPart = -10000LL; KeDelayExecutionThread(KernelMode, FALSE, &d); }
+#elif defined(_MSC_VER)
+        Sleep(1);
+#else
+        usleep(1000);
+#endif
+    }
 }
 /* serial flush: mutual exclusion vs zoned flushers (sflush/zflush protocol) */
 static size_t flush_stream(rb_stream *s, int force)
@@ -1593,6 +1917,7 @@ void rb_engine_note_flush_done(rb_engine *eng)
 #include "usertest/parflush_stub.c"
 #endif /* !RB_KERNEL_BUILD */
 void rb_engine_mark_teardown(rb_engine *eng){ if(eng)eng->teardown_discard=1; }
+
 /* ---- batched eviction (fixes O(N*K) scans) ---- */
 #define RB_EVICT_SCAN  1024
 #define RB_EVICT_BATCH 64
@@ -1600,28 +1925,42 @@ void rb_engine_mark_teardown(rb_engine *eng){ if(eng)eng->teardown_discard=1; }
  * pointer outside the chain lock -- clean_slot's write_release can chunk_destroy
  * a just-cleaned block between chain release and evict_victim's stripe lock. */
 struct rb_evict_vic{ rb_u64 start; rb_u64 last_access; rb_u64 epoch; };
+/* [D2] 分片版 evict_select：16 片【升序取、逆序放】——本函数是唯一的多片
+ * 持有者（对应旧单链锁全持），且全程不持条纹锁 → 锁序（stripe→片锁）无倒置。
+ * 每片扫描上限 RB_EVICT_SCAN/RB_CHAIN_SHARDS=64，总预算 1024 不变。
+ * 与旧单链版逐 victim 等价：分片 LRU 是全局 LRU 的保序划分——设 X 为全局
+ * 第 64 旧的 victim，若 X 所在片中旧于 X 的块超过 64，则全局旧于 X 的块已
+ * >64，X 不可能是全局 64 最旧（矛盾）→ 全局最旧的 maxv 个必落在各自片的
+ * 64 最旧之内，筛选结果一致。 */
 static int evict_select(rb_stream *s, struct rb_evict_vic *vics, int maxv)
 {
-    struct rb_chunk *c; int n=0, scanned=0, i;
-    RB_M_LOCK(&s->chain);
-    for(c=s->lru_tail;c && scanned<RB_EVICT_SCAN;c=c->lru_prev){
-        int dup,d;
-        scanned++;
-        dup=0; for(d=0;d<n;d++){ if(vics[d].start==c->start){ dup=1; break; } }
-        if(dup)continue;
-        if(n<maxv){
-            vics[n].start=c->start; vics[n].last_access=c->last_access; vics[n].epoch=c->epoch; n++;
-            for(i=n-1;i>0 && vics[i-1].last_access>vics[i].last_access;i--){
-                struct rb_evict_vic t=vics[i]; vics[i]=vics[i-1]; vics[i-1]=t;
-            }
-        }else if(c->last_access < vics[maxv-1].last_access){
-            vics[maxv-1].start=c->start; vics[maxv-1].last_access=c->last_access; vics[maxv-1].epoch=c->epoch;
-            for(i=maxv-1;i>0 && vics[i-1].last_access>vics[i].last_access;i--){
-                struct rb_evict_vic t=vics[i]; vics[i]=vics[i-1]; vics[i-1]=t;
+    struct rb_chunk *c; int n=0, sh, i;
+    /* 升序取：0..15 全片同时持有（阻塞面与旧单链锁全持一致）；
+     * 扫描全部 16 片后逆序放。全程不持条纹锁 → 锁序（stripe→片锁）无倒置。 */
+    for(sh=0; sh<RB_CHAIN_SHARDS; sh++)
+        RB_M_LOCK(&s->chain[sh]);
+    for(sh=0; sh<RB_CHAIN_SHARDS; sh++){
+        int scanned=0;
+        for(c=s->lru_tail[sh]; c && scanned<RB_EVICT_SCAN/RB_CHAIN_SHARDS; c=c->lru_prev){
+            int dup,d;
+            scanned++;
+            dup=0; for(d=0;d<n;d++){ if(vics[d].start==c->start){ dup=1; break; } }
+            if(dup)continue;
+            if(n<maxv){
+                vics[n].start=c->start; vics[n].last_access=c->last_access; vics[n].epoch=c->epoch; n++;
+                for(i=n-1;i>0 && vics[i-1].last_access>vics[i].last_access;i--){
+                    struct rb_evict_vic t=vics[i]; vics[i]=vics[i-1]; vics[i-1]=t;
+                }
+            }else if(c->last_access < vics[maxv-1].last_access){
+                vics[maxv-1].start=c->start; vics[maxv-1].last_access=c->last_access; vics[maxv-1].epoch=c->epoch;
+                for(i=maxv-1;i>0 && vics[i-1].last_access>vics[i].last_access;i--){
+                    struct rb_evict_vic t=vics[i]; vics[i]=vics[i-1]; vics[i-1]=t;
+                }
             }
         }
     }
-    RB_M_UNLOCK(&s->chain);
+    for(sh=RB_CHAIN_SHARDS-1; sh>=0; sh--)          /* 逆序放 */
+        RB_M_UNLOCK(&s->chain[sh]);
     return n;
 }
 static int evict_victim(rb_stream *s, rb_u64 start, rb_u64 epoch)
@@ -1804,8 +2143,13 @@ rb_u64 rb_engine_apply_pressure(rb_engine *eng, int level)
          * 销毁/flush 整体 stall，且 core 持锁进驱动侧取锁有锁序纠缠风险。
          * 锁内快照+io 引用，锁外逐流淘汰。 */
         rb_stream *snap[64]; int n, i;
+        /* [FIX R6-03] dl==0（非 AutoMemory 固定尺寸模式）不得整体早退：
+         * 原实现 return 0 使驱动 SHRINK/MEMGUARD 端口在固定模式下完全空转
+         * （内存压力来了不回收，契约相悖）。dl==0 时以固定上限 max_bytes 为
+         * 回收目标——语义=把缓存压回用户设定的固定尺寸。 */
         rb_u64 dl=RB_ALOAD64(&eng->dynamic_limit);
-        if(dl==0)return 0;
+        if(dl==0) dl=RB_ALOAD64(&eng->cfg.max_bytes);
+        if(dl==0)return 0;                 /* 固定上限也为 0（未配置）：无可回收目标 */
         n=rb_engine_snapshot_streams(eng,snap,64,0);
         for(i=0;i<n && RB_ALOAD64(&eng->total_bytes)>dl;i++){
             while(RB_ALOAD64(&eng->total_bytes)>dl){

@@ -1,0 +1,1645 @@
+<!--
+  ══════════════════════════════════════════════════════════════
+  RAMBlockCache Controller · UI 高保真原型（最终交付版）
+  生成日期：2026-10-15
+  版本：V1.0（基于 Phase 3b 原型 v2 整体重构）
+  质量审查：第 2 轮严过审 PASS 25/25（M1–M9 全过）
+  审查报告：deliverables/design/04-critique-v2.md
+  配套契约：联调契约.md（同目录 · 前后端联调行为依据）
+  ══════════════════════════════════════════════════════════════
+-->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAMBlockCache Controller · 高保真原型 V2.0（整体重构）</title>
+<!--
+  设计系统：Linear（骨架）+ Tech Utility（视觉方向）· 深色
+  令牌唯一来源：deliverables/design/02-design-system.md（v1.0）+ 02b-charts-motion.md（v1.1 增补）
+  原型：Phase 3b · 整体重构 V2.0 · 原型构建师 筑原型（Zhu）
+  说明：单文件自包含，无任何外部依赖（不引 CDN；图表全部内联 SVG + CSS/JS 手绘，不用 canvas 库）。
+        所有数值为演示用真实感示例，非编造统计结论。统计不可用一律显示「—」，禁止 0。
+  v2 变更：整体 UI 重构（自解释导航 + 页面副标题 + bento 数据卡）；7 类真实数据图；11 类特效；
+        演示态扩至 15 种（含 flushfail / access / attaching / loading）；关闭 MF-1~MF-4 与 NH-1~NH-5。
+-->
+<style>
+/* ════════════════════════════════════════════════════════════
+   设计令牌（逐值取自 02-design-system.md §B / §G.3 快速令牌块）
+   ════════════════════════════════════════════════════════════ */
+:root{
+  /* 背景层级 */
+  --rbc-bg-app:#0E0E11; --rbc-bg-sidebar:#121216; --rbc-bg-statusbar:#14141A;
+  --rbc-bg-surface:#17171C; --rbc-bg-surface-hover:#1E1E24; --rbc-bg-elevated:#22222A;
+  --rbc-bg-input:#1B1B21; --rbc-bg-skeleton:#1B1B21;
+  --rbc-border-subtle:#23232B; --rbc-border-default:#2C2C35; --rbc-border-strong:#3A3A45;
+  --rbc-scrim:rgba(0,0,0,.62);
+  /* 文字 */
+  --rbc-text-primary:#EDEDF2; --rbc-text-secondary:#9A9AA5; --rbc-text-tertiary:#6B6B76;
+  --rbc-text-disabled:#4A4A54; --rbc-text-on-accent:#06222E;
+  /* 强调 */
+  --rbc-accent:#4CC2FF; --rbc-accent-hover:#6FD0FF; --rbc-accent-active:#2AA8E8;
+  --rbc-accent-subtle:#0A2636; --rbc-focus-ring:rgba(76,194,255,.45);
+  /* 语义 */
+  --rbc-success-fg:#63D6A0; --rbc-success-bg:#0E2A20; --rbc-success-border:#1E5C46; --rbc-success-solid:#1F8F63;
+  --rbc-warning-fg:#F2B84B; --rbc-warning-bg:#2E2109; --rbc-warning-border:#7A5310; --rbc-warning-solid:#B07C18;
+  --rbc-danger-fg:#F27A72;  --rbc-danger-bg:#331312;  --rbc-danger-border:#8A2A26;  --rbc-danger-solid:#B3382F; --rbc-danger-solid-hover:#C6453B;
+  --rbc-info-fg:#6FB4F5;    --rbc-info-bg:#0C2138;    --rbc-info-border:#1E4E80;    --rbc-info-solid:#2E6DB4;
+  --rbc-neutral-fg:#A6A6B0; --rbc-neutral-bg:#1C1C22; --rbc-neutral-border:#3A3A45;
+  /* 图表专用色（02b §A.2 · 仅 2 色系：数据系青蓝 + 语义系绿/琥珀/红） */
+  --chart-1:#4CC2FF; --chart-2:#2E86D6;
+  --chart-grid:#23232B; --chart-axis-text:#6B6B76;
+  --chart-area-fill:rgba(76,194,255,.12); --chart-track:#23232B;
+  --chart-heat-1:#1E3A4D; --chart-heat-2:#2E86D6; --chart-heat-3:#4CC2FF;
+  --chart-ok:#63D6A0; --chart-warn:#F2B84B; --chart-danger:#F27A72; --chart-neutral:#A6A6B0;
+  /* 字体 */
+  --rbc-font-ui:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+  --rbc-font-display:"Segoe UI Variable Display","Segoe UI Semibold","Microsoft YaHei UI","Microsoft YaHei",sans-serif;
+  --rbc-font-mono:"Cascadia Mono","Consolas","JetBrains Mono","SF Mono","Courier New",monospace;
+  /* 间距 / 圆角 */
+  --rbc-space-1:4px; --rbc-space-2:8px; --rbc-space-3:12px; --rbc-space-4:16px;
+  --rbc-space-5:24px; --rbc-space-6:32px; --rbc-space-7:48px;
+  --rbc-radius-xs:4px; --rbc-radius-sm:6px; --rbc-radius-md:10px; --rbc-radius-lg:14px; --rbc-radius-pill:999px;
+  --rbc-shadow-raised:0 1px 2px rgba(0,0,0,.4);
+  --rbc-shadow-floating:0 8px 24px rgba(0,0,0,.55);
+  --rbc-shadow-overlay:0 16px 48px rgba(0,0,0,.65);
+  --rbc-sidebar-w:216px; --rbc-statusbar-h:40px; --rbc-content-pad:20px;
+  /* 动效令牌（02b §B.1 · 5 档时长 + 4 条曲线） */
+  --dur-instant:90ms; --dur-fast:120ms; --dur-base:180ms; --dur-slow:240ms; --dur-slower:480ms;
+  --ease-standard:cubic-bezier(.2,0,0,1); --ease-out:cubic-bezier(.16,1,.3,1);
+  --ease-in:cubic-bezier(.4,0,1,1); --ease-linear:linear;
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--rbc-bg-app);                 /* NH-2 修正：不再使用越界色 #08080A */
+  color:var(--rbc-text-primary);
+  font:400 13px/1.6 var(--rbc-font-ui);
+  display:flex;align-items:center;justify-content:center;
+  padding:20px;min-height:100%;
+  -webkit-font-smoothing:antialiased;
+}
+.num{font-family:var(--rbc-font-mono);font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+.mono{font-family:var(--rbc-font-mono)}
+
+/* ═══════════ 桌面窗口框架（1180×760 · NH-3） ═══════════ */
+.win{
+  width:1180px;height:760px;flex:none;
+  background:var(--rbc-bg-app);
+  border:1px solid var(--rbc-border-strong);
+  border-radius:var(--rbc-radius-md);overflow:hidden;
+  display:flex;flex-direction:column;
+  box-shadow:0 24px 70px rgba(0,0,0,.72);
+  position:relative;
+}
+.titlebar{
+  height:34px;flex:none;display:flex;align-items:center;gap:8px;
+  padding:0 6px 0 12px;background:var(--rbc-bg-sidebar);border-bottom:1px solid var(--rbc-border-subtle);  /* NH-2 修正：改用令牌色 */
+  user-select:none;
+}
+.titlebar .ico{width:16px;height:16px;flex:none;display:block}
+.titlebar .ttl{font-size:12px;color:var(--rbc-text-secondary);font-weight:600;letter-spacing:.2px}
+.titlebar .ttl b{color:var(--rbc-text-primary)}
+.titlebar .wctrl{margin-left:auto;display:flex;height:34px}
+.titlebar .wctrl span{width:44px;height:34px;display:flex;align-items:center;justify-content:center;color:var(--rbc-text-secondary);transition:background var(--dur-fast) var(--ease-standard),color var(--dur-fast) var(--ease-standard)}
+.titlebar .wctrl span:hover{background:var(--rbc-bg-surface-hover);color:var(--rbc-text-primary)}
+.titlebar .wctrl span.close:hover{background:var(--rbc-danger-solid);color:#fff}
+
+/* ═══════════ 顶部常驻四段状态条 ═══════════ */
+.statusbar{
+  height:var(--rbc-statusbar-h);flex:none;display:flex;align-items:center;gap:10px;
+  padding:0 16px;background:var(--rbc-bg-statusbar);
+  border-bottom:1px solid var(--rbc-border-subtle);overflow:hidden;
+}
+.seg{
+  display:inline-flex;align-items:center;gap:8px;flex:none;
+  border:1px solid var(--rbc-border-default);border-radius:var(--rbc-radius-pill);
+  padding:4px 12px;font-size:12px;color:var(--rbc-text-secondary);
+  background:transparent;font-family:inherit;cursor:default;
+  transition:background var(--dur-base) var(--ease-standard),border-color var(--dur-base) var(--ease-standard),color var(--dur-base) var(--ease-standard);
+}
+.seg .dot{width:8px;height:8px;border-radius:50%;background:var(--rbc-neutral-fg);flex:none;transition:background var(--dur-base) var(--ease-standard)}
+.seg .nm{color:var(--rbc-text-tertiary)}
+.seg b{font-weight:600;color:var(--rbc-text-primary)}
+.seg.ok{border-color:var(--rbc-success-border);background:var(--rbc-success-bg)}
+.seg.ok .dot{background:var(--rbc-success-fg)} .seg.ok b{color:var(--rbc-success-fg)}
+.seg.warn{border-color:var(--rbc-warning-border);background:var(--rbc-warning-bg)}
+.seg.warn .dot{background:var(--rbc-warning-fg)} .seg.warn b{color:var(--rbc-warning-fg)}
+.seg.bad{border-color:var(--rbc-danger-border);background:var(--rbc-danger-bg)}
+.seg.bad .dot{background:var(--rbc-danger-fg)} .seg.bad b{color:var(--rbc-danger-fg)}
+.seg.mut{border-color:var(--rbc-neutral-border);background:var(--rbc-neutral-bg)}
+.seg.mut .dot{background:var(--rbc-neutral-fg)} .seg.mut b{color:var(--rbc-neutral-fg)}
+.seg.click{cursor:pointer}
+.seg.click:hover{background:var(--rbc-bg-surface-hover)}
+.seg.click:focus-visible{outline:2px solid var(--rbc-focus-ring);outline-offset:1px}
+.statusbar .reconnect{margin-left:auto;font-size:11px;color:var(--rbc-warning-fg);display:flex;align-items:center;gap:6px}
+.statusbar .reconnect .dot{width:8px;height:8px;border-radius:50%;background:var(--rbc-warning-fg);display:inline-block;animation:pulse 1200ms var(--ease-standard) infinite}
+
+/* ═══════════ 主体 ═══════════ */
+.main{flex:1;display:flex;min-height:0}
+.sidebar{
+  width:var(--rbc-sidebar-w);flex:none;background:var(--rbc-bg-sidebar);
+  border-right:1px solid var(--rbc-border-subtle);display:flex;flex-direction:column;min-height:0;
+}
+.brand{padding:16px 16px 10px}
+.brand .nm{font-size:15px;font-weight:600;letter-spacing:.2px;display:flex;align-items:center;gap:8px}
+.brand .ver{font-size:11px;color:var(--rbc-text-tertiary);margin-top:4px}
+.nav{padding:4px 10px;overflow-y:auto;flex:1}
+.nav .sec{font-size:11px;color:var(--rbc-text-tertiary);padding:12px 12px 6px;font-weight:600;letter-spacing:.4px}
+/* 自解释导航：图标 + 标签 + 一行说明 */
+.nav button.nv{
+  width:100%;text-align:left;background:transparent;border:0;border-radius:var(--rbc-radius-sm);
+  color:var(--rbc-text-secondary);padding:8px 10px;font:400 13px/1.4 var(--rbc-font-ui);
+  cursor:pointer;margin-bottom:3px;display:grid;grid-template-columns:18px 1fr auto;align-items:center;gap:10px;
+  transition:background var(--dur-fast) var(--ease-standard),color var(--dur-fast) var(--ease-standard);
+}
+.nav button.nv .nvico{width:18px;height:18px;color:var(--rbc-text-tertiary);transition:color var(--dur-fast) var(--ease-standard)}
+.nav button.nv .nvtxt{min-width:0}
+.nav button.nv .nvtxt .nvl{display:block;font-weight:600;color:inherit}
+.nav button.nv .nvtxt .nvd{display:block;font-size:11px;color:var(--rbc-text-tertiary);line-height:1.35;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nav button.nv:hover{background:var(--rbc-bg-surface-hover);color:var(--rbc-text-primary)}
+.nav button.nv:hover .nvico{color:var(--rbc-text-secondary)}
+.nav button.nv.on{background:var(--rbc-accent-subtle);color:var(--rbc-text-primary);box-shadow:inset 2px 0 0 var(--rbc-accent)}
+.nav button.nv.on .nvico{color:var(--rbc-accent)}
+.nav button.nv.on .nvtxt .nvd{color:var(--rbc-text-secondary)}
+.nav button.nv .ndot{width:6px;height:6px;border-radius:50%;background:transparent;flex:none}
+.nav button.nv .ndot.alert{background:var(--rbc-danger-fg)}
+.nav button.nv .ndot.warn{background:var(--rbc-warning-fg)}
+.side-foot{border-top:1px solid var(--rbc-border-subtle);padding:10px 12px;flex:none}
+.side-foot .lbl{font-size:11px;color:var(--rbc-text-tertiary);margin-bottom:6px}
+.demo-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.demo-grid button{
+  background:var(--rbc-bg-input);border:1px solid var(--rbc-border-default);border-radius:var(--rbc-radius-xs);
+  color:var(--rbc-text-secondary);font:400 11px/1.3 var(--rbc-font-ui);padding:5px 6px;cursor:pointer;text-align:center;
+  transition:background var(--dur-fast) var(--ease-standard),color var(--dur-fast) var(--ease-standard),border-color var(--dur-fast) var(--ease-standard);
+}
+.demo-grid button:hover{background:var(--rbc-bg-surface-hover);color:var(--rbc-text-primary)}
+.demo-grid button.on{border-color:var(--rbc-accent);color:var(--rbc-accent)}
+
+/* ═══════════ 内容区 ═══════════ */
+.content{flex:1;min-width:0;overflow-y:auto;padding:var(--rbc-content-pad) var(--rbc-content-pad) 40px}
+/* 页面切换：淡入 + 8px 位移（240ms --ease-out，仅 transform/opacity） */
+.page-enter{animation:pageEnter var(--dur-slow) var(--ease-out) both}
+@keyframes pageEnter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.page-head{display:flex;align-items:flex-start;gap:16px;margin-bottom:16px}
+.page-head h1{font:600 20px/1.3 var(--rbc-font-display)}
+.page-head .sub{font-size:12px;color:var(--rbc-text-secondary);margin-top:4px;display:flex;align-items:center;gap:6px}
+.page-head .sub svg{color:var(--rbc-text-tertiary);flex:none}
+.page-head .headact{margin-left:auto;display:flex;gap:8px;align-items:center;flex:none}
+h2.sec{font:600 14px/1.4 var(--rbc-font-ui);margin:24px 0 10px;display:flex;align-items:center;gap:10px}
+h2.sec .hint-inline{font:400 11px/1 var(--rbc-font-ui);color:var(--rbc-text-tertiary)}
+h3.sub{font:600 13px/1.4 var(--rbc-font-ui);margin:0 0 8px}
+
+/* ── 数据卡（bento）── */
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.dcard{
+  background:var(--rbc-bg-surface);border:1px solid var(--rbc-border-subtle);border-radius:var(--rbc-radius-md);
+  padding:16px 18px;position:relative;
+  transition:transform var(--dur-fast) var(--ease-standard),background var(--dur-fast) var(--ease-standard),border-color var(--dur-fast) var(--ease-standard);
+}
+.dcard.hov:hover{transform:translateY(-1px);background:var(--rbc-bg-surface-hover);border-color:var(--rbc-border-default)}  /* 卡片 hover 抬升 1px（02b §B.2） */
+.dcard .k{font-size:12px;color:var(--rbc-text-secondary);display:flex;align-items:center;gap:8px}
+.dcard .vrow{display:flex;align-items:flex-end;justify-content:space-between;gap:10px;margin-top:8px}
+.dcard .v{font:600 32px/1.15 var(--rbc-font-mono);font-variant-numeric:tabular-nums;letter-spacing:-.5px;color:var(--rbc-text-primary)}
+.dcard .v .u{font-size:13px;color:var(--rbc-text-tertiary);margin-left:4px;font-weight:400}
+.dcard .s{font-size:11px;color:var(--rbc-text-tertiary);margin-top:6px}
+.dcard .flag{position:absolute;top:12px;right:12px}
+.dcard.unavail .v{color:var(--rbc-text-tertiary)}
+.dcard.unavail .s{color:var(--rbc-warning-fg)}
+.dcard .spark{margin-top:8px;height:28px}
+
+/* ── 徽标 ── */
+.badge{
+  display:inline-flex;align-items:center;gap:6px;height:22px;padding:3px 10px;border-radius:var(--rbc-radius-pill);
+  font:600 12px/1 var(--rbc-font-ui);border:1px solid;white-space:nowrap;position:relative;
+  transition:background var(--dur-base) var(--ease-standard),border-color var(--dur-base) var(--ease-standard),color var(--dur-base) var(--ease-standard);
+}
+.badge .dot{width:6px;height:6px;border-radius:50%}
+.bd-green{color:var(--rbc-success-fg);background:var(--rbc-success-bg);border-color:var(--rbc-success-border)}
+.bd-green .dot{background:var(--rbc-success-fg)}
+.bd-blue{color:var(--rbc-info-fg);background:var(--rbc-info-bg);border-color:var(--rbc-info-border)}
+.bd-blue .dot{background:var(--rbc-info-fg)}
+.bd-amber{color:var(--rbc-warning-fg);background:var(--rbc-warning-bg);border-color:var(--rbc-warning-border)}
+.bd-amber .dot{background:var(--rbc-warning-fg)}
+.bd-red{color:var(--rbc-danger-fg);background:var(--rbc-danger-bg);border-color:var(--rbc-danger-border)}
+.bd-red .dot{background:var(--rbc-danger-fg)}
+.bd-gray{color:var(--rbc-neutral-fg);background:var(--rbc-neutral-bg);border-color:var(--rbc-neutral-border)}
+.bd-gray .dot{background:var(--rbc-neutral-fg)}
+/* 回写双语义：绿主体 + 右上角琥珀角标（6px · NH-4 修正） */
+.badge.corner::after{content:"";position:absolute;top:-2px;right:-2px;width:6px;height:6px;border-radius:50%;background:var(--rbc-warning-fg);border:2px solid var(--rbc-bg-app)}
+/* 自愈中 / 重连中呼吸圆点（1200ms ≤2s · 02b §B.3-2） */
+.badge.healing .dot{animation:pulse 1200ms var(--ease-standard) infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+
+/* ── 卷卡 ── */
+.vcard{
+  background:var(--rbc-bg-surface);border:1px solid var(--rbc-border-subtle);border-radius:var(--rbc-radius-md);
+  padding:14px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:10px;
+  transition:transform var(--dur-fast) var(--ease-standard),background var(--dur-fast) var(--ease-standard),border-color var(--dur-fast) var(--ease-standard);
+}
+.vcard.hov:hover{transform:translateY(-1px);border-color:var(--rbc-border-default);background:var(--rbc-bg-surface-hover)}
+.vcard .vid{font:600 16px/1.2 var(--rbc-font-display);min-width:44px}
+.vcard .vinfo{min-width:120px}
+.vcard .vinfo .lbl{font-size:13px;color:var(--rbc-text-primary)}
+.vcard .vinfo .cap{font-size:11px;color:var(--rbc-text-tertiary);font-family:var(--rbc-font-mono)}
+.vcard .vstate{display:flex;align-items:center;gap:10px}
+.vcard .vmode{font-size:12px;color:var(--rbc-text-secondary);display:flex;align-items:center;gap:6px}
+.vcard .acts{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.vcard .why{width:100%;font-size:11px;color:var(--rbc-text-tertiary);padding-left:2px}
+.vcard .why.ok{color:var(--rbc-success-fg)}
+.vcard.dim{opacity:.72}
+
+/* ── 按钮 ── */
+.btn{
+  height:32px;padding:0 12px;border-radius:var(--rbc-radius-sm);border:1px solid var(--rbc-border-default);
+  background:transparent;color:var(--rbc-text-primary);font:600 13px/1 var(--rbc-font-ui);cursor:pointer;
+  display:inline-flex;align-items:center;gap:8px;white-space:nowrap;
+  transition:background var(--dur-fast) var(--ease-standard),border-color var(--dur-fast) var(--ease-standard),transform var(--dur-instant) var(--ease-standard);
+}
+.btn:hover{background:var(--rbc-bg-surface-hover)}
+.btn:active{transform:translateY(1px)}   /* 按钮按下位移 1px（02b §B.3-4） */
+.btn:focus-visible{outline:2px solid var(--rbc-focus-ring);outline-offset:1px}
+.btn.pri{background:var(--rbc-accent);border-color:var(--rbc-accent);color:var(--rbc-text-on-accent)}
+.btn.pri:hover{background:var(--rbc-accent-hover);border-color:var(--rbc-accent-hover)}
+.btn.pri:active{background:var(--rbc-accent-active)}
+.btn.danger{background:var(--rbc-danger-solid);border-color:var(--rbc-danger-solid);color:#fff}
+.btn.danger:hover{background:var(--rbc-danger-solid-hover);border-color:var(--rbc-danger-solid-hover)}
+.btn.ghost{border-color:transparent;height:28px;padding:0 10px;color:var(--rbc-text-secondary);font-weight:400}
+.btn.ghost:hover{background:var(--rbc-bg-input);color:var(--rbc-text-primary)}
+.btn.sm{height:28px;font-size:12px;padding:0 10px}
+.btn:disabled{background:var(--rbc-bg-input);border-color:var(--rbc-border-subtle);color:var(--rbc-text-disabled);cursor:not-allowed}
+.btn:disabled:hover{background:var(--rbc-bg-input)}
+.btn:disabled:active{transform:none}
+
+/* ── 下拉 ── */
+.sel{
+  height:30px;padding:0 28px 0 10px;border-radius:var(--rbc-radius-sm);background:var(--rbc-bg-input);
+  border:1px solid var(--rbc-border-default);color:var(--rbc-text-primary);font:400 13px/1 var(--rbc-font-ui);
+  cursor:pointer;appearance:none;
+}
+.selwrap{position:relative;display:inline-flex;align-items:center}
+.selwrap .selcaret{position:absolute;right:9px;pointer-events:none;color:var(--rbc-text-secondary);flex:none}
+.sel:focus-visible{outline:2px solid var(--rbc-focus-ring);outline-offset:1px}
+.sel:disabled{color:var(--rbc-text-disabled);cursor:not-allowed}
+
+/* ── 开关 ── */
+.sw{width:36px;height:20px;border-radius:var(--rbc-radius-pill);background:var(--rbc-border-default);position:relative;flex:none;border:0;cursor:pointer;transition:background var(--dur-base) var(--ease-standard)}
+.sw::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:var(--rbc-text-secondary);transition:transform var(--dur-base) var(--ease-standard),background var(--dur-base) var(--ease-standard)}
+.sw.on{background:var(--rbc-success-solid)}
+.sw.on::after{transform:translateX(16px);background:#fff}
+.sw.busy{background:var(--rbc-warning-solid)}
+.sw.busy::after{animation:swbusy 1200ms var(--ease-standard) infinite}
+@keyframes swbusy{0%,100%{opacity:1}50%{opacity:.4}}
+.sw:disabled{opacity:.4;cursor:not-allowed}
+.sw:focus-visible{outline:2px solid var(--rbc-focus-ring);outline-offset:2px}
+
+/* ── 异常卡 / 三段式 ── */
+.alert{border-radius:var(--rbc-radius-md);padding:14px 16px;margin-bottom:12px;border:1px solid;position:relative;overflow:hidden;transition:background var(--dur-base) var(--ease-standard),border-color var(--dur-base) var(--ease-standard)}
+.alert::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px}
+.alert .at{font:600 14px/1.4 var(--rbc-font-ui);margin-bottom:4px;display:flex;align-items:center;gap:8px}
+.alert .ar{font-size:13px;color:var(--rbc-text-secondary);line-height:1.6}
+.alert .aa{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap}
+.alert .meta{margin-top:10px;font:400 11px/1.5 var(--rbc-font-mono);color:var(--rbc-text-tertiary);display:flex;gap:14px;flex-wrap:wrap}
+.alert.danger{background:var(--rbc-danger-bg);border-color:var(--rbc-danger-border)}
+.alert.danger::before{background:var(--rbc-danger-fg)}
+.alert.danger .at{color:var(--rbc-danger-fg)}
+.alert.warn{background:var(--rbc-warning-bg);border-color:var(--rbc-warning-border)}
+.alert.warn::before{background:var(--rbc-warning-fg)}
+.alert.warn .at{color:var(--rbc-warning-fg)}
+.alert.info{background:var(--rbc-accent-subtle);border-color:var(--rbc-info-border)}
+.alert.info::before{background:var(--rbc-info-fg)}
+.alert.info .at{color:var(--rbc-info-fg)}
+
+/* ── 进度条 ── */
+.prog{height:6px;border-radius:var(--rbc-radius-pill);background:var(--rbc-bg-input);overflow:hidden;margin:10px 0;position:relative}
+.prog .fill{height:100%;background:var(--rbc-success-solid);border-radius:inherit;transform-origin:left center;transition:transform var(--dur-base) var(--ease-standard)}
+.prog.indet .fill{width:40%;animation:indet 1200ms var(--ease-standard) infinite}
+@keyframes indet{0%{transform:translateX(-100%)}100%{transform:translateX(250%)}}
+.prog .lbl{font-size:11px;color:var(--rbc-text-secondary)}
+
+/* ── 表格 ── */
+table.tb{width:100%;border-collapse:collapse;font-size:13px}
+table.tb th{font:600 11px/1 var(--rbc-font-ui);color:var(--rbc-text-secondary);text-align:left;height:32px;border-bottom:1px solid var(--rbc-border-subtle);letter-spacing:.3px}
+table.tb td{height:36px;border-bottom:1px solid var(--rbc-border-subtle);vertical-align:middle;color:var(--rbc-text-primary)}
+table.tb td.n,table.tb th.n{text-align:right;font-family:var(--rbc-font-mono);font-variant-numeric:tabular-nums}
+table.tb tr:hover td{background:var(--rbc-bg-surface)}
+table.tb .ev{color:var(--rbc-text-tertiary);font-size:11px;font-family:var(--rbc-font-mono)}
+
+/* ── 空态 / 加载态 ── */
+.empty{text-align:center;padding:48px 20px;color:var(--rbc-text-secondary)}
+.empty svg{margin-bottom:14px;color:var(--rbc-text-tertiary)}
+.empty .et{font:600 14px/1.4 var(--rbc-font-ui);color:var(--rbc-text-primary);margin-bottom:6px}
+.empty .es{font-size:12px;color:var(--rbc-text-secondary);margin-bottom:16px}
+/* 骨架 shimmer：单色低对比扫光（02b §B.3-8） */
+.skel{background:var(--rbc-bg-skeleton);border-radius:var(--rbc-radius-sm);position:relative;overflow:hidden}
+.skel::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,#26262E,transparent);background-size:200% 100%;animation:shimmer 1400ms var(--ease-linear) infinite}
+@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+.skel.line{height:12px;margin-bottom:10px}
+.skel.block{height:72px;border-radius:var(--rbc-radius-md);margin-bottom:12px}
+
+/* ── IOCTL 通道健康 ── */
+.panel{background:var(--rbc-bg-surface);border:1px solid var(--rbc-border-subtle);border-radius:var(--rbc-radius-md);overflow:hidden}
+.panel .ph{display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--rbc-border-subtle);flex-wrap:wrap}
+.panel .ph .pt{font:600 14px/1.4 var(--rbc-font-ui)}
+.panel .ph .ps{font-size:11px;color:var(--rbc-text-tertiary)}
+.legend{margin-left:auto;display:flex;gap:12px;font-size:11px;color:var(--rbc-text-secondary);flex-wrap:wrap}
+.legend i{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px;vertical-align:middle}
+.dotmatrix{display:grid;grid-template-columns:repeat(12,1fr);gap:6px;padding:14px 16px;border-bottom:1px solid var(--rbc-border-subtle)}
+.dotmatrix .cell{display:flex;flex-direction:column;align-items:center;gap:5px}
+.dotmatrix .cell .d{width:12px;height:12px;border-radius:50%}
+.dotmatrix .cell .l{font:400 10px/1 var(--rbc-font-mono);color:var(--rbc-text-tertiary)}
+.dotmatrix .cell .lb{font:400 10px/1 var(--rbc-font-ui);color:var(--rbc-text-tertiary);white-space:nowrap}
+.chrow{display:grid;grid-template-columns:14px 1.5fr 40px 66px 78px 1.1fr 96px;align-items:center;gap:10px;padding:8px 16px;border-bottom:1px solid var(--rbc-border-subtle);font-size:12px}
+.chrow:last-child{border-bottom:0}
+.chrow:hover{background:var(--rbc-bg-surface-hover)}
+.chrow .cdot{width:8px;height:8px;border-radius:50%}
+.chrow .cname{color:var(--rbc-text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chrow .cno{font-family:var(--rbc-font-mono);font-size:11px;color:var(--rbc-text-tertiary)}
+.chrow .clat{font-family:var(--rbc-font-mono);font-variant-numeric:tabular-nums;text-align:right;color:var(--rbc-text-secondary)}
+.chrow .ctime{font-family:var(--rbc-font-mono);font-size:11px;color:var(--rbc-text-tertiary)}
+.chrow .cstat{font-size:12px}
+.chrow .cstat.ok{color:var(--rbc-success-fg)} .chrow .cstat.warn{color:var(--rbc-warning-fg)}
+.chrow .cstat.bad{color:var(--rbc-danger-fg)} .chrow .cstat.mut{color:var(--rbc-neutral-fg)}
+/* 延迟迷你条 */
+.latbar{height:6px;border-radius:var(--rbc-radius-pill);background:var(--rbc-bg-input);overflow:hidden}
+.latbar i{display:block;height:100%;border-radius:inherit}
+.attrib{display:flex;gap:20px;padding:12px 16px;background:var(--rbc-bg-app);border-top:1px solid var(--rbc-border-subtle);font-size:12px;flex-wrap:wrap}
+.attrib b{font-family:var(--rbc-font-mono)}
+.chan-note{font-size:11px;color:var(--rbc-text-tertiary);padding:0 16px 14px;line-height:1.6}
+.chan-note code{font-family:var(--rbc-font-mono);color:var(--rbc-text-secondary)}
+
+/* ── 日志时间线 ── */
+.log{background:var(--rbc-bg-app);border:1px solid var(--rbc-border-subtle);border-radius:var(--rbc-radius-md);padding:12px 14px;font:400 12px/1.65 var(--rbc-font-mono);max-height:280px;overflow-y:auto}
+.log .ln{display:flex;gap:10px;white-space:nowrap}
+.log .ts{color:var(--rbc-text-tertiary)}
+.log .src{font-weight:600}
+.log .src.drv-i{color:var(--rbc-info-fg)} .log .src.drv-w{color:var(--rbc-warning-fg)}
+.log .src.drv-e{color:var(--rbc-danger-fg)} .log .src.ui-i{color:var(--rbc-success-fg)}
+.log .src.ui-w{color:var(--rbc-warning-fg)}
+.log .msg{color:var(--rbc-text-secondary);white-space:pre-wrap}
+
+/* ── 弹窗 ── */
+.mask{position:absolute;inset:0;background:var(--rbc-scrim);display:flex;align-items:center;justify-content:center;padding:24px;z-index:300;animation:fadein var(--dur-fast) var(--ease-out)}
+@keyframes fadein{from{opacity:0}to{opacity:1}}
+.modal{
+  width:560px;max-width:100%;background:var(--rbc-bg-elevated);border:1px solid var(--rbc-border-strong);
+  border-radius:var(--rbc-radius-lg);padding:20px;box-shadow:var(--rbc-shadow-floating);
+  animation:rise var(--dur-base) var(--ease-out);
+}
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.modal h3{font:600 16px/1.4 var(--rbc-font-display);margin-bottom:14px;display:flex;align-items:center;gap:10px}
+.modal .seg3{border-top:1px solid var(--rbc-border-subtle);padding-top:12px;margin-top:12px}
+.modal .seg3 .lab{font:600 12px/1 var(--rbc-font-ui);color:var(--rbc-text-secondary);margin-bottom:5px;letter-spacing:.3px}
+.modal .seg3 .txt{font-size:13px;color:var(--rbc-text-primary);line-height:1.6}
+.modal .row{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}
+.modal .row .note{margin-right:auto;font-size:11px;color:var(--rbc-text-tertiary);align-self:center}
+
+/* 向导全屏 */
+.wizard{position:absolute;inset:0;background:var(--rbc-scrim);display:flex;align-items:center;justify-content:center;z-index:350;padding:32px}
+.wizard .wp{width:720px;max-width:100%;background:var(--rbc-bg-elevated);border:1px solid var(--rbc-border-strong);border-radius:var(--rbc-radius-lg);box-shadow:var(--rbc-shadow-overlay);overflow:hidden;animation:rise var(--dur-base) var(--ease-out)}
+.wizard .wh{padding:18px 22px;border-bottom:1px solid var(--rbc-border-subtle);display:flex;align-items:center;gap:14px}
+.wizard .wh .wt{font:600 16px/1.3 var(--rbc-font-display)}
+.steps{display:flex;gap:8px;margin-left:auto}
+.steps .st{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--rbc-text-tertiary)}
+.steps .st .n{width:18px;height:18px;border-radius:50%;border:1px solid var(--rbc-border-strong);display:flex;align-items:center;justify-content:center;font-size:11px}
+.steps .st.on{color:var(--rbc-text-primary)} .steps .st.on .n{border-color:var(--rbc-accent);background:var(--rbc-accent);color:var(--rbc-text-on-accent);font-weight:600}
+.steps .st.done .n{background:var(--rbc-success-solid);border-color:var(--rbc-success-solid);color:#fff}
+.wizard .wb{padding:22px}
+.wizard .wf{padding:14px 22px;border-top:1px solid var(--rbc-border-subtle);display:flex;gap:10px;justify-content:flex-end;align-items:center}
+.wizard .wf .note{margin-right:auto;font-size:11px;color:var(--rbc-text-tertiary)}
+
+/* 模式二选一 */
+.pick{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.pick .opt{border:1px solid var(--rbc-border-default);border-radius:var(--rbc-radius-md);padding:16px;cursor:pointer;background:var(--rbc-bg-input);transition:border-color var(--dur-fast) var(--ease-standard),background var(--dur-fast) var(--ease-standard)}
+.pick .opt:hover{border-color:var(--rbc-border-strong)}
+.pick .opt.on{border-color:var(--rbc-accent);background:var(--rbc-accent-subtle)}
+.pick .opt .ot{font:600 14px/1.3 var(--rbc-font-ui);display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.pick .opt .od{font-size:12px;color:var(--rbc-text-secondary);line-height:1.6}
+.pick .opt .tag{font:600 10px/1 var(--rbc-font-ui);padding:2px 7px;border-radius:var(--rbc-radius-xs);border:1px solid}
+.pick .opt .tag.rec{color:var(--rbc-success-fg);border-color:var(--rbc-success-border);background:var(--rbc-success-bg)}
+.pick .opt .tag.adv{color:var(--rbc-text-secondary);border-color:var(--rbc-border-default);background:var(--rbc-bg-app)}
+
+/* 三步图 */
+.step3{display:flex;gap:12px;align-items:flex-start;background:var(--rbc-bg-surface);border:1px solid var(--rbc-border-subtle);border-radius:var(--rbc-radius-md);padding:14px 16px;margin-bottom:10px}
+.step3 .n{width:26px;height:26px;border-radius:50%;background:var(--rbc-accent);color:var(--rbc-text-on-accent);display:flex;align-items:center;justify-content:center;font:600 12px/1 var(--rbc-font-mono);flex:none}
+.step3 .txt{font-size:13px;color:var(--rbc-text-primary);line-height:1.6}
+.step3 .txt .mono{color:var(--rbc-accent);font-size:12px}
+.step3 .txt .sub{font-size:11px;color:var(--rbc-text-tertiary);margin-top:4px}
+
+/* 设置行 */
+.setrow{display:flex;align-items:center;gap:14px;padding:14px 16px;border-bottom:1px solid var(--rbc-border-subtle);background:var(--rbc-bg-surface)}
+.setrow:last-child{border-bottom:0}
+.setrow .sk{flex:1}
+.setrow .sk .t{font-size:13px;color:var(--rbc-text-primary)}
+.setrow .sk .d{font-size:11px;color:var(--rbc-text-tertiary);margin-top:3px}
+.setrow .sc{display:flex;align-items:center;gap:10px}
+
+/* Toast */
+.toast{position:absolute;right:20px;bottom:20px;background:var(--rbc-bg-elevated);border:1px solid var(--rbc-border-strong);border-radius:var(--rbc-radius-md);padding:12px 16px;font-size:13px;box-shadow:var(--rbc-shadow-floating);z-index:400;display:flex;align-items:center;gap:10px;max-width:360px;animation:toastIn var(--dur-base) var(--ease-out)}
+.toast.out{animation:toastOut var(--dur-fast) var(--ease-in) forwards}
+@keyframes toastIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes toastOut{from{opacity:1;transform:none}to{opacity:0;transform:translateY(8px)}}
+.toast .dot{width:8px;height:8px;border-radius:50%;flex:none}
+
+.flowchart{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--rbc-text-secondary);padding:12px 0}
+.flowchart .fn{border:1px solid var(--rbc-border-default);border-radius:var(--rbc-radius-pill);padding:5px 12px;background:var(--rbc-bg-input)}
+.flowchart .fn.red{border-color:var(--rbc-danger-border);color:var(--rbc-danger-fg)}
+.flowchart .fn.amber{border-color:var(--rbc-warning-border);color:var(--rbc-warning-fg)}
+.flowchart .fn.blue{border-color:var(--rbc-info-border);color:var(--rbc-info-fg)}
+.flowchart .fn.green{border-color:var(--rbc-success-border);color:var(--rbc-success-fg)}
+.flowchart .fa{color:var(--rbc-text-tertiary)}
+.collapse{background:var(--rbc-bg-surface);border:1px solid var(--rbc-border-subtle);border-radius:var(--rbc-radius-md);overflow:hidden}
+.collapse .ch{padding:12px 16px;cursor:pointer;display:flex;align-items:center;gap:8px;font:600 13px/1.4 var(--rbc-font-ui);color:var(--rbc-text-secondary)}
+.collapse .ch:hover{color:var(--rbc-text-primary)}
+.collapse .cb{padding:0 16px 14px}
+.hide{display:none}
+
+/* ── 图表容器 ── */
+.chart{margin-top:10px}
+.chart svg{display:block;width:100%}
+.chart .legendrow{display:flex;gap:16px;font-size:11px;color:var(--rbc-text-secondary);margin-top:8px;flex-wrap:wrap}
+.chart .legendrow i{width:10px;height:3px;border-radius:2px;display:inline-block;margin-right:6px;vertical-align:middle}
+.chart .cap{font-size:11px;color:var(--rbc-text-tertiary);margin-top:8px}
+/* 图表一次性描边入场（480ms · 仅首次） */
+.draw{animation:draw var(--dur-slower) var(--ease-out) both}
+@keyframes draw{from{stroke-dashoffset:var(--len)}to{stroke-dashoffset:0}}
+/* 面积图淡入 */
+.areaIn{animation:areaIn var(--dur-slower) var(--ease-out) both}
+@keyframes areaIn{from{opacity:0}to{opacity:1}}
+
+/* ═══════════ reduced-motion 全量降级（02b §B.5 · NH-5） ═══════════ */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{
+    animation-duration:.01ms !important;
+    animation-iteration-count:1 !important;
+    transition-duration:.01ms !important;
+    scroll-behavior:auto !important;
+  }
+  .page-enter{animation:none !important;transform:none !important;opacity:1 !important}
+  .dcard.hov:hover,.vcard.hov:hover{transform:none !important}
+  .btn:active{transform:none !important}
+  .badge.healing .dot,.statusbar .reconnect .dot,.sw.busy::after{animation:none !important;opacity:1 !important}
+  .skel::after{animation:none !important;background:none !important}
+  .prog.indet .fill{animation:none !important;transform:scaleX(.4) !important}
+  .draw,.areaIn{animation:none !important;stroke-dashoffset:0 !important;opacity:1 !important}
+}
+</style>
+</head>
+<body>
+
+<!-- ══════════ WPF 桌面窗口（1180×760）══════════ -->
+<div class="win" id="win">
+
+  <!-- 标题栏 -->
+  <div class="titlebar">
+    <svg class="ico" viewBox="0 0 16 16" fill="none"><rect x="1" y="2" width="14" height="5" rx="1.2" fill="#4CC2FF"/><rect x="1" y="9" width="14" height="5" rx="1.2" fill="#1F8F63"/><rect x="3.2" y="3.6" width="2" height="1.8" rx=".4" fill="#06222E"/><rect x="3.2" y="10.6" width="2" height="1.8" rx=".4" fill="#06222E"/></svg>
+    <span class="ttl">RAMBlockCache <b>控制台</b></span>
+    <div class="wctrl">
+      <span title="最小化"><svg width="11" height="11" viewBox="0 0 11 11"><line x1="1.5" y1="5.5" x2="9.5" y2="5.5" stroke="currentColor" stroke-width="1"/></svg></span>
+      <span title="最大化"><svg width="11" height="11" viewBox="0 0 11 11"><rect x="1.5" y="1.5" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1"/></svg></span>
+      <span class="close" title="关闭"><svg width="11" height="11" viewBox="0 0 11 11"><line x1="2" y1="2" x2="9" y2="9" stroke="currentColor" stroke-width="1.1"/><line x1="9" y1="2" x2="2" y2="9" stroke="currentColor" stroke-width="1.1"/></svg></span>
+    </div>
+  </div>
+
+  <!-- 顶部常驻四段状态条 -->
+  <div class="statusbar" id="statusbar"></div>
+
+  <!-- 主体 -->
+  <div class="main">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="nm">
+          <svg width="18" height="18" viewBox="0 0 16 16" fill="none"><rect x="1" y="2" width="14" height="5" rx="1.2" fill="#4CC2FF"/><rect x="1" y="9" width="14" height="5" rx="1.2" fill="#1F8F63"/></svg>
+          RAMBlockCache
+        </div>
+        <div class="ver" id="verline">V10.4.3 Build 19（10.3.4.19）</div>
+      </div>
+      <nav class="nav" id="nav"></nav>
+      <div class="side-foot">
+        <div class="lbl">演示 · 切换用户态（15 种）</div>
+        <div class="demo-grid" id="demo"></div>
+      </div>
+    </aside>
+    <div class="content" id="content"></div>
+  </div>
+
+  <div id="layer"></div>
+</div>
+
+<script>
+/* ════════════════════════════════════════════════════════════
+   工具
+   ════════════════════════════════════════════════════════════ */
+function reducedMotion(){ return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); }
+function nowStr(){ var d=new Date(); function p(n){return (n<10?'0':'')+n;} return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds()); }
+/* 确定性伪随机序列（保证每次渲染一致） */
+function mkSeries(n,start,end,noise,seed){
+  var out=[], s=seed||7;
+  function rnd(){ s=(s*9301+49297)%233280; return s/233280; }
+  for(var i=0;i<n;i++){ var t=i/(n-1); out.push(start+(end-start)*t+(rnd()-0.5)*noise); }
+  return out;
+}
+function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+
+/* ════════════════════════════════════════════════════════════
+   单一状态对象（对齐 02-design-system §C 单一映射表 / 需求 RB.2）
+   所有页面 / 图表均从此对象派生，禁止各页面自行拼装状态
+   ════════════════════════════════════════════════════════════ */
+var S = {
+  installed:true,          // 控制设备是否可打开
+  connErr:null,            // null | 'access'(5) | 'notfound'(2/3)
+  protocolOk:true,         // GET_VERSION 协议号是否匹配（硬校验）
+  drvProto:9, uiProto:9,   // MF-1：协议不匹配一律「驱动 8 / 控制台 9」
+  loading:false,           // NH-1：加载态
+  volumes:[                // GET_VOLUMES 结果
+    {letter:'D:',label:'数据盘',cap:'1.0 TB',sys:false,bound:true},
+    {letter:'F:',label:'游戏盘',cap:'2.0 TB',sys:false,bound:true},
+    {letter:'C:',label:'系统盘',cap:'476 GB',sys:true, bound:true}
+  ],
+  attached:{'D:':true,'F:':true,'C:':false},   // ATTACH_VOLUME 状态
+  mode:{'D:':0,'F:':1,'C:':0},                 // 0 直写 / 1 回写 / 2 跟随全局
+  safeMode:false,          // RB_STATS.SafeMode
+  panic:false,             // RB_STATS.PanicActive
+  settling:false,          // 熔断·自愈中（PANIC_CLEAR 返回 0xC00000A3）
+  statsOk:true,            // GET_STATS 采样是否可用
+  flushFail:false,         // MF-2：FLUSH 失败态（0xC0000001）
+  attaching:false,         // MF-4：attach 退避重试中
+  retrying:false,          // 轮询退避重连中
+  pollFail:0,
+  // 统计（单一事实源：首页大数字 = 各图表数据）
+  hit:74.2,                // %
+  savedGB:31.4,
+  cacheUsed:3.2, cacheCap:8.0,
+  dirty:620, lost:0,       // MB
+  readMBs:418, writeMBs:176,
+  rmwReads:1284, trimCount:3006, pressure:2, pressureMax:5,
+  evictGB:11.0, writebackGB:72.0,
+  memReserve:4096, wbInterval:60,
+  // 序列（图表数据源）
+  hitSeries:  mkSeries(60,58,74.2,5,7),
+  readSeries: mkSeries(60,300,418,60,3),
+  writeSeries:mkSeries(60,120,176,42,11),
+  savedSeries:mkSeries(30,24,31.4,.5,5),
+  cacheSeries:mkSeries(30,2.4,3.2,.28,9),
+  shards:(function(){ var a=mkSeries(64,30,80,40,17); return a; })(),
+  verify:null,             // {letter, phase:'running'|'done', hit}
+  // 联调通道健康：12 条消息
+  ch:[
+    {n:1, name:'读取统计',      en:'GET_STATS',      st:'ok',  lat:'0.8 ms', t:'刚刚',     err:''},
+    {n:2, name:'设置配置',      en:'SET_CONFIG',     st:'mut', lat:'—',      t:'未调用',   err:''},
+    {n:3, name:'立即回写',      en:'FLUSH',          st:'mut', lat:'—',      t:'未调用',   err:''},
+    {n:4, name:'读回配置',      en:'GET_CONFIG',     st:'ok',  lat:'0.6 ms', t:'启动时',   err:''},
+    {n:5, name:'退出安全模式',  en:'EXIT_SAFE_MODE', st:'mut', lat:'—',      t:'未调用',   err:''},
+    {n:6, name:'设置卷参数',    en:'SET_VOLUME',     st:'mut', lat:'—',      t:'未调用',   err:''},
+    {n:7, name:'枚举卷',        en:'GET_VOLUMES',    st:'ok',  lat:'1.1 ms', t:'刚刚',     err:''},
+    {n:8, name:'挂载/卸载',     en:'ATTACH_VOLUME',  st:'mut', lat:'—',      t:'未调用',   err:''},
+    {n:9, name:'读取日志',      en:'GET_LOG',        st:'ok',  lat:'2.4 ms', t:'进页时',   err:''},
+    {n:10,name:'读取版本',      en:'GET_VERSION',    st:'ok',  lat:'0.5 ms', t:'启动握手', err:''},
+    {n:11,name:'一键熔断',      en:'PANIC',          st:'mut', lat:'—',      t:'未调用',   err:''},
+    {n:12,name:'解除熔断',      en:'PANIC_CLEAR',    st:'mut', lat:'—',      t:'未调用',   err:''}
+  ],
+  chNote:'最近 60 秒窗口内采样'
+};
+/* 数据一致性：把各序列末点钉到共享统计值，保证「首页大数字 = 图表末点」 */
+S.hitSeries[S.hitSeries.length-1]     = S.hit;
+S.readSeries[S.readSeries.length-1]   = S.readMBs;
+S.writeSeries[S.writeSeries.length-1] = S.writeMBs;
+S.savedSeries[S.savedSeries.length-1] = S.savedGB;
+S.cacheSeries[S.cacheSeries.length-1] = S.cacheUsed;
+
+/* ── 六态唯一判定函数（对齐 design-system §C.1 / 需求 RB.1）── */
+function userState(){
+  if(!S.installed) return 'notinstalled';
+  if(!S.protocolOk) return 'protocol';
+  if(S.panic) return S.settling ? 'panic-heal' : 'panic';
+  if(S.safeMode) return 'safemode';
+  var anyBound = S.volumes.some(function(v){return v.bound;});
+  if(!anyBound) return 'bound';
+  var anyAttached = S.volumes.some(function(v){return S.attached[v.letter];});
+  if(!anyAttached) return 'ready';
+  var attachedVols = S.volumes.filter(function(v){return S.attached[v.letter];});
+  if(attachedVols.some(function(v){return S.mode[v.letter]===1;})) return 'accel-back';
+  return 'accel-through';
+}
+/* 状态 → 文案/色/主行动/禁止动作（白名单，禁止临时文案）*/
+var STATE = {
+  'notinstalled':{t:'未安装',        c:'gray', one:'未检测到 RAMBlockCache 驱动',            act:'运行安装向导'},
+  'bound':       {t:'已安装未挂栈',  c:'blue', one:'驱动已就绪，尚未挂到任何卷',              act:'运行首次向导'},
+  'ready':       {t:'就绪未加速',    c:'blue', one:'已挂栈，未开启加速',                     act:'开启加速'},
+  'accel-through':{t:'加速中 · 直写',c:'green',one:'正在加速（直写，最安全）',                act:'查看收益'},
+  'accel-back':  {t:'加速中 · 回写', c:'green',one:'正在加速（回写，异常退出可能丢未落盘数据）',act:'查看收益'},
+  'safemode':    {t:'降级 · 安全模式',c:'amber',one:'上次未正常退出，已强制直写保护数据',      act:'确认数据无误'},
+  'panic':       {t:'熔断 · 全局透传',c:'red',  one:'熔断中：所有读写直接到盘，缓存暂停（数据最安全，速度最慢）',act:'解除熔断'},
+  'panic-heal':  {t:'熔断 · 自愈中', c:'red',  one:'正在把未落盘数据写完（自愈中），暂不可解除',act:'等待自愈完成'},
+  'protocol':    {t:'版本不匹配',    c:'red',  one:'驱动版本与控制台不匹配，已禁用写操作',      act:'重新安装同一发布包'}
+};
+/* 每卷用户态（卷级）*/
+function volState(v){
+  if(S.panic) return {t:'熔断 · 透传', c:'red', txt:'缓存暂停，读写直达磁盘'};
+  if(!v.bound) return {t:'未挂栈', c:'gray', txt:'该卷未挂到缓存驱动'};
+  if(!S.attached[v.letter]) return {t:'就绪未加速', c:'blue', txt:'已挂栈，未开启加速'};
+  if(S.mode[v.letter]===1) return {t:'加速中 · 回写', c:'green', txt:'回写（异常退出可能丢未落盘数据）', corner:true};
+  if(S.safeMode) return {t:'加速中 · 直写（安全模式）', c:'amber', txt:'安全模式已强制直写'};
+  return {t:'加速中 · 直写', c:'green', txt:'直写（最安全）'};
+}
+function modeLabel(m){
+  if(m===1) return '回写（更快 · 异常退出可能丢未落盘数据）';
+  if(m===2) return '跟随全局设置';
+  return '直写（推荐 · 最安全）';
+}
+function modeShort(m){ return m===1?'回写':(m===2?'跟随全局':'直写'); }
+function badge(t,c,extra){ return '<span class="badge bd-'+c+(extra?' '+extra:'')+'"><span class="dot"></span>'+t+'</span>'; }
+/* 写模式下拉（内联 SVG 箭头，零外部资源） */
+var SELCARET='<svg class="selcaret" width="12" height="12" viewBox="0 0 12 12"><path d="M2.5 4.5L6 8l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+function writeSel(letter,disabled){
+  return '<span class="selwrap">'+SELCARET+'<select class="sel" onchange="setMode(\''+letter+'\',this.value)"'+(disabled?' disabled':'')+'>'+
+    '<option value="0"'+(S.mode[letter]===0?' selected':'')+'>直写（推荐 · 最安全）</option>'+
+    '<option value="1"'+(S.mode[letter]===1?' selected':'')+'>回写（更快 · 异常退出可能丢未落盘数据）</option>'+
+    '<option value="2"'+(S.mode[letter]===2?' selected':'')+'>跟随全局设置</option></select></span>';
+}
+
+/* ════════════ 状态条（四段）════════════ */
+function segs(){
+  var out=[];
+  // 驱动段
+  if(S.loading){
+    out.push({nm:'驱动', val:'正在读取…', c:'mut', go:'diag'});
+  }else if(!S.installed){
+    var code = S.connErr==='access' ? '5' : (S.connErr==='notfound'?'2':'—');
+    out.push({nm:'驱动', val:'未连接（错误 '+code+'）', c:'bad', go:'diag', why:'控制设备打开失败'});
+  }else if(!S.protocolOk){
+    out.push({nm:'驱动', val:'版本不匹配', c:'bad', go:'diag', why:'协议号 ≠ 控制台期望'});
+  }else if(S.retrying){
+    out.push({nm:'驱动', val:'正在重连…', c:'warn', go:'diag', why:'轮询退避重连中'});
+  }else{
+    out.push({nm:'驱动', val:'已连接 v10.3.4.19', c:'ok', go:'diag'});
+  }
+  // 挂栈段
+  var boundN = S.volumes.filter(function(v){return v.bound;}).length;
+  out.push(boundN>0 ? {nm:'挂栈', val:'已挂 '+boundN+' 卷', c:'ok', go:'boost'}
+                    : {nm:'挂栈', val:'未挂栈', c:'bad', go:'boost', why:'尚无卷挂到驱动'});
+  // 加速段
+  var st = userState();
+  var accC = (st==='accel-through'||st==='accel-back') ? 'ok'
+           : (st==='safemode'?'warn':(st==='panic'||st==='panic-heal'||st==='protocol'?'bad':'mut'));
+  var accV = (st==='accel-through')?'正常加速中'
+           : (st==='accel-back')?'正常加速中（含回写卷）'
+           : (st==='safemode')?'安全模式'
+           : (st==='panic'||st==='panic-heal')?'熔断中'
+           : (st==='protocol')?'已禁用'
+           : (st==='notinstalled')?'未安装' : '就绪未加速';
+  out.push({nm:'加速', val:accV, c:accC, go:'state'});
+  // 风险段
+  var r;
+  if(st==='panic'||st==='panic-heal') r={nm:'风险',val:'熔断中',c:'bad',go:'rescue'};
+  else if(S.lost>0) r={nm:'风险',val:'已确认丢失 '+S.lost+' MB',c:'warn',go:'rescue'};
+  else if(S.safeMode) r={nm:'风险',val:'安全模式（上次异常退出）',c:'warn',go:'rescue'};
+  else if(S.dirty>0 && S.dirty>200) r={nm:'风险',val:'未落盘 '+S.dirty+' MB',c:'warn',go:'rescue'};
+  else r={nm:'风险',val:'无',c:'ok',go:'rescue'};
+  out.push(r);
+  return out;
+}
+function renderStatus(){
+  var h = segs().map(function(s){
+    var click = (s.c!=='ok');
+    return '<button class="seg '+s.c+(click?' click':'')+'" '+(click?'onclick="go(\''+s.go+'\')" title="'+(s.why||('跳转到 '+s.nm+' 处置'))+'"':'disabled style="cursor:default"')+'>'+
+      '<span class="dot"></span><span class="nm">'+s.nm+'</span><b>'+s.val+'</b></button>';
+  }).join('');
+  if(S.retrying) h += '<div class="reconnect"><span class="dot"></span>正在重连…（第 '+S.pollFail+' 次失败，已退避，上限 10s）</div>';
+  document.getElementById('statusbar').innerHTML = h;
+}
+
+/* ════════════ 导航（自解释：图标 + 标签 + 一行说明）════════════ */
+var ICON = {
+  state:'<svg class="nvico" viewBox="0 0 18 18" fill="none"><circle cx="9" cy="9" r="6.2" stroke="currentColor" stroke-width="1.4"/><path d="M9 9l3-2.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M9 2.8v1.2M9 14v1.2M2.8 9h1.2M14 9h1.2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>',
+  boost:'<svg class="nvico" viewBox="0 0 18 18" fill="none"><path d="M9.6 2L4 10h3.6L6.4 16 12.8 8H9.2z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>',
+  gain:'<svg class="nvico" viewBox="0 0 18 18" fill="none"><path d="M2.5 12.5l3.8-3.8 2.7 2.7L15 5.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M11.6 5.6H15V9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  diag:'<svg class="nvico" viewBox="0 0 18 18" fill="none"><circle cx="8" cy="8" r="4.6" stroke="currentColor" stroke-width="1.4"/><path d="M11.4 11.4L15.4 15.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
+  rescue:'<svg class="nvico" viewBox="0 0 18 18" fill="none"><path d="M9 2l5.6 2.2v4.3c0 3.2-2.4 5.8-5.6 7-3.2-1.2-5.6-3.8-5.6-7V4.2z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M9 6.4v3.2M9 12.2h.01" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
+  settings:'<svg class="nvico" viewBox="0 0 18 18" fill="none"><circle cx="9" cy="9" r="2.4" stroke="currentColor" stroke-width="1.4"/><path d="M9 2v2.1M9 13.9V16M2 9h2.1M13.9 9H16M4.1 4.1l1.5 1.5M12.4 12.4l1.5 1.5M13.9 4.1l-1.5 1.5M5.6 12.4l-1.5 1.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>'
+};
+var PAGES=[
+  ['状态','state',   'state',   '一眼看清是否在加速、安不安全'],
+  ['加速','boost',   'boost',   '逐卷开启 / 停止加速，选写模式'],
+  ['收益','gain',    'gain',    '看见省下的磁盘读与命中率'],
+  ['诊断','diag',    'diag',    '出问题时自助定位与取证'],
+  ['应急','rescue',  'rescue',  '危险与故障时的唯一去处'],
+  ['设置','settings','settings','全局参数与生命周期']
+];
+var cur='state';
+function renderNav(){
+  var st=userState();
+  function dot(p){
+    if(p[1]==='rescue' && (st==='panic'||st==='panic-heal'||S.lost>0)) return '<span class="ndot alert"></span>';
+    if(p[1]==='diag' && (!S.installed||!S.protocolOk)) return '<span class="ndot alert"></span>';
+    if(p[1]==='state' && (st==='safemode')) return '<span class="ndot warn"></span>';
+    return '<span class="ndot"></span>';
+  }
+  var h='<div class="sec">任务</div>'+PAGES.map(function(p){
+    return '<button class="nv '+(cur===p[1]?'on':'')+'" onclick="go(\''+p[1]+'\')" title="'+p[3]+'">'+
+      ICON[p[2]]+'<span class="nvtxt"><span class="nvl">'+p[0]+'</span><span class="nvd">'+p[3]+'</span></span>'+dot(p)+'</button>';
+  }).join('');
+  h+='<div class="sec">引导</div><button class="nv" onclick="openWizard()" title="一次性把挂栈、卷选择、写模式讲清楚">'+
+     '<svg class="nvico" viewBox="0 0 18 18" fill="none"><path d="M9 2.5l1.9 3.9 4.3.6-3.1 3 .7 4.3L9 12.3 5.2 14.3l.7-4.3-3.1-3 4.3-.6z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>'+
+     '<span class="nvtxt"><span class="nvl">首次配置向导</span><span class="nvd">3 步完成安装与首次加速</span></span><span class="ndot"></span></button>';
+  document.getElementById('nav').innerHTML=h;
+}
+/* 演示面板（15 种） */
+var DEMOS=[['正常加速','normal'],['未安装','notinstalled'],['已挂栈','bound'],['就绪未加速','ready'],
+           ['直写','through'],['回写','back'],['安全模式','safemode'],['熔断','panic'],['自愈中','heal'],
+           ['统计不可用','statsfail'],['协议不匹配','protocol'],['回写失败','flushfail'],['权限不足','access'],
+           ['挂载重试中','attaching'],['加载中','loading']];
+var demoCur='normal';
+function renderDemo(){
+  document.getElementById('demo').innerHTML = DEMOS.map(function(d){
+    return '<button class="'+(demoCur===d[1]?'on':'')+'" onclick="setDemo(\''+d[1]+'\')">'+d[0]+'</button>';
+  }).join('');
+}
+
+/* ════════════ 通用小组件 ════════════ */
+function alertCard(sev, title, reason, action, meta, extra){
+  return '<div class="alert '+sev+'"><div class="at">'+title+'</div>'+
+    '<div class="ar">'+reason+'</div>'+
+    (action?'<div class="aa">'+action+'</div>':'')+
+    (meta?'<div class="meta">'+meta+'</div>':'')+
+    (extra||'')+'</div>';
+}
+function emptyState(title,sub,btn){ return '<div class="empty">'+
+  '<svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="6" rx="1.5" stroke="currentColor" stroke-width="1.4"/><rect x="3" y="14" width="18" height="6" rx="1.5" stroke="currentColor" stroke-width="1.4" stroke-dasharray="3 3"/></svg>'+
+  '<div class="et">'+title+'</div><div class="es">'+sub+'</div>'+btn+'</div>'; }
+function skeletonCards(){ return '<div class="grid3">'+Array(3).fill('<div class="dcard"><div class="skel line" style="width:60px"></div><div class="skel line" style="width:120px;height:28px;margin-top:14px"></div><div class="skel line" style="width:90px;margin-top:14px"></div><div class="skel line" style="width:100%;height:26px;margin-top:12px"></div></div>').join('')+'</div>'; }
+function skeletonPanel(){ return '<div class="panel"><div style="padding:16px"><div class="skel line" style="width:180px"></div><div class="skel block"></div><div class="skel block"></div></div></div>'; }
+function pageHead(title, what, act){
+  return '<div class="page-head"><div style="flex:1"><h1>'+title+'</h1>'+
+    '<div class="sub"><svg width="13" height="13" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.4" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2v3.4M8 5.3h.01" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>这页是干什么的：'+what+'</div></div>'+
+    (act?'<div class="headact">'+act+'</div>':'')+'</div>';
+}
+
+/* ════════════════════════════════════════════════════════════
+   图表（7 类 · 全部内联 SVG · 数据来自单一状态对象 S）
+   ════════════════════════════════════════════════════════════ */
+
+/* 迷你图 Sparkline（02b §A.3）：28px 高、1.5px 线、末端 3px 圆点、无轴无填充 */
+function sparkSVG(data, color){
+  var W=120,H=28,pad=3, n=data.length;
+  var min=Math.min.apply(null,data), max=Math.max.apply(null,data), rng=(max-min)||1;
+  function X(i){return pad+(W-2*pad)*i/(n-1);}
+  function Y(v){return H-pad-(H-2*pad)*((v-min)/rng);}
+  var d=data.map(function(v,i){return (i?'L':'M')+X(i).toFixed(1)+' '+Y(v).toFixed(1);}).join(' ');
+  var lx=X(n-1), ly=Y(data[n-1]);
+  return '<svg class="spark" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none"><path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="'+lx.toFixed(1)+'" cy="'+ly.toFixed(1)+'" r="3" fill="'+color+'"/></svg>';
+}
+
+/* #1 读命中率趋势（折线 + 单色低透明度面积 · 60 采样点 · 支持断线 gap） */
+function trendChart(series, opt){
+  opt=opt||{};
+  var W=520,H=170,padL=30,padR=14,padT=12,padB=24;
+  var n=series.length;
+  function X(i){return padL+(W-padL-padR)*i/(n-1);}
+  function Y(v){return H-padB-(H-padT-padB)*(v/100);}
+  var g='';
+  [0,50,100].forEach(function(v){
+    g+='<line x1="'+padL+'" y1="'+Y(v).toFixed(1)+'" x2="'+(W-padR)+'" y2="'+Y(v).toFixed(1)+'" stroke="var(--chart-grid)" stroke-width="1"/>'+
+       '<text x="2" y="'+(Y(v)+4).toFixed(1)+'" fill="var(--chart-axis-text)" font-size="10" font-family="var(--rbc-font-mono)">'+v+'%</text>';
+  });
+  // 分段（支持 null 断点）
+  var segsArr=[], curSeg=[];
+  series.forEach(function(v,i){ if(v===null){ if(curSeg.length){segsArr.push(curSeg);curSeg=[];} } else curSeg.push([i,v]); });
+  if(curSeg.length) segsArr.push(curSeg);
+  var lineD='', areaD='';
+  segsArr.forEach(function(seg){
+    lineD += seg.map(function(p,i){return (i?'L':'M')+X(p[0]).toFixed(1)+' '+Y(p[1]).toFixed(1);}).join(' ')+' ';
+  });
+  if(segsArr.length){
+    var first=segsArr[0], last=segsArr[segsArr.length-1];
+    areaD = lineD+' L '+X(last[last.length-1][0]).toFixed(1)+' '+(H-padB)+' L '+X(first[0][0]).toFixed(1)+' '+(H-padB)+' Z';
+  }
+  var lastV = series[n-1];
+  var endLabel = (lastV!=null) ? '<text x="'+(W-padR)+'" y="'+(Y(lastV)-8).toFixed(1)+'" fill="var(--chart-1)" font-size="11" font-family="var(--rbc-font-mono)" text-anchor="end">'+lastV.toFixed(1)+'%</text>' : '';
+  var axis='<text x="'+padL+'" y="'+(H-6)+'" fill="var(--chart-axis-text)" font-size="10" font-family="var(--rbc-font-ui)">5 分钟前</text>'+
+           '<text x="'+(W-padR)+'" y="'+(H-6)+'" fill="var(--chart-axis-text)" font-size="10" font-family="var(--rbc-font-ui)" text-anchor="end">现在</text>';
+  var areaCls = opt.animate ? 'areaIn' : '';
+  var lineCls = opt.animate ? 'draw' : '';
+  var lenAttr = opt.animate ? ' style="--len:1400"' : '';
+  return '<div class="chart"><svg viewBox="0 0 '+W+' '+H+'">'+g+
+    '<path class="'+areaCls+'" d="'+areaD+'" fill="var(--chart-area-fill)" stroke="none"/>'+
+    '<path class="'+lineCls+'" d="'+lineD+'" fill="none" stroke="var(--chart-1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1400" stroke-dashoffset="'+(opt.animate?'1400':'0')+'"'+lenAttr+'/>'+
+    endLabel+axis+'</svg></div>';
+}
+
+/* #2 缓存占用环形（中心大数字） */
+function ringChart(used, cap, opt){
+  var R=54,C=2*Math.PI*R, pct=clamp(used/cap,0,1), off=C*(1-pct);
+  var over = used>cap;
+  var col = over ? 'var(--chart-warn)' : 'var(--chart-1)';
+  return '<div class="chart"><svg viewBox="0 0 160 160" style="width:160px;height:160px;margin:6px auto 0">'+
+    '<circle cx="80" cy="80" r="'+R+'" fill="none" stroke="var(--chart-track)" stroke-width="10"/>'+
+    '<circle class="'+((opt&&opt.animate)?'areaIn':'')+'" cx="80" cy="80" r="'+R+'" fill="none" stroke="'+col+'" stroke-width="10" stroke-linecap="round" stroke-dasharray="'+C.toFixed(1)+'" stroke-dashoffset="'+off.toFixed(1)+'" transform="rotate(-90 80 80)"/>'+
+    '<text x="80" y="76" text-anchor="middle" fill="var(--rbc-text-primary)" font-size="22" font-weight="600" font-family="var(--rbc-font-mono)">'+used.toFixed(1)+'</text>'+
+    '<text x="80" y="92" text-anchor="middle" fill="var(--rbc-text-tertiary)" font-size="11" font-family="var(--rbc-font-mono)">GB / '+cap.toFixed(1)+' GB</text>'+
+    (over?'<text x="80" y="112" text-anchor="middle" fill="var(--chart-warn)" font-size="11" font-family="var(--rbc-font-ui)">已超限</text>':'')+
+    '</svg></div>';
+}
+
+/* #3 读写吞吐（双序列对比 · 数据系两色） */
+function throughputChart(readS, writeS, opt){
+  var W=520,H=150,padL=40,padR=14,padT=12,padB=24, n=readS.length;
+  var max=Math.max(Math.max.apply(null,readS),Math.max.apply(null,writeS))*1.15;
+  function X(i){return padL+(W-padL-padR)*i/(n-1);}
+  function Y(v){return H-padB-(H-padT-padB)*(v/max);}
+  function path(a){ return a.map(function(v,i){return (i?'L':'M')+X(i).toFixed(1)+' '+Y(v).toFixed(1);}).join(' '); }
+  var g='';
+  [0,0.5,1].forEach(function(f){
+    var v=max*f;
+    g+='<line x1="'+padL+'" y1="'+Y(v).toFixed(1)+'" x2="'+(W-padR)+'" y2="'+Y(v).toFixed(1)+'" stroke="var(--chart-grid)" stroke-width="1"/>'+
+       '<text x="2" y="'+(Y(v)+4).toFixed(1)+'" fill="var(--chart-axis-text)" font-size="10" font-family="var(--rbc-font-mono)">'+Math.round(v)+'</text>';
+  });
+  var cls=opt&&opt.animate?'draw':'';
+  var off=opt&&opt.animate?'1400':'0';
+  return '<div class="chart"><svg viewBox="0 0 '+W+' '+H+'">'+g+
+    '<path class="'+cls+'" d="'+path(readS)+'" fill="none" stroke="var(--chart-1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1400" stroke-dashoffset="'+off+'"/>'+
+    '<path class="'+cls+'" d="'+path(writeS)+'" fill="none" stroke="var(--chart-2)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1400" stroke-dashoffset="'+off+'"/>'+
+    '<text x="'+(W-padR)+'" y="'+(H-6)+'" fill="var(--chart-axis-text)" font-size="10" font-family="var(--rbc-font-ui)" text-anchor="end">现在</text>'+
+    '</svg>'+
+    '<div class="legendrow"><span><i style="background:var(--chart-1)"></i>读吞吐 MB/s</span><span><i style="background:var(--chart-2)"></i>写吞吐 MB/s</span><span style="color:var(--rbc-text-tertiary)">纵轴单位 MB/s</span></div></div>';
+}
+
+/* #4 64 分片吞吐（迷你热力条 · 3 档色阶） */
+function shardHeat(shards, opt){
+  var W=384,H=24, cw=4, gap=2, max=Math.max.apply(null,shards);
+  var cells='';
+  shards.forEach(function(v,i){
+    var r=v/max, col = r>0.66?'var(--chart-heat-3)':(r>0.33?'var(--chart-heat-2)':'var(--chart-heat-1)');
+    cells+='<rect x="'+(i*(cw+gap))+'" y="0" width="'+cw+'" height="'+H+'" rx="1" fill="'+col+'"/>';
+  });
+  return '<div class="chart"><svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" style="height:24px">'+cells+'</svg>'+
+    '<div class="legendrow"><span><i style="background:var(--chart-heat-1)"></i>低</span><span><i style="background:var(--chart-heat-2)"></i>中</span><span><i style="background:var(--chart-heat-3)"></i>高</span><span style="color:var(--rbc-text-tertiary)">64 分片归一化到当期最大值</span></div></div>';
+}
+
+/* #5 未落盘数据（堆叠水平条：未落盘 / 已确认丢失） */
+function dirtyStack(dirty, lost, capMB){
+  var total=dirty+lost;
+  if(total<=0) return '<div class="chart"><div class="latbar" style="height:10px"><i style="width:100%;background:var(--chart-track)"></i></div><div class="cap">无未落盘数据（显示「—」，不画 0 长度条）</div></div>';
+  var dw=clamp(dirty/capMB*100,0,100), lw=clamp(lost/capMB*100,0,100-dw);
+  return '<div class="chart"><div style="display:flex;height:10px;border-radius:999px;overflow:hidden;background:var(--chart-track)">'+
+    (dirty>0?'<i style="width:'+dw.toFixed(1)+'%;background:var(--chart-warn);display:block"></i>':'')+
+    (lost>0?'<i style="width:'+lw.toFixed(1)+'%;background:var(--chart-danger);display:block"></i>':'')+
+    '</div>'+
+    '<div class="legendrow"><span><i style="background:var(--chart-warn)"></i>未落盘 '+dirty+' MB</span>'+
+    (lost>0?'<span><i style="background:var(--chart-danger)"></i>已确认丢失 '+lost+' MB</span>':'')+
+    '<span style="color:var(--rbc-text-tertiary)">相对缓存上限 '+ (capMB/1024).toFixed(1) +' GB</span></div></div>';
+}
+
+/* #7 写模式构成（分段水平条：直写 / 回写 卷数） */
+function writeModeBar(){
+  var bound=S.volumes.filter(function(v){return v.bound && S.attached[v.letter];});
+  if(!bound.length) return '<div class="chart"><div class="latbar" style="height:10px"><i style="width:100%;background:var(--chart-track)"></i></div><div class="cap">尚未加速任何卷</div></div>';
+  var through=bound.filter(function(v){return S.mode[v.letter]!==1;}).length;
+  var back=bound.filter(function(v){return S.mode[v.letter]===1;}).length;
+  var total=bound.length, tw=through/total*100, bw=back/total*100;
+  return '<div class="chart"><div style="display:flex;height:10px;border-radius:999px;overflow:hidden;background:var(--chart-track)">'+
+    (through>0?'<i style="width:'+tw.toFixed(1)+'%;background:var(--chart-ok);display:block"></i>':'')+
+    (back>0?'<i style="width:'+bw.toFixed(1)+'%;background:var(--chart-warn);display:block"></i>':'')+
+    '</div>'+
+    '<div class="legendrow"><span><i style="background:var(--chart-ok)"></i>直写 '+through+' 卷</span>'+
+    (back>0?'<span><i style="background:var(--chart-warn)"></i>回写 '+back+' 卷</span>':'<span style="color:var(--rbc-text-tertiary)">无回写卷</span>')+
+    '</div></div>';
+}
+
+/* 数据卡（大数字 + 迷你趋势图）：数字单独包裹，避免滚动时擦除单位 */
+function dcard(k, val, unit, sub, spark, sparkColor){
+  var dec = String(val).indexOf('.')>=0 ? 1 : 0;
+  return '<div class="dcard hov"><div class="k">'+k+'</div>'+
+    '<div class="vrow"><div class="v num"><span data-roll="'+val+'" data-dec="'+dec+'">'+val+'</span>'+(unit?'<span class="u">'+unit+'</span>':'')+'</div></div>'+
+    (spark?sparkSVG(spark, sparkColor||'var(--chart-1)'):'')+
+    '<div class="s">'+sub+'</div></div>';
+}
+function dcardUnavail(k){
+  return '<div class="dcard unavail"><div class="flag">'+badge('数据暂停','amber')+'</div><div class="k">'+k+'</div><div class="vrow"><div class="v">—</div></div><div class="s">统计暂不可用</div></div>';
+}
+
+/* ════════════════════════════════════════════════════════════
+   页面：状态（首页）
+   ════════════════════════════════════════════════════════════ */
+function pgState(){
+  var st=userState(), h='';
+  h+=pageHead('状态','3 秒回答：现在有没有在加速、安不安全、有没有风险',
+      '<button class="btn danger" onclick="askPanic()" '+(S.panic?'disabled title="已处于熔断状态"':'')+'>一键熔断</button>');
+
+  if(S.loading){
+    h+='<div class="alert info"><div class="at">正在读取驱动状态…</div><div class="ar">首次连接或切换状态时读取驱动快照，请稍候。</div>'+
+       '<div class="prog indet"><div class="fill"></div></div></div>';
+    h+=skeletonCards();
+    return h;
+  }
+
+  // 协议不匹配（MF-1：统一 驱动 8 / 控制台 9 + Win32 87）
+  if(!S.protocolOk){
+    h+=alertCard('danger','驱动版本与控制台不匹配（驱动 8 / 控制台 9）',
+      '原因：安装包与控制台不是同一版本。下一步：使用同一发布包重新安装。<b>所有写操作已禁用</b>，避免对不兼容驱动下发错误指令。',
+      '<button class="btn pri" onclick="toast(\'已打开重新安装指引\',\'info\')">打开重新安装指引</button><button class="btn" onclick="go(\'diag\')">打开诊断</button>',
+      '<span>错误码 Win32 87</span><span>消息 #10 GET_VERSION</span><span>'+nowStr()+'</span>');
+  }
+  // 熔断
+  if(S.panic){
+    var healing=S.settling;
+    h+=alertCard('danger','缓存已熔断（全局透传）',
+      '所有读写直接到盘，缓存暂停，数据最安全但速度最慢。'+(healing?'驱动正在把未落盘数据写完（自愈中），此时解除会被驱动拒绝。':'未落盘数据已写完，可以解除熔断。'),
+      '<button class="btn" onclick="go(\'rescue\')">前往应急处理</button>'+
+      (healing?'<button class="btn" disabled title="自愈未完成，暂不可解除">解除熔断（自愈中）</button>':'<button class="btn pri" onclick="clearPanic()">解除熔断</button>'),
+      '<span>'+(healing?'错误码 0xC00000A3（自愈未完成）':'自愈已完成，无活跃错误')+'</span><span>'+(healing?'消息 #11 PANIC / #12 PANIC_CLEAR':'消息 #12 PANIC_CLEAR 已确认')+'</span>',
+      healing?'<div class="prog indet"><div class="fill"></div></div><div style="font-size:11px;color:var(--rbc-text-secondary)">正在把未落盘数据写完…（'+S.dirty+' MB 待回写）</div>':'');
+  }
+  // 安全模式
+  if(S.safeMode){
+    h+=alertCard('warn','降级 · 安全模式',
+      '上次未正常退出，已强制直写保护数据。请确认数据无误后退出安全模式。',
+      '<button class="btn" onclick="go(\'rescue\')">前往应急处理</button><button class="btn ghost" onclick="exitSafe()">确认数据无误，退出安全模式</button>',
+      '<span>安全模式 = 开</span><span>消息 #1 GET_STATS</span>');
+  }
+  // 未安装 / 权限不足（MF-3：access 可触发，Win32 5 与 2/3 文案不同）
+  if(!S.installed){
+    var access = S.connErr==='access';
+    h+=alertCard('danger', access?'没有权限访问缓存驱动。':'未检测到缓存驱动。',
+      access?'原因：控制设备仅允许管理员访问。下一步：右键以管理员身份运行本程序。'
+            :'原因：驱动未安装或未启动。下一步：点击「运行安装向导」。',
+      access?'<button class="btn pri" onclick="toast(\'请关闭本窗口，右键以管理员身份重新运行\',\'info\')">以管理员身份重开</button><button class="btn" onclick="go(\'diag\')">打开诊断</button>'
+            :'<button class="btn pri" onclick="openWizard()">运行安装向导</button><button class="btn" onclick="go(\'diag\')">打开诊断</button>',
+      '<span>错误码 Win32 '+(access?'5':'2')+'</span><span>消息 #10 GET_VERSION</span><span>'+nowStr()+'</span>');
+  }
+  // FLUSH 失败（MF-2：三段式）
+  if(S.flushFail){
+    h+=alertCard('warn','数据尚未完全写入磁盘。',
+      '原因：磁盘报告写入错误（STATUS_IO_DEVICE_ERROR 0xC0000001）。下一步：检查磁盘健康；<b>未落盘数据仍在缓存中</b>，可稍后重试。',
+      '<button class="btn pri" onclick="retryFlush()">稍后重试</button><button class="btn" onclick="go(\'rescue\')">前往应急处理</button>',
+      '<span>错误码 0xC0000001（专属 FLUSH 失败）</span><span>消息 #3 FLUSH</span><span>'+nowStr()+'</span>');
+  }
+
+  // 三数字摘要（大数字 + 迷你趋势图 · 数据与图表同源）
+  if(S.statsOk){
+    h+='<div class="grid3">'+
+      dcard('读命中率', S.hit.toFixed(1), '%', '近 5 分钟 · 1 秒轮询', S.hitSeries, 'var(--chart-1)')+
+      dcard('省下磁盘读', S.savedGB.toFixed(1), 'GB', '累计 · 随使用增长', S.savedSeries, 'var(--chart-ok)')+
+      dcard('缓存占用', S.cacheUsed.toFixed(1), 'GB', '上限 '+S.cacheCap.toFixed(1)+' GB · 未落盘 '+S.dirty+' MB', S.cacheSeries, 'var(--chart-1)')+
+      '</div>';
+  }else{
+    h+='<div class="grid3">'+dcardUnavail('读命中率')+dcardUnavail('省下磁盘读')+dcardUnavail('缓存占用')+'</div>'+
+      '<div style="font-size:11px;color:var(--rbc-text-secondary);margin-top:8px">统计暂不可用（'+(S.installed?(S.retrying?'驱动连接退避重连中':'驱动连接正常但采样超时'):'驱动未连接')+'）——数值以「—」呈现，<b>不以 0 呈现</b>，避免误读为「未生效」。'+
+      ' <button class="btn ghost sm" onclick="retryStats()">重试</button></div>';
+  }
+
+  // 卷状态卡
+  h+='<h2 class="sec">卷状态<span class="hint-inline">共 '+S.volumes.length+' 卷 · 每卷含六态徽标 / 写模式 / 主行动 / 停止加速</span></h2>';
+  var boundVols=S.volumes.filter(function(v){return v.bound;});
+  var anyAttached=S.volumes.some(function(v){return S.attached[v.letter];});
+  if(!S.installed){
+    h+=emptyState('尚未安装缓存驱动','安装后可对固定盘（数据盘 / 游戏盘）开启加速','<button class="btn pri" onclick="openWizard()">运行安装向导</button>');
+  }else if(boundVols.length===0){
+    h+=emptyState('尚未挂载任何卷','标准模式需一次重启完成挂栈；也可用保守模式运行时挂载','<button class="btn pri" onclick="openWizard()">运行首次向导</button>');
+  }else{
+    boundVols.forEach(function(v){ h+=volCard(v); });
+    if(!anyAttached){
+      h+='<div style="margin-top:6px">'+emptyState('尚未加速任何卷','已挂栈卷处于「就绪未加速」，可一键开启','<button class="btn pri" onclick="go(\'boost\')">去开启加速</button>')+'</div>';
+    }
+  }
+  return h;
+}
+function volCard(v){
+  var vs=volState(v), acc=S.attached[v.letter];
+  var acts='';
+  if(S.attaching && !acc){
+    acts='<button class="btn" disabled title="正在退避重试挂载（300/600/900ms）">正在挂载…</button>'+
+         '<span class="prog indet" style="width:90px;display:inline-block;vertical-align:middle;margin:0"><span class="fill" style="display:block"></span></span>';
+  }else if(S.panic){
+    acts='<button class="btn" disabled title="熔断中，写操作已禁用">开启/停止加速</button>';
+  }else if(!acc){
+    acts='<button class="btn pri" onclick="toggleAccel(\''+v.letter+'\')" '+(S.protocolOk?'':'disabled title="协议不匹配，已禁用写操作"')+'>开启加速</button>';
+  }else{
+    acts=writeSel(v.letter,!S.protocolOk)+
+      '<button class="btn" onclick="flushVol(\''+v.letter+'\')">立即回写</button>'+
+      '<button class="btn" onclick="toggleAccel(\''+v.letter+'\')">停止加速</button>';
+  }
+  var why='';
+  if(v.sys && !acc) why='<div class="why">缓存系统盘 C: 会增加开机异常风险；如确需，请先了解应急页的回滚指引。</div>';
+  return '<div class="vcard hov'+(acc?'':' dim')+'">'+
+    '<span class="vid num">'+v.letter+'</span>'+
+    '<span class="vinfo"><span class="lbl">'+v.label+'</span><br><span class="cap">'+v.cap+'</span></span>'+
+    '<span class="vstate">'+badge(vs.t,vs.c,vs.corner?'corner':'')+'</span>'+
+    '<span class="vmode">写模式：'+(acc?modeShort(S.mode[v.letter]):'—')+'</span>'+
+    '<span class="acts">'+acts+'</span>'+why+'</div>';
+}
+
+/* ════════════════════════════════════════════════════════════
+   页面：加速
+   ════════════════════════════════════════════════════════════ */
+function pgBoost(){
+  var h=pageHead('加速','逐卷开启 / 停止加速，选择写模式；切换即时生效，无需重启',
+      '<button class="btn pri" onclick="batchAccel()" '+(S.protocolOk&&!S.panic&&!S.attaching?'':'disabled title="协议不匹配 / 熔断中 / 挂载中，已禁用"')+'>批量开启加速</button>');
+  if(!S.installed){
+    return h+alertCard('danger','未检测到缓存驱动','原因：驱动未安装或未启动。下一步：点击「运行安装向导」。',
+      '<button class="btn pri" onclick="openWizard()">运行安装向导</button>','<span>错误码 Win32 '+(S.connErr==='access'?'5':'2')+'</span>');
+  }
+  if(!S.protocolOk){
+    h+=alertCard('warn','协议不匹配，写操作已禁用','当前驱动协议号（8）与控制台期望（9）不一致，为安全起见已禁用全部挂载 / 写模式变更。<b>下一步：使用同一发布包重新安装。</b>',
+      '<button class="btn" onclick="go(\'diag\')">打开诊断</button>','<span>错误码 Win32 87</span>');
+  }
+  // MF-4：attach 退避重试可观测
+  if(S.attaching){
+    h+=alertCard('info','正在挂载卷（自动退避重试）',
+      '驱动返回瞬时错误（Win32 170 驱动忙 / Win32 21 设备未就绪 / 0x80000011 设备忙），程序按 300 / 600 / 900ms 自动重试，最多 3 次。',
+      '<button class="btn" onclick="go(\'diag\')">查看通道健康</button>',
+      '<span>消息 #8 ATTACH_VOLUME</span><span>退避 300/600/900ms · ≤3 次</span>',
+      '<div class="prog indet"><div class="fill"></div></div><div style="font-size:11px;color:var(--rbc-text-secondary)">正在挂载…（第 2 次重试，等待 600ms）</div>');
+  }
+  // 写模式说明
+  h+='<h2 class="sec">写模式说明<span class="hint-inline">默认直写（最安全）；回写更快，但异常退出可能丢未落盘数据</span></h2>';
+  h+='<div class="grid2">'+
+    '<div class="dcard hov"><div class="k">'+badge('直写 · 推荐','green')+'</div><div style="font-size:12px;color:var(--rbc-text-secondary);margin-top:10px;line-height:1.7">每次写入同时落到磁盘与缓存，异常掉电不会丢数据。适合办公用户与系统盘。</div></div>'+
+    '<div class="dcard hov"><div class="k">'+badge('回写','amber','corner')+'</div><div style="font-size:12px;color:var(--rbc-text-secondary);margin-top:10px;line-height:1.7">写入先落缓存、延后回写磁盘，吞吐更高。异常退出时「未落盘数据」可能丢失，适合游戏盘等可重建数据。</div></div>'+
+    '</div>';
+
+  // 卷列表
+  h+='<h2 class="sec">卷列表</h2>';
+  S.volumes.forEach(function(v){
+    var vs=volState(v), acc=S.attached[v.letter];
+    var verify = (S.verify && S.verify.letter===v.letter) ? S.verify : null;
+    var ctrl;
+    if(!v.bound){
+      ctrl='<span class="vmode">'+badge('未挂栈','gray')+'</span><button class="btn" disabled title="该卷未挂到缓存驱动，请先完成挂栈（标准模式需重启）">开启加速</button>';
+    }else if(S.attaching && !acc){
+      ctrl=badge('挂载中 · 重试','amber','healing')+'<span class="prog indet" style="width:80px;display:inline-block;vertical-align:middle;margin:0"><span class="fill" style="display:block"></span></span>';
+    }else if(S.panic){
+      ctrl=badge('熔断 · 透传','red')+'<button class="btn" disabled title="熔断中，写操作已禁用">开启/停止加速</button>';
+    }else if(!acc){
+      ctrl=writeSel(v.letter,!S.protocolOk)+
+        '<button class="sw" role="switch" aria-checked="false" onclick="toggleAccel(\''+v.letter+'\')" '+(S.protocolOk?'':'disabled')+' title="开启加速"></button>';
+    }else{
+      ctrl=badge(vs.t,vs.c,vs.corner?'corner':'')+
+        writeSel(v.letter,!S.protocolOk)+
+        '<button class="sw on" role="switch" aria-checked="true" onclick="toggleAccel(\''+v.letter+'\')" title="停止加速"></button>';
+    }
+    var vmsg='';
+    if(verify && verify.phase==='running') vmsg='<div class="why">正在验证加速效果…（挂载即验证，3 秒内给出结论）</div>';
+    else if(verify && verify.phase==='done') vmsg='<div class="why ok">已加速 · 命中率 '+Math.round(verify.hit)+'%（挂载后 2.4 秒验证通过）</div>';
+    else if(v.sys) vmsg='<div class="why">系统盘 C:：缓存会增加开机异常风险，开启需二次确认；如开机异常可用应急页回滚。</div>';
+    h+='<div class="vcard hov">'+
+      '<span class="vid num">'+v.letter+'</span>'+
+      '<span class="vinfo"><span class="lbl">'+v.label+'</span><br><span class="cap">'+v.cap+'</span></span>'+
+      '<span class="acts" style="margin-left:0">'+ctrl+'</span>'+vmsg+'</div>';
+  });
+
+  // 批量操作
+  h+='<h2 class="sec">批量操作</h2><div class="vcard"><span class="vinfo"><span class="lbl">对所有非系统盘一键开启加速（直写）</span><br><span class="cap">跳过 C: 等系统卷</span></span>'+
+     '<span class="acts"><button class="btn" onclick="batchAccel()" '+(S.protocolOk&&!S.panic&&!S.attaching?'':'disabled title="协议不匹配或熔断中，已禁用"')+'>批量开启加速</button>'+
+     '<button class="btn" onclick="flushAll()">全部立即回写</button></span></div>';
+  return h;
+}
+
+/* ════════════════════════════════════════════════════════════
+   页面：收益（7 类图表集中呈现）
+   ════════════════════════════════════════════════════════════ */
+function pgGain(){
+  var h=pageHead('收益','看见价值：命中率趋势 / 读写吞吐 / 缓存占用 / 分片与未落盘；二级指标默认折叠',
+      '<button class="btn" onclick="toast(\'已导出收益快照（PNG 由宿主截图）\',\'info\')">导出收益快照</button>');
+  if(!S.statsOk){
+    h+=alertCard('warn','统计暂不可用','原因：'+(S.installed?'驱动连接正常但采样超时':'驱动未连接')+'。为避免误读为「未生效」，本页不以 0 呈现。',
+      '<button class="btn" onclick="retryStats()">重试</button><button class="btn ghost" onclick="go(\'diag\')">打开诊断</button>','<span>消息 #1 GET_STATS</span>');
+    return h+'<div class="grid2">'+
+      '<div class="dcard" style="height:220px;display:flex;align-items:center;justify-content:center;color:var(--rbc-text-tertiary)">趋势图暂不可用（不画归零曲线）</div>'+
+      '<div class="dcard" style="height:220px;display:flex;align-items:center;justify-content:center;color:var(--rbc-text-tertiary)">缓存环图暂不可用</div></div>';
+  }
+  // 三数字
+  h+='<div class="grid3">'+
+    dcard('读命中率', S.hit.toFixed(1), '%', '近 5 分钟', S.hitSeries, 'var(--chart-1)')+
+    dcard('省下磁盘读', S.savedGB.toFixed(1), 'GB', '累计', S.savedSeries, 'var(--chart-ok)')+
+    dcard('回写总量', S.writebackGB.toFixed(1), 'GB', '累计已落盘', null)+'</div>';
+
+  // 图表 #1 命中率趋势 + #2 缓存环
+  h+='<div class="grid2" style="margin-top:12px">';
+  h+='<div class="dcard hov"><div class="k">读命中率趋势（近 5 分钟 · 60 采样点）</div>'+trendChart(S.hitSeries,{animate:drawOnce('trend')})+'</div>';
+  h+='<div class="dcard hov"><div class="k">缓存占用 / 上限</div>'+ringChart(S.cacheUsed,S.cacheCap,{animate:drawOnce('ring')})+
+     '<div class="s">未落盘 '+S.dirty+' MB · 淘汰 '+S.evictGB.toFixed(1)+' GB</div></div>';
+  h+='</div>';
+
+  // 图表 #3 读写吞吐 + #4 分片热力
+  h+='<div class="grid2" style="margin-top:12px">';
+  h+='<div class="dcard hov"><div class="k">读写吞吐（当前 '+S.readMBs+' / '+S.writeMBs+' MB/s）</div>'+throughputChart(S.readSeries,S.writeSeries,{animate:drawOnce('thr')})+'</div>';
+  h+='<div class="dcard hov"><div class="k">64 分片吞吐（热点定位）</div>'+shardHeat(S.shards,{animate:drawOnce('shard')})+
+     '<div class="s">3 档色阶：低 / 中 / 高（归一化到当期最大值）</div></div>';
+  h+='</div>';
+
+  // 图表 #5 未落盘 + #7 写模式构成
+  h+='<div class="grid2" style="margin-top:12px">';
+  h+='<div class="dcard hov"><div class="k">未落盘数据（掉电可能丢失的上界）</div>'+dirtyStack(S.dirty,S.lost,S.cacheCap*1024)+'</div>';
+  h+='<div class="dcard hov"><div class="k">写模式构成（直写 / 回写 卷数）</div>'+writeModeBar()+'</div>';
+  h+='</div>';
+
+  // 二级折叠
+  h+='<h2 class="sec">深度指标<span class="hint-inline">默认折叠 · 面向技术用户</span></h2>';
+  h+='<div class="collapse"><div class="ch" onclick="toggleCollapse(this)"><span>&#9656;</span> 展开：读改写 / 裁剪 / 压力等级 / 未落盘明细</div><div class="cb hide">'+
+     '<table class="tb"><tr><th>指标</th><th class="n">值</th><th>面向用户含义</th></tr>'+
+     '<tr><td>读改写次数（未对齐读）</td><td class="n">'+S.rmwReads.toLocaleString()+'</td><td>未对齐读触发的读改写</td></tr>'+
+     '<tr><td>裁剪次数</td><td class="n">'+S.trimCount.toLocaleString()+'</td><td>释放的无效缓存块</td></tr>'+
+     '<tr><td>压力等级</td><td class="n">'+S.pressure+' / '+S.pressureMax+'</td><td>缓存压力，越高越可能淘汰</td></tr>'+
+     '<tr><td>未落盘数据</td><td class="n">'+S.dirty+' MB</td><td>掉电可能丢失的上界</td></tr>'+
+     '<tr><td>已确认丢失</td><td class="n">'+S.lost+' MB</td><td>回写失败且无法恢复的字节</td></tr>'+
+     '</table></div></div>';
+  h+='<div style="font-size:11px;color:var(--rbc-text-tertiary);margin-top:10px">平均延迟：Protocol 9 的 RB_STATS 无逐请求延迟字段，标注为「暂不可得」，不以推导值冒充实测。</div>';
+  return h;
+}
+
+/* ════════════════════════════════════════════════════════════
+   页面：诊断
+   ════════════════════════════════════════════════════════════ */
+function pgDiag(){
+  var h=pageHead('诊断','出问题时自助定位与取证：通道健康 / 自检清单 / 版本单轨 / 日志时间线',
+      '<button class="btn pri" onclick="exportDiag()">导出诊断包</button>');
+
+  if(S.loading){ return h+skeletonPanel(); }
+
+  // 图表 #6：IOCTL 通道健康（12 条消息点阵 + 延迟迷你条 + 归因结论）
+  h+='<h2 class="sec">IOCTL 通道健康 · 12 条消息<span class="hint-inline">'+S.chNote+' · 一眼判断「驱动问题还是 UI 问题」</span></h2>';
+  h+=channelPanel();
+
+  // 自检清单
+  h+='<h2 class="sec">自检清单</h2><div class="panel"><table class="tb" style="padding:0">'+
+    '<tr><th style="padding-left:16px">检查项</th><th>结果</th><th>证据</th></tr>'+
+    checkRow('驱动连接', S.installed?(S.protocolOk?'正常':'正常（协议不符）'):'未连接',
+             S.installed?'控制设备已打开':'Win32 '+(S.connErr==='access'?'5 拒绝访问':'2 路径未找到'), S.installed&&S.protocolOk?'green':(S.installed?'amber':'red'))+
+    // MF-1：自检证据串统一「Protocol 不匹配（期望 9，实际 8）」，禁止复用 0xC0000001
+    checkRow('协议版本', S.protocolOk?'正常（Protocol 9）':'不匹配（期望 9，实际 8）',
+             S.protocolOk?'GET_VERSION.Protocol = 9':'Protocol 不匹配（期望 9，实际 8）', S.protocolOk?'green':'red')+
+    checkRow('驱动版本 vs 控制台', '一致', '驱动 1.1 Build19 / 控制台期望 1.1 Build19（软校验放行）', 'green')+
+    checkRow('卷过滤链配置（UpperFilters）', '正常', 'volsnap, RAMBlockCache（未发现残留项）', 'green')+
+    checkRow('安全模式', S.safeMode?'是（降级）':'否', '安全模式 = '+(S.safeMode?'开':'关'), S.safeMode?'amber':'green')+
+    checkRow('熔断状态', S.panic?(S.settling?'熔断 · 自愈中':'熔断 · 透传'):'否', '熔断 = '+(S.panic?'开':'关'), S.panic?'red':'green')+
+    '</table></div>';
+
+  // 归因指引
+  h+='<h2 class="sec">归因指引</h2><div class="grid3">'+
+    '<div class="dcard hov"><div class="k">错误 2 / 3</div><div style="font-size:12px;color:var(--rbc-text-secondary);margin-top:8px;line-height:1.7">UI 未能打开控制设备 = <b style="color:var(--rbc-text-primary)">驱动未加载</b>。下一步：运行安装向导。</div></div>'+
+    '<div class="dcard hov"><div class="k">错误 5</div><div style="font-size:12px;color:var(--rbc-text-secondary);margin-top:8px;line-height:1.7">拒绝访问 = <b style="color:var(--rbc-text-primary)">权限问题</b>。下一步：以管理员身份重开。</div></div>'+
+    '<div class="dcard hov"><div class="k">错误 87</div><div style="font-size:12px;color:var(--rbc-text-secondary);margin-top:8px;line-height:1.7">参数非法 = <b style="color:var(--rbc-text-primary)">版本问题</b>。下一步：用同一发布包重装。</div></div>'+
+    '</div>';
+
+  // 版本单轨
+  h+='<h2 class="sec">版本</h2><div class="panel">'+
+    '<div class="setrow"><div class="sk"><div class="t">RAMBlockCache <span class="num">V10.4.3 Build 19（10.3.4.19）</span></div><div class="d">面向用户的唯一版本串（来源：Version.cs ← version.h，禁止界面硬编码）</div></div>'+badge('当前版本','blue')+'</div>'+
+    '<div class="setrow"><div class="sk"><div class="t">驱动内部版本 <span class="num">1.1 Build19</span></div><div class="d">驱动内部版本（用于支持排查）—— 仅在诊断页出现，不在其他界面展示</div></div>'+badge('仅供支持排查','gray')+'</div>'+
+    '</div>';
+
+  // 日志
+  h+='<h2 class="sec">驱动日志与 UI 日志时间线<span class="hint-inline">自动拉取 · 来源可区分 · 同屏对照</span></h2>';
+  h+=logView();
+  return h;
+}
+function checkRow(name,res,ev,c){
+  return '<tr><td style="padding-left:16px">'+name+'</td><td>'+badge(res,c)+'</td><td class="ev">'+ev+'</td></tr>';
+}
+function channelPanel(){
+  var cnt={ok:0,warn:0,bad:0,mut:0};
+  S.ch.forEach(function(m){cnt[m.st]++;});
+  // 12 格点阵（图表 #6 点阵部分）
+  var matrix=S.ch.map(function(m){
+    var c={ok:'var(--chart-ok)',warn:'var(--chart-warn)',bad:'var(--chart-danger)',mut:'var(--chart-neutral)'}[m.st];
+    return '<div class="cell"><span class="d" style="background:'+c+'"></span><span class="l">#'+m.n+'</span><span class="lb">'+m.name+'</span></div>';
+  }).join('');
+  // 延迟迷你条：归一化（正常按延迟，其余 0 宽不渲染）
+  var maxLat=0; S.ch.forEach(function(m){ if(m.st==='ok'){ var v=parseFloat(m.lat); if(v>maxLat)maxLat=v; } });
+  var rows=S.ch.map(function(m){
+    var stTxt={ok:'正常',warn:'降级 · 重试中',bad:'不可用',mut:'未接通'}[m.st];
+    var c={ok:'var(--chart-ok)',warn:'var(--chart-warn)',bad:'var(--chart-danger)',mut:'var(--chart-neutral)'}[m.st];
+    var latBar='';
+    if(m.st==='ok'){ var v=parseFloat(m.lat); var w=maxLat?clamp(v/maxLat*100,8,100):100; latBar='<div class="latbar"><i style="width:'+w.toFixed(0)+'%;background:var(--chart-1)"></i></div>'; }
+    else if(m.st==='warn'){ latBar='<div class="latbar"><i style="width:35%;background:var(--chart-warn)"></i></div>'; }
+    else { latBar='<div class="latbar"></div>'; }
+    return '<div class="chrow">'+
+      '<span class="cdot" style="background:'+c+'"></span>'+
+      '<span class="cname">'+m.name+'</span>'+
+      '<span class="cno">#'+m.n+'</span>'+
+      '<span class="clat">'+m.lat+'</span>'+
+      '<span class="ctime">'+m.t+'</span>'+
+      latBar+
+      '<span class="cstat '+m.st+'">'+stTxt+(m.err?' ('+m.err+')':'')+'</span>'+
+      '</div>';
+  }).join('');
+  // MF-3：瞬时错误码可视（21/170/0x80000011）
+  var hasTransient = S.ch.some(function(m){return m.st==='warn';});
+  return '<div class="panel">'+
+    '<div class="ph"><span class="pt">IOCTL 0x222000 · Protocol 9</span><span class="ps">单通道承载 12 条消息</span>'+
+    '<span class="legend"><span><i style="background:var(--rbc-success-fg)"></i>正常 '+cnt.ok+'</span><span><i style="background:var(--rbc-warning-fg)"></i>降级 '+cnt.warn+'</span><span><i style="background:var(--rbc-danger-fg)"></i>不可用 '+cnt.bad+'</span><span><i style="background:var(--rbc-neutral-fg)"></i>未接通 '+cnt.mut+'</span></span></div>'+
+    '<div class="dotmatrix">'+matrix+'</div>'+
+    rows+
+    '<div class="attrib">'+
+      '<span>归因：<b>'+attrib()+'</b></span>'+
+      '<span>驱动侧：'+(S.installed?'响应正常':'无响应')+'</span>'+
+      '<span>UI 侧：轮询任务运行中（1s，退避上限 10s）</span>'+
+      '<span>最近错误：'+lastErr()+'</span>'+
+    '</div>'+
+    (hasTransient?'<div class="chan-note">瞬时错误码（可自动退避重试，最多 3 次，300/600/900ms）：<code>Win32 170（驱动忙）</code> · <code>Win32 21（设备未就绪）</code> · <code>0x80000011（设备忙）</code>。确定性拒绝（<code>Win32 5</code> / 负 NTSTATUS）立即失败不重试。</div>':'')+
+    '</div>';
+}
+function attrib(){
+  if(!S.installed) return '驱动问题（控制设备打不开）';
+  if(!S.protocolOk) return '驱动问题（协议不匹配）';
+  if(S.ch.some(function(m){return m.st==='bad';})) return '驱动问题（消息返回确定性错误）';
+  if(S.ch.some(function(m){return m.st==='warn';})) return '瞬时问题（正在退避重试）';
+  return '无异常';
+}
+function lastErr(){
+  if(!S.installed) return 'Win32 '+(S.connErr==='access'?'5':'2')+' @ 消息 #10';
+  if(!S.protocolOk) return 'Win32 87 @ 消息 #10';
+  if(S.flushFail) return '0xC0000001 @ 消息 #3';
+  if(S.panic&&S.settling) return '0xC00000A3 @ 消息 #12';
+  if(S.attaching) return 'Win32 170 @ 消息 #8';
+  return '无';
+}
+function logView(){
+  var L=[
+    ['14:22:01','drv-i','[驱动 INFO]','控制设备已打开，协议号 9，握手成功'],
+    ['14:22:01','ui-i','[UI  INFO]','握手完成：RAMBlockCache V10.4.3 Build 19'],
+    ['14:22:02','drv-i','[驱动 INFO]','枚举到 3 卷：C: 系统盘 / D: 数据盘 / F: 游戏盘'],
+    ['14:22:02','ui-i','[UI  INFO]','卷 D: 已挂栈，开启加速（直写）'],
+    ['14:22:03','drv-w','[驱动 WARN]','卷 F: 回写延迟偏高 314ms，已提示风险'],
+    ['14:22:05','drv-i','[驱动 INFO]','GET_STATS 采样：命中率 74.2%，未落盘 620 MB'],
+    ['14:23:10','drv-e','[驱动 ERR ]','FLUSH 回写失败：STATUS_IO_DEVICE_ERROR 0xC0000001（数据尚未完全写入磁盘）'],
+    ['14:23:10','ui-w','[UI  WARN]','立即回写失败：磁盘报告写入错误；未落盘数据仍在缓存中，可稍后重试'],
+    ['14:25:44','drv-i','[驱动 INFO]','卷 F: 回写恢复，脏量回落至 620 MB'],
+    ['14:26:12','ui-i','[UI  INFO]','用户切换卷 D: 写模式 → 直写'],
+    ['14:27:30','drv-i','[驱动 INFO]','GET_LOG 返回最近 64 条（Cursor=1284）'],
+    ['14:27:30','ui-i','[UI  INFO]','诊断页日志已刷新（来源：驱动 9 条 / UI 3 条）']
+  ];
+  return '<div class="log">'+L.map(function(x){
+    return '<div class="ln"><span class="ts">'+x[0]+'</span><span class="src '+x[1]+'">'+x[2]+'</span><span class="msg">'+x[3]+'</span></div>';
+  }).join('')+'</div>'+
+  '<div style="font-size:11px;color:var(--rbc-text-tertiary);margin-top:8px">GET_LOG 契约：全量返回最近 64 条 + 累计写入序号（Cursor）；自动拉取，空态显示「暂无日志」。</div>';
+}
+
+/* ════════════════════════════════════════════════════════════
+   页面：应急
+   ════════════════════════════════════════════════════════════ */
+function pgRescue(){
+  var h=pageHead('应急','危险与故障的唯一去处 · 熔断 / 安全模式 / 回滚指引 ≤ 2 次点击可达','');
+
+  // 熔断
+  h+='<h2 class="sec">一键熔断<span class="hint-inline">所有读写直接到盘，缓存暂停（数据最安全，速度最慢）</span></h2>';
+  var btn, note='';
+  if(!S.panic){
+    btn='<button class="btn danger" onclick="askPanic()">一键熔断</button>';
+    note='<div class="d">将发生什么 / 影响与风险 / 如何撤销 —— 点击后以三段式确认弹窗呈现，危险按钮不做默认焦点。</div>';
+  }else if(S.settling){
+    btn='<button class="btn" disabled title="自愈未完成，暂不可解除">解除熔断（自愈中，暂不可用）</button>';
+    note='<div class="d" style="color:var(--rbc-warning-fg)">原因：驱动正在把未落盘数据写完（自愈中）。下一步：等待风险段变为「无」后重试。</div>'+
+         '<div class="prog indet"><div class="fill"></div></div><div style="font-size:11px;color:var(--rbc-text-secondary)">正在把未落盘数据写完…（'+S.dirty+' MB 待回写）</div>';
+  }else{
+    btn='<button class="btn pri" onclick="clearPanic()">解除熔断</button>';
+    note='<div class="d" style="color:var(--rbc-success-fg)">自愈已完成，可以解除熔断，恢复到「就绪未加速」。</div>';
+  }
+  h+='<div class="panel"><div class="setrow"><div class="sk"><div class="t">缓存熔断开关</div>'+note+'</div>'+btn+'</div></div>';
+
+  // MF-2：FLUSH 失败三段式卡（应急页）
+  if(S.flushFail){
+    h+='<h2 class="sec">回写失败处理</h2>'+
+      alertCard('warn','数据尚未完全写入磁盘。',
+        '原因：磁盘报告写入错误（STATUS_IO_DEVICE_ERROR 0xC0000001）。下一步：检查磁盘健康；<b>未落盘数据仍在缓存中，可稍后重试</b>。',
+        '<button class="btn pri" onclick="retryFlush()">稍后重试</button><button class="btn" onclick="go(\'diag\')">打开诊断</button>',
+        '<span>错误码 0xC0000001（专属 FLUSH 失败）</span><span>消息 #3 FLUSH</span><span>'+nowStr()+'</span>');
+  }
+
+  // 安全模式
+  h+='<h2 class="sec">安全模式</h2><div class="panel"><div class="setrow">'+
+     '<div class="sk"><div class="t">'+(S.safeMode?'当前处于安全模式（写缓存已关闭，强制直写）':'当前未处于安全模式')+'</div>'+
+     '<div class="d">安全模式在检测到上次异常退出时自动进入，用于保护未落盘数据。</div></div>'+
+     '<button class="btn" onclick="exitSafe()" '+(S.safeMode?'':'disabled title="当前未处于安全模式，无需退出"')+'>确认数据无误，退出安全模式</button>'+
+     '</div></div>';
+
+  // 未落盘 / 丢失量核对
+  h+='<h2 class="sec">未落盘 / 丢失量核对</h2><div class="grid2">'+
+    '<div class="dcard hov"><div class="k">未落盘数据</div><div class="vrow"><div class="v num" data-roll="'+S.dirty+'" data-dec="0">'+S.dirty+'</div></div><div class="s">掉电可能丢失的上界</div></div>'+
+    '<div class="dcard hov"><div class="k">已确认丢失</div><div class="vrow"><div class="v num" data-roll="'+S.lost+'" data-dec="0">'+S.lost+'</div></div><div class="s">'+(S.lost>0?'回写失败且无法恢复的字节 —— 风险段已变琥珀':'暂无已确认丢失数据')+'</div></div>'+
+    '</div>';
+
+  // 回滚指引
+  h+='<h2 class="sec">开机失败（0x7B）回滚指引<span class="hint-inline">三步图文 · 可在 WinRE 离线执行</span></h2>';
+  h+='<div class="step3"><span class="n">1</span><div class="txt">用 Windows 安装介质启动，进入 <b>疑难解答 → 高级选项 → 命令提示符</b>（WinRE 环境）。<div class="sub">无需进入系统，也不需要联网。</div></div></div>';
+  h+='<div class="step3"><span class="n">2</span><div class="txt">确认系统盘位置（WinRE 中通常不是 <span class="mono">C:</span>），必要时修改脚本内 <span class="mono">SYSROOT</span>。<div class="sub">用 diskpart 列出卷，按容量与卷标识别系统盘。</div></div></div>';
+  h+='<div class="step3"><span class="n">3</span><div class="txt">运行 <span class="mono">offline_rollback.cmd</span>：它会探测实际引导的 ControlSet，并<b>只摘除 RAMBlockCache</b>，保留其他卷过滤器（如 volsnap 与第三方）。<div class="sub">执行完成后重启，即可正常进入系统。</div></div></div>';
+  h+='<div style="display:flex;gap:10px;align-items:center;margin-top:4px"><button class="btn pri" onclick="exportCard()">导出救援卡（救援说明.txt）</button>'+
+     '<span style="font-size:11px;color:var(--rbc-text-tertiary)">含 WinRE 步骤、命令与 offline_rollback.cmd 路径，便于无网环境使用。</span></div>';
+  return h;
+}
+
+/* ════════════════════════════════════════════════════════════
+   页面：设置
+   ════════════════════════════════════════════════════════════ */
+function pgSettings(){
+  var h=pageHead('设置','全局参数与生命周期：全局启用 / 内存预算 / 回写间隔 / 启动项 / 卸载回滚','');
+  if(!S.installed){
+    return h+alertCard('danger','未检测到缓存驱动','安装后可配置全局参数。',
+      '<button class="btn pri" onclick="openWizard()">运行安装向导</button>','<span>错误码 Win32 '+(S.connErr==='access'?'5':'2')+'</span>');
+  }
+  h+='<h2 class="sec">全局</h2><div class="panel">'+
+    setRow('全局启用','关闭后所有卷停止加速，读写直接到磁盘',toggle(S.statsOk))+
+    setRow('内存预算','自动 = 按可用内存比例分配；固定 = 指定上限','<span class="selwrap">'+SELCARET+'<select class="sel" onchange="toast(\'内存预算已更新（显示驱动 clamp 后实际生效值）\',\'info\')"><option>自动（80%）</option><option>固定</option></select></span>')+
+    setRow('保留内存','不用于缓存的最小空闲内存','<span class="num" style="font-size:13px">'+S.memReserve+' MB</span>')+
+    setRow('回写间隔','回写模式下脏数据周期性落盘的间隔','<span class="num" style="font-size:13px">'+S.wbInterval+' s</span>')+
+    '</div>';
+  h+='<h2 class="sec">启动</h2><div class="panel">'+
+    setRow('开机自动随卷挂载','标准模式在开机时自动挂栈（跳过系统盘 C:）',toggle(true))+
+    setRow('随 Windows 启动本控制台','已写入注册表 Run 键',toggle(true))+
+    '</div>';
+  h+='<h2 class="sec">卸载</h2><div class="panel"><div class="setrow">'+
+     '<div class="sk"><div class="t">卸载并回滚</div><div class="d">将停止加速、回写全部未落盘数据、从卷过滤链配置中移除 RAMBlockCache，<b>保留其他过滤器</b>，并提示重启。</div></div>'+
+     '<button class="btn danger" onclick="askUninstall()">卸载并回滚</button></div></div>';
+  return h;
+}
+function setRow(t,d,ctrl){ return '<div class="setrow"><div class="sk"><div class="t">'+t+'</div><div class="d">'+d+'</div></div><div class="sc">'+ctrl+'</div></div>'; }
+function toggle(on){
+  return '<button class="sw'+(on?' on':'')+'" role="switch" aria-checked="'+on+'" onclick="toast(\'设置已更新（显示驱动 clamp 后实际生效值）\',\'info\')"></button>';
+}
+
+/* ════════════════════════════════════════════════════════════
+   渲染主入口
+   ════════════════════════════════════════════════════════════ */
+var PAGE={state:pgState,boost:pgBoost,gain:pgGain,diag:pgDiag,rescue:pgRescue,settings:pgSettings};
+/* 图表一次性描边：每会话每图只播一次，切换演示态重置 */
+var drawn={};
+function drawOnce(key){ if(drawn[key]) return false; drawn[key]=true; return true; }
+function resetDrawn(){ drawn={}; }
+
+function paint(animate){
+  var el=document.getElementById('content');
+  var keep=el.scrollTop;
+  var fn=PAGE[cur]||pgState;
+  el.innerHTML='<div class="'+(animate?'page-enter':'')+'">'+fn()+'</div>';
+  el.scrollTop=keep;
+  rollNumbers();
+}
+function render(){ renderStatus(); renderNav(); renderDemo(); paint(true); }
+function go(p){ if(cur!==p){ cur=p; paint(true); } else { paint(true); } renderStatus(); renderNav(); renderDemo(); }
+function toggleCollapse(el){
+  var cb=el.parentNode.querySelector('.cb');
+  cb.classList.toggle('hide');
+  el.querySelector('span').textContent = cb.classList.contains('hide')?'\u25B8':'\u25BE';
+}
+
+/* 数字滚动计数（320ms · rAF · 仅 transform/opacity 无关；reduced-motion 直显） */
+var lastVals={};
+function rollNumbers(){
+  var els=document.querySelectorAll('[data-roll]');
+  els.forEach(function(el){
+    var target=parseFloat(el.getAttribute('data-roll'));
+    var dec=parseInt(el.getAttribute('data-dec')||'0',10);
+    var key='k'+(el.getAttribute('data-roll'))+'_'+(el.parentNode?el.parentNode.childNodes.length:'')+'_'+(el.getAttribute('data-dec'));
+    var from=lastVals[key];
+    if(from===undefined) from=0;
+    lastVals[key]=target;
+    if(reducedMotion()||from===target){ el.textContent=fmt(target,dec); return; }
+    animateNumber(el,from,target,dec);
+  });
+}
+function fmt(v,dec){ return dec>0? v.toFixed(dec) : Math.round(v).toString(); }
+function animateNumber(el,from,to,dec){
+  var start=performance.now(), dur=320;
+  function step(t){
+    var p=Math.min(1,(t-start)/dur);
+    var e=1-Math.pow(1-p,3);
+    el.textContent=fmt(from+(to-from)*e,dec);
+    if(p<1) requestAnimationFrame(step); else el.textContent=fmt(to,dec);
+  }
+  requestAnimationFrame(step);
+}
+
+/* ════════════ 交互动作 ════════════ */
+function toggleAccel(letter){
+  if(!S.protocolOk || S.panic) return;
+  var v=S.volumes.filter(function(x){return x.letter===letter;})[0];
+  if(!v || !v.bound) return;
+  if(S.attached[letter]){
+    S.attached[letter]=false; S.verify=null;
+    toast('已停止 '+letter+' 加速','info');
+    render();
+  }else{
+    // MF-4：若处于挂载重试演示态，走退避路径；否则直接成功 + 挂载即验证
+    if(S.attaching){
+      toast('挂载中：正在退避重试（300/600/900ms）','warn');
+      setTimeout(function(){
+        S.attaching=false; S.attached[letter]=true;
+        setCh(8,'ok','1.9 ms','刚刚'); S.verify={letter:letter,phase:'done',hit:S.hit};
+        toast(letter+' 已加速 · 命中率 '+Math.round(S.hit)+'%','ok'); render();
+      },1400);
+      render();
+      return;
+    }
+    S.attached[letter]=true;
+    setCh(8,'ok','1.9 ms','刚刚');
+    S.verify={letter:letter,phase:'running'};
+    render();
+    setTimeout(function(){
+      S.verify={letter:letter,phase:'done',hit:S.hit};
+      toast(letter+' 已加速 · 命中率 '+Math.round(S.hit)+'%','ok');
+      render();
+    },1600);
+  }
+}
+function batchAccel(){
+  if(S.attaching) return;
+  S.volumes.forEach(function(v){ if(!v.sys) S.attached[v.letter]=true; });
+  setCh(8,'ok','2.2 ms','刚刚');
+  toast('已对非系统盘开启加速（直写）','ok'); render();
+}
+function setMode(letter,val){
+  var m=parseInt(val,10);
+  if(m===1 && S.mode[letter]!==1){ askWriteMode(letter); return; }
+  S.mode[letter]=m; setCh(6,'ok','0.7 ms','刚刚');
+  toast('写模式已切换为「'+modeShort(m)+'」，即时生效，无需重启','info'); render();
+}
+function askWriteMode(letter){
+  showModal('<h3>切换 '+letter+' 为「回写」模式？</h3>'+
+    seg3('① 将发生什么','该卷写入先落缓存、延后回写磁盘，吞吐更高。')+
+    seg3('② 影响与风险','异常退出（断电 / 蓝屏）时，「未落盘数据」可能丢失。')+
+    seg3('③ 如何撤销','随时切回「直写」；或在应急页「立即回写」把脏数据落盘。')+
+    '<div class="row"><span class="note">危险按钮不做默认焦点</span>'+
+    '<button class="btn" onclick="closeModal()" autofocus>保持直写</button>'+
+    '<button class="btn pri" onclick="confirmWriteMode(\''+letter+'\')">确认切回写</button></div>');
+}
+function confirmWriteMode(letter){
+  S.mode[letter]=1; setCh(6,'ok','0.7 ms','刚刚');
+  closeModal(); toast('写模式已切换为「回写」，即时生效','warn'); render();
+}
+function flushVol(letter){
+  if(S.flushFail){ toast('回写失败：数据尚未完全写入磁盘，可稍后重试','warn'); return; }
+  setCh(3,'ok','4.6 ms','刚刚');
+  S.dirty=Math.max(0,S.dirty-160);
+  toast(letter+' 未落盘数据已回写（剩余 '+S.dirty+' MB）','ok'); render();
+}
+function flushAll(){
+  if(S.flushFail){ toast('回写失败：数据尚未完全写入磁盘，可稍后重试','warn'); return; }
+  setCh(3,'ok','6.1 ms','刚刚');
+  S.dirty=0; toast('全部未落盘数据已回写','ok'); render();
+}
+function retryFlush(){
+  S.flushFail=false; S.dirty=0; setCh(3,'ok','5.2 ms','刚刚');
+  toast('重试成功：未落盘数据已回写','ok'); render();
+}
+function retryStats(){ S.statsOk=true; S.retrying=false; S.pollFail=0; toast('统计已恢复','ok'); render(); }
+
+function askPanic(){
+  showModal('<h3>确认一键熔断？</h3>'+
+    seg3('① 将发生什么','所有读写直接到磁盘，缓存暂停；驱动在后台把未落盘数据写完（自愈）。')+
+    seg3('② 影响与风险','加速效果消失，速度回落到物理盘水平；数据安全性最高。')+
+    seg3('③ 如何撤销','在应急页点「解除熔断」——需等待自愈完成后才可点击。')+
+    '<div class="row"><span class="note">危险按钮不做默认焦点</span>'+
+    '<button class="btn" onclick="closeModal()" autofocus>取消</button>'+
+    '<button class="btn danger" onclick="doPanic()">确认熔断</button></div>');
+}
+function doPanic(){
+  S.panic=true; S.settling=true; closeModal();
+  setCh(11,'ok','1.2 ms','刚刚'); setCh(12,'warn','0.9 ms','刚刚');
+  cur='rescue'; toast('已熔断：缓存暂停，正在自愈…','warn'); render();
+  setTimeout(function(){ S.settling=false; setCh(12,'ok','0.8 ms','刚刚'); toast('自愈完成，可解除熔断','ok'); render(); },2600);
+}
+function clearPanic(){
+  if(S.settling){ toast('自愈未完成，暂不可解除','warn'); return; }
+  S.panic=false; S.settling=false; S.dirty=0;
+  setCh(12,'ok','0.8 ms','刚刚');
+  toast('熔断已解除，状态恢复为「就绪未加速」','ok'); render();
+}
+function exitSafe(){
+  if(!S.safeMode){ toast('当前未处于安全模式','info'); return; }
+  setCh(5,'ok','0.7 ms','刚刚');
+  S.safeMode=false; toast('已退出安全模式，写缓存恢复','ok'); render();
+}
+function askUninstall(){
+  showModal('<h3>确认卸载并回滚？</h3>'+
+    seg3('① 将发生什么','停止加速 → 回写全部未落盘数据 → 从卷过滤链配置移除 RAMBlockCache → 提示重启。')+
+    seg3('② 影响与风险','重启后加速失效；已落盘数据不受影响。')+
+    seg3('③ 如何撤销','重新运行安装向导即可再次安装。')+
+    '<div class="row"><span class="note">危险按钮不做默认焦点</span>'+
+    '<button class="btn" onclick="closeModal()" autofocus>取消</button>'+
+    '<button class="btn danger" onclick="closeModal();toast(\'已开始卸载流程，完成后将提示重启\',\'warn\')">确认卸载</button></div>');
+}
+function exportCard(){ toast('已导出 救援说明.txt（含 WinRE 步骤与 offline_rollback.cmd 路径）','ok'); }
+function exportDiag(){ toast('已导出 诊断包.zip（含驱动日志 64 条 / 自检清单 / 版本信息 / UI 日志 / 通道快照）','ok'); }
+
+function setCh(n,st,lat,t,err){
+  var m=S.ch.filter(function(x){return x.n===n;})[0];
+  if(m){ m.st=st; m.lat=lat; m.t=t; if(err!==undefined) m.err=err; }
+}
+
+/* ════════════ 弹窗 / 向导 / Toast ════════════ */
+function seg3(lab,txt){ return '<div class="seg3"><div class="lab">'+lab+'</div><div class="txt">'+txt+'</div></div>'; }
+function showModal(html){ document.getElementById('layer').innerHTML='<div class="mask"><div class="modal">'+html+'</div></div>'; }
+function closeModal(){ document.getElementById('layer').innerHTML=''; }
+function toast(msg,kind){
+  var c = kind==='ok'?'var(--rbc-success-fg)':(kind==='warn'?'var(--rbc-warning-fg)':(kind==='info'?'var(--rbc-info-fg)':'var(--rbc-neutral-fg)'));
+  var el=document.createElement('div'); el.className='toast';
+  el.innerHTML='<span class="dot" style="background:'+c+'"></span><span>'+msg+'</span>';
+  document.getElementById('win').appendChild(el);
+  setTimeout(function(){ el.classList.add('out'); }, 3000);
+  setTimeout(function(){ el.remove(); }, 3200);
+}
+
+/* ════════════ 首次配置向导 ════════════ */
+var wizStep=1, wizMode='standard';
+function openWizard(){ wizStep=1; document.getElementById('layer').innerHTML=wizHTML(); }
+function wizHTML(){
+  var body, foot, title;
+  if(wizStep===1){
+    title='环境自检';
+    body='<div class="panel" style="background:var(--rbc-bg-input)">'+
+      wizChk('管理员权限', S.installed?'已具备':'未具备 —— 需以管理员身份运行','ok')+
+      wizChk('驱动状态', S.installed?'已安装并已加载':'未安装','ok')+
+      wizChk('残留卷过滤链', '未发现残留 UpperFilters 项','ok')+
+      wizChk('是否需要重启挂栈', '标准模式需一次重启；保守模式免重启','warn')+
+      '</div><div style="font-size:12px;color:var(--rbc-text-secondary);margin-top:12px">下一步：选择安装模式。两种模式的差异与回滚方式会一并说明。</div>';
+    foot='<span class="note">第 1 / 3 步 · 环境自检</span><button class="btn" onclick="closeWiz()">稍后</button><button class="btn pri" onclick="wizGo(2)">下一步</button>';
+  }else if(wizStep===2){
+    title='选择安装模式（二选一）';
+    body='<div class="pick">'+
+      '<div class="opt '+(wizMode==='standard'?'on':'')+'" onclick="pickMode(\'standard\')"><div class="ot">标准模式 <span class="tag rec">推荐</span></div><div class="od">挂栈 + 可缓存任意卷（含系统卷），开机即加速。<b>需一次重启。</b>回滚：应急页救援卡 / offline_rollback.cmd。</div></div>'+
+      '<div class="opt '+(wizMode==='conservative'?'on':'')+'" onclick="pickMode(\'conservative\')"><div class="ot">保守模式 <span class="tag adv">高级</span></div><div class="od">不挂栈、运行时挂载，<b>免重启</b>，但开机过程不加速。两种模式互斥，请勿混用。</div></div>'+
+      '</div>';
+    foot='<span class="note">第 2 / 3 步 · 安装模式</span><button class="btn" onclick="wizGo(1)">上一步</button><button class="btn pri" onclick="wizGo(3)">下一步</button>';
+  }else{
+    title='首次加速';
+    body='<div class="panel" style="background:var(--rbc-bg-input)">'+
+      wizChk('D: 数据盘（1.0 TB）','默认勾选 · 写模式：直写','ok')+
+      wizChk('F: 游戏盘（2.0 TB）','默认勾选 · 写模式：直写','ok')+
+      wizChk('C: 系统盘（476 GB）','默认不勾选（系统盘加速有开机风险）','warn')+
+      '</div><div style="font-size:12px;color:var(--rbc-text-secondary);margin-top:12px">默认直写（最安全）。想更快可改回写，代价是异常退出可能丢未落盘数据。完成后 3 秒内给出加速结论。</div>';
+    foot='<span class="note">第 3 / 3 步 · 首次加速</span><button class="btn" onclick="wizGo(2)">上一步</button><button class="btn pri" onclick="finishWiz()">完成并开启加速</button>';
+  }
+  var steps=[1,2,3].map(function(i){
+    var cls = i<wizStep?'done':(i===wizStep?'on':'');
+    return '<div class="st '+cls+'"><span class="n">'+(i<wizStep?'\u2713':i)+'</span>第'+i+'步</div>';
+  }).join('');
+  return '<div class="wizard"><div class="wp"><div class="wh"><span class="wt">首次配置向导 · '+title+'</span><span class="steps">'+steps+'</span></div>'+
+    '<div class="wb">'+body+'</div><div class="wf">'+foot+'</div></div></div>';
+}
+function wizChk(name,val,c){ return '<div class="setrow" style="background:transparent"><div class="sk"><div class="t">'+name+'</div></div>'+badge(val,c)+'</div>'; }
+function pickMode(m){ wizMode=m; document.getElementById('layer').innerHTML=wizHTML(); }
+function wizGo(s){ wizStep=s; document.getElementById('layer').innerHTML=wizHTML(); }
+function closeWiz(){ closeModal(); }
+function finishWiz(){
+  closeModal();
+  S.installed=true; S.protocolOk=true; S.connErr=null;
+  S.volumes.forEach(function(v){ v.bound=true; });
+  S.attached={'D:':true,'F:':true,'C:':false};
+  S.mode={'D:':0,'F:':1,'C:':0};
+  setCh(8,'ok','2.0 ms','刚刚'); setCh(10,'ok','0.5 ms','刚刚');
+  cur='state'; toast('安装完成：D: / F: 已开启加速（直写）','ok'); render();
+}
+
+/* ════════════ 演示状态切换（15 种）════════════ */
+function setDemo(k){
+  demoCur=k; resetDrawn(); lastVals={};
+  // 复位基线
+  S.installed=true; S.connErr=null; S.protocolOk=true; S.loading=false;
+  S.volumes=[{letter:'D:',label:'数据盘',cap:'1.0 TB',sys:false,bound:true},
+             {letter:'F:',label:'游戏盘',cap:'2.0 TB',sys:false,bound:true},
+             {letter:'C:',label:'系统盘',cap:'476 GB',sys:true,bound:true}];
+  S.attached={'D:':true,'F:':true,'C:':false};
+  S.mode={'D:':0,'F:':1,'C:':0};
+  S.safeMode=false; S.panic=false; S.settling=false; S.dirty=620; S.lost=0;
+  S.statsOk=true; S.verify=null; S.retrying=false; S.pollFail=0;
+  S.flushFail=false; S.attaching=false;
+  S.ch.forEach(function(m){ m.st='mut'; m.lat='—'; m.t='未调用'; m.err=''; });
+  setCh(1,'ok','0.8 ms','刚刚'); setCh(4,'ok','0.6 ms','启动时'); setCh(7,'ok','1.1 ms','刚刚');
+  setCh(9,'ok','2.4 ms','进页时'); setCh(10,'ok','0.5 ms','启动握手');
+
+  switch(k){
+    case 'normal': break;
+    case 'notinstalled': S.installed=false; S.connErr='notfound'; S.volumes.forEach(function(v){v.bound=false;}); S.attached={'D:':false,'F:':false,'C:':false}; setCh(10,'bad','—','失败'); break;
+    case 'bound': S.volumes.forEach(function(v){v.bound=false;}); S.attached={'D:':false,'F:':false,'C:':false}; break;
+    case 'ready': S.attached={'D:':false,'F:':false,'C:':false}; break;
+    case 'through': S.mode={'D:':0,'F:':0,'C:':0}; break;
+    case 'back': S.mode={'D:':0,'F:':1,'C:':0}; break;
+    case 'safemode': S.safeMode=true; S.mode={'D:':0,'F:':0,'C:':0}; S.attached={'D:':true,'F:':true,'C:':false}; break;
+    case 'panic': S.panic=true; S.settling=false; S.dirty=0; setCh(11,'ok','1.2 ms','刚刚'); break;
+    case 'heal': S.panic=true; S.settling=true; S.dirty=620; setCh(11,'ok','1.2 ms','刚刚'); setCh(12,'warn','0.9 ms','刚刚','0xC00000A3'); break;
+    case 'statsfail': S.statsOk=false; setCh(1,'warn','—','采样超时','Win32 170'); S.retrying=true; S.pollFail=3; break;
+    case 'protocol': S.protocolOk=false; setCh(10,'bad','0.5 ms','失败','Win32 87'); break;
+    case 'flushfail': S.flushFail=true; S.dirty=620; setCh(3,'bad','—','失败','0xC0000001'); break;
+    case 'access': S.installed=false; S.connErr='access'; S.volumes.forEach(function(v){v.bound=false;}); S.attached={'D:':false,'F:':false,'C:':false}; setCh(10,'bad','—','失败','Win32 5'); break;
+    case 'attaching': S.attaching=true; S.attached={'D:':false,'F:':true,'C:':false}; setCh(8,'warn','—','重试中','Win32 170'); break;
+    case 'loading': S.loading=true; break;
+  }
+  render();
+}
+
+/* ════════════ 启动 ════════════ */
+setDemo('normal');
+// 轻量轮询演示：仅刷新延迟数值与累计值，避免数字剧烈跳动
+setInterval(function(){
+  if(!S.installed||S.panic||S.loading||S.attaching) return;
+  var lat=(0.6+Math.random()*0.6).toFixed(1);
+  setCh(1,'ok',lat+' ms','刚刚');
+  S.savedGB=Math.min(99.9,S.savedGB+0.1);
+  renderStatus(); renderNav(); paint(false);
+}, 3000);
+</script>
+</body>
+</html>

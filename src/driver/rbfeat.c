@@ -294,6 +294,9 @@ static VOID Rb2Tick(PVOID Ctx)
         if (g_Rb2Flags & RB2F_PREFETCH) RbPrefGC();
         if ((g_Rb2Flags & RB2F_THERMAL) && (n % 5 == 0)) RbThermalTick();  /* [Build15] 温度采样 5s */
         if ((g_Rb2Flags & RB2F_L2) && (n % 60 == 0)) RbL2Periodic();      /* [Build15] L2 落盘 60s */
+        /* [FIX B-U0-8] 运行时挂栈卷孤儿巡检（30s）：TestMode 卷不在 PnP 链上，
+         * 底层卷意外移除时无 REMOVE IRP——此处兜底完整拆除。生产零行为。 */
+        if (n % 30 == 0) RbJanitorSweepRuntimeAttached();
     }
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -384,7 +387,7 @@ NTSTATUS RbFeatShutdown(VOID)
  * 解闩 + 重建 Rb2Tick（保持 s_Init=1，不重走计数器/池初始化）。 */
 VOID RbFeatRecover(VOID)
 {
-    HANDLE h; OBJECT_ATTRIBUTES oa; UNICODE_STRING u;
+    HANDLE h = NULL; OBJECT_ATTRIBUTES oa; UNICODE_STRING u;   /* [FIX A-12] h 初值 NULL：创建失败时不得对未初始化句柄调 ZwClose */
     if (!s_Init) return;                       /* 未初始化过：无需复活 */
     /* 先有界复核旧 Tick：Shutdown join 超时后线程可能已延迟退出，
      * 此时需清理旧句柄再重建（不能只解闩——旧线程已死，解闩等于没复活） */
@@ -404,6 +407,10 @@ VOID RbFeatRecover(VOID)
         s_TickH = h;
         RbLog(0, __LINE__, 0, L"feat layer recovered (Rb2Tick restarted)");
     } else {
+        /* [FIX A-12] PsCreateSystemThread 成功但 ObReference 失败：h 句柄必须关
+         * （原泄漏），且线程未登记 s_TickObj/s_TickH = 幽灵线程（join 够不到）——
+         * s_Stop=1 通知其自退，与 rbpools leak-by-design 同口径。 */
+        if (h) ZwClose(h);
         RbLog(2, __LINE__, 0, L"feat recover: Rb2Tick restart failed (retry via REFRESH)");
         InterlockedExchange(&s_Stop, 1);       /* 复活失败保持闩：下轮 REFRESH 重试 */
     }
@@ -533,7 +540,10 @@ static VOID RbEvictJob(PVOID Ctx)
 {
     RB2_EVICT_JOB *j = (RB2_EVICT_JOB *)Ctx;
     if (j) {
+        /* [FIX S7-04b] 异步执行期间卷可能已拆除：Ext 引用由提交方 CAS 加引用
+         * （拒绝 0→1 复活，同 RbGetExt 纪律），用完在此归还。 */
         RbL2Store(j->Ext, j->Lba, j->Len, j->Buf);   /* PASSIVE：内部同步拷贝入容器 */
+        RbDerefExt((PRB_DEV_EXT)j->Ext);
         Rb2Free(j->Buf);
         Rb2Free(j);
     }
@@ -549,21 +559,33 @@ VOID RbFeatOnEvict(PVOID Ext, ULONG64 Lba, ULONG Len, PVOID Src, ULONG64 Hits)
     if (RbPanicActive())                    return;
     if (Ext == NULL || Src == NULL || Len == 0) return;
     if (Hits < 2)                           return;   /* 冷块不进 L2 */
-    if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
-        RbL2Store(Ext, Lba, Len, Src);      /* 内部同步拷贝，Src 无需延寿 */
-        return;
-    }
-    /* >PASSIVE：拷贝 + Rb2PoolSubmit 排 PASSIVE 执行（见 :308 预留意图，D5 落地） */
+    /* [FIX S7-04] PASSIVE 也一律走池异步：原 PASSIVE 分支内联同步 RbL2Store
+     * （一次 ZwWriteFile 64KB+24B）——该回调处于 stream_reclaim 的
+     * reclaim_active 临界区内，L2 盘慢/挂死会把发起回收的 I/O worker 楔住
+     * 数秒~永久（32 worker 逐个耗尽=该卷 I/O 全面停摆）。拷贝+排队后
+     * 数据路径只付出一次非分页拷贝；L2 盘劣化的代价由池 worker 承担。 */
     {
-        RB2_EVICT_JOB *j = (RB2_EVICT_JOB *)Rb2Alloc(sizeof(*j));
-        PVOID buf;
-        if (!j) return;                     /* 分配失败=放弃本次存储机会（安全方向） */
+        RB2_EVICT_JOB *j; PVOID buf; PRB_DEV_EXT ext = (PRB_DEV_EXT)Ext;
+        /* [FIX S7-04b] 提交前 CAS 加引用（回调执行期间 ext 必然存活，可安全加引用；
+         * 拒绝 0→1 复活）。失败=卷正在拆除，放弃本次存储（安全方向）。 */
+        if (ext->Magic != RB_EXT_MAGIC || ext->Removed) return;
+        {
+            LONG r;
+            for (;;) {
+                r = ext->Refs;
+                if (r <= 0) return;
+                if (InterlockedCompareExchange(&ext->Refs, r + 1, r) == r) break;
+            }
+        }
+        j = (RB2_EVICT_JOB *)Rb2Alloc(sizeof(*j));
+        if (!j) { RbDerefExt(ext); return; }   /* 分配失败=放弃本次存储机会（安全方向） */
         buf = Rb2Alloc((SIZE_T)Len);
-        if (!buf) { Rb2Free(j); return; }
-        RtlCopyMemory(buf, Src, Len);       /* Src=非分页 chunk 数据，高 IRQL 可读 */
+        if (!buf) { Rb2Free(j); RbDerefExt(ext); return; }
+        RtlCopyMemory(buf, Src, Len);       /* Src=非分页 chunk 数据，任意 IRQL 可读 */
         j->Ext = Ext; j->Lba = Lba; j->Len = Len; j->Hits = Hits; j->Buf = buf;
         if (!NT_SUCCESS(Rb2PoolSubmit(RbEvictJob, j))) {
-            Rb2Free(buf); Rb2Free(j);       /* 提交失败：成对释放 */
+            Rb2Free(buf); Rb2Free(j);       /* 提交失败：成对释放 + 归还引用 */
+            RbDerefExt(ext);
         }
     }
 }
@@ -571,7 +593,11 @@ VOID RbFeatOnRead(PVOID Ext, ULONG64 Lba, ULONG Len)
 {
     PRB_DEV_EXT ext = (PRB_DEV_EXT)Ext;
     if (g_Rb2Flags & RB2F_THERMAL && ext->Letter) RbThermalNote(ext->Letter);
-    if ((g_Rb2Flags & RB2F_PREFETCH) && !s_Panic && !s_InFeat)
+    /* [契约 B-11] 预取激活后端同判：只对【已挂载缓存】的卷预取（未挂载=无缓存流可填，
+     * 预取纯浪费盘带宽）。系统卷排除由 RbPrefStream 入口既有判断负责；温度字段
+     * 协议未就绪（跳过并注释，不造假）。与前端 IPrefetchGate / CLI
+     * `prefetch check` 同口径。 */
+    if ((g_Rb2Flags & RB2F_PREFETCH) && !s_Panic && !s_InFeat && ext->IsAttached)
         if (!RbThermalPrefBlocked(ext->Letter)) RbPrefStream(Ext, Lba, Len);
 }
 

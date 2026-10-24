@@ -43,7 +43,11 @@ public sealed class StatsService : IDisposable
     private Task? _loop;
     private CancellationTokenSource? _cts;
     private readonly object _gate = new();
-    private readonly Dictionary<ulong, (ulong hits, ulong disk, ulong wb, DateTime at)> _last = new();
+    /* [FIX S7-01] 速率基线改单调 TickCount64：原用 DateTime.UtcNow——NTP 回拨/
+     * 休眠跨钟点后 now>prev.at 为假 → 读写吞吐静默显示 0 且无降级提示
+     * （违反 RD.5"禁把过期值当正常数据"）。TickCount64 单调、免时钟跳变，
+     * 与 FeedSeries 的口径统一。 */
+    private readonly Dictionary<ulong, (ulong hits, ulong disk, ulong wb, long at)> _last = new();
     private ulong[] _keys = Array.Empty<ulong>();
 
     /// <summary>每次成功采样后触发（DriveItemViewModel.OnSample 订阅）。</summary>
@@ -60,6 +64,25 @@ public sealed class StatsService : IDisposable
     private const int DegradeAfterFailRounds = 3;
     private int _failStreak;
     private bool _degraded;
+
+    /// <summary>[FIX R6-UI1] 增量更新轮询键集合（热插拔）：RefreshDrives 发现新卷时调用。
+    /// 原 _keys 一次性物化后永不更新——握手后插入的新卷其 DeviceKey 不在集合中，
+    /// OnSample 的 key 过滤永远不命中 → 该卷统计恒"—"；拔除的卷留在集合中每秒
+    /// 失败（Win32Error=2）→ DriverReportedUnmounted 刷 WARN。持 _gate 与轮询循环互斥。</summary>
+    public void SetKeys(IEnumerable<ulong> deviceKeys)
+    {
+        lock (_gate)
+        {
+            _keys = deviceKeys.Distinct().ToArray();
+        }
+    }
+
+    /// <summary>[FIX S7-02] 遗忘指定卷的速率基线（热插拔移除时调用）：
+    /// 原 _last 字典只增不减——反复插拔的卷基线无限累积（长跑内存缓慢增长）。</summary>
+    public void ForgetKey(ulong deviceKey)
+    {
+        lock (_gate) { _last.Remove(deviceKey); }
+    }
 
     /// <summary>启动轮询（重复调用先停后开，幂等）。</summary>
     public void Start(IEnumerable<ulong> deviceKeys)
@@ -146,13 +169,13 @@ public sealed class StatsService : IDisposable
     private StatsSnapshot BuildSnapshot(ulong key)
     {
         var s = DriverService.Instance.QueryStats(key);
-        var now = DateTime.UtcNow;
+        var now = Environment.TickCount64;
         double rMbps = 0, wMbps = 0;
         lock (_gate)
         {
             if (_last.TryGetValue(key, out var prev) && now > prev.at)
             {
-                var dt = (now - prev.at).TotalSeconds;
+                var dt = (now - prev.at) / 1000.0;
                 ulong dDisk = s.BytesFromDisk >= prev.disk ? s.BytesFromDisk - prev.disk : 0;
                 rMbps = Math.Max(0, dDisk / dt / 1048576.0);
                 /* [BUG3] 回写吞吐：脏块后台落盘速率（WbBytes 差值）——回写模式下
@@ -180,7 +203,8 @@ public sealed class StatsService : IDisposable
     {
         _cts?.Cancel();
         _timer?.Dispose(); _timer = null;
-        try { _loop?.Wait(500); } catch { }
+        // [FIX U-07] 停止等待失败可见（行为不变：仍继续停止流程）
+        try { _loop?.Wait(500); } catch (Exception ex) { LogService.Warn($"轮询线程停止等待异常（继续停止流程）：{ex.Message}"); }
         _loop = null; _cts?.Dispose(); _cts = null;
         _last.Clear();
         // [B7] 重置 watchdog 状态：Stop 后再 Start 不应沿用旧的降级标记

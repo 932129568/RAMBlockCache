@@ -11,10 +11,13 @@ $core = $PSScriptRoot
 Set-Location $core
 if (-not (Test-Path build)) { New-Item -ItemType Directory build | Out-Null }
 
+# [FIX #9 2026-10-21] 列表与 build_all.bat 对齐（原缺 test_write_ex/test_wsconc，
+# 与 .bat 权威清单漂移；.bat 在沙箱禁 cmd 通道时不可跑，本脚本是其等价入口）。
 $Tests = @(
   "test_cache","test_counter","test_geom","test_mixed","test_parflush","test_regress",
   "test_release","test_v5","test_v6","test_bigread","test_flush_many",
-  "edge_v3","edge_v4","stress_v3","stress_v4","bench_readhit","test_auditfix"
+  "edge_v3","edge_v4","stress_v3","stress_v4","bench_readhit","test_auditfix",
+  "test_write_ex","test_wsconc"
 )
 $ok=0; $fail=0; $runFail=0
 foreach ($t in $Tests) {
@@ -30,7 +33,9 @@ Write-Output "ASAN_OK=$ok ASAN_FAIL=$fail"
 foreach ($t in ($Tests + @("test_evict_wire"))) {
   $exe = Join-Path $core "build\asan_$t.exe"
   if (Test-Path $exe) {
-    & $exe > "build\asanrun_$t.out" 2> "build\asanrun_$t.err"
+    # [FIX R9-15] 输出名与 run_all.bat 逐字对齐（原 asanrun_ 前缀导致 check_repo
+    #  freshness 门禁按 asan_<t>.out 配对时永远拿到 run_all.bat 的陈旧证据）。
+    & $exe > "build\asan_$t.out" 2> "build\asan_$t.err"
     if ($LASTEXITCODE -ne 0) { Write-Output "$t exit=$LASTEXITCODE"; $runFail++ }
   }
 }

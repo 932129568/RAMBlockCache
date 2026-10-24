@@ -29,6 +29,9 @@ static void RbFillStats(RB_STATS *out)
     out->PanicActive     = (uint32_t)g_Rb.PanicPassthrough;
     out->BootFails       = g_Rb.BootFailCount;
     out->DirtySnapshotMB = g_Rb.DirtySnapshotMB;
+    /* [V10.6/B-12] 读延迟 EWMA（微秒）：与引擎无关（驱动侧测量），同样前置 */
+    out->CacheReadLatencyUs = (uint32_t)g_Rb.ReadLatEwmaUs[0];
+    out->DiskReadLatencyUs  = (uint32_t)g_Rb.ReadLatEwmaUs[1];
     if (!g_Rb.Engine) return;
     rb_engine_get_stripe_stats(g_Rb.Engine, out->StripeRead, out->StripeWrite, RB_STRIPES);
 
@@ -74,6 +77,9 @@ static void RbFillStats(RB_STATS *out)
 VOID RbClampConfig(RB_CONFIG *c)
 {
     if (c->DirtyHighPct < 10 || c->DirtyHighPct > 99) c->DirtyHighPct = 60;
+    /* [FIX R6-05a] DirtyLowPct 补下界并与 High 联动：原 Low=0 合法下发 →
+     * High=10 & Low=0 时水位策略退化（10%/0%）。 */
+    if (c->DirtyLowPct < 5) c->DirtyLowPct = 5;
     if (c->DirtyLowPct > c->DirtyHighPct) c->DirtyLowPct = c->DirtyHighPct - 10;
     if (c->AutoUsePct < 10 || c->AutoUsePct > 95) c->AutoUsePct = 80;
     if (c->MemReserveMB > 65536) c->MemReserveMB = 4096;
@@ -82,6 +88,17 @@ VOID RbClampConfig(RB_CONFIG *c)
     if (c->FlushIntervalMs != 0 && c->FlushIntervalMs < 1000) c->FlushIntervalMs = 1000;
     if (c->FlushIntervalMs > 600000) c->FlushIntervalMs = 600000;
     if (c->CacheSizeMB > 1024 * 1024) c->CacheSizeMB = 0;
+    /* [FIX S7-15] CacheSizeMB=0 且 AutoMemory 关 = 语义陷阱：core create 收到
+     * max_bytes=0 会回落内置 16GB 固定上限——用户想表达"小缓存"却拿到大缓存，
+     * 且 GET_CONFIG 回读的是用户原值（显示与生效不一致）。固定尺寸模式下
+     * 0 不是合法值，钳到 1024MB（想要自动 sizing 请开 AutoMemory）。 */
+    if (c->CacheSizeMB == 0 && !c->AutoMemory) c->CacheSizeMB = 1024;
+    /* [FIX R6-05b] 原三个字段完全无 clamp：ReadaheadWindowKB*1024 直进 core
+     * cfg.readahead_window、IdleReclaimSec*1000 进 idle_reclaim_ms——极大值
+     * （如 0xFFFFFFFF → 约 4TB 窗口）可致预读策略退化/IO 放大。 */
+    if (c->ReadaheadWindowKB > 1024 * 1024) c->ReadaheadWindowKB = 1024 * 1024;   /* ≤1GB 窗口 */
+    if (c->IdleReclaimSec > 86400) c->IdleReclaimSec = 86400;                    /* ≤24h */
+    if (c->ParallelFlush > 64) c->ParallelFlush = 64;
     /* BlockSize 由 core 在 create 时校验（非法回落 4096） */
 }
 
@@ -94,6 +111,12 @@ VOID RbApplyEngineConfig(const RB_CONFIG *cfg)
     rb_engine_set_max_bytes(g_Rb.Engine, mb * 1024ull * 1024ull);
     rb_engine_set_watermarks_pct(g_Rb.Engine, cfg->DirtyHighPct, cfg->DirtyLowPct);
     rb_engine_set_idle_reclaim(g_Rb.Engine, (rb_u64)cfg->IdleReclaimSec * 1000);
+    /* [FIX S7-15] WriteRelease 原本只在引擎创建时应用（SET_CONFIG 改了不生效）——
+     * core 有运行期 setter，补上下发。ReadaheadEnabled 仍为创建期冻结
+     * （core 无运行期开关，几何/窗口在 create 定型）：SET_CONFIG 路径已由
+     * RbApplyConfig 的 BlockSize 同款"推迟+日志"纪律处理（见下 RbSetConfig 提示），
+     * 此处不静默吞。 */
+    rb_engine_set_write_release(g_Rb.Engine, cfg->WriteRelease ? 1 : 0);
 }
 
 static void RbApplyConfig(const RB_CONFIG *cfg)
@@ -146,6 +169,8 @@ static ULONG RbCtlMinBuffer(const RB_MSG *msg)
     case RB_MSG_SET_VOLUME:     return offsetof(RB_MSG, Data) + sizeof(RB_VOLUME_SET);
     case RB_MSG_ATTACH_VOLUME:  return offsetof(RB_MSG, Data) + sizeof(RB_VOLUME_ATTACH);
     case RB_MSG_GET_VERSION:    return offsetof(RB_MSG, Data) + sizeof(RB_VERSION);
+    case RB_MSG_INVALIDATE_RANGE: return offsetof(RB_MSG, Data) + sizeof(RB_INVALIDATE_RANGE);   /* [V10.6/B-5] */
+    case RB_MSG_GET_EVENTS:     return offsetof(RB_MSG, Data) + sizeof(RB_EVENT_LIST);            /* [V10.6/B-7] */
     default:                    return offsetof(RB_MSG, Data);
     }
 }
@@ -179,6 +204,13 @@ static VOID RbMsgSetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
      * CLI 却打印成功——静默空操作。此处显式告警（失败可观测）。 */
     if (msg->Data.Config.VolumeFilter[0][0] != L'\0')
         RbLog(1, __LINE__, 0, L"SET_CONFIG: VolumeFilter not implemented; use ATTACH_VOLUME (ignored)");
+    /* [契约 B-10] 系统卷 opt-in 状态翻转留证（审计轨迹：谁在何时开了系统卷缓存）。
+     * opt-in 后系统卷仍强制直写（rbio.c RbIsWriteBack 硬规则）——本日志只记意图。 */
+    if (msg->Data.Config.SystemVolumeCached != g_Rb.Config.SystemVolumeCached)
+        RbLog(0, __LINE__, (LONG)msg->Data.Config.SystemVolumeCached,
+              msg->Data.Config.SystemVolumeCached
+                  ? L"system volume opt-in ON by user (write-through still forced)"
+                  : L"system volume opt-in OFF by user");
     RbApplyConfig(&msg->Data.Config);
     /* FIX[audit 假回读]: 应答回填 clamp 后的实际生效配置，而非回显输入 */
     ExAcquireFastMutex(&g_Rb.CfgLock);
@@ -249,6 +281,12 @@ static VOID RbMsgSetVolume(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     PRB_DEV_EXT ext;
     UNREFERENCED_PARAMETER(pinfo);
+    /* [FIX S7-09] 盘符范围校验：Letter=0（未解析卷的 ext->Letter 亦为 0）会让
+     * 每卷开关落到任意一个"盘符未解析"的卷上——畸形输入必须拒绝。 */
+    if (msg->Data.VolumeSet.Letter < L'A' || msg->Data.VolumeSet.Letter > L'Z') {
+        *pst = STATUS_INVALID_PARAMETER;
+        return;
+    }
     ext = RbFindExtByLetter(msg->Data.VolumeSet.Letter);
     if (ext) {
         uint32_t wm = msg->Data.VolumeSet.WriteMode;
@@ -275,8 +313,13 @@ static VOID RbMsgAttachVolume(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     letter = msg->Data.VolumeAttach.Letter;
     if (letter < L'A' || letter > L'Z') { *pst = STATUS_INVALID_PARAMETER; return; }
     if (msg->Data.VolumeAttach.Attach) {
-        /* V9：运行时从零打开卷→挂栈→建流（不依赖已存在 ext） */
+        /* V10 生产语义：AddDevice 已挂栈，ATTACH 只翻 IsAttached 热开关。
+         * [U0-1 2026-10-19] 测试模式（TestMode=1）：无 ext 的既有卷（sc start
+         * 热加载不会为既有卷重跑 AddDevice）→ 回退"运行时开卷→Safe 挂栈→建流"
+         * 路径（RbAttachVolumeRuntime；默认关，生产安装不可达）。 */
         *pst = RbAttachVolumeByLetter(letter);
+        if (*pst == STATUS_NOT_FOUND && RbTestModeEnabled())
+            *pst = RbAttachVolumeRuntime(letter);
         if (NT_SUCCESS(*pst)) {
             PRB_DEV_EXT ext = RbFindExtByLetter(letter);
             if (ext) {
@@ -286,6 +329,16 @@ static VOID RbMsgAttachVolume(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
                 ext->ReadEnabled  = msg->Data.VolumeAttach.ReadEnabled;
                 ext->WriteEnabled = msg->Data.VolumeAttach.WriteEnabled;
                 RbDerefExt(ext);
+            }
+            /* [FIX R6-09] 二次查找失败必须可见：原实现静默跳过——attach 成功后
+             * 窗口内并发 detach（关热开关/完整拆除）致查找落空时，每卷开关
+             * （WriteMode/ReadEnabled/WriteEnabled）静默丢失，落到设备创建默认值，
+             * "带参 attach"语义丢失且无日志可循。现如实回报调用方。 */
+            else
+            {
+                RbLog(1, __LINE__, STATUS_NOT_FOUND,
+                      L"attach: per-volume switches not applied (ext vanished after attach)");
+                *pst = STATUS_NOT_FOUND;
             }
         }
     } else {
@@ -301,6 +354,88 @@ static VOID RbMsgGetLog(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_LOG_LIST);
 }
 
+/* [契约 B-7] RB_MSG_GET_EVENTS：操作进度事件轮询（游标增量；09 移交报告 §3 B-7）。
+ * 入参 EventQuery{Cursor, MaxCount}：回 Cursor+1 起、至多 MaxCount 条未消费事件；
+ * 回参 EventList{Cursor=最后一条 Seq（无事件=入参原值）, Count, Items[]}。
+ * 环 semantics：驱动侧 RB_EVENT_MAX=64 条固定环 + 单调 Seq；轮询间隔大于
+ * 覆盖周期时最旧事件被覆盖（游标只保证不漏未覆盖的——消费方按 250ms-1s 轮询）。
+ * 无锁：EvSeq 一次读快照 + 逐条拷（事件发布与读取并发的最坏=读到半条，
+ * 但 Seq 单调不回退，调用方以下次轮询补齐；展示层可容忍）。 */
+static VOID RbMsgGetEvents(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+{
+    RB_EVENT_QUERY q;
+    RB_EVENT_LIST  *out = &msg->Data.EventList;
+    LONG maxSeq, i;
+    ULONG n = 0;
+    uint64_t cursor;
+
+    UNREFERENCED_PARAMETER(pst);
+    RtlZeroMemory(&q, sizeof(q));
+    q = msg->Data.EventQuery;               /* 入参（驱动收到的查询） */
+    cursor = q.Cursor;
+    if (q.MaxCount == 0 || q.MaxCount > RB_EVENT_MAX) q.MaxCount = RB_EVENT_MAX;
+
+    maxSeq = g_Rb.EvSeq;                    /* 快照：>=此值的发布可能进行中，不取 */
+    RtlZeroMemory(out, sizeof(*out));
+    for (i = 0; i < (LONG)RB_EVENT_MAX && n < q.MaxCount; i++) {
+        /* 环内第 i 条的 Seq 由发布方写入；只取 (cursor, maxSeq] 区间 */
+        RB_EVENT_REC *e = &g_Rb.EvRing[i];
+        uint64_t seq = (uint64_t)InterlockedCompareExchange64((volatile LONG64 *)&e->Seq, 0, 0);
+        if (seq == 0 || seq <= cursor || seq > (uint64_t)maxSeq) continue;
+        out->Items[n++] = *e;
+        out->Cursor = seq;                  /* 推进游标（单调不回退） */
+    }
+    out->Count = n;
+    if (n == 0) out->Cursor = cursor;       /* 无事件：游标原样回（调用方不重复取） */
+    *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_EVENT_LIST);
+}
+
+/* [契约 B-5] RB_MSG_INVALIDATE_RANGE：缓存范围失效（FlushFileRange 执行体半边）。
+ * 语义：把该卷 [Offset, Offset+Length) 字节区间内的缓存块失效，使随后的第一遍读
+ * 真正落到磁盘（冷热二遍读的第一遍冷读前提）。CLI ramboostctl flushfile 消费。
+ *
+ * core 契约（cache.c rb_stream_invalidate_range → _ex(superseded=1)）：
+ *   - 内部先 wb_drain（有界 60s 排空在途回写）再取条纹 WLOCK；恢复路径锁外 readback
+ *     —— 全段要求 PASSIVE_LEVEL，且调用方不得持有任何 engine/stripe 锁；
+ *   - len==0 / offset+len 回绕时 core 静默 return——驱动侧前置校验并返回明确
+ *     NTSTATUS，不把"参数非法"伪装成"已失效"。
+ * 引用纪律（C3 同款）：find 引用 + 显式 Refs 自增覆盖"校验→invalidate"全程，
+ * 阻塞并发 detach 在窗口内销毁 Stream（detach 排空等 Refs 回落）；双引用成对
+ * 释放。严禁持 s_AttachMutex 调用（wb_drain 最长 60s，会堵死全部 attach/detach
+ * ——[FIX C-5] 同款教训）。 */
+static VOID RbMsgInvalidateRange(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+{
+    RB_INVALIDATE_RANGE *r = &msg->Data.InvalidateRange;
+    PRB_DEV_EXT ext;
+
+    PAGED_CODE();   /* 控制面全 PASSIVE；wb_drain/readback 要求 PASSIVE */
+    if (r->Letter < L'A' || r->Letter > L'Z') { *pst = STATUS_INVALID_PARAMETER; return; }
+    if (r->Length == 0)               { *pst = STATUS_INVALID_PARAMETER; return; }
+    if (r->Offset + r->Length < r->Offset) { *pst = STATUS_INVALID_PARAMETER; return; }  /* 回绕 */
+
+    ext = RbFindExtByLetter(r->Letter);          /* 带引用（Refs+1） */
+    if (!ext) { *pst = STATUS_NOT_FOUND; return; }
+    InterlockedIncrement(&ext->Refs);            /* IO 式引用：窗口内 Stream 不被拆毁 */
+
+    if (ext->Magic != RB_EXT_MAGIC || ext->Removed || !ext->IsAttached || !ext->Stream) {
+        /* 先按现场定性（解引用只在持引用期内），再成对释放双引用 */
+        NTSTATUS why = (ext->Magic == RB_EXT_MAGIC && !ext->Removed)
+                       ? STATUS_DEVICE_NOT_READY   /* 卷在但未挂载缓存/无流 */
+                       : STATUS_NOT_FOUND;          /* 解析残留/已移除 */
+        RbDerefExt(ext);                          /* IO 引用 */
+        RbDerefExt(ext);                          /* find 引用 */
+        *pst = why;
+        return;
+    }
+
+    rb_stream_invalidate_range(ext->Stream, r->Offset, r->Length);
+
+    RbDerefExt(ext);                              /* IO 引用 */
+    RbDerefExt(ext);                              /* find 引用 */
+    RbLog(0, __LINE__, 0, L"cache range invalidated (B-5 flushfile)");
+    *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_INVALIDATE_RANGE);
+}
+
 static VOID RbMsgGetVersion(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     RB_VERSION *v;
@@ -313,6 +448,12 @@ static VOID RbMsgGetVersion(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     v->Build = RB_DRIVER_BUILD;
     v->IsBlockFilter = 1;
     RtlStringCchCopyW(v->Name, RB_NAME_LEN, L"RAMBlockCache");
+    /* [契约 B-6] 驱动签名态（RB_VERSION_T 末尾追加字段；注册表缓存经 DriverEntry 加载）。
+     * 旧前端读不到这两个字段时看到零缓冲=0=正式签名——危险方向；新前端必须按
+     * "TestSigned==0 且 Signer 非空"才认正式签名（契约消费规则，Models.cs 注释同款）。 */
+    v->TestSigned = g_Rb.DriverTestSigned ? 1u : 0u;
+    v->Reserved2 = 0;
+    RtlStringCchCopyW(v->Signer, RB_SIGNER_LEN, g_Rb.DriverSigner);
     *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_VERSION);
 }
 
@@ -372,6 +513,8 @@ NTSTATUS RbDispatchDeviceControl(PDEVICE_OBJECT dev, PIRP irp)
     case RB_MSG_ATTACH_VOLUME:  RbMsgAttachVolume(msg, &st, &info);  break;
     case RB_MSG_GET_LOG:        RbMsgGetLog(msg, &st, &info);        break;
     case RB_MSG_GET_VERSION:    RbMsgGetVersion(msg, &st, &info);    break;
+    case RB_MSG_INVALIDATE_RANGE: RbMsgInvalidateRange(msg, &st, &info); break;   /* [V10.6/B-5] */
+    case RB_MSG_GET_EVENTS:     RbMsgGetEvents(msg, &st, &info);      break;   /* [V10.6/B-7] */
     default:
         st = STATUS_INVALID_DEVICE_REQUEST;
         break;

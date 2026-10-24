@@ -65,7 +65,16 @@ if ($sig.Status -ne 'Valid') {
 }
 
 # ---- 3) 哈希与三处锚点一致性（红线） ----
-$got = (Get-FileHash -LiteralPath $SysPath -Algorithm SHA256).Hash.ToLower()
+# [FIX S-05] Get-FileHash 包 try/catch：文件不可读时走 Fail -> 干净的
+# result: FAIL + exit 1，不再让裸异常栈冒充 usage 错误（对齐上面
+# Get-AuthenticodeSignature 的 catch 形状）。
+try {
+    $got = (Get-FileHash -LiteralPath $SysPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+} catch {
+    Fail "Get-FileHash threw: $($_.Exception.Message)"
+    Write-Host 'result: FAIL (1 fail, 0 warn)'
+    exit 1
+}
 Write-Host "  sha256: $got"
 
 $anchorFiles = @(
@@ -91,7 +100,10 @@ else {
     $sidecar = "$SysPath.sha256"
     if (Test-Path -LiteralPath $sidecar) {
         $first = (Get-Content -LiteralPath $sidecar -TotalCount 1 -ErrorAction SilentlyContinue)
-        if ($first -match '^([0-9a-fA-F]{64})') { $expected = $Matches[1].ToLower() }
+        # [FIX S-02] sidecar 首行哈希正则三处统一（deploy.ps1 / verify_deploy_signature.ps1 /
+        # check_signature.ps1）：词边界匹配，禁行内任意位置取首条——"SHA256: <hash>" 格式
+        # 必须三处同解；改此正则必须同步另两处。
+        if ($first -match '(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])') { $expected = $Matches[0].ToLower() }
     }
     if (-not $expected -and $anchors.ContainsKey('deploy.ps1')) { $expected = $anchors['deploy.ps1'] }
 }

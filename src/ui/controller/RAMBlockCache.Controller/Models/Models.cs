@@ -31,6 +31,8 @@ public static class RbP
     public const uint GET_VERSION = 10;
     public const uint PANIC = 11;
     public const uint PANIC_CLEAR = 12;
+    public const uint INVALIDATE_RANGE = 13;   /* [V10.6/B-5] 缓存范围失效 */
+    public const uint GET_EVENTS = 14;         /* [V10.6/B-7] 操作进度事件轮询 */
 
     public const int DataOffset = 16;
     public const int MsgSize = 7704;
@@ -38,6 +40,19 @@ public static class RbP
     public const int MaxVolumes = 8;
     public const int Stripes = 64;
     public const int NameLen = 16;
+    public const int SignerLen = 32;
+    public const int EventMax = 64;            /* [V10.6/B-7] 事件环容量 */
+    public const int EventText = 48;           /* [V10.6/B-7] 阶段文案上限 */
+
+    /* [V10.6/B-7] 操作类型（OpProgress.OpType 合法值） */
+    public const uint OpBenchmark = 1;
+    public const uint OpPresetApply = 2;
+    public const uint OpUnmount = 3;
+    public const uint OpL2Rebuild = 4;
+    /* [V10.6/B-8] L2 重建阶段 */
+    public const uint PhaseStart = 1;
+    public const uint PhaseProgress = 2;
+    public const uint PhaseDone = 3;
 
     public const uint WM_THROUGH = 0;
     public const uint WM_BACK = 1;
@@ -61,6 +76,11 @@ public struct RbStats
     public ulong AvailablePhysMB, PeakBytes, ReadaheadBytes, ReadaheadHitBytes, PressureShrinkBytes;
     public uint ReadaheadActive;
     public uint PanicActive, BootFails, DirtySnapshotMB;
+    /* ---- [V10.6/B-12] 读延迟 EWMA（微秒；末尾纯追加；0=尚无样本）----
+     * 后端已交付（rb_proto.h RB_STATS 末尾 + DriverService.RbStats 镜像 + wpf 第三副本，
+     * check_proto_sync --strict 把关）。UI 消费位：MainViewModel.LatencyDetailText
+     * → V106Contracts.RbStatsLatency.FormatDetail（无样本显示「—」不画假值）。 */
+    public uint CacheReadLatencyUs, DiskReadLatencyUs;
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 8)]
@@ -103,6 +123,57 @@ public struct RbVersionNative
     public uint ProtocolVersion, Major, Minor, Build, IsBlockFilter, Reserved;
     public ulong DriverFlags;
     [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbP.NameLen)] public ushort[] Name;
+    /* [V10.6/B-6] 驱动签名态（rb_proto.h RB_VERSION_T 末尾纯追加；三副本同步） */
+    public uint TestSigned, Reserved2;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbP.SignerLen)] public ushort[] Signer;
+}
+
+/// <summary>[V10.6/B-5] 缓存范围失效请求（rb_proto.h RB_INVALIDATE_RANGE_T 镜像；消息 13）。</summary>
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbInvalidateRangeNative
+{
+    public ushort Letter;
+    public uint Reserved;
+    public ulong Offset;
+    public ulong Length;
+}
+
+/// <summary>
+/// [V10.6/B-7] 操作进度事件（rb_proto.h RB_EVENT_REC_T 镜像；消息 14 游标增量）。
+/// 驱动当前发布点=卸载回写；二遍读/预设应用在 UI 本地总线（不经驱动）。
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbEventRecNative
+{
+    public ulong Seq;
+    public uint OpType;
+    public uint Percent;
+    public uint Cancelable;
+    public uint Phase;
+    public ulong RecoveredBytes;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbP.EventText)] public ushort[] StageText;
+
+    /// <summary>阶段文案（宽字符数组 → 字符串，去尾零）。</summary>
+    public string StageTextStr => StageText == null ? "" :
+        new string(Array.ConvertAll(StageText, c => (char)c)).TrimEnd('\0');
+}
+
+/// <summary>[V10.6/B-7] 事件轮询请求（游标=上次消费到的 Seq；0=从环内最早开始）。</summary>
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbEventQueryNative
+{
+    public ulong Cursor;
+    public uint MaxCount;
+}
+
+/// <summary>[V10.6/B-7] 事件轮询应答（Cursor=新消费游标；Count=本次条数）。</summary>
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbEventListNative
+{
+    public ulong Cursor;
+    public uint Count;
+    public uint Reserved;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbP.EventMax)] public RbEventRecNative[] Items;
 }
 
 // ---------------- UI 展示 DTO（ViewModel/XAML 绑定用，保持字段名不变） ----------------

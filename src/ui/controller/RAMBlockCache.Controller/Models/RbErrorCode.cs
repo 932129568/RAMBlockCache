@@ -20,4 +20,9 @@ public enum RbErrorCode
     DriverOffline = 5,
     /// <summary>重复初始化（如向导已完成后再次启动）。</summary>
     AlreadyInitialized = 6,
+    /// <summary>重复盘符/卷 GUID 冲突（B-9 挂载前校验拒绝；前端展示部分已就绪）。</summary>
+    DuplicateVolume = 7,
+    /// <summary>缓存范围刷新不支持/未就绪（B-5 FlushFileRange；前端降级横幅文案已就绪：
+    /// 「缓存范围刷新能力不可用，第一遍可能不是冷读，结果仅供参考」）。</summary>
+    FlushRangeUnsupported = 8,
 }

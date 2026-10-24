@@ -1,0 +1,26 @@
+<UserControl x:Class="RAMBlockCache.Controller.Controls.DialogHost"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Focusable="False" Visibility="Collapsed">
+    <Grid x:Name="Root">
+        <!-- 遮罩：absolute 全屏（限窗口内——06 D-a 裁决：桌面 App 语境遮罩不得晕染窗口外） -->
+        <Border x:Name="Mask" Background="#9E000000" Opacity="0" MouseLeftButtonDown="Mask_OnClick"/>
+        <!-- 面板：居中；宽度/最大高由 Show 指定（480=回写引导 / 440=反作弊 / 360=许可占位 / 560=文件选择） -->
+        <Border x:Name="Panel" HorizontalAlignment="Center" VerticalAlignment="Center"
+                Background="{StaticResource RbcBgElevated}"
+                BorderBrush="{StaticResource RbcBorderStrong}" BorderThickness="1"
+                CornerRadius="{StaticResource RbcRadiusLg}"
+                RenderTransformOrigin="0.5,0.5">
+            <Border.RenderTransform>
+                <TransformGroup>
+                    <ScaleTransform x:Name="PanelScale"/>
+                    <TranslateTransform x:Name="PanelSlide"/>
+                </TransformGroup>
+            </Border.RenderTransform>
+            <Border.Effect>
+                <DropShadowEffect BlurRadius="24" ShadowDepth="8" Direction="270" Color="Black" Opacity="0.45"/>
+            </Border.Effect>
+            <ContentPresenter x:Name="ContentSite"/>
+        </Border>
+    </Grid>
+</UserControl>

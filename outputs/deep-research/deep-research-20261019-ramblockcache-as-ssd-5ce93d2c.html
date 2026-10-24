@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>深度检索报告 · RAMBlockCache AS SSD 跑分分析与下一代设计优化</title>
+<style>
+:root{
+  --bg:#faf9f7;
+  --card:#ffffff;
+  --card-soft:#fbfaf8;
+  --ink:#2b2f36;
+  --ink-2:#6b7280;
+  --line:#eceae6;
+  --accent:#2f4858;
+  --accent-deep:#1f3a5f;
+  --point:#d9684a;
+  --muted:#9aa0a6;
+  --serif:"Noto Serif SC","Source Han Serif SC",serif;
+  --sans:"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:"Inter","JetBrains Mono",monospace;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family:var(--sans);
+  background:var(--bg);
+  color:var(--ink);
+  padding:40px 32px;
+  line-height:1.7;
+}
+.report {
+  max-width:880px;
+  margin:0 auto;
+  background:var(--card);
+  border-radius:12px;
+  box-shadow:0 2px 16px rgba(43,47,54,.05);
+  overflow:hidden;
+}
+.header {
+  background:var(--card);
+  border-top:4px solid var(--accent);
+  border-bottom:1px solid var(--line);
+  color:var(--ink);
+  padding:32px;
+}
+.header .kicker { font-family:var(--sans); font-size:13px; color:var(--muted); letter-spacing:1px; }
+.header h1 { font-family:var(--serif); font-size:22px; color:var(--accent); margin:8px 0 16px; font-weight:700; }
+.meta { display:flex; flex-wrap:wrap; gap:8px 20px; font-size:13px; color:var(--ink-2); }
+.meta b { font-weight:600; color:var(--ink); }
+.chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+.chip { background:#f1efea; padding:4px 12px; border-radius:999px; font-size:12px; color:var(--ink-2); }
+.body { padding:32px 32px 24px; }
+h2 {
+  font-family:var(--serif);
+  font-size:18px; color:var(--accent); margin:32px 0 16px;
+  display:flex; align-items:center; gap:8px;
+}
+h2::before { content:""; width:4px; height:18px; background:var(--accent); border-radius:2px; }
+h3 { font-size:15px; color:var(--ink); margin:20px 0 10px; }
+.grid { display:grid; grid-template-columns:1fr; gap:16px; }
+.card {
+  display:flex; gap:14px; align-items:flex-start;
+  background:var(--card-soft); border:1px solid var(--line); border-radius:10px;
+  padding:16px 20px; border-left:4px solid var(--muted);
+}
+.card .num { font-family:var(--mono); font-weight:700; color:var(--muted); font-size:14px; min-width:22px; }
+.card .txt { flex:1; font-size:14px; }
+.card.s-in { border-left-color:var(--accent); }
+.card.s-out { border-left-color:var(--point); }
+.card.s-both { border-left-color:var(--accent-deep); }
+.card.s-gap { border-left-color:var(--muted); }
+.badge {
+  display:inline-block; font-family:var(--sans); font-size:11px; font-weight:600;
+  padding:2px 8px; border-radius:999px; margin-right:6px; vertical-align:1px;
+}
+.b-in { background:#e7ecf0; color:#2f4858; }
+.b-out { background:#fbe9e3; color:#c0533a; }
+.b-both { background:#e3e9f0; color:#1f3a5f; }
+.b-gap { background:#f1efea; color:#6b7280; }
+table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+th { background:#f3f1ec; text-align:left; padding:10px; font-weight:600; color:var(--ink-2); }
+td { padding:10px; border-bottom:1px solid var(--line); vertical-align:top; }
+tr:last-child td { border-bottom:none; }
+.src-block { background:var(--card-soft); border:1px solid var(--line); border-radius:10px; padding:16px 20px; margin-top:16px; font-size:13px; }
+.src-block h4 { font-family:var(--sans); font-size:13px; margin-bottom:8px; color:var(--ink); }
+.src-block ul { list-style:none; }
+.src-block li { padding:4px 0; }
+.src-block .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; }
+.dot-in { background:var(--accent); } .dot-out { background:var(--point); } .dot-his { background:var(--accent); }
+code { font-family:var(--mono); background:#f3f1ec; padding:1px 5px; border-radius:4px; font-size:12px; color:var(--ink); }
+.win { color:#1c7c4a; font-weight:600; }
+.lose { color:#c0533a; font-weight:600; }
+.mid { color:#9a6b1f; font-weight:600; }
+.footer { background:var(--card-soft); border-top:1px solid var(--line); padding:20px 32px 24px; font-size:12px; color:var(--muted); }
+.disclaimer { font-style:italic; color:var(--ink-2); margin-top:6px; }
+@media print { body{background:#fff;padding:0} .report{box-shadow:none;border-radius:0} }
+</style>
+</head>
+<body>
+<div class="report">
+  <div class="header">
+    <div class="kicker">深度检索报告 · DEEP-RESEARCH</div>
+    <h1>RAMBlockCache AS SSD 跑分分析与下一代设计优化</h1>
+    <div class="meta">
+      <span><b>范围</b>：三次 AS SSD Benchmark 跑分（D: CT1000MX500SSD1 / MX500 1TB）判定与下一版本设计优化</span>
+      <span><b>来源</b>：内部 7 · 外部 15</span>
+      <span><b>日期</b>：2026-10-19</span>
+    </div>
+    <div class="chips">
+      <span class="chip">检索路径：代码定位 → 部署核验 → 联网（2 轮 4 查询）</span>
+      <span class="chip">检索模式：关键词 + 外部检索</span>
+      <span class="chip">查询改写：无（实体已精确）</span>
+    </div>
+  </div>
+
+  <div class="body">
+    <h2>核心结论</h2>
+    <div class="grid">
+      <div class="card s-both">
+        <div class="num">1</div>
+        <div class="txt"><span class="badge b-both">内+外</span><b>真正加速的只有一项：4K-64Thrd 随机读</b>：三次 3393–3496 MB/s ≈ 868–894K IOPS，而 MX500 的 QD64 读能力约 97K IOPS（≈388 MB/s，三篇横评一致）——9 倍于盘能力，SATA 协议从物理上排除来自盘的可能，只能来自内存。领先假设=本品缓存命中；次要假设=工具/页缓存假象，判别式见「判别式测量」。</div>
+      </div>
+      <div class="card s-in">
+        <div class="num">2</div>
+        <div class="txt"><span class="badge b-in">内</span><b>「大多数没变」有代码级根因</b>：① AS SSD Seq 用 16MB 大块（官方站），撞上驱动 <code>len &gt; 8MB 直接透传</code> 门（rbio.c:773）——顺序读写永不进缓存；② 全局默认直写（rb_proto.h:85 RB_DEFAULT_WRITEBACK=0），写永远不加速；③ 吸收架构每 IO 附加「worker 跳转+同步重发」开销，4K QD1 写仅 ~5K IOPS vs 盘能力 ~28K——小写疑似负优化。</div>
+      </div>
+      <div class="card s-out">
+        <div class="num">3</div>
+        <div class="txt"><span class="badge b-out">外</span><b>测试方法论对缓存软件天然不利</b>：AS SSD 合成测试为非缓冲 I/O（FILE_FLAG_NO_BUFFERING + WRITE_THROUGH，绕过操作系统缓存；Seq=16MB 块/1GB 文件；4K=QD1；4K-64Thrd=QD64）——来源：<a href="https://www.as-ssd-benchmark.cn/">as-ssd-benchmark.cn</a>、<a href="https://wenku.csdn.net/doc/88oqqofjwk">CSDN 文库（实现细节）</a>、<a href="https://rottenwifi.com/services/as-ssd-benchmark">rottenwifi 2026 综述</a>。它度量的是「冷缓存单遍」——任何 RAM 缓存软件（含 PrimoCache）首遍都只能达盘速；缓存价值在第二遍/重复访问，跑分不表达这一点。</div>
+      </div>
+      <div class="card s-gap">
+        <div class="num">4</div>
+        <div class="txt"><span class="badge b-gap">⚠ 未覆盖</span><b>缺「脱离驱动的裸盘基线」对照</b>：无 AS SSD 2.0 在本盘的 detached 基线，4K 写 ~5K IOPS 是驱动开销还是盘体固有基线无法判定；4K 读中场 +37%（43→59 MB/s）同样无法归因。建议按判别式方案补测（约半天）。</div>
+      </div>
+    </div>
+
+    <h2>关键要点</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>缓存在工作，但加速面太窄</b>：命中只发生在「小 IO（≤8MB）× 已缓存工作集 × 读 × 高队列深度」——QD64 随机读 9 倍于盘能力是真实的内存级命中（待确认）。</li>
+        <li><b>下一版本杠杆排序</b>：① 数据卷默认回写（写进加速面）② 8MB 门改造+大块直 Commit（大 IO 进加速面）③ 吸收路径每 IO 延迟治理（消除小写负优化）④ 预取默认开（第一遍体感）⑤ L2 维持默认关（跑分无感、战略项）。</li>
+        <li><b>测量先于优化</b>：<code>ramboostctl stats</code> 的 ReadReq/ReadHit 曲线是区分「缓存命中」与「工具假象」的唯一硬证据；所有改动须 attached/detached 对照 + 固定方法论。</li>
+        <li><b>建议重排迭代计划</b>：在 W2（L2）之前插入「读写路径性能专项」波次——L2 不移动跑分数字，用户抱怨正指向写路径与大 IO 门。</li>
+        <li><b>跑分总分（5599–5743）不可横向比</b>：MX500 参考总分 ~1184–1244（无缓存），本品分数被权重最高的 4K-64Thrd 读拉高 ~4.5 倍——分数通胀同样来自缓存命中，佐证结论 1。</li>
+      </ul>
+    </div>
+
+    <h2>三次跑分数据与判定</h2>
+    <p style="font-size:13px;color:var(--ink-2);margin-bottom:8px;">D:（MX500 1TB，931.51 GB，AHCI OK），1GB 测试文件，连续三轮（01:42 → 01:45 → 01:46），运行构建含全部 10-17 修复且数据卷开机自动挂载。</p>
+    <table>
+      <tr><th>指标</th><th>#3 (01:42)</th><th>#2 (01:45)</th><th>#1 (01:46)</th><th>MX500 盘能力参照</th><th>判定</th></tr>
+      <tr><td>Seq 读</td><td>517.36</td><td>513.95</td><td>513.95 MB/s</td><td>~530–563</td><td class="lose">无变化（盘速）</td></tr>
+      <tr><td>Seq 写</td><td>435.00</td><td>423.93</td><td>423.93 MB/s</td><td>~455–515</td><td class="lose">无变化（盘速）</td></tr>
+      <tr><td>4K 读 (QD1)</td><td>43.04</td><td><b>59.03</b></td><td>44.255 MB/s</td><td>~38–47</td><td class="mid">#2 +33~37% 存疑</td></tr>
+      <tr><td>4K 写 (QD1)</td><td>19.76</td><td>19.70</td><td>19.62 MB/s</td><td>~110–136</td><td class="lose">无变化且疑似负优化（~5K vs ~28K IOPS）</td></tr>
+      <tr><td>4K-64Thrd 读</td><td>3496.04</td><td>3395.50</td><td>3393.41 MB/s</td><td>~388（~97K IOPS）</td><td class="win">加速 ~9 倍（内存级，待确认）</td></tr>
+      <tr><td>4K-64Thrd 写</td><td>276.27</td><td>292.22</td><td>285.84 MB/s</td><td>~341（~85K IOPS）</td><td class="lose">无变化（≈盘能力 85%）</td></tr>
+      <tr><td>Acc.time 读</td><td>0.096</td><td>0.093</td><td>0.087 ms</td><td>~0.05–0.15</td><td class="lose">无变化（冷 QD1）</td></tr>
+      <tr><td>Acc.time 写</td><td>0.199</td><td>0.190</td><td>0.214 ms</td><td>略高于读</td><td class="lose">无变化（含吸收开销）</td></tr>
+      <tr><td>总分</td><td>5743</td><td>5638</td><td>5599</td><td>参考 ~1184–1244</td><td class="mid">分数被 QD64 读拉高，不可横向比</td></tr>
+    </table>
+
+    <h2>根因分析（代码级）</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>A · 16MB 顺序 IO 撞 8MB 透传门（Seq 零收益）</b>：<code>rbio.c:773</code> <code>len &gt; (8UL&lt;&lt;20) → RbDispatchPassthrough</code>；AS SSD Seq=16MB 块/1GB 文件（官方站）→ 每个 Seq IO 直接透传。该门本是 staging 安全阀，实际把大块顺序读写整体排除出加速面（视频编辑/大文件拷贝/DB 顺序扫描同理）。</li>
+        <li><b>B · 全局默认直写（写永远不加速）</b>：<code>rb_proto.h:85 RB_DEFAULT_WRITEBACK=0</code>；直写模式（rbio.c:481-488）写同步落盘后才以干净块入缓存——写吞吐恒等于盘速。PrimoCache 的 Defer-Write 对应用户显式开回写；本品默认值与引导未讲清「回写=写加速唯一入口」。</li>
+        <li><b>C · 吸收架构每 IO 延迟（小写负优化）</b>：进入缓存的 IO 走「pend → per-CPU worker 跳转 → 同步重发（RbSyncIo）→ 完成」。QD1 写观测 ~198µs/IO vs 盘 ~36µs；QD64 写≈盘能力 85%（开销被队列部分掩盖）。读路径同架构但盘延迟占比高，故 4K 读「正常」——恰说明命中路径也有数微秒可回收。</li>
+        <li><b>D · 命中面依赖预热而预取默认关</b>：rbpref.c（倒流跟踪+8MB 分片）与 rbL2.c 均已实现，但部署默认 <code>Features\Flags=0</code> 全关（rb_common2.h）——第一遍顺序读无提前量。</li>
+      </ul>
+    </div>
+
+    <h2>判别式测量方案（优化前必做，约半天）</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>附着/脱离对照</b>：<code>rbfeatctl vols</code> 确认 D: attached=1 → 跑一轮 AS SSD（A）→ detach D: → 同条件跑一轮（基线 B）→ 重新 attach。A/B 差=缓存净效果；B 给出 4K 写的盘体固有基线（判定根因 C 是回归还是基线）。</li>
+        <li><b>测试中抓计数器</b>：AS SSD 运行期间另开提权窗每 2s <code>ramboostctl stats</code>，记录 ReadReq/ReadHit/ReadHitBytes 曲线——ReadReq 与 ReadHit 同步激增=H1（本品缓存命中）；ReadReq 平稳（IO 从未到达卷）=H2（工具/页缓存假象）。</li>
+        <li><b>固定方法论</b>：同工具同版本、1GB 文件、关后台（Search/Defender 实时扫描）、测前空闲 60s、每配置 3 轮取中位。</li>
+        <li><b>二遍读协议</b>：同一测试文件连读两遍（冷/暖），记录差异——这才是缓存产品的正确度量。</li>
+      </ul>
+    </div>
+
+    <h2>下一版本设计优化方向与具体改进方案</h2>
+    <table>
+      <tr><th>#</th><th>方向（优先级）</th><th>具体改动</th><th>预期收益</th><th>影响范围 / 对应迭代</th></tr>
+      <tr><td>1</td><td><b>写进入加速面：默认回写+安全网明示</b>（P0，杠杆最大）</td><td>数据卷（非系统卷）自动挂载默认模式直写→回写；UI 明示安全网（句柄关闭/Flush/卸载/关机全量回写+异常退出安全模式已在代码内）；新装机默认回写、老用户升级不改既有卷模式；设置页加「全局默认写模式」；高级选项对标 PrimoCache Defer-Write 官方词汇（Latency=0=禁用，与本品「回写周期 0=无限」同语义；写入模式五档可作 M2）</td><td>4K 写 ~5K IOPS → 内存吸收速度；≤8MB 写全面进加速面——回应用户抱怨中占比最大的写项</td><td>驱动默认配置+安装器+UI 向导；数据安全叙事同步 / 新波次 W1.5 首项，先于 W2</td></tr>
+      <tr><td>2</td><td><b>大 IO 进加速面：8MB 门改造</b>（P0）</td><td>门限 8MB→64MB（注册表可配 MaxCacheIoKB）；分级：≤8MB 现有 staging，8–64MB 大块直 Commit（读整段下盘整段 commit/写整段下盘+commit，免逐子块搬运）；&gt;64MB 维持透传</td><td>Seq（16MB 块）进缓存——第二遍 Seq 读达内存带宽；大文件/视频/DB 扫描重复访问受益（第一遍仍盘速，配合方向 4）</td><td>rbio.c 分发门+staging 策略+配置面；须过 Driver Verifier / W1.5 第二项</td></tr>
+      <tr><td>3</td><td><b>吸收路径每 IO 延迟治理</b>（P0，消除负优化）</td><td>命中读 PASSIVE 快速通道（不过 worker）；miss/写路径用完成例程替代同步重发（消双 IRP）；每 IO 开销预算（命中 &lt;5µs P99）进基准门禁；进程排除判定按线程缓存</td><td>4K QD1 写回盘能力基线以上；命中 QD1 读延迟进微秒级；Acc.time 写回落</td><td>rbio.c 核心数据通路——高风险高收益，Verifier+失败注入前置 / W1.5 第三项</td></tr>
+      <tr><td>4</td><td><b>第一遍体感：预取默认开</b>（P1）</td><td>数据卷自动挂载默认置 RB2F_PREFETCH（温度护栏已有，超温自停）；每卷 ReadAheadMB 默认 16MB 档；PrefIssued/FillOk 进 UI 与遥测</td><td>顺序/流式负载第一遍获预读重叠；与方向 2 组合=「第二遍内存带宽+第一遍有预读」</td><td>特性开关默认值+缓存页文案；默认档由方向 6 基准库裁定 / W3 提前或与 W1.5 衔接</td></tr>
+      <tr><td>5</td><td><b>L2 维持默认关、按需启用</b>（P2，战略项非跑分项）</td><td>维持 Flags 默认 0（安全红线）；缓存页入口+掉电恢复验收按 PRD-01 M1 推进</td><td>对跑分无感（L1 已覆盖 1GB 测试集）；真实价值在跨重启预热与超内存工作集——技术用户转化要件，不为跑分让路也不被跑分否定</td><td>同 PRD-01 / W2 不变，但明示「L2 不承诺移动跑分」</td></tr>
+      <tr><td>6</td><td><b>测量与基线基建</b>（P0，所有方向前置）</td><td>判别式固化为 bench_proto.ps1（attached/detached 对照+计数器曲线+二遍读+3 轮中位→CSV）；基准库纳入 W3-4 四负载×三盘型；「无 Verifier 证据不合并」写入数据通路 DoD</td><td>后续每个优化项可归因、可回归；终结「看不出变化」类争议</td><td>脚本+流程，~2-3 人天（估）/ W0 验收包的自然延伸，立即做</td></tr>
+    </table>
+
+    <h2>对既有迭代计划的重排建议</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>插入 W1.5「读写路径性能专项」</b>（方向 1/2/3 + 方向 6），位于 W0 出口后、W2 前——用户抱怨直指此处，且 L2 对跑分无感。</li>
+        <li><b>W3 预取激活保留在覆盖验证之后</b>——依赖方向 2 的基准库裁定默认档，但应早于 L2 完整版排期。</li>
+        <li><b>W2 L2 范围与叙事不变</b>：L2 解决持久性与容量，不解决冷启动跑分——避免用错误指标验收 L2。</li>
+        <li><b>W1 遥测集加「命中率/加速面分布」指标</b>（哪些 IO 走缓存、哪些透传），让下一轮分析有数据而非截图推理。</li>
+      </ul>
+    </div>
+
+    <h2>证据清单</h2>
+    <table>
+      <tr><th>#</th><th>结论摘要</th><th>支撑</th><th>口径</th><th>来源</th></tr>
+      <tr><td>1</td><td>Seq 读/写三次均 ~514/424–435 MB/s，与盘能力一致，零缓存收益</td><td><span class="badge b-both">内+外</span></td><td>IO &gt;8MB 透传；AS SSD Seq=16MB 块</td><td>rbio.c:773 + as-ssd-benchmark.cn</td></tr>
+      <tr><td>2</td><td>4K-64Thrd 读 ≈868–894K IOPS ≈ 盘能力 9 倍，物理上只能来自内存</td><td><span class="badge b-both">内+外</span></td><td>SATA III ≈100K IOPS@4K 上限；MX500 QD64 ~97K IOPS</td><td>跑分截图 + TheSSDReview + coolaler</td></tr>
+      <tr><td>3</td><td>4K QD1 写 ~5K IOPS 远低于盘能力 ~28–35K IOPS</td><td><span class="badge b-both">内+外</span></td><td>直写吸收每 IO 附加开销；基线未测</td><td>跑分截图 + Mobile01 + TheSSDReview</td></tr>
+      <tr><td>4</td><td>AS SSD 合成测试为非缓冲 I/O，绕过操作系统缓存</td><td><span class="badge b-out">外</span></td><td>测试方法论</td><td>as-ssd-benchmark.cn + CSDN 文库 + rottenwifi</td></tr>
+      <tr><td>5</td><td>直写模式写成功即以干净块入缓存；全局默认直写</td><td><span class="badge b-in">内</span></td><td>代码语义</td><td>rbio.c:481-488 + rb_proto.h:85</td></tr>
+      <tr><td>6</td><td>预取与 L2 均已实现但部署默认 Flags=0 全关</td><td><span class="badge b-in">内</span></td><td>特性开关</td><td>rb_common2.h + ramboostsetup.c:217</td></tr>
+      <tr><td>7</td><td>运行构建为 10-17 晚签名版（锚点 b6fb097b），含当日全部修复</td><td><span class="badge b-in">内</span></td><td>部署状态</td><td>memory/2026-10-17.md + deploy.ps1:42</td></tr>
+      <tr><td>8</td><td>无 detached 裸盘基线；4K 读中场 +37% 无法归因</td><td><span class="badge b-gap">⚠</span></td><td>—</td><td>当前资料未覆盖，按判别式补测</td></tr>
+      <tr><td>9</td><td>PrimoCache 写加速同样以回写（Defer-Write）为唯一入口，Latency=0 即禁用，官方建议仅临时盘/UPS 场景开启</td><td><span class="badge b-out">外</span></td><td>竞品口径对标</td><td><a href="https://www.romexsoftware.com/en-us/primo-cache/term-defer-write.html">romexsoftware Defer-Write</a> + <a href="https://www.romexsoftware.com/en-us/primo-cache/terms-configuration.html">配置术语</a></td></tr>
+    </table>
+
+    <h2>口径与来源（进阶）</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>实体解析</b>：「AS SSD 跑分」→ AS SSD Benchmark 2.0.7316.34247（Seq=16MB 块×1GB 文件；4K=QD1；4K-64Thrd=QD64）；「D:」→ CT1000MX500SSD1（MX500 1TB SATA III，storahci）</li>
+        <li><b>术语口径</b>：IOPS=MB/s ÷ 4KiB；「透传」=IO 不经缓存直通下层盘；「吸收」=IO 进入过滤驱动缓存路径</li>
+        <li><b>数据状态</b>：跑分 2026-10-19 01:42–01:46；代码截至 2026-10-19 01:51（dist=b6fb097b 运行中）；公开信息检索 2026-10-19</li>
+      </ul>
+    </div>
+
+    <h2>来源分区</h2>
+    <div class="src-block">
+      <h4>内部资料（7）</h4>
+      <ul>
+        <li><span class="dot dot-in"></span>src/driver/rbio.c（8MB 透传门 :773；直写 commit :481-488）</li>
+        <li><span class="dot dot-in"></span>src/ctl/rb_proto.h（RB_DEFAULT_WRITEBACK=0 :85）</li>
+        <li><span class="dot dot-in"></span>src/driver/rb_common2.h（特性开关语义）</li>
+        <li><span class="dot dot-in"></span>src/setup/ramboostsetup.c（安装默认值表 :217）</li>
+        <li><span class="dot dot-in"></span>src/scripts/deploy.ps1（锚点 :42）</li>
+        <li><span class="dot dot-in"></span>.workbuddy/memory/2026-10-17.md（部署与修复时间线）</li>
+        <li><span class="dot dot-in"></span>deliverables/iteration-plan-ramblockcache-2026-10-17.md（被重排的既有计划）</li>
+      </ul>
+    </div>
+    <div class="src-block">
+      <h4>公开信息（15）</h4>
+      <ul>
+        <li><span class="dot dot-out"></span><a href="https://www.as-ssd-benchmark.cn/">AS SSD Benchmark 中文站（Seq=16MB 块/1GB 文件；绕过系统缓存）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.as-ssd-benchmark.cn/news2.html">AS SSD Benchmark 评分参考区间</a></li>
+        <li><span class="dot dot-out"></span><a href="https://as-ssd-benchmark.updatestar.com">AS SSD Benchmark 版本档案（2.0.7316.34247，2020-03）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://mundobytes.com/zh-CN/para-que-sirve-as-ssd-benchmark/">MundoBytes：AS SSD 用途与测试内容</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.pchardwarepro.com/zh-CN?p=194655">PChardwarePro：AS SSD 详解（最小化中间缓冲）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.thessdreview.com/our-reviews/crucial-mx500-ssd-review-1tb-the-best-value-in-sata/3/">TheSSDReview：MX500 1TB 横评（~97K IOPS；CDM 47/136 MB/s）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.mobile01.com/newsdetail/23896/crucial-mx500-1tb-ssd-smi-sm2258h-64layer-3dnand-tlc">Mobile01：MX500 1TB 实测（4K-64Thrd 96,565 IOPS）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.coolaler.com/?p=13263/">coolaler：MX500 1TB 开箱（4K-64Thrd 读 97,029 IOPS）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://wenku.csdn.net/doc/88oqqofjwk">CSDN 文库：AS SSD 实现细节（NO_BUFFERING+WRITE_THROUGH）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://rottenwifi.com/services/as-ssd-benchmark">rottenwifi 2026 综述（合成测试不走 OS 缓存）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.romexsoftware.com/en-us/primo-cache/term-defer-write.html">Romex Defer-Write 官方文档（写加速唯一入口；紧急写入；水库模型）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.romexsoftware.com/zh-cn/primo-cache/term-defer-write.html">Romex 延时写入中文文档（风险与启用场景建议）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.romexsoftware.com/en-us/primo-cache/terms-configuration.html">Romex 配置术语（Latency=0=禁用；写入模式五档；Flush on Sleep/Hibernate）</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.romexsoftware.com/zh-cn/primo-cache/terms-configuration.html">Romex 配置术语中文版</a></li>
+        <li><span class="dot dot-out"></span><a href="http://eww.romexsoftware.com/zh-cn/primo-cache/term-l2cache.html">Romex 二级缓存文档（L2 一致性检测与离线修改风险）</a></li>
+      </ul>
+    </div>
+
+    <h2>研究方法（使用外部检索 [外] 时填写）</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>子问题</b>：① AS SSD 的 I/O 方式与块大小 ② MX500 1TB 各负载真实能力基线 ③ 3393 MB/s 的 4K-64Thrd 读在 SATA 盘上是否可能 ④ PrimoCache Defer-Write 官方语义与启用口径</li>
+        <li><b>检索查询</b>：web 共 6 条（3 轮，证据补齐轮次已到上限）</li>
+        <li><b>唯一来源</b>：15 个（官方站 2、横评 4、工具实现/综述 4、Romex 官方 4、社区 1）</li>
+        <li><b>深读篇数</b>：0 篇 WebFetch 全文（检索摘要已含所需数值）</li>
+        <li><b>源优先级</b>：官方/硬件媒体 &gt; 文库/论坛；盘体规格取三篇横评交叉一致</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="footer">
+    <div class="disclaimer">⚠️ 本报告基于现有知识库资料与公开信息的整理归纳，跑分判定的最终确认依赖判别式测量；信息以原始资料为准，不构成专业医疗/法律/投资/教育等建议。</div>
+    <div style="margin-top:4px;">生成：deep-research skill · md 底稿与证据表随 HTML 一并交付</div>
+  </div>
+</div>
+</body>
+</html>

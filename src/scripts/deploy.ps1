@@ -39,7 +39,7 @@ $ErrorActionPreference = 'Stop'
 
 # Build19 delivered driver pin. Override with -ExpectedSha256 or a <sys>.sha256
 # sidecar file next to the source sys. If none is available the gate FAILS CLOSED.
-$DefaultExpectedSha256 = 'b6fb097ba24fab1621df48ca066cebd57d1a9cc55015c5737d69e27e3dd64882'
+$DefaultExpectedSha256 = '5ebde9e28441d861b1df33508d3b2c7d3f72beeac7ef1d8f2cc324bac47a629d'
 
 Write-Host '== RAMBlockCache V10.4.3 deploy (verify-before-change) =='
 
@@ -94,7 +94,10 @@ function Resolve-ExpectedSha([string]$Sys, [string]$Explicit) {
     $sidecar = "$Sys.sha256"
     if (Test-Path -LiteralPath $sidecar) {
         $first = Get-Content -LiteralPath $sidecar -TotalCount 1
-        if ($first -match '([0-9a-fA-F]{64})') { return $matches[1].ToLower() }
+        # [FIX S-02] sidecar 首行哈希正则三处统一（deploy.ps1 / verify_deploy_signature.ps1 /
+        # check_signature.ps1）：词边界匹配，禁行内任意位置取首条——"SHA256: <hash>" 格式
+        # 必须三处同解；改此正则必须同步另两处。
+        if ($first -match '(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])') { return $matches[0].ToLower() }
         throw "sidecar hash file has no 64-hex SHA256: $sidecar"
     }
     if ($DefaultExpectedSha256) { return $DefaultExpectedSha256.ToLower() }
@@ -173,12 +176,22 @@ Write-Host '[ok] Pre-flight gate PASSED - applying changes.'
 # =====================================================================
 #  BACKUP original state (before the first mutation)
 # =====================================================================
+# [FIX S-01] 备份段扩充：除原"值备份"外，新增整键/文件/目录/任务存在性快照
+# （fresh-install 回滚"不存在->删除"的依据）。System32 旧文件与守卫脚本的
+# 内容备份不在此段——变异可能中途失败，内容备份必须紧贴覆盖点（见变异段）。
+$backupErrors = @()
 $backup = @{
     UpperFiltersExisted = $false; UpperFilters = @()
     SvcExisted = $false; SvcStart = $null; SvcType = $null; SvcError = $null; SvcGroup = $null
     PfroExisted = $false; Pfro = @()
     ParamProps = @{}
     FeatExisted = $false; FeatFlags = 0
+    SvcRootExisted = $false
+    FeatKeyExisted = $false
+    Sys32Existed = $false; Sys32Backup = $null; Sys32Replaced = $false
+    PdDirExisted = $false
+    GuardExisted = @{}; GuardBackup = @{}
+    TaskExisted = @{}; TaskDef = @{}
     Mutated = $false
 }
 
@@ -202,7 +215,7 @@ if ($pfroProp -and $null -ne $pfroProp.PendingFileRenameOperations) {
 }
 if (Test-Path -LiteralPath $svcRoot) {
     $pp = Get-ItemProperty -Path $svcRoot -ErrorAction SilentlyContinue
-    foreach ($n in @('DeploySeq','BootFailCount','LastBootHealthy','FilterArmed')) {
+    foreach ($n in @('DeploySeq','BootFailCount','LastBootHealthy','FilterArmed','TestSigned','Signer')) {
         if ($pp -and ($pp.PSObject.Properties.Name -contains $n)) { $backup.ParamProps[$n] = $pp.$n }
     }
 }
@@ -210,11 +223,32 @@ if (Test-Path -LiteralPath $featKey) {
     $fp = Get-ItemProperty -Path $featKey -Name Flags -ErrorAction SilentlyContinue
     if ($fp -and $null -ne $fp.Flags) { $backup.FeatExisted = $true; $backup.FeatFlags = $fp.Flags }
 }
+# [FIX S-01] 存在性快照：Parameters/Features 整键、System32 目标、pdDir、
+# 两个守卫脚本、两个计划任务（含 XML 导出，供 redeploy 场景还原）。
+$backup.SvcRootExisted = Test-Path -LiteralPath $svcRoot
+$backup.FeatKeyExisted = Test-Path -LiteralPath $featKey
+$backup.Sys32Existed   = Test-Path -LiteralPath $dest
+$backup.PdDirExisted   = Test-Path -LiteralPath $pdDir
+foreach ($g in @('boot_guard.ps1','logon_disarm.ps1')) {
+    $backup.GuardExisted[$g] = Test-Path -LiteralPath (Join-Path $pdDir $g)
+}
+foreach ($tn in @('RAMBoostBootGuard','RAMBoostLogonDisarm')) {
+    $t = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+    $backup.TaskExisted[$tn] = [bool]$t
+    if ($t) {
+        try { $backup.TaskDef[$tn] = Export-ScheduledTask -TaskName $tn }
+        catch { $backupErrors += "export task $tn`: $($_.Exception.Message)" }
+    }
+}
+if ($backupErrors.Count -gt 0) {
+    foreach ($e in $backupErrors) { Write-Host "[X] backup incomplete: $e" -ForegroundColor Red }
+    Fail 'pre-deploy backup incomplete; refusing to mutate (rollback would not be symmetric).' 1
+}
 
 function Invoke-Rollback {
     Write-Host '[..] rolling back to pre-deploy state ...' -ForegroundColor Yellow
     $errors = @()
-    # UpperFilters
+    # ① UpperFilters：存在→恢复 / 不存在→删属性
     try {
         if ($backup.UpperFiltersExisted) {
             Set-ItemProperty -Path $clsKey -Name UpperFilters -Value $backup.UpperFilters -Type MultiString
@@ -222,28 +256,106 @@ function Invoke-Rollback {
             Remove-ItemProperty -Path $clsKey -Name UpperFilters -ErrorAction SilentlyContinue
         }
     } catch { $errors += "UpperFilters: $($_.Exception.Message)" }
-    # Service config
+    # ② 服务：存在→sc config 恢复（[FIX S-01] 查退出码）/ 不存在→Stop + sc delete
+    #    （fresh-install 残留必须清除，否则机器带着 BOOT_START 服务重启）
     if ($backup.SvcExisted) {
         try {
             $st = if ($null -ne $backup.SvcStart -and $startMap.ContainsKey([int]$backup.SvcStart)) { $startMap[[int]$backup.SvcStart] } else { 'demand' }
             $ec = if ($null -ne $backup.SvcError -and $errorMap.ContainsKey([int]$backup.SvcError)) { $errorMap[[int]$backup.SvcError] } else { 'normal' }
             $ty = if ($null -ne $backup.SvcType  -and $typeMap.ContainsKey([int]$backup.SvcType))   { $typeMap[[int]$backup.SvcType] }   else { 'kernel' }
             & sc.exe config RAMBlockCache start= $st error= $ec type= $ty | Out-Null
+            # [FIX S-01] 恢复路径同样查退出码：sc.exe 失败必须可见，不能静默"恢复成功"
+            if ($LASTEXITCODE -ne 0) { throw "sc.exe config restore failed (exit $LASTEXITCODE)" }
             # [FIX 建议-2 2026-10-18] 组名含空格（System Bus Extender）需整参数传递，否则 sc.exe 拆词回滚失败
-            if ($backup.SvcGroup) { & sc.exe config RAMBlockCache "group=$($backup.SvcGroup)" | Out-Null }
+            if ($backup.SvcGroup) {
+                & sc.exe config RAMBlockCache "group=$($backup.SvcGroup)" | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "sc.exe config group restore failed (exit $LASTEXITCODE)" }
+            }
         } catch { $errors += "service: $($_.Exception.Message)" }
+    } else {
+        # [FIX S-01] fresh-install：服务是本次部署引入的，停掉并删除。
+        # A2：Stop-Service + 10s 有界轮询；轮询超时仍继续 sc.exe delete（打删除标记），
+        # 与 install.ps1:53 一致容忍 {0,1060}（1060=服务已不存在）。
+        try {
+            Stop-Service -Name 'RAMBlockCache' -ErrorAction SilentlyContinue
+            $waited = 0
+            while ($waited -lt 10) {
+                $svc = Get-Service -Name 'RAMBlockCache' -ErrorAction SilentlyContinue
+                if (-not $svc -or $svc.Status -eq 'Stopped') { break }
+                Start-Sleep -Seconds 1
+                $waited++
+            }
+            & sc.exe delete RAMBlockCache | Out-Null
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1060) {
+                throw "sc.exe delete failed (exit $LASTEXITCODE; 1060=already-gone is tolerated)"
+            }
+            Write-Host '[ok] fresh-install service RAMBlockCache removed (stop + sc delete)'
+        } catch { $errors += "service delete: $($_.Exception.Message)" }
     }
-    # Parameters (armed baseline)
-    foreach ($n in $backup.ParamProps.Keys) {
-        try { Set-ItemProperty -Path $svcRoot -Name $n -Value $backup.ParamProps[$n] -Type DWord }
-        catch { $errors += "param ${n}: $($_.Exception.Message)" }
+    # ③ Parameters（armed 基线）：svcRoot 键不存在→整键删 / 存在→恢复备份值 + 删部署新建属性
+    try {
+        if (-not $backup.SvcRootExisted) {
+            if (Test-Path -LiteralPath $svcRoot) { Remove-Item -Path $svcRoot -Recurse -Force -ErrorAction Stop }
+        } else {
+            foreach ($n in @('DeploySeq','BootFailCount','LastBootHealthy','FilterArmed','TestSigned','Signer')) {
+                if ($backup.ParamProps.ContainsKey($n)) {
+                    Set-ItemProperty -Path $svcRoot -Name $n -Value $backup.ParamProps[$n] -Type DWord
+                } else {
+                    Remove-ItemProperty -Path $svcRoot -Name $n -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    } catch { $errors += "Parameters: $($_.Exception.Message)" }
+    # ④ Features\Flags：键不存在→整键删 / Flags 部署前不存在→删属性 / 存在→恢复
+    try {
+        if (-not $backup.FeatKeyExisted) {
+            if (Test-Path -LiteralPath $featKey) { Remove-Item -Path $featKey -Recurse -Force -ErrorAction Stop }
+        } elseif (-not $backup.FeatExisted) {
+            Remove-ItemProperty -Path $featKey -Name Flags -ErrorAction SilentlyContinue
+        } else {
+            Set-ItemProperty -Path $featKey -Name Flags -Value $backup.FeatFlags -Type DWord
+        }
+    } catch { $errors += "Features\Flags: $($_.Exception.Message)" }
+    # ⑤ 计划任务：存在→Register -Xml 还原 / 不存在→Unregister
+    foreach ($tn in @('RAMBoostBootGuard','RAMBoostLogonDisarm')) {
+        try {
+            if ($backup.TaskExisted[$tn]) {
+                if (-not $backup.TaskDef[$tn]) { throw "no exported XML for pre-existing task $tn" }
+                Register-ScheduledTask -TaskName $tn -Xml $backup.TaskDef[$tn] -Force -ErrorAction Stop | Out-Null
+            } else {
+                Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+            }
+        } catch { $errors += "task $tn`: $($_.Exception.Message)" }
     }
-    # Features\Flags
-    if ($backup.FeatExisted) {
-        try { Set-ItemProperty -Path $featKey -Name Flags -Value $backup.FeatFlags -Type DWord }
-        catch { $errors += "Features\Flags: $($_.Exception.Message)" }
+    # ⑥ 文件：sys32 还原或删除 + 守卫脚本还原或删除 + pdDir（部署新建则整删）
+    try {
+        if ($backup.Sys32Existed) {
+            if ($backup.Sys32Replaced -and $backup.Sys32Backup -and (Test-Path -LiteralPath $backup.Sys32Backup)) {
+                Copy-Item -LiteralPath $backup.Sys32Backup -Destination $dest -Force -ErrorAction Stop
+            }
+        } elseif (Test-Path -LiteralPath $dest) {
+            Remove-Item -LiteralPath $dest -Force -ErrorAction Stop
+        }
+    } catch { $errors += "System32 sys: $($_.Exception.Message)" }
+    foreach ($g in @('boot_guard.ps1','logon_disarm.ps1')) {
+        $gp = Join-Path $pdDir $g
+        try {
+            if ($backup.GuardExisted[$g]) {
+                if ($backup.GuardBackup[$g] -and (Test-Path -LiteralPath $backup.GuardBackup[$g])) {
+                    Copy-Item -LiteralPath $backup.GuardBackup[$g] -Destination $gp -Force -ErrorAction Stop
+                }
+            } elseif (Test-Path -LiteralPath $gp) {
+                Remove-Item -LiteralPath $gp -Force -ErrorAction Stop
+            }
+        } catch { $errors += "guard $g`: $($_.Exception.Message)" }
     }
-    # PendingFileRenameOperations
+    try {
+        if (-not $backup.PdDirExisted -and (Test-Path -LiteralPath $pdDir)) {
+            Remove-Item -Path $pdDir -Recurse -Force -ErrorAction Stop
+        }
+    } catch { $errors += "pdDir: $($_.Exception.Message)" }
+    # ⑦ PFRO：恢复或删除（现状已含取消 MoveFileEx 排队替换）+ [FIX S-01] 回滚后一致性断言
+    #    （既验"排队已取消"，也防误删第三方条目）
     try {
         if ($backup.PfroExisted) {
             Set-ItemProperty -Path $smKey -Name PendingFileRenameOperations -Value $backup.Pfro -Type MultiString
@@ -251,6 +363,13 @@ function Invoke-Rollback {
             Remove-ItemProperty -Path $smKey -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
         }
     } catch { $errors += "PFRO: $($_.Exception.Message)" }
+    try {
+        $nowPfro = @((Get-ItemProperty -Path $smKey -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations)
+        $expectPfro = if ($backup.PfroExisted) { @($backup.Pfro) } else { @() }
+        if (($nowPfro -join '|') -ne ($expectPfro -join '|')) {
+            $errors += ("PFRO assertion: post-rollback value differs from backup (now=[{0}] expected=[{1}])" -f ($nowPfro -join ', '), ($expectPfro -join ', '))
+        }
+    } catch { $errors += "PFRO assertion: $($_.Exception.Message)" }
 
     if ($errors.Count -eq 0) {
         Write-Host '[ok] rollback complete - system restored to pre-deploy state.' -ForegroundColor Green
@@ -283,8 +402,19 @@ try {
     }
 
     # --- 2. Copy signed sys into System32\drivers ---
+    # [FIX S-01] 覆盖前一刻内容备份（紧贴覆盖点：变异可能中途失败，
+    # 备份段只记存在性布尔值）。A3：备份留在 $env:TEMP，回滚不删。
+    if ($backup.Sys32Existed) {
+        $backup.Sys32Backup = Join-Path $env:TEMP 'RAMBlockCache.sys.predeploy'
+        try {
+            Copy-Item -LiteralPath $dest -Destination $backup.Sys32Backup -Force -ErrorAction Stop
+        } catch {
+            throw "cannot back up existing $dest before overwrite: $($_.Exception.Message)"
+        }
+    }
     try {
         Copy-Item -LiteralPath $srcSys -Destination $dest -Force -ErrorAction Stop
+        $backup.Sys32Replaced = $true
         Write-Host "[ok] copied $srcSys -> $dest"
     } catch {
         Write-Host "[..] $dest is locked; queueing replace on next reboot (MoveFileEx) ..."
@@ -324,6 +454,19 @@ try {
     Set-ItemProperty -Path $svcRoot -Name BootFailCount   -Value 0 -Type DWord
     Set-ItemProperty -Path $svcRoot -Name LastBootHealthy -Value 0 -Type DWord
     Set-ItemProperty -Path $svcRoot -Name FilterArmed     -Value 1 -Type DWord
+    # --- 3a. [B-6] 签名态盖章：驱动 Load 时读 TestSigned/Signer 填 GET_VERSION
+    # （前端 DriverSignatureState 契约；取不到=保守 1/空=反作弊警示照弹）。
+    # 判定口径：证书自签（Subject==Issuer）= 测试签名 → 1；CA 链签发 → 0。 ---
+    $b6Test = 1
+    try {
+        $b6cert = $auth.SignerCertificate
+        if ($b6cert -and "$($b6cert.Subject)" -ne "$($b6cert.Issuer)") { $b6Test = 0 }
+    } catch { $b6Test = 1 }
+    $b6Signer = ''
+    try { if ($auth.SignerInfo -and $auth.SignerInfo.Subject) { $b6Signer = [string]$auth.SignerInfo.Subject } } catch { }
+    Set-ItemProperty -Path $svcRoot -Name TestSigned -Value $b6Test -Type DWord
+    if ($b6Signer) { Set-ItemProperty -Path $svcRoot -Name Signer -Value $b6Signer -Type String }
+    Write-Host ('[ok] signature state stamped: TestSigned={0}, Signer={1}' -f $b6Test, $(if ($b6Signer) { $b6Signer } else { '(empty)' }))
     Write-Host ('[ok] armed: DeploySeq={0}, BootFailCount=0, LastBootHealthy=0, FilterArmed=1' -f ($seq + 1))
 
     # --- 3b. Features\Flags default = 0 ---
@@ -333,6 +476,18 @@ try {
 
     # --- 4. Install guard scripts ---
     if (-not (Test-Path -LiteralPath $pdDir)) { New-Item -ItemType Directory -Path $pdDir -Force | Out-Null }
+    # [FIX S-01] 覆盖前一刻内容备份（紧贴覆盖点，同 System32 备份原则）。
+    foreach ($g in @('boot_guard.ps1','logon_disarm.ps1')) {
+        if ($backup.GuardExisted[$g]) {
+            $gb = Join-Path $env:TEMP "RAMBoost.$g.predeploy"
+            try {
+                Copy-Item -LiteralPath (Join-Path $pdDir $g) -Destination $gb -Force -ErrorAction Stop
+                $backup.GuardBackup[$g] = $gb
+            } catch {
+                throw "cannot back up existing guard script ${g}: $($_.Exception.Message)"
+            }
+        }
+    }
     Copy-Item (Join-Path $scriptsDir 'boot_guard.ps1')   (Join-Path $pdDir 'boot_guard.ps1')   -Force -ErrorAction Stop
     Copy-Item (Join-Path $scriptsDir 'logon_disarm.ps1') (Join-Path $pdDir 'logon_disarm.ps1') -Force -ErrorAction Stop
     Write-Host "[ok] guard scripts installed to $pdDir"

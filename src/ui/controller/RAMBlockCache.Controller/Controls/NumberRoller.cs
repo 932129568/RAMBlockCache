@@ -65,8 +65,7 @@ public static class NumberRoller
         }
 
         SetRolling(d, true);
-        var anim = Motion.Frames(tb, ValueProperty, from, to,
-            new Duration(TimeSpan.FromMilliseconds(320)), Motion.EaseOut);
+        var anim = Motion.Frames(tb, ValueProperty, from, to, Motion.Dur320, Motion.EaseOut);
         // FillBehavior.Stop：结束即交还绑定控制权，后续采样照常触发
         anim.FillBehavior = FillBehavior.Stop;
         anim.Completed += (_, _) => SetRolling(d, false);

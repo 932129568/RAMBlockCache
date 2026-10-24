@@ -20,6 +20,11 @@
             <Button x:Name="refreshBtn" Content="刷新卷列表" Style="{StaticResource PillButton}" HorizontalAlignment="Right" Click="Refresh_Click"/>
         </Grid>
 
+        <!-- [FIX B31] 空态：卷列表为空时给"现在没有+下一步"（原空白区）。
+             旧代 UI 树（归档决策前保留）——与 Controller 树 B21 同纪律。
+             显隐由 LoadVolumes 末尾按 Items.Count 切换（无 BoolToVis 转换器，禁失败绑定）。 -->
+        <TextBlock x:Name="emptyHint" Grid.Row="1" Text="未枚举到卷——点右上「刷新卷列表」重试" Opacity="0.6"
+                   HorizontalAlignment="Center" Margin="0,40,0,0" Visibility="Collapsed"/>
         <ItemsControl x:Name="volumeList" Grid.Row="1" HorizontalContentAlignment="Stretch">
             <ItemsControl.ItemTemplate>
                 <DataTemplate>

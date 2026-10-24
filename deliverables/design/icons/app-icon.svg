@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- RAMBlockCache 应用图标母版 V1.0
+       设计语义：内存芯片（RAM）+ 闪电（加速）+ 分层缓存色带
+       令牌：底 #0E0E11 / 卡片 #17171C / 强调 #4CC2FF / 语义绿 #63D6A0 / 琥珀 #F2B84B
+       约束：扁平、无渐变、无发光、仅令牌色，与 UI 设计系统同源 -->
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#0E0E11"/>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="none" stroke="#26262E" stroke-width="2"/>
+
+  <!-- 内存芯片主体：双列芯片脚 + 芯片体 -->
+  <g fill="#17171C" stroke="#4CC2FF" stroke-width="7" stroke-linejoin="round">
+    <rect x="60" y="76" width="136" height="104" rx="14"/>
+  </g>
+  <!-- 芯片脚：上 4 下 4 -->
+  <g stroke="#4CC2FF" stroke-width="7" stroke-linecap="round">
+    <line x1="84"  y1="76"  x2="84"  y2="56"/>
+    <line x1="116" y1="76"  x2="116" y2="56"/>
+    <line x1="148" y1="76"  x2="148" y2="56"/>
+    <line x1="180" y1="76"  x2="180" y2="56"/>
+    <line x1="84"  y1="180" x2="84"  y2="200"/>
+    <line x1="116" y1="180" x2="116" y2="200"/>
+    <line x1="148" y1="180" x2="148" y2="200"/>
+    <line x1="180" y1="180" x2="180" y2="200"/>
+  </g>
+
+  <!-- 分层缓存色带（芯片体内的三层数据带：冷/热/脏） -->
+  <g stroke-linecap="round">
+    <line x1="82" y1="106" x2="150" y2="106" stroke="#4CC2FF" stroke-width="8" opacity="0.55"/>
+    <line x1="82" y1="128" x2="174" y2="128" stroke="#63D6A0" stroke-width="8"/>
+    <line x1="82" y1="150" x2="128" y2="150" stroke="#F2B84B" stroke-width="8"/>
+  </g>
+
+  <!-- 闪电（加速语义），叠于芯片右下 -->
+  <path d="M150 108 L124 160 L142 160 L134 196 L172 140 L152 140 L166 108 Z"
+        fill="#4CC2FF" stroke="#0E0E11" stroke-width="6" stroke-linejoin="round"/>
+</svg>

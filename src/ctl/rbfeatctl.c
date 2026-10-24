@@ -197,13 +197,16 @@ int main(int argc, char **argv)
         return 3;
     }
 
+    /* [FIX R6-CLI2] 所有 IOCTL 失败路径返回非零：原 refresh/shrink 对 Xfer 失败
+     * 一律 exit 0（批量脚本把"没下发"当成功）。Xfer 返回 BOOL。 */
+    int rc = 0;
     if (!strcmp(argv[1], "refresh")) {
-        Xfer(d, RB2_IOCTL_REFRESH, NULL, 0, NULL, 0, NULL);
+        if (!Xfer(d, RB2_IOCTL_REFRESH, NULL, 0, NULL, 0, NULL)) { fprintf(stderr, "refresh failed\n"); rc = 1; }
     } else if (!strcmp(argv[1], "snapshot")) {
-        Xfer(d, RB2_IOCTL_SNAPSHOT, NULL, 0, NULL, 0, NULL);
+        if (!Xfer(d, RB2_IOCTL_SNAPSHOT, NULL, 0, NULL, 0, NULL)) { fprintf(stderr, "snapshot failed\n"); rc = 1; }
     } else if (!strcmp(argv[1], "shrink") && argc > 2) {
         ULONG p = (ULONG)atoi(argv[2]);
-        Xfer(d, RB2_IOCTL_SHRINK, &p, sizeof(p), NULL, 0, NULL);
+        if (!Xfer(d, RB2_IOCTL_SHRINK, &p, sizeof(p), NULL, 0, NULL)) { fprintf(stderr, "shrink failed\n"); rc = 1; }
     } else if (!strcmp(argv[1], "l2") && argc > 2 && !strcmp(argv[2], "status")) {
         /* l2 status：注册表配置 + STATS IOCTL 的 L2State 与 L2 计数器 */
         DWORD letter = FeatDW("L2Letter", 0), gb = FeatDW("L2SizeGB", 32);
@@ -211,7 +214,7 @@ int main(int argc, char **argv)
         STATS2 s; DWORD r = 0;
         memset(&s, 0, sizeof(s));
         if (!Xfer(d, RB2_IOCTL_STATS, NULL, 0, &s, sizeof(s), &r) || r < sizeof(s)) {
-            fprintf(stderr, "stats read failed\n");
+            fprintf(stderr, "stats read failed\n"); rc = 1;   /* [FIX R6-CLI2] */
         } else {
             printf("L2 config: letter=%lc sizeGB=%lu flagsL2=%s\n",
                    letter ? (wint_t)(WCHAR)letter : L'-', (unsigned long)gb,
@@ -315,7 +318,7 @@ int main(int argc, char **argv)
                        vl.Items[i].State ? "accelerated" : "bypass",
                        VolReasonText(vl.Items[i].Reason));
         } else {
-            fprintf(stderr, "volstatus read failed\n");
+            fprintf(stderr, "volstatus read failed\n"); rc = 1;   /* [FIX R6-CLI2] */
         }
     } else if (!strcmp(argv[1], "watch")) {
         int sec = (argc > 2) ? atoi(argv[2]) : 2;
@@ -367,7 +370,7 @@ int main(int argc, char **argv)
                        s.L2State, s.ThermalStops, s.AdmitRejects);
             }
         } else {
-            fprintf(stderr, "stats read failed\n");
+            fprintf(stderr, "stats read failed\n"); rc = 1;   /* [FIX R6-CLI2] */
         }
     } else {
         fprintf(stderr, "unknown command: %s\n", argv[1]);
@@ -376,5 +379,5 @@ int main(int argc, char **argv)
     }
 
     CloseHandle(d);
-    return 0;
+    return rc;   /* [FIX R6-CLI2] 失败路径非零 */
 }

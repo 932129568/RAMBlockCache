@@ -1,6 +1,8 @@
 @echo off
-rem [P2-12] 支持环境覆盖：VCVARS64 / MSBUILD / NUGET_PACKAGES。
-rem 旧脚本三个路径全硬编码且无覆盖点，换机/换 VS 版本即构建失败。
+rem [FIX S-12] REM comments English-ized (batch encoding discipline; .cmd wrapper only, driver sources untouched).
+rem [P2-12] Supports environment overrides: VCVARS64 / MSBUILD / NUGET_PACKAGES.
+rem The old script hardcoded all three paths with no override point, so a
+rem different machine or VS version broke the build.
 if not defined VCVARS64 set "VCVARS64=C:\Program1\VC\Auxiliary\Build\vcvars64.bat"
 if not defined MSBUILD  set "MSBUILD=C:\Program1\MSBuild\Current\Bin\MSBuild.exe"
 if not defined NUGET_PACKAGES set "NUGET_PACKAGES=%~dp0..\..\.nuget\packages"

@@ -25,14 +25,17 @@
 #include "rb_common2.h"
 
 #define RB2_L2BLK       (64*1024)
-#define RB2_L2REC       (16 + RB2_L2BLK)       /* 记录 = 16B 头 + 64KB 数据 */
+/* [FIX R6-01] 记录头 16B -> 24B：加卷身份 VolId（索引键仅 LBA 的根治）。
+ * 容器尺寸公式随之变化——旧 v2 容器大小不符即走重建路径（旧数据一次性作废，
+ * 缓存可弃，fail-closed 方向）。 */
+#define RB2_L2REC       (24 + RB2_L2BLK)       /* 记录 = 24B 头 + 64KB 数据 */
 #define RB2_L2_MAX_GB   128UL
 #define RB2_L2IDX_MAX   262144
 
 typedef struct _RB2_L2E     { ULONG64 Lba; ULONG Stamp; ULONG Use; } RB2_L2E;
-typedef struct _RB2_L2HDR   { ULONG64 Lba; ULONG Stamp; ULONG Crc;  } RB2_L2HDR;
+typedef struct _RB2_L2HDR   { ULONG64 Lba; ULONG Stamp; ULONG Crc; ULONG64 VolId; } RB2_L2HDR;
 typedef struct _RB2_L2IDX_E { ULONG64 Lba; ULONG Stamp; ULONG Slot; } RB2_L2IDX_E;
-typedef struct _RB2_L2IDX_H { ULONG Magic, Build, SlotCount, Count, Crc; } RB2_L2IDX_H;
+typedef struct _RB2_L2IDX_H { ULONG Magic, Build, SlotCount, Count, Crc; ULONG64 VolId; } RB2_L2IDX_H;
 
 typedef RB2_L2E *PRB2_L2E;
 typedef RB2_L2HDR *PRB2_L2HDR;
@@ -43,7 +46,15 @@ typedef RB2_L2IDX_E *PRB2_L2IDX_E;
 
 static PVOID   s_Idx; static ULONG s_Slots, s_Stamp;
 static HANDLE  s_File, s_IdxFile; static WCHAR s_Letter; static ULONG s_SizeGB;
-static KEVENT  s_OpEv; static LONG s_TryTick; static volatile LONG s_IdxDirty;
+/* [FIX R6-01] 容器卷身份：打开时从唯一被加速卷捕获（0=未开/未知）。
+ * 记录/索引/每次探测均比对——跨卷、换卷、换盘的数据一律 MISS。 */
+static volatile ULONG64 s_VolId;
+/* [FIX S7-02] 延迟重开闩：数据路径（probe/store，持 s_Ops）发现卷身份变更/
+ * 多卷冲突时**绝不内联 close**——CloseIntEx 的 s_Ops 排空会被调用方自持计数
+ * 死锁（5s 停摆 + s_Halt 闩死 + 句柄泄漏不关）。数据路径只置闩 + 停机；
+ * 真正关闭由控制面（REFRESH IOCTL / Rb2Tick 周期 / flags-off / 关机）执行。 */
+static volatile LONG s_Reopen;
+static KEVENT  s_OpEv; static ULONG64 s_TryTick64; static volatile LONG s_IdxDirty;
 /* [D7] L2 状态：0=Flags关/未开 1=已打开 2=拒绝-多卷 3=拒绝-块大小 4=拒绝-配置无效 */
 static ULONG   s_State;
 /* [F1] 在飞操作计数：probe/store（及 Periodic 索引落盘）触碰 s_File/s_Idx 的
@@ -62,7 +73,10 @@ static PRB2_L2E L2Idx(VOID) { return (PRB2_L2E)s_Idx; }
 
 /* 前向声明：RbL2LazyOpenInt（拒绝/关 Flags 路径）先于二者定义调用 */
 static VOID  RbL2CloseInt(VOID);
+static VOID  RbL2CloseIntEx(BOOLEAN Persist);
+static VOID  RbL2LazyOpenInt(BOOLEAN ControlPath);
 static ULONG RbL2CountAttached(VOID);
+static ULONG64 RbL2AttachedVolId(VOID);
 
 /* ---- CRC32（表惰性初始化，RbFeatInit 单线程期预热） ---- */
 static ULONG s_CrcTbl[256]; static volatile LONG s_CrcReady = 0;
@@ -139,9 +153,14 @@ static VOID RbL2IdxLoad(VOID)
     PRB2_L2IDX_E es; ULONG k;
     if (!s_IdxFile || !s_Idx || !s_Slots) return;
     z.QuadPart = 0;
+    /* [FIX R6-01] 头部读取必须整读（旧 20B 布局/半写文件不得进字段解析） */
     if (!NT_SUCCESS(ZwReadFile(s_IdxFile, NULL, NULL, NULL, &ib, &h, sizeof(h), &z, NULL)) ||
+        ib.Information != sizeof(h) ||
         h.Magic != RB2_IDX_MAGIC || h.Build != RB_DRIVER_BUILD ||
-        h.SlotCount != s_Slots || h.Count == 0 || h.Count > RB2_L2IDX_MAX)
+        h.SlotCount != s_Slots || h.Count == 0 || h.Count > RB2_L2IDX_MAX ||
+        /* [FIX R6-01] 索引卷身份必须匹配当前容器身份：换卷/换盘的旧索引整份弃用
+         * （内存索引随之从零重建，旧条目探针自然 MISS） */
+        h.VolId != InterlockedOr64(&s_VolId, 0))
         return;                                    /* 任何不符 -> 空索引，安全 */
     es = (PRB2_L2IDX_E)Rb2Alloc((SIZE_T)h.Count * sizeof(RB2_L2IDX_E));
     if (!es) return;
@@ -172,6 +191,7 @@ static VOID RbL2IdxSave(VOID)
     h.Magic = RB2_IDX_MAGIC; h.Build = RB_DRIVER_BUILD;
     h.SlotCount = s_Slots; h.Count = used;
     h.Crc = 0;
+    h.VolId = InterlockedOr64(&s_VolId, 0);   /* [FIX R6-01] 索引卷身份 */
     es = NULL;
     if (used) {
         es = (PRB2_L2IDX_E)Rb2Alloc((SIZE_T)used * sizeof(RB2_L2IDX_E));
@@ -197,6 +217,14 @@ static VOID RbL2IdxSave(VOID)
 
 VOID RbL2Periodic(VOID)                            /* Rb2Tick 每 60s */
 {
+    /* [FIX S7-02] 周期清偿延迟闩：tick 线程不持 s_Ops，可安全关闭；
+     * 随后下次探针重开并捕获新卷身份（无需用户手工 REFRESH）。 */
+    if (s_Reopen && s_File) {
+        RbL2CloseIntEx(FALSE);
+        InterlockedExchange(&s_Reopen, 0);
+        RbLog(1, __LINE__, 0, L"l2: deferred reopen settled by periodic tick");
+    }
+
     /* [F1] 与 RbL2Close 的竞态治理同 probe/store：持 s_Ops 在飞计数后才触碰
      * 落盘目标（s_IdxFile/s_Idx/s_Slots），Close 关闭前有界排空该计数。
      * Flags 门仍保留（关 Flags 时无需落盘），与 Close 的触发条件同源；
@@ -209,23 +237,50 @@ VOID RbL2Periodic(VOID)                            /* Rb2Tick 每 60s */
     }
 }
 
-static VOID RbL2LazyOpenInt(VOID)
+static VOID RbL2LazyOpenInt(BOOLEAN ControlPath)
 {
     ULONG v; NTSTATUS st; UNICODE_STRING u; OBJECT_ATTRIBUTES oa;
     IO_STATUS_BLOCK ib; WCHAR path[96]; FILE_STANDARD_INFORMATION si;
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) return;   /* 本模块全部例程仅 PASSIVE（含下方收尾/遍历） */
+    /* [FIX S7-02] 控制面先清偿延迟闩（REFRESH 到达即关+清闩，随后重开捕获新卷身份） */
+    if (ControlPath && s_Reopen && s_File) {
+        RbL2CloseIntEx(FALSE);
+        InterlockedExchange(&s_Reopen, 0);
+    }
     if (!(g_Rb2Flags & RB2F_L2)) {
         /* [D4/F3] 关 Flags：连带给容器收尾（索引先落盘），状态回零——`l2 disable` 后
          * `l2 status` 必须显示 off 而非残留 opened/refused。探测/存储路径已在入口挡
          * Flags，能走到这里的只有 REFRESH 控制面与"门检查后 Flags 被翻"的在途操作。 */
         if (s_File) RbL2CloseInt();
+        InterlockedExchange(&s_Reopen, 0);
         s_State = 0;
         return;
     }
     /* 300ms 节流（含已开复检：防探针热路径每次遍历 DevList）；
-     * [FIX M14] KeQueryUnbiasedInterruptTime 单位为 100ns，300ms = 3,000,000（原 300 实为 30µs，节流失效） */
-    if ((LONG)(KeQueryUnbiasedInterruptTime() & 0xFFFFFFFF) - s_TryTick < 3000000 && s_TryTick) return;
-    s_TryTick = (LONG)(KeQueryUnbiasedInterruptTime() & 0xFFFFFFFF);
+     * [FIX M14] KeQueryUnbiasedInterruptTime 单位为 100ns，300ms = 3,000,000（原 300 实为 30µs，节流失效）
+     * [FIX S7-07] 64 位无符号差比较：原取低 32 位做 LONG 差，回绕周期 429.5s——
+     * 空闲间隔落在负半区时开容器门最多多关 ~429s（300ms 语义失效）。 */
+    {
+        ULONG64 now = KeQueryUnbiasedInterruptTime();
+        if (s_TryTick64 && now - s_TryTick64 < 3000000ULL) return;
+        s_TryTick64 = now;
+    }
+
+    /* [FIX R6-01/S7-02] 卷身份复检（节流后，≤每 300ms 一次 DevList 遍历）：
+     * s_File 已开时验证当前被加速卷身份（detach 换卷/attach 第二卷场景）。
+     * 数据路径只置延迟闩+停机（禁内联 close——自持 s_Ops 会死锁排空）；
+     * 控制路径直接关闭。停机态下探针全 MISS，绝不跨卷伺服。 */
+    if (s_File) {
+        ULONG64 cur = RbL2AttachedVolId();
+        if (cur != InterlockedOr64(&s_VolId, 0)) {
+            RbLog(1, __LINE__, 0, L"l2: volume identity changed - halt + deferred reopen (no cross-volume serving)");
+            s_Halt = 1;
+            InterlockedExchange(&s_Reopen, 1);
+            if (s_State != 2) { s_State = 2; }
+            if (ControlPath) { RbL2CloseIntEx(FALSE); InterlockedExchange(&s_Reopen, 0); }
+            return;
+        }
+    }
 
     Rb2GetDW(L"Features", L"L2Letter", 0, &v);
     Rb2GetDW(L"Features", L"L2SizeGB", 32, &s_SizeGB);
@@ -238,9 +293,14 @@ static VOID RbL2LazyOpenInt(VOID)
     }
     s_Letter = (WCHAR)v;
 
-    /* [D4] 单卷门（打开容器前）：>1 个被加速卷即拒绝启用并明示原因。 */
+    /* [D4] 单卷门（打开容器前）：>1 个被加速卷即拒绝启用并明示原因。
+     * [FIX S7-02] 数据路径同样禁内联 close（自持 s_Ops 死锁排空）：置闩+停机，
+     * 关闭交由控制面；停机态探针全 MISS，拒绝语义不退让。 */
     if (RbL2CountAttached() > 1) {
-        if (s_File) RbL2CloseInt();
+        s_Halt = 1;
+        InterlockedExchange(&s_Reopen, 1);
+        if (ControlPath && s_File) RbL2CloseIntEx(FALSE);
+        if (ControlPath) InterlockedExchange(&s_Reopen, 0);
         if (s_State != 2) { s_State = 2; RbLog(1, __LINE__, 0, L"l2: refused (multi-volume attached; M1 single-volume only)"); }
         return;
     }
@@ -255,6 +315,17 @@ static VOID RbL2LazyOpenInt(VOID)
         s_Halt = 0; s_State = 1;
         return;
     }
+
+    /* [FIX S7-06] 无卷挂载时拒绝开容器：原此况下以 s_VolId=0 开容器，首卷
+     * attach 后探测/存储门（Extp->VolId != 0）把新卷全部拒之门外——L2 对新卷
+     * 静默失效直至用户手工 REFRESH（且 L2State 仍报 1=opened，状态说谎）。
+     * 拒绝开后由首卷的 miss 探针带正确 VolId 重开（探针路径自带重试）。 */
+    if (RbL2AttachedVolId() == 0) {
+        if (s_State != 2) { s_State = 2; RbLog(1, __LINE__, 0, L"l2: refused (no attached volume yet - opens on first miss after attach)"); }
+        return;
+    }
+    /* [FIX R6-01] 捕获容器卷身份：唯一被加速卷的 VolId。 */
+    InterlockedExchange64(&s_VolId, (LONG64)RbL2AttachedVolId());
 
     /* [FIX M12] 打开串行化：并发 miss（per-CPU worker）与 REFRESH 线程可同时越过
      * s_File==NULL 判定 → 双开容器（句柄泄漏）/重初始化使用中的 s_OpEv/双份索引。
@@ -347,13 +418,14 @@ static VOID RbL2LazyOpenInt(VOID)
     s_Halt = 0;                                    /* [F1] 开机闸解除 */
     InterlockedExchange(&s_Opening, 0);
 }
-VOID RbL2LazyOpen(VOID) { RbL2LazyOpenInt(); }
+/* 导出面 = 控制路径（REFRESH IOCTL）：允许执行延迟的关闭/重开。 */
+VOID RbL2LazyOpen(VOID) { RbL2LazyOpenInt(TRUE); }
 
 /* [F1] 关闭内部实现：先有界排空在飞操作，再落盘/关句柄/释放索引。
  * 排空失败（超时）= leak-by-design：不释放索引、不关句柄，照本品既有超时语义
  * （rb_stream_destroy 的 60s 放弃 / Rb2PoolShutdown 的 30s join 同款），
  * 由后续外部 REFRESH/关机路径重试；s_Halt 已保证此期间无新操作进入容器。 */
-static VOID RbL2CloseInt(VOID)
+static VOID RbL2CloseIntEx(BOOLEAN Persist)
 {
     ULONG spin; PVOID old;
     /* 同一时刻仅一个线程执行真正 teardown（防双 ZwClose/双 free） */
@@ -369,15 +441,17 @@ static VOID RbL2CloseInt(VOID)
         }
         { LARGE_INTEGER d; d.QuadPart = -10000LL; KeDelayExecutionThread(KernelMode, FALSE, &d); }
     }
-    if (s_File) RbL2IdxSave();                     /* 排空后才持久化 */
+    if (s_File && Persist) RbL2IdxSave();          /* 排空后才持久化；[FIX R6-01] 拒绝/换卷态不持久化 */
     if (s_IdxFile) { ZwClose(s_IdxFile); s_IdxFile = NULL; }
     if (s_File)    { ZwClose(s_File);    s_File = NULL; }
     old = InterlockedExchangePointer(&s_Idx, NULL);   /* [F1] 原子摘指针后再释放，收窄 free->NULL 间解引用窗口 */
     if (old) Rb2Free(old);
     s_Slots = 0;
+    InterlockedExchange64(&s_VolId, 0);            /* [FIX R6-01] 容器身份随关闭作废 */
     s_State = 0;                                   /* [D7/F3] 关闭回零（拒绝码由调用方随后覆盖） */
     InterlockedExchange(&s_Closing, 0);
 }
+static VOID RbL2CloseInt(VOID) { RbL2CloseIntEx(TRUE); }
 VOID RbL2Close(VOID) { RbL2CloseInt(); }
 
 /* [D7] L2 状态查询（Rb2StatsFill / rbfeatctl l2 status 使用；任意 IRQL 只读） */
@@ -398,6 +472,28 @@ static ULONG RbL2CountAttached(VOID)
     return attached;
 }
 
+/* [FIX R6-01] 当前唯一被加速卷的 VolId（无卷返回 0）。持 DevListLock 遍历。 */
+static ULONG64 RbL2AttachedVolId(VOID)
+{
+    ULONG64 id = 0; PLIST_ENTRY le;
+    ExAcquireFastMutex(&g_Rb.DevListLock);
+    for (le = g_Rb.DevList.Flink; le != &g_Rb.DevList; le = le->Flink) {
+        PRB_DEV_EXT e = CONTAINING_RECORD(le, RB_DEV_EXT, ListEntry);
+        if (e->IsAttached && !e->Removed) { id = e->VolId; break; }
+    }
+    ExReleaseFastMutex(&g_Rb.DevListLock);
+    return id;
+}
+
+/* [FIX R6-01] attach 入口冲突预检（导出于 rb_common2.h）：L2 已开且已有其他
+ * 被加速卷 → TRUE。任意 IRQL 安全（CountAttached 内部自持 DevListLock；
+ * FastMutex 提升至 APC_LEVEL——调用方均为 PASSIVE 控制路径）。 */
+BOOLEAN RbL2AttachBlocked(VOID)
+{
+    if (s_File == NULL && s_Opening == 0) return FALSE;   /* 未开：首卷 attach 允许 */
+    return RbL2CountAttached() >= 1 ? TRUE : FALSE;
+}
+
 static BOOLEAN RbL2IdxProbe(ULONG64 blk)
 {
     ULONG i; PRB2_L2E idx;
@@ -409,24 +505,32 @@ static BOOLEAN RbL2IdxProbe(ULONG64 blk)
 NTSTATUS RbL2ProbeFill(PVOID Extp, ULONG64 lba, ULONG len, PVOID dst)
 {
     PRB2_L2HDR rec; ULONG64 blk; ULONG off; NTSTATUS st;
-    UNREFERENCED_PARAMETER(Extp);
 
     if ((g_Rb2Flags & RB2F_L2) == 0)               return STATUS_NOT_FOUND;
     if (RbPanicActive())                           return STATUS_NOT_FOUND;
     if (KeGetCurrentIrql() != PASSIVE_LEVEL)       return STATUS_NOT_FOUND;
     if (!dst || len == 0 || len > RB2_L2BLK)       return STATUS_NOT_FOUND;
 
+    /* [FIX R6-01] 每次探测的卷身份闸（无状态滞后，不依赖节流/复检时序）：
+     * 请求卷的 VolId 必须匹配容器身份——第二卷/换卷的读一律 MISS。 */
+    if (Extp && ((PRB_DEV_EXT)Extp)->VolId != InterlockedOr64(&s_VolId, 0))
+        return STATUS_NOT_FOUND;
+
     /* [F1] 在飞计数：通过全部门之后、触碰 s_File/s_Idx 之前占位；
      * 单一出口 cleanup 保证与 RbL2Close 的排空等待严格配对（所有路径必达）。 */
     InterlockedIncrement(&s_Ops);
     rec = NULL; st = STATUS_NOT_FOUND;
     if (s_Halt) goto cleanup;                      /* [F1] 拒绝/关闭态：容器不可用（防跨卷污染） */
-    RbL2LazyOpenInt();
-    if (s_Halt) goto cleanup;                      /* 本次开路径恰好判罪（含 drain 超时未回收） */
+    RbL2LazyOpenInt(FALSE);                   /* [FIX S7-02] 数据路径：禁内联 close */
+    if (s_Halt) goto cleanup;                      /* 本次开路径恰好判罪（含延迟闩停机） */
 
     blk = lba / RB2_L2BLK;
     off = (ULONG)(lba % RB2_L2BLK);
     if ((ULONG64)off + len > RB2_L2BLK) goto cleanup;   /* 跨槽拒绝 */
+    /* [FIX R6-08] 与 Store 的 [F4] 守卫对称：损坏/伪造的索引文件可注入越界键
+     * （IdxLoad 只校验 slot<s_Slots，不校验 Lba>>16<s_Slots）。探测读偏移
+     * 4096+blk*RB2_L2REC 在极端 blk 下 64 位乘加可回绕成小偏移。 */
+    if (blk >= s_Slots) goto cleanup;
 
     if (!RbL2IdxProbe(blk)) { Rb2Count(9, 1); goto cleanup; }
 
@@ -435,6 +539,7 @@ NTSTATUS RbL2ProbeFill(PVOID Extp, ULONG64 lba, ULONG len, PVOID dst)
     st = RbL2Io(s_File, FALSE, 4096 + blk * RB2_L2REC, rec, RB2_L2REC);
     if (NT_SUCCESS(st) &&
         rec->Lba == (blk << 16) &&                 /* 记录头校验：索引错/撕裂/旧容器 -> MISS */
+        rec->VolId == InterlockedOr64(&s_VolId, 0) &&   /* [FIX R6-01] 记录卷身份 */
         rec->Crc == RbCrc32(rec + 1, RB2_L2BLK))
     {
         RtlCopyMemory(dst, (PCHAR)(rec + 1) + off, len);
@@ -453,18 +558,19 @@ cleanup:
 VOID RbL2Store(PVOID Extp, ULONG64 lba, ULONG len, PVOID src)
 {
     PRB2_L2HDR rec; ULONG i; ULONG64 blk; PRB2_L2E idx;
-    UNREFERENCED_PARAMETER(Extp);
     if ((g_Rb2Flags & RB2F_L2) == 0) return;
     if (RbPanicActive()) return;
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) return;
     if (!s_Idx || !s_Slots || !src) return;        /* 仅指针读（不解引用）：安全快路径 */
     if (len != RB2_L2BLK) return;                  /* 只收整块：杜绝 v1 越界读/零填充污染 */
+    /* [FIX R6-01] 存储的卷身份闸（同探测）：非本容器的卷不写（防覆写他卷记录） */
+    if (Extp && ((PRB_DEV_EXT)Extp)->VolId != InterlockedOr64(&s_VolId, 0)) return;
 
     /* [F1] 在飞计数 + 单一出口 cleanup（配对规则同 RbL2ProbeFill） */
     InterlockedIncrement(&s_Ops);
     rec = NULL;
     if (s_Halt) goto cleanup;                      /* [F1] 拒绝/关闭态：容器不可用 */
-    RbL2LazyOpenInt();
+    RbL2LazyOpenInt(FALSE);                   /* [FIX S7-02] 数据路径：禁内联 close */
     if (s_Halt) goto cleanup;
     if (!s_File) goto cleanup;
 
@@ -473,6 +579,7 @@ VOID RbL2Store(PVOID Extp, ULONG64 lba, ULONG len, PVOID src)
     rec = (PRB2_L2HDR)Rb2Alloc(RB2_L2REC);
     if (!rec) goto cleanup;
     rec->Lba = blk << 16; rec->Stamp = ++s_Stamp;
+    rec->VolId = InterlockedOr64(&s_VolId, 0);    /* [FIX R6-01] 记录卷身份 */
     RtlCopyMemory((PCHAR)(rec + 1), src, RB2_L2BLK);
     rec->Crc = RbCrc32((PCHAR)(rec + 1), RB2_L2BLK);
 

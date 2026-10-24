@@ -1,4 +1,6 @@
 @echo off
+REM [FIX S-12] chcp 65001: the wrapped .ps1 emits UTF-8 Chinese output.
+chcp 65001 >nul
 REM game_mode.cmd - launcher wrapper for game_mode.ps1 (self-elevate + invoke).
 REM Error-handling convention (spec D.3):
 REM   * direct path: propagates the wrapped script's exit code (exit /b %errorlevel%).

@@ -34,6 +34,7 @@ public enum TelemetryEvent
     DirtyLossDetected,
     HandshakeFailed,
     UnmountCompleted,
+    UnmountPartialFailed,   /* [FIX C#11] 全部卸载部分卷失败（与 UnmountCompleted 分流） */
     FlushCompleted,
 }
 

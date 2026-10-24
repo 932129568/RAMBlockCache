@@ -44,6 +44,18 @@ public sealed class RelayCommand : ICommand
     { add => CommandManager.RequerySuggested += value; remove => CommandManager.RequerySuggested -= value; }
 }
 
+/// <summary>带参数同步命令（如"按页名跳转"的行内行动按钮；参数经 CommandParameter 传入）。</summary>
+public sealed class RelayCommand<T> : ICommand
+{
+    private readonly Action<T> _exec;
+    private readonly Func<T, bool>? _can;
+    public RelayCommand(Action<T> exec, Func<T, bool>? can = null) { _exec = exec; _can = can; }
+    public bool CanExecute(object? p) => _can is null || (p is T t && _can(t));
+    public void Execute(object? p) { if (p is T t) _exec(t); }
+    public event EventHandler? CanExecuteChanged
+    { add => CommandManager.RequerySuggested += value; remove => CommandManager.RequerySuggested -= value; }
+}
+
 /// <summary>
 /// 异步命令：包装 Func&lt;Task&gt;，执行期间禁用重入（_busy）；
 /// 未处理异常写 LogService，不冒泡到 UI 调度器。

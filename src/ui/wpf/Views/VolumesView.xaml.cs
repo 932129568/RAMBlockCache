@@ -82,10 +82,13 @@ public partial class VolumesView : UserControl
 
     private async void LoadVolumes()
     {
-        if (_s == null) return;
+        /* [FIX B31] 空态显隐：末尾与两个早退分支都切换（旧实现空列表=空白区）。 */
+        try
+        {
+        if (_s == null) { SyncEmpty(); return; }
         var list = await _s.Client.GetVolumesAsync();
         Items.Clear();
-        if (list == null) return;
+        if (list == null) { SyncEmpty(); return; }
         var v = list.Value;
         for (int i = 0; i < v.Count && i < RbProtoDefs.RB_MAX_VOLUMES; i++)
         {
@@ -122,6 +125,21 @@ public partial class VolumesView : UserControl
                 SectorText = $"逻辑扇区 {logSec} B · 物理扇区 {physSec} B",
             });
         }
+        SyncEmpty();
+        }
+        catch (Exception ex)
+        {
+            /* [FIX B31] 加载异常也刷新空态（旧实现异常时列表停在旧内容、空态不联动） */
+            SyncEmpty();
+            System.Diagnostics.Debug.WriteLine($"LoadVolumes failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>[FIX B31] 空态显隐与 Items.Count 联动（失败/空列表均显示引导文案）。</summary>
+    private void SyncEmpty()
+    {
+        if (emptyHint is null) return;
+        emptyHint.Visibility = Items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private async void Attach_Click(object sender, RoutedEventArgs e)

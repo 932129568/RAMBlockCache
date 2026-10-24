@@ -1,0 +1,19 @@
+﻿dotnet.exe : The command could not be loaded, possibly because:
+所在位置 行:503 字符: 271
++ ... ockCache.Controller'; & dotnet build -c Release --nologo 2>&1 | Out-F ...
++                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (The command cou...ssibly because: 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  * You intended to execute a .NET application:
+      The application 'build' does not exist.
+  * You intended to execute a .NET SDK command:
+      No .NET SDKs were found.
+
+Download a .NET SDK:
+https://aka.ms/dotnet/download
+
+Learn about SDK resolution:
+https://aka.ms/dotnet/sdk-not-found
+EXIT=-2147450735

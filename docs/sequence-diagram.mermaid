@@ -1,0 +1,30 @@
+sequenceDiagram
+    participant D as RbDispatchReadWrite
+    participant S as RbSubmitIo
+    participant W as RbWriteWorker
+    participant C as rb_write_ex (core)
+    participant P as rb_write_pass1
+    participant IO as RbSyncIo
+    participant I as rb_stream_invalidate_range_ex
+    D->>D: 门/开关/引用校验（MaxCacheIoKB<<10）
+    D->>S: ctx 入队（IoWorkerByCpu[当前CPU] 优先，回退轮询）
+    Note over S,W: 同核事件唤醒 ~1-2µs（原跨核 C-state 唤醒 30-100µs）
+    W->>W: 8MB 分块循环；pre{mask,dseq,2048} 复用
+    W->>C: rb_write_ex(stream, cur, cb, clen, direct, &dcnt, 32, &pre)
+    C->>P: pass1 持条纹 WLOCK：查找/创建/拷入/置脏 + pre 采集（同持锁期）
+    P-->>W: pre.bits/base 输出（零窗口写前快照）
+    alt dcnt 溢出（缓存满/随机小 IO）
+        W->>IO: 整块直写
+        W->>I: invalidate_ex(superseded=成败, pre)
+    else 正常
+        loop direct[i]（与块边界裁交）
+            W->>IO: 区间直写
+            alt 失败
+                W->>I: invalidate_ex(区间, 0, pre)
+            end
+        end
+        alt s 已失败
+            W->>I: invalidate_ex(整块, 0, pre)
+        end
+    end
+    W->>W: IoCompleteRequest（同核交还客户端）

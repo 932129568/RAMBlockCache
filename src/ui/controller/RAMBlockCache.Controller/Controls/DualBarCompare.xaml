@@ -1,0 +1,41 @@
+<UserControl x:Class="RAMBlockCache.Controller.Controls.DualBarCompare"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Focusable="False">
+    <!-- 06 C-3.2 纵向双条：条宽 48px、区高 120px（标签 16 + 条 88 + 基线 1）、顶圆角 sm(6) 底 0、
+         坐基线、无外框无背景块、两遍同 Y 尺度；生长 scaleY(0)→1（Dur480，Motion 单一事实源） -->
+    <Grid x:Name="Root" Height="120">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <!-- 第一遍（磁盘直读）：neutral 基线灰 -->
+        <StackPanel Grid.Column="0" VerticalAlignment="Bottom">
+            <TextBlock x:Name="Val1" Text="—" FontSize="12" FontFamily="{StaticResource RbcFontMono}"
+                       HorizontalAlignment="Center" Margin="0,0,0,4"/>
+            <Border x:Name="Bar1Track" Width="48" Height="88" CornerRadius="6,6,0,0" ClipToBounds="True"
+                    HorizontalAlignment="Center" VerticalAlignment="Bottom">
+                <Rectangle x:Name="Bar1" Fill="{StaticResource RbcNeutralFg}" RadiusX="6" RadiusY="6"
+                           VerticalAlignment="Bottom" RenderTransformOrigin="0.5,1">
+                    <Rectangle.RenderTransform>
+                        <ScaleTransform x:Name="Bar1Scale" ScaleY="0"/>
+                    </Rectangle.RenderTransform>
+                </Rectangle>
+            </Border>
+        </StackPanel>
+        <!-- 第二遍（缓存读取）：chart-1 品牌青 -->
+        <StackPanel Grid.Column="2" VerticalAlignment="Bottom">
+            <TextBlock x:Name="Val2" Text="—" FontSize="12" FontFamily="{StaticResource RbcFontMono}"
+                       Foreground="{StaticResource RbcTextPrimary}"
+                       HorizontalAlignment="Center" Margin="0,0,0,4"/>
+            <Border x:Name="Bar2Track" Width="48" Height="88" CornerRadius="6,6,0,0" ClipToBounds="True"
+                    HorizontalAlignment="Center" VerticalAlignment="Bottom">
+                <Rectangle x:Name="Bar2" Fill="{StaticResource RbcChart1}" RadiusX="6" RadiusY="6"
+                           VerticalAlignment="Bottom" RenderTransformOrigin="0.5,1">
+                    <Rectangle.RenderTransform>
+                        <ScaleTransform x:Name="Bar2Scale" ScaleY="0"/>
+                    </Rectangle.RenderTransform>
+                </Rectangle>
+            </Border>
+        </StackPanel>
+    </Grid>
+</UserControl>

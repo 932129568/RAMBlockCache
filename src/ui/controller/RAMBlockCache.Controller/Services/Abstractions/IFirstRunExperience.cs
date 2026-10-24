@@ -24,20 +24,5 @@ public interface IFirstRunExperience
     void Reset();
 }
 
-/// <summary>向导步骤占位定义。</summary>
+/// <summary>向导步骤定义（三步：认知 / 卷选择 / 完成+效果验证）。</summary>
 public sealed record FirstRunStep(int Ordinal, string Title, string Description, bool IsOptional);
-
-/// <summary>默认占位实现：恒非首次运行、步骤为空（向导未上线）。</summary>
-public sealed class NoopFirstRunExperience : IFirstRunExperience
-{
-    public static NoopFirstRunExperience Instance { get; } = new();
-
-    public bool IsFirstRun => false;
-
-    public IReadOnlyList<FirstRunStep> Steps => Array.Empty<FirstRunStep>();
-
-    public void MarkCompleted() { }
-
-    public void Reset() => throw new RbFeatureException(RbErrorCode.NotImplemented, "W1-4",
-        "首次向导为 W1-4 预留占位：步骤框架已就位（0 步待填充），零术语文案随 W1-4 波次开发产出");
-}

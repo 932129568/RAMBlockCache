@@ -1,15 +1,24 @@
-﻿# gen_version.ps1 —— 从 common/version.h 生成各 UI 树的 Version.cs，保证单一事实来源。
+﻿# gen_version.ps1 —— 从 common/version.h 生成各 UI/安装器树的 Version.cs，保证单一事实来源。
 # [P2-10] 修复：旧脚本只生成旧 WPF 树（且该树实测也无 Version.cs），Controller 树
-# 完全没有生成物 → 版本显示硬编码、与 version.h 漂移。现两棵树都生成。
+# 完全没有生成物 → 版本显示硬编码、与 version.h 漂移。现所有树都生成。
+# [2026-10-19] 发布名改由 RB_RELEASE_* 宏显式定义（此前用机器版本拼发布名，
+# 与 README/UI 的营销版本双轨漂移）；安装器树（RAMBlockCache.Setup）加入生成列表。
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $h = Get-Content "$root\common\version.h" -Raw
-$null = $h -match '#define RB_VERSION_MAJOR\s+(\d+)'; $maj = $Matches[1]
-$null = $h -match '#define RB_VERSION_MINOR\s+(\d+)'; $min = $Matches[1]
-$null = $h -match '#define RB_VERSION_PATCH\s+(\d+)'; $pat = $Matches[1]
-$null = $h -match '#define RB_VERSION_BUILD\s+(\d+)'; $bld = $Matches[1]
+function Get-Def([string]$name) {
+    if ($h -match "#define\s+$name\s+(\d+)") { return $Matches[1] }
+    throw "version.h 缺少 #define $name"
+}
+$maj = Get-Def 'RB_VERSION_MAJOR'
+$min = Get-Def 'RB_VERSION_MINOR'
+$pat = Get-Def 'RB_VERSION_PATCH'
+$bld = Get-Def 'RB_VERSION_BUILD'
+$rmaj = Get-Def 'RB_RELEASE_MAJOR'
+$rmin = Get-Def 'RB_RELEASE_MINOR'
+$rpat = Get-Def 'RB_RELEASE_PATCH'
 $ver = "$maj.$min.$pat.$bld"
-$rel = "V$maj.$min.$pat Build $bld"
+$rel = "V$rmaj.$rmin.$rpat Build $bld"
 Write-Host "version.h -> machine=$ver release=$rel"
 
 function Write-VersionCs([string]$path, [string]$ns, [string]$ver, [string]$rel) {
@@ -34,5 +43,7 @@ namespace $ns
 
 # 现行 UI（Controller 树，Build19 重写）
 Write-VersionCs "$root\ui\controller\RAMBlockCache.Controller\Version.cs" 'RAMBlockCache.Controller' $ver $rel
+# 安装器（Setup 树，U0-2 单 exe 安装器）
+Write-VersionCs "$root\ui\installer\RAMBlockCache.Setup\Version.cs" 'RAMBlockCache.Setup' $ver $rel
 # 旧代 UI（RamBoostFS.Wpf，归档待决策；存在即同步）
 Write-VersionCs "$root\ui\wpf\Version.cs" 'RamBoostFS.Wpf' $ver $rel

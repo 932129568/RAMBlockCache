@@ -73,6 +73,10 @@ int main(void) {
         for(i=0;i<N;i++){ rb_direct_range dr[2]; int dc=0;
             rb_write(s,(rb_u64)i*CHUNK,buf,CHUNK,dr,&dc,2); }
         rb_engine_flush_parallel(e,1);
+        /* [FIX #5.4] 扫描钳制：g_nw 可能超过 MAX_WRITES（回调整记丢弃越界项），
+         * 原双重循环对越界 g_nw 越界读 g_off/g_len（潜伏夹具缺陷；当前 N=64
+         * 不可达）。上界钳到数组容量——越界丢弃项不计入重复判定。 */
+        if (g_nw > MAX_WRITES) g_nw = MAX_WRITES;
         for(a=0;a<g_nw;a++)for(b=a+1;b<g_nw;b++)
             if(g_off[a]==g_off[b]){ printf("FAIL: offset %llu written twice\n",
                 (unsigned long long)g_off[a]); return 1; }

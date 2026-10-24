@@ -1,14 +1,18 @@
 @echo off
-net session >nul 2>&1
-if %errorlevel% neq 0 (
-  echo Requesting administrator privileges...
-  powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-  exit /b
-)
-set "ST=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
-set "SHA=DF1A0ADA2F2CD6E5778EA937C079CB0A035BA431"
-set "F=%~dp0ui\wpf\bin\Release\net8.0-windows\win-x64\publish\RamBoostFS.Wpf.exe"
-"%ST%" sign /sm /s My /sha1 %SHA% /fd SHA256 "%F%"
-echo.
-echo SIGN_WPF_SINGLE_DONE
-pause
+rem ==================================================================
+rem DEPRECATED - sign_wpf_single.cmd is intentionally retired [FIX S-09].
+rem Reason (code-standards 7.3): the old target
+rem   ui\wpf\...\RamBoostFS.Wpf.exe
+rem is a legacy NON-release artifact; fixing only its path discovery
+rem would just make a stale target fail more prettily.
+rem Authoritative entry: sign_all.cmd in this same directory.
+rem   SIGTOOL env var first, then Windows Kits descending version scan;
+rem   exits 1 if no signtool is found. It signs the real release
+rem   artifacts: RAMBlockCache.sys / RAMBlockCache.Controller.exe /
+rem   ramboostctl.exe (missing targets are skipped).
+rem This stub always exits 1 ("script intentionally deprecated").
+rem ==================================================================
+echo [DEPRECATED] sign_wpf_single.cmd is retired; use sign_all.cmd.
+echo   Old target RamBoostFS.Wpf.exe is not a release artifact.
+echo   sign_all.cmd signs the real release artifacts (sys / Controller.exe / ctl).
+exit /b 1

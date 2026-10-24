@@ -46,7 +46,8 @@ public enum UiRisk
     None,            // 无
     DirtyPending,    // 有未落盘数据
     SafeMode,        // 安全模式
-    Panic            // 熔断中
+    Panic,           // 熔断中
+    LostDirty        // [FIX B2] 已确认丢失（异常退出未能落盘、驱动如实记账；琥珀，不新增色）
 }
 
 /// <summary>一个状态的全部用户可见产物（文案/颜色键/主行动/是否阻断写操作）。</summary>
@@ -95,26 +96,66 @@ public sealed record UiStateView(
             "驱动已就绪，尚未挂到任何卷", "运行首次向导", "RbcInfoFg", false);
     }
 
-    /// <summary>风险段（状态条第 4 段）判定。</summary>
-    public static UiRisk ResolveRisk(bool panicActive, bool safeMode, ulong dirtyBytes, ulong thresholdBytes)
+    /// <summary>风险段（状态条第 4 段）判定。
+    /// [FIX B2] 增 lostDirtyBytes：已确认丢失（既成事实）优先于未落盘超限（预测风险）
+    /// 呈现；两者都只到琥珀（RbcWarningFg），不新增色、不制造双红。</summary>
+    public static UiRisk ResolveRisk(bool panicActive, bool safeMode, ulong dirtyBytes, ulong thresholdBytes,
+                                     ulong lostDirtyBytes = 0, ulong lostThresholdBytes = 0)
         => panicActive ? UiRisk.Panic
          : safeMode ? UiRisk.SafeMode
+         : lostDirtyBytes > lostThresholdBytes ? UiRisk.LostDirty
          : dirtyBytes > thresholdBytes ? UiRisk.DirtyPending
          : UiRisk.None;
 
     /// <summary>语义色键 → 画刷（只允许从这里取色，禁止界面散落 Color 常量）。</summary>
-    public static SolidColorBrush ColorForKey(string key) => FindBrush(key, Brushes.Gray);
     public static SolidColorBrush ColorForRisk(UiRisk risk) => risk switch
     {
-        UiRisk.Panic => FindBrush("RbcDangerFg", Brushes.IndianRed),
-        UiRisk.SafeMode => FindBrush("RbcWarningFg", Brushes.Goldenrod),
-        UiRisk.DirtyPending => FindBrush("RbcWarningFg", Brushes.Goldenrod),
-        _ => FindBrush("RbcSuccessFg", Brushes.MediumSeaGreen)
+        // [FIX U-06] 回退色收敛到 FallbackPalette 单点（与 Dark.xaml 令牌等值）
+        UiRisk.Panic => FindBrush("RbcDangerFg", FallbackPalette.Danger),
+        UiRisk.SafeMode => FindBrush("RbcWarningFg", FallbackPalette.Warning),
+        UiRisk.DirtyPending => FindBrush("RbcWarningFg", FallbackPalette.Warning),
+        // [FIX B2] 已确认丢失同为琥珀（异常事实提示，非系统级危险）
+        UiRisk.LostDirty => FindBrush("RbcWarningFg", FallbackPalette.Warning),
+        _ => FindBrush("RbcSuccessFg", FallbackPalette.Success)
     };
 
     private static SolidColorBrush FindBrush(string key, SolidColorBrush fallback)
     {
         try { return (Application.Current.Resources[key] as SolidColorBrush) ?? fallback; }
         catch { return fallback; }
+    }
+}
+
+/// <summary>
+/// [FIX U-06] 代码侧回退色单点（D9 / SW-8）：主题资源缺失时的降级路径与正常
+/// 路径同色相。取值 = Dark.xaml 令牌值；字段注释逐条锚定令牌键——改令牌值必须
+/// 同步此处（注释即契约）。CardHover / StateBar / UiState.ColorForRisk 全部引用
+/// 本点，替代原散落回退字面量（三色语义回退 + 两处 Gray + 两处 hover 十六进制色）。
+/// internal：仅程序集内使用，不扩大公开面。
+/// </summary>
+internal static class FallbackPalette
+{
+    /// <summary>危险语义（锚定令牌 RbcDangerFg #FFF27A72）。</summary>
+    public static readonly SolidColorBrush Danger = new(Color.FromRgb(0xF2, 0x7A, 0x72));
+    /// <summary>警告语义（锚定令牌 RbcWarningFg #FFF2B84B）。</summary>
+    public static readonly SolidColorBrush Warning = new(Color.FromRgb(0xF2, 0xB8, 0x4B));
+    /// <summary>成功语义（锚定令牌 RbcSuccessFg #FF63D6A0）。</summary>
+    public static readonly SolidColorBrush Success = new(Color.FromRgb(0x63, 0xD6, 0xA0));
+    /// <summary>中性语义（锚定令牌 RbcNeutralFg #FFA6A6B0；StateBar 旧 Gray 回退映射于此，A7）。</summary>
+    public static readonly SolidColorBrush Neutral = new(Color.FromRgb(0xA6, 0xA6, 0xB0));
+    /// <summary>卡片 hover 底色回退（锚定令牌 RbcBgSurfaceHover #FF1E1E24）。</summary>
+    public static readonly SolidColorBrush SurfaceHover = new(Color.FromRgb(0x1E, 0x1E, 0x24));
+    /// <summary>卡片 hover 描边回退（锚定令牌 RbcBorderStrong #FF3A3A45）。</summary>
+    public static readonly SolidColorBrush BorderStrong = new(Color.FromRgb(0x3A, 0x3A, 0x45));
+
+    /// <summary>静态构造统一冻结画刷（跨线程共享 + 零可变状态）。</summary>
+    static FallbackPalette()
+    {
+        Danger.Freeze();
+        Warning.Freeze();
+        Success.Freeze();
+        Neutral.Freeze();
+        SurfaceHover.Freeze();
+        BorderStrong.Freeze();
     }
 }

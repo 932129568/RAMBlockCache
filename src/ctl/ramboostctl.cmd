@@ -8,7 +8,8 @@ rem Usage: ramboostctl.cmd volumes | stats | get-config | set enabled=1 vol=D: .
 rem Args with embedded spaces are NOT quoted through UAC relay; keep args simple.
 setlocal
 chcp 65001 >nul 2>&1
-if "%RB_ELEVATED%"=="1" goto run
+rem [FIX S-12] Elevation gate is the net session check below; RB_ELEVATED was a dead
+rem variable (UAC relay never sets it).
 net session >nul 2>&1
 if errorlevel 1 (
     echo [i] requesting administrator rights ^(control device is admins-only^) ...
@@ -16,7 +17,6 @@ if errorlevel 1 (
     if errorlevel 1 echo [!] UAC declined or elevation failed - run this .cmd as Administrator manually.
     exit /b
 )
-:run
 if not exist "%~dp0ramboostctl.exe" (
     echo [!] ramboostctl.exe not found next to this .cmd.
     echo     expected dir: %~dp0

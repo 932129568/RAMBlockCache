@@ -4,6 +4,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using RAMBlockCache.Controller.Services;
 
 namespace RAMBlockCache.Controller.Controls;
 
@@ -61,8 +62,9 @@ public static class CardHover
         if (Motion.IsReducedMotion) return;
         if (sender is not Border b) return;
         AnimateY(b, 0, -1);
-        SwapColor(b, Border.BackgroundProperty, GetOriginalBg(b), HoverColor(b, "RbcBgSurfaceHover", Color.FromRgb(0x1E, 0x1E, 0x24)));
-        SwapColor(b, Border.BorderBrushProperty, GetOriginalBorder(b), HoverColor(b, "RbcBorderStrong", Color.FromRgb(0x3A, 0x3A, 0x45)));
+        // [FIX U-06] 回退色引 FallbackPalette 单点（与令牌等值，删散落字面量）
+        SwapColor(b, Border.BackgroundProperty, GetOriginalBg(b), HoverColor(b, "RbcBgSurfaceHover", FallbackPalette.SurfaceHover.Color));
+        SwapColor(b, Border.BorderBrushProperty, GetOriginalBorder(b), HoverColor(b, "RbcBorderStrong", FallbackPalette.BorderStrong.Color));
     }
 
     private static void OnLeave(object sender, MouseEventArgs e)
@@ -70,8 +72,8 @@ public static class CardHover
         if (Motion.IsReducedMotion) return;
         if (sender is not Border b) return;
         AnimateY(b, -1, 0);
-        SwapColor(b, Border.BackgroundProperty, HoverColor(b, "RbcBgSurfaceHover", Color.FromRgb(0x1E, 0x1E, 0x24)), GetOriginalBg(b));
-        SwapColor(b, Border.BorderBrushProperty, HoverColor(b, "RbcBorderStrong", Color.FromRgb(0x3A, 0x3A, 0x45)), GetOriginalBorder(b));
+        SwapColor(b, Border.BackgroundProperty, HoverColor(b, "RbcBgSurfaceHover", FallbackPalette.SurfaceHover.Color), GetOriginalBg(b));
+        SwapColor(b, Border.BorderBrushProperty, HoverColor(b, "RbcBorderStrong", FallbackPalette.BorderStrong.Color), GetOriginalBorder(b));
     }
 
     private static void AnimateY(Border b, double from, double to)

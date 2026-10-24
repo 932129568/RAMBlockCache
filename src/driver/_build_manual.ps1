@@ -66,7 +66,7 @@ try {
     & $link @(
         "/nologo","/DRIVER","/NODEFAULTLIB","/MANIFEST:NO","/SUBSYSTEM:NATIVE",
         "/ENTRY:GsDriverEntry","/MACHINE:X64","/DEBUG","/RELEASE","/OPT:REF","/OPT:ICF",
-        "ntoskrnl.lib","BufferOverflowK.lib","wdmsec.lib",
+        "ntoskrnl.lib","hal.lib","BufferOverflowK.lib","wdmsec.lib",
         "/LIBPATH:$wdklib",
         "/OUT:$out\RAMBlockCache.sys",
         "$obj\*.obj"

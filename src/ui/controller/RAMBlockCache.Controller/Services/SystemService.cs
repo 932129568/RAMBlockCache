@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Security.Principal;
@@ -27,11 +28,25 @@ public static class SystemService
     public static char LetterFromKey(ulong deviceKey) => (char)(ushort)(deviceKey & 0xFFFF);
 
     /// <summary>枚举固定磁盘卷（盘符根，如 "C:\"）。</summary>
-    public static string[] EnumerateFixedVolumes() =>
-        DriveInfo.GetDrives()
-            .Where(d => d.DriveType == DriveType.Fixed && d.IsReady)
-            .Select(d => d.Name)
-            .ToArray();
+    /* [FIX S7-11] 逐卷 try/catch：DriveInfo.IsReady 对异常卷（热拔瞬间/未就绪/
+     * 掉线）可抛 IOException——原裸调经 RefreshDrivesCommand（同步命令无 Guard）
+     * 冒泡到 DispatcherUnhandledException = fail-fast 崩溃。与 LabelFromRoot 纪律对齐。 */
+    public static string[] EnumerateFixedVolumes()
+    {
+        var outp = new List<string>();
+        DriveInfo[] drives;
+        try { drives = DriveInfo.GetDrives(); }
+        catch { return Array.Empty<string>(); }
+        foreach (var d in drives)
+        {
+            try
+            {
+                if (d.DriveType == DriveType.Fixed && d.IsReady) outp.Add(d.Name);
+            }
+            catch { /* 单卷异常：跳过（热插拔/未就绪），不影响其余卷枚举 */ }
+        }
+        return outp.ToArray();
+    }
 
     /// <summary>卷标；取不到时返回"本地磁盘"。</summary>
     public static string LabelFromRoot(string root)

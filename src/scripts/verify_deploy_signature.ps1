@@ -11,7 +11,9 @@
 #      PendingFileRenameOperations entry for the destination).
 #
 # Exit codes: 0 = verified, 2 = hash/deployed mismatch, 3 = signature/signtool failure,
-#             1 = usage / missing input.
+#             1 = usage / missing input, 4 = I/O failure (source sys missing/unreadable,
+#             Get-FileHash threw). [FIX S-03] 4 = I/O failure added; source-unreachable
+#             used to fall into 1 (usage) with a raw exception stack.
 
 [CmdletBinding()]
 param(
@@ -22,7 +24,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$DefaultExpectedSha256 = 'b6fb097ba24fab1621df48ca066cebd57d1a9cc55015c5737d69e27e3dd64882'
+$DefaultExpectedSha256 = '5ebde9e28441d861b1df33508d3b2c7d3f72beeac7ef1d8f2cc324bac47a629d'
 
 $scriptsDir = $PSScriptRoot
 $root       = Split-Path -Parent $scriptsDir   # = src\
@@ -31,6 +33,10 @@ $root       = Split-Path -Parent $scriptsDir   # = src\
 $repoRoot   = Split-Path -Parent $root
 $dest       = Join-Path $env:SystemRoot 'System32\drivers\RAMBlockCache.sys'
 $smKey      = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+
+# [FIX S-04] PFRO 纯函数库（无顶层副作用）：dot-source 供下方 -AllowPendingReplace
+# 成对匹配使用；QA 亦可独立 dot-source 本库做内存正/负例断言（不碰注册表）。
+. (Join-Path $PSScriptRoot 'pfro_pending.ps1')
 
 function Resolve-SysSource([string]$Explicit) {
     if ($Explicit) {
@@ -52,7 +58,10 @@ function Resolve-ExpectedSha([string]$Sys, [string]$Explicit) {
     $sidecar = "$Sys.sha256"
     if (Test-Path -LiteralPath $sidecar) {
         $first = Get-Content -LiteralPath $sidecar -TotalCount 1
-        if ($first -match '([0-9a-fA-F]{64})') { return $matches[1].ToLower() }
+        # [FIX S-02] sidecar 首行哈希正则三处统一（deploy.ps1 / verify_deploy_signature.ps1 /
+        # check_signature.ps1）：词边界匹配，禁行内任意位置取首条——"SHA256: <hash>" 格式
+        # 必须三处同解；改此正则必须同步另两处。
+        if ($first -match '(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])') { return $matches[0].ToLower() }
         throw "sidecar hash file has no 64-hex SHA256: $sidecar"
     }
     if ($DefaultExpectedSha256) { return $DefaultExpectedSha256.ToLower() }
@@ -79,8 +88,9 @@ function Resolve-SignTool {
 try {
     $srcSys = Resolve-SysSource $SourcePath
 } catch {
-    Write-Host "[X] $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
+    # [FIX S-03] 源不可达归 I/O 失败（exit 4），不再混作 usage（exit 1）。
+    Write-Host "[X] source sys not readable (I/O): $($_.Exception.Message)" -ForegroundColor Red
+    exit 4
 }
 Write-Host "[..] source sys   : $srcSys"
 
@@ -97,8 +107,18 @@ if (-not $expected) {
     exit 1
 }
 
-$srcHash = (Get-FileHash -LiteralPath $srcSys -Algorithm SHA256).Hash.ToLower()
-$depHash = (Get-FileHash -LiteralPath $dest   -Algorithm SHA256).Hash.ToLower()
+# [FIX S-03] 两处 Get-FileHash 包 try/catch：文件不可读归 I/O 失败（exit 4），
+# 不再让裸异常栈冒充 usage 错误。
+try { $srcHash = (Get-FileHash -LiteralPath $srcSys -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() }
+catch {
+    Write-Host "[X] cannot hash source sys (I/O): $($_.Exception.Message)" -ForegroundColor Red
+    exit 4
+}
+try { $depHash = (Get-FileHash -LiteralPath $dest   -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() }
+catch {
+    Write-Host "[X] cannot hash deployed sys (I/O): $($_.Exception.Message)" -ForegroundColor Red
+    exit 4
+}
 Write-Host "source    : $srcHash"
 Write-Host "deployed  : $depHash"
 Write-Host "expected  : $expected"
@@ -132,15 +152,12 @@ if ($depHash -eq $srcHash) {
 
 # mismatch: accept only a queued replace-on-reboot
 if ($AllowPendingReplace) {
+    # [FIX S-04] 成对匹配：PFRO REG_MULTI_SZ 按 (源,目标) 步长 2 切对，源（归一化）==
+    # 本次 $srcSys 且 目标 == $dest 才放行；陈旧队列（源是旧 dist 路径）/空队列 -> exit 2。
+    # 旧实现：任意条目 -like '*RAMBlockCache.sys*' 即放行——陈旧部署队列可制造假 PASS。
     $pfro = (Get-ItemProperty -Path $smKey -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
-    $queued = $false
-    if ($pfro) {
-        foreach ($entry in $pfro) {
-            if ($entry -like '*RAMBlockCache.sys*') { $queued = $true; break }
-        }
-    }
-    if ($queued) {
-        Write-Host '[ok] deployed copy differs but a replace-on-reboot is queued; source verified.' -ForegroundColor Yellow
+    if (Test-PfroPendingReplace -PfroEntries @($pfro) -ExpectedSource $srcSys -ExpectedTarget $dest) {
+        Write-Host '[ok] deployed copy differs but a matching (source,target) replace-on-reboot pair is queued; source verified.' -ForegroundColor Yellow
         exit 0
     }
 }

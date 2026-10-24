@@ -49,7 +49,18 @@ NTSTATUS Rb2PoolSubmit(VOID (*Fn)(PVOID), PVOID Ctx)
     j = (RB2_JOB *)Rb2Alloc(sizeof(*j)); if (!j) return STATUS_INSUFFICIENT_RESOURCES;
     j->Fn = Fn; j->Ctx = Ctx;
     /* 持 s_Lock 入队：与 Rb2Worker 摘取互斥；锁外信号量唤醒 */
-    KeAcquireSpinLock(&s_Lock, &irql); InsertTailList(&s_Q, &j->Le); KeReleaseSpinLock(&s_Lock, irql);
+    KeAcquireSpinLock(&s_Lock, &irql);
+    /* [FIX R6-04] 锁内复验 s_Stop：原实现入队前检查、入队后不复验——Shutdown 在
+     * "检查通过→入队前"窗口完成全部 join（彼时队空）后，本作业入队+释放信号量
+     * 后永无 worker 拾取 = j(24B) 与 Ctx（淘汰作业含 ≤64KB 非分页）泄漏。
+     * 复验命中则摘除并释放，返回关闭中。 */
+    if (InterlockedCompareExchange(&s_Stop, 0, 0)) {
+        KeReleaseSpinLock(&s_Lock, irql);
+        Rb2Free(j);
+        return STATUS_SHUTDOWN_IN_PROGRESS;
+    }
+    InsertTailList(&s_Q, &j->Le);
+    KeReleaseSpinLock(&s_Lock, irql);
     KeReleaseSemaphore(&s_Sem, IO_NO_INCREMENT, 1, FALSE);
     return STATUS_SUCCESS;
 }
@@ -61,9 +72,19 @@ ULONG Rb2PoolWorkerCount(VOID)
 
 NTSTATUS Rb2PoolInit(VOID)
 {
-    ULONG g, ng = KeQueryActiveGroupCount(), per, i, n; NTSTATUS st;
+    ULONG g, ng = KeQueryActiveGroupCount(), per, i, n, k; NTSTATUS st;
     KeInitializeSpinLock(&s_Lock); InitializeListHead(&s_Q);
     KeInitializeSemaphore(&s_Sem, 0, 0x7FFFFFFF);
+    /* [FIX A-11] 世代重置：上次 Init→Shutdown 超时路径（STATUS_TIMEOUT）不复位
+     * s_N（leak-by-design 保留幽灵句柄在表中）。不复零则本次以陈旧 s_N 为基：
+     * 满载(64)时建线程循环零执行却 return STATUS_SUCCESS = init 假成功
+     * （池零线程而调用方继续建 Rb2Tick 报成功，淘汰/L2 作业永无 worker 消费）。
+     * 幽灵线程本就不可 join（超时即选定泄漏），此处仅断开表登记。 */
+    if (s_N != 0) {
+        RbLog(2, __LINE__, 0, L"pool: stale worker registry reset (previous shutdown timed out)");
+        for (k = 0; k < s_N; k++) { s_Hnd[k] = NULL; s_Obj[k] = NULL; }
+        s_N = 0;
+    }
     InterlockedExchange(&s_Stop, 0);            /* [FIX W5] init→shutdown→init 后再初始化必须解除停止闩 */
     Rb2GetDW(NULL, L"WorkersPerGroup", 4, &per); if (per < 1) per = 1; if (per > 8) per = 8;
     for (g = 0; g < ng && s_N < 64; g++) {

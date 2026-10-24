@@ -1,6 +1,9 @@
 @echo off
-rem _build_rbfeatctl.cmd —— 本机 MSVC(非标准路径) 编译 rbfeatctl 的包装
-rem 正常机器上请直接: cl /utf-8 /O2 /W3 rbfeatctl.c /Fe:rbfeatctl.exe advapi32.lib
+rem [FIX S-12] REM comments English-ized (batch encoding discipline).
+rem _build_rbfeatctl.cmd - wrapper to build rbfeatctl with this machine's
+rem non-standard MSVC install path.
+rem On a normal machine just run directly:
+rem cl /utf-8 /O2 /W3 rbfeatctl.c /Fe:rbfeatctl.exe advapi32.lib
 setlocal
 set "VCT=C:\Program1\VC\Tools\MSVC\14.44.35207"
 set "KIT=C:\Program Files (x86)\Windows Kits\10"

@@ -40,21 +40,40 @@ try {
 } catch { L ("   PF FAIL: " + $_.Exception.Message) }
 
 L "4) create service"
+# [FIX S-08] sc.exe 链退出码检查：create/config/start 失败（如 1072 服务标记删除）
+# 必须记日志并非零收尾，不能带着 MANUAL_INSTALL_DONE 静默通关。
 $c = sc.exe create RAMBlockCache type= kernel start= demand error= normal binPath= $dst DisplayName= "RAMBlockCache RAM Disk Cache" 2>&1
 L ("   " + ($c -join ' '))
+if ($LASTEXITCODE -ne 0) {
+    L ("   SC CREATE FAIL: exit $LASTEXITCODE")
+    L "MANUAL_INSTALL_FAILED"
+    exit 1
+}
 sc.exe config RAMBlockCache loadordergroup= "Volume Filter" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    L ("   SC CONFIG FAIL: exit $LASTEXITCODE")
+    L "MANUAL_INSTALL_FAILED"
+    exit 1
+}
 
 L "5) UpperFilters"
 $cls = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{71a27cdd-812a-11d0-bec7-08002be2092f}"
 $existing = @((Get-ItemProperty $cls -Name UpperFilters).UpperFilters) | Where-Object { $_ }
 if ($existing -notcontains 'RAMBlockCache') {
-    Set-ItemProperty $cls -Name UpperFilters -Value ($existing + 'RAMBlockCache')
+    # [FIX S-08] 显式 -Type MultiString：UpperFilters 不存在时 Set-ItemProperty
+    # 默认推断会写成 REG_SZ，卷类过滤器失效。
+    Set-ItemProperty $cls -Name UpperFilters -Value ($existing + 'RAMBlockCache') -Type MultiString
 }
 L ("   now: " + (((Get-ItemProperty $cls).UpperFilters) -join ','))
 
 L "6) start service"
 $s = sc.exe start RAMBlockCache 2>&1
 L ("   " + ($s -join ' '))
+if ($LASTEXITCODE -ne 0) {
+    L ("   SC START FAIL: exit $LASTEXITCODE")
+    L "MANUAL_INSTALL_FAILED"
+    exit 1
+}
 
 L "7) testsigning"
 $t = bcdedit /enum | Select-String 'testsigning'

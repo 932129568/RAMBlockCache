@@ -1,49 +1,58 @@
 <UserControl x:Class="RAMBlockCache.Controller.Controls.StateBar"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-    <!-- 常驻四段状态条（契约 §1 / 体验架构 §4.2）
-         段：驱动 · 挂栈 · 加速 · 风险；异常段变色，Click 事件由 MainViewModel 路由到处置页 -->
-    <Border Background="{StaticResource RbcBgSurface}" BorderBrush="{StaticResource RbcBorder}"
-            BorderThickness="0,0,0,1" Padding="16,8">
-        <StackPanel Orientation="Horizontal">
-            <!-- 段模板：圆点 + 标签 + 值；各段颜色由代码按 UiState 绑定 -->
-            <Border x:Name="SegDriver" CornerRadius="999" Padding="12,4" Margin="0,0,8,0"
-                    Background="{StaticResource RbcNeutralBg}" Cursor="Hand"
+    <!-- 常驻四段状态条（契约 §1 / 体验架构 §4.2；原型 renderStatusbar + .seg CSS 的 1:1 转译）
+         段：驱动 · 挂栈 · 加速 · 风险；Click 事件由 MainViewModel 路由到处置页。
+         [FIX B26] 三枚状态条令牌落地消费（原 Dark.xaml 死令牌）：
+         底= RbcBgStatusbar、高= RbcStatusbarHeight、内边距= RbcPadStatusbar。
+         [W1.5 截图比对 S8 2026-10-23] 对齐原型 .seg 精确规格：
+         · 药丸：高恒 30px（设计软件实测 45px@150%DPI，非 HTML 原型 CSS 的 24px）、padding 0 12px、元素间距 8px（flex gap）、radius=md(10px) 圆角矩形——用户 17:29 裁决圆角矩形 + 17:34 裁决弧度加大一档（sm6→md10）；
+         · 标签/点 = 段类语义色（ok=绿/info=蓝/warning=琥珀/danger=红/neutral=灰）；
+         · 值 = 恒 RbcTextPrimary + 600（原型 .seg-val，不随语义色）；
+         · 「success」类在原型 CSS 无 tint 定义 → 加速/风险正常态 = 透明裸段（点/标签灰）。
+         颜色由 code-behind ColorSeg 按 Update() 状态驱动（XAML 不写死任何前景色）。 -->
+    <Border Background="{StaticResource RbcBgStatusbar}" BorderBrush="{StaticResource RbcBorder}"
+            BorderThickness="0,0,0,1" Padding="{StaticResource RbcPadStatusbar}"
+            MinHeight="{StaticResource RbcStatusbarHeight}">
+        <!-- 原型 .statusbar{align-items:center}：24px 药丸在 40px 条内垂直居中 -->
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+            <Border x:Name="SegDriver" CornerRadius="{StaticResource RbcRadiusMd}" Padding="12,0" MinHeight="30" Margin="0,0,12,0"
+                    Background="Transparent" Cursor="Hand"
                     MouseLeftButtonUp="SegDriver_Click">
-                <StackPanel Orientation="Horizontal">
-                    <Ellipse Width="8" Height="8" Margin="0,0,6,0" x:Name="DotDriver"/>
-                    <TextBlock Text="驱动" Foreground="{StaticResource RbcTextSecondary}" FontSize="12"/>
-                    <TextBlock x:Name="ValDriver" Margin="6,0,0,0" FontSize="12" Foreground="{StaticResource RbcTextPrimary}"/>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Ellipse Width="8" Height="8" Margin="0,0,8,0" x:Name="DotDriver"/>
+                    <TextBlock x:Name="LblDriver" Text="驱动" FontSize="12"/>
+                    <TextBlock x:Name="ValDriver" Margin="8,0,0,0" FontSize="12" FontWeight="SemiBold"/>
                 </StackPanel>
             </Border>
 
-            <Border x:Name="SegStack" CornerRadius="999" Padding="12,4" Margin="0,0,8,0"
-                    Background="{StaticResource RbcNeutralBg}" Cursor="Hand"
+            <Border x:Name="SegStack" CornerRadius="{StaticResource RbcRadiusMd}" Padding="12,0" MinHeight="30" Margin="0,0,12,0"
+                    Background="Transparent" Cursor="Hand"
                     MouseLeftButtonUp="SegStack_Click">
-                <StackPanel Orientation="Horizontal">
-                    <Ellipse Width="8" Height="8" Margin="0,0,6,0" x:Name="DotStack"/>
-                    <TextBlock Text="挂栈" Foreground="{StaticResource RbcTextSecondary}" FontSize="12"/>
-                    <TextBlock x:Name="ValStack" Margin="6,0,0,0" FontSize="12" Foreground="{StaticResource RbcTextPrimary}"/>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Ellipse Width="8" Height="8" Margin="0,0,8,0" x:Name="DotStack"/>
+                    <TextBlock x:Name="LblStack" Text="挂栈" FontSize="12"/>
+                    <TextBlock x:Name="ValStack" Margin="8,0,0,0" FontSize="12" FontWeight="SemiBold"/>
                 </StackPanel>
             </Border>
 
-            <Border x:Name="SegAccel" CornerRadius="999" Padding="12,4" Margin="0,0,8,0"
-                    Background="{StaticResource RbcNeutralBg}" Cursor="Hand"
+            <Border x:Name="SegAccel" CornerRadius="{StaticResource RbcRadiusMd}" Padding="12,0" MinHeight="30" Margin="0,0,12,0"
+                    Background="Transparent" Cursor="Hand"
                     MouseLeftButtonUp="SegAccel_Click">
-                <StackPanel Orientation="Horizontal">
-                    <Ellipse Width="8" Height="8" Margin="0,0,6,0" x:Name="DotAccel"/>
-                    <TextBlock Text="加速" Foreground="{StaticResource RbcTextSecondary}" FontSize="12"/>
-                    <TextBlock x:Name="ValAccel" Margin="6,0,0,0" FontSize="12" Foreground="{StaticResource RbcTextPrimary}"/>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Ellipse Width="8" Height="8" Margin="0,0,8,0" x:Name="DotAccel"/>
+                    <TextBlock x:Name="LblAccel" Text="加速" FontSize="12"/>
+                    <TextBlock x:Name="ValAccel" Margin="8,0,0,0" FontSize="12" FontWeight="SemiBold"/>
                 </StackPanel>
             </Border>
 
-            <Border x:Name="SegRisk" CornerRadius="999" Padding="12,4"
-                    Background="{StaticResource RbcNeutralBg}" Cursor="Hand"
+            <Border x:Name="SegRisk" CornerRadius="{StaticResource RbcRadiusMd}" Padding="12,0" MinHeight="30"
+                    Background="Transparent" Cursor="Hand"
                     MouseLeftButtonUp="SegRisk_Click">
-                <StackPanel Orientation="Horizontal">
-                    <Ellipse Width="8" Height="8" Margin="0,0,6,0" x:Name="DotRisk"/>
-                    <TextBlock Text="风险" Foreground="{StaticResource RbcTextSecondary}" FontSize="12"/>
-                    <TextBlock x:Name="ValRisk" Margin="6,0,0,0" FontSize="12" Foreground="{StaticResource RbcTextPrimary}"/>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Ellipse Width="8" Height="8" Margin="0,0,8,0" x:Name="DotRisk"/>
+                    <TextBlock x:Name="LblRisk" Text="风险" FontSize="12"/>
+                    <TextBlock x:Name="ValRisk" Margin="8,0,0,0" FontSize="12" FontWeight="SemiBold"/>
                 </StackPanel>
             </Border>
         </StackPanel>

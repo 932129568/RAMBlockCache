@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>深度检索报告 · 内存缓存软件公开调研与迭代方案</title>
+<style>
+:root{
+  --bg:#faf9f7; --card:#ffffff; --card-soft:#fbfaf8;
+  --ink:#2b2f36; --ink-2:#6b7280; --line:#eceae6;
+  --accent:#2f4858; --accent-deep:#1f3a5f; --point:#d9684a; --muted:#9aa0a6;
+  --serif:"Noto Serif SC","Source Han Serif SC",serif;
+  --sans:"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:"Inter","JetBrains Mono",monospace;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:var(--sans); background:var(--bg); color:var(--ink); padding:40px 32px; line-height:1.7; }
+.report { max-width:880px; margin:0 auto; background:var(--card); border-radius:12px; box-shadow:0 2px 16px rgba(43,47,54,.05); overflow:hidden; }
+.header { background:var(--card); border-top:4px solid var(--accent); border-bottom:1px solid var(--line); color:var(--ink); padding:32px; }
+.header .kicker { font-family:var(--sans); font-size:13px; color:var(--muted); letter-spacing:1px; }
+.header h1 { font-family:var(--serif); font-size:22px; color:var(--accent); margin:8px 0 16px; font-weight:700; }
+.meta { display:flex; flex-wrap:wrap; gap:8px 20px; font-size:13px; color:var(--ink-2); }
+.meta b { font-weight:600; color:var(--ink); }
+.chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+.chip { background:#f1efea; padding:4px 12px; border-radius:999px; font-size:12px; color:var(--ink-2); }
+.body { padding:32px 32px 24px; }
+h2 { font-family:var(--serif); font-size:18px; color:var(--accent); margin:32px 0 16px; display:flex; align-items:center; gap:8px; }
+h2::before { content:""; width:4px; height:18px; background:var(--accent); border-radius:2px; }
+h3 { font-size:15px; color:var(--ink); margin:20px 0 10px; }
+.grid { display:grid; grid-template-columns:1fr; gap:16px; }
+.card { display:flex; gap:14px; align-items:flex-start; background:var(--card-soft); border:1px solid var(--line); border-radius:10px; padding:16px 20px; border-left:4px solid var(--muted); }
+.card .num { font-family:var(--mono); font-weight:700; color:var(--muted); font-size:14px; min-width:22px; }
+.card .txt { flex:1; font-size:14px; }
+.card.s-in { border-left-color:var(--accent); }
+.card.s-out { border-left-color:var(--point); }
+.card.s-both { border-left-color:var(--accent-deep); }
+.card.s-gap { border-left-color:var(--muted); }
+.badge { display:inline-block; font-family:var(--sans); font-size:11px; font-weight:600; padding:2px 8px; border-radius:999px; margin-right:6px; vertical-align:1px; }
+.b-in { background:#e7ecf0; color:#2f4858; }
+.b-out { background:#fbe9e3; color:#c0533a; }
+.b-both { background:#e3e9f0; color:#1f3a5f; }
+.b-gap { background:#f1efea; color:#6b7280; }
+table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+th { background:#f3f1ec; text-align:left; padding:10px; font-weight:600; color:var(--ink-2); }
+td { padding:10px; border-bottom:1px solid var(--line); vertical-align:top; }
+tr:last-child td { border-bottom:none; }
+.src-block { background:var(--card-soft); border:1px solid var(--line); border-radius:10px; padding:16px 20px; margin-top:16px; font-size:13px; }
+.src-block h4 { font-family:var(--sans); font-size:13px; margin-bottom:8px; color:var(--ink); }
+.src-block ul { list-style:none; }
+.src-block li { padding:4px 0; }
+.src-block .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; }
+.dot-in { background:var(--accent); } .dot-out { background:var(--point); }
+code { font-family:var(--mono); background:#f3f1ec; padding:1px 5px; border-radius:4px; font-size:12px; color:var(--ink); }
+.p0 { color:#c0533a; font-weight:700; }
+.p1 { color:#9a6b1f; font-weight:700; }
+.p2 { color:#2f4858; font-weight:700; }
+.footer { background:var(--card-soft); border-top:1px solid var(--line); padding:20px 32px 24px; font-size:12px; color:var(--muted); }
+.disclaimer { font-style:italic; color:var(--ink-2); margin-top:6px; }
+@media print { body{background:#fff;padding:0} .report{box-shadow:none;border-radius:0} }
+</style>
+</head>
+<body>
+<div class="report">
+  <div class="header">
+    <div class="kicker">深度检索报告 · DEEP-RESEARCH</div>
+    <h1>内存缓存软件公开调研与迭代方案</h1>
+    <div class="meta">
+      <span><b>范围</b>：RAMBlockCache 公开网络调研（100 批矩阵，执行 12 批）+ 迭代方案</span>
+      <span><b>来源</b>：内部 4 · 外部 24</span>
+      <span><b>日期</b>：2026-10-21</span>
+    </div>
+    <div class="chips">
+      <span class="chip">检索路径：100 批矩阵 → 优先级执行 12 批 → 综合</span>
+      <span class="chip">检索模式：关键词 + 外部检索（4 轮）</span>
+      <span class="chip">查询改写：无（实体精确）</span>
+    </div>
+  </div>
+
+  <div class="body">
+    <h2>核心结论</h2>
+    <div class="grid">
+      <div class="card s-both">
+        <div class="num">1</div>
+        <div class="txt"><span class="badge b-both">[内+外]</span><b>竞品大量退场，窗口期真实存在，但舆论逆风是更大障碍</b>：SuperCache/FancyCache/StoreMI/傲腾均已停产（<a href="https://alternativeto.net/software/fancycache/">AlternativeTo</a>、<a href="https://blog.51cto.com/xfxuezhang/14841036">51CTO</a>），PrimoCache 一家独大且节奏放缓（最新 v4.4.1=2025-01，<a href="https://www.romexsoftware.com/en-us/primo-cache/changelog.html">官方 ChangeLog</a>）；但中文社区有「内存缓存=骗过测速软件的智商税」叙事（<a href="https://pcnow.cc/p/QJ97459c5d.html">PCNow</a>、<a href="https://www.howtogeek.com/171424/why-memory-optimizers-and-ram-boosters-are-worse-than-useless/">HowToGeek</a>）——产品成败的一半在「可自证的有效性」。</div>
+      </div>
+      <div class="card s-out">
+        <div class="num">2</div>
+        <div class="txt"><span class="badge b-out">[外]</span><b>中外用户反馈高度一致，可直接转为需求</b>：全 NVMe+大内存收益小（<a href="https://superuser.com/posts/comments/2705238">SuperUser「zero noticeable difference」</a>）；顺序读写提升有限（<a href="https://www.pcworld.com/article/2839387/wd-blue-sn580-nvme-ssd-review.html">PCWorld 实测</a>）——与本品 10-19 跑分结论互证；缓存粒度 4K 显著优（<a href="https://xiaoyi.vc/primocache.html">贴吧实测</a>）；掉电是最大采用障碍（<a href="https://www.romexsoftware.com/zh-cn/primo-cache/term-defer-write.html">PrimoCache 官方都建议仅临时盘+UPS</a>）。</div>
+      </div>
+      <div class="card s-out">
+        <div class="num">3</div>
+        <div class="txt"><span class="badge b-out">[外]</span><b>测试签名驱动与反作弊冲突是硬红线，EV 签名必须前移</b>：Riot Vanguard 对 unsigned/test-signed 内核驱动「no supported workaround」（<a href="https://www.positioniseverything.net/fix-vanguard-detected-incompatible-software-in-windows-11">排障指南</a>），BattlEye 官方 FAQ 明说拦截「有已知安全问题的内核驱动」（<a href="https://www.battleye.com/support/faq/">BE FAQ</a>）。UI 需主动检测+提示。</div>
+      </div>
+      <div class="card s-out">
+        <div class="num">4</div>
+        <div class="txt"><span class="badge b-out">[外]</span><b>渠道与定价有空档</b>：winget 社区 2025-07 求 PrimoCache 上架至 2026-04 未果（<a href="https://github.com/microsoft/winget-pkgs/issues/279277">winget-pkgs#279277</a>）；国产 QILING 用 SharewareOnSale 限免打法获客（<a href="https://xiaoyi.vc/qiling-fast-cache.html">小羿</a>）。正规签名+包管理器+限免首发是低成本分发组合。</div>
+      </div>
+      <div class="card s-gap">
+        <div class="num">5</div>
+        <div class="txt"><span class="badge b-gap">[⚠]</span><b>100 批中 88 批为 backlog</b>：矩阵与查询词已固化（§6）；微博平台技术品类信号弱，建议后续以微信公众号/什么值得买替代；B 站视频与知乎长文未逐篇精读。</div>
+      </div>
+    </div>
+
+    <h2>关键要点</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>市场判断</b>：活跃更新者仅 PrimoCache+QILING 两家——功能追赶窗口约 12 个月，与路线图 Phase 1 窗口期互证。</li>
+        <li><b>用户反馈六主题</b>：收益预期错配 / 掉电恐惧 / 粒度与容量经验值（空闲内存 1/3、粒度 4K）/ 大工作集物理极限 / 反作弊冲突 / 破解版报毒（正规签名的信任红利）。</li>
+        <li><b>可复用点直采</b>：场景预设菜单、命中率主窗可见、冷热二遍读自证、掉电防御清单（UPS/分页文件勿入缓存盘/低电量强制 flush）、DirectStorage 兼容、安装期许可证、winget manifest。</li>
+        <li><b>迭代方案一句话</b>：以「可信（可自证）+ 易用（场景预设）+ 安全（默认直写+引导回写+反作弊检测）」为下一版本三支柱，渠道上 winget+正式签名，性能沿既定六方向。</li>
+      </ul>
+    </div>
+
+    <h2>竞品格局与方案对比</h2>
+    <table>
+      <tr><th>方案</th><th>思路</th><th>优点</th><th>缺点</th><th>可复用点（本品）</th></tr>
+      <tr><td><b>PrimoCache</b></td><td>卷过滤 L1 RAM+L2 SSD 双级；LFU/LRU；Defer-Write 五档</td><td>功能最深；预设菜单；统计全；Win11 24H2</td><td>付费贵；设置复杂；高端机收益小；破解生态乱</td><td>预设菜单、统计口径、Defer-Write 话术、DirectStorage 清单</td></tr>
+      <tr><td><b>QILING Fast Cache</b></td><td>同架构轻量实现</td><td>4 步上手；限免获客；命中率主窗直显</td><td>无延时写/无 CLI；功能浅</td><td>「主窗口即见命中率」信息架构；限免首发打法</td></tr>
+      <tr><td><b>SuperCache/FancyCache</b></td><td>同架构（历史 4K 随机读口碑）</td><td>性能标杆注脚</td><td>已停产/停更</td><td>无</td></tr>
+      <tr><td><b>ImDisk/SoftPerfect/Primo Ramdisk</b></td><td>内存盘（创建设备非过滤卷）</td><td>免重启</td><td>非缓存品类</td><td>免重启设备创建思路（TestMode 已吸收）</td></tr>
+      <tr><td><b>傲腾/StoreMI/SSHD</b></td><td>硬件/分层</td><td>硬件级安全</td><td>停产/淘汰</td><td>无（市场教育已完成是红利）</td></tr>
+      <tr><td><b>Windows 自带缓存</b></td><td>Cc 文件缓存</td><td>零成本</td><td>非缓冲 IO/元数据不覆盖</td><td>反面论据库（用冷热二遍读协议反击）</td></tr>
+    </table>
+
+    <h2>用户反馈主题聚类（跨平台收敛）</h2>
+    <table>
+      <tr><th>主题</th><th>证据</th><th>对产品的含义</th></tr>
+      <tr><td>收益预期错配</td><td>SuperUser「zero noticeable difference」；「全固态装它脱裤子放屁」</td><td>适用/不适用白名单前置（首跑向导已有雏形）</td></tr>
+      <tr><td>掉电恐惧</td><td>官方建议仅临时盘；贴吧「意外断电你会哭的」</td><td>直写默认+回写风险一句话+UPS 检测</td></tr>
+      <tr><td>容量/粒度经验</td><td>空闲内存 1/3；粒度 4K 最优；16G→70% 命中</td><td>默认值数据化+容量引导经验值</td></tr>
+      <tr><td>大工作集极限</td><td>「90GB 游戏 never get a good cache rate」</td><td>预期管理+L2 叙事（跨重启/超内存）</td></tr>
+      <tr><td>冷启动物理</td><td>「二次启动后才生效」；本品 Seq 零加速</td><td>禁「首遍即飞」话术；验收用二遍读</td></tr>
+      <tr><td>反作弊冲突</td><td>Vanguard/BE 对内核驱动零容忍</td><td>EV 签名前移+UI 检测提示</td></tr>
+      <tr><td>破解生态乱象</td><td>报毒/蓝屏反馈集中破解版</td><td>正规签名分发=信任差异化</td></tr>
+    </table>
+
+    <h2>迭代方案</h2>
+    <h3>问题分析（调研确诊六问题）</h3>
+    <div class="src-block">
+      <ul>
+        <li><b>P1 可自证性缺失</b>：「智商税」舆论下没有可见命中率与冷热对比无法取信——数据已有（RB_STATS）未在产品叙事层使用。</li>
+        <li><b>P2 预期管理缺位</b>：按「秒变 SSD」预期安装、按「没感觉」卸载——差评风险在预期不在功能。</li>
+        <li><b>P3 回写安全叙事弱</b>：官方「仅临时盘」话术劝退本可安全使用直写+选择性回写的用户。</li>
+        <li><b>P4 兼容红线未提示</b>：测试签名驱动与 Vanguard/BE 冲突无 UI 预警，遇到即灾难性口碑。</li>
+        <li><b>P5 渠道空白</b>：winget 无收录；中文获客依赖限免/自媒体（QILING 打法已验证）。</li>
+        <li><b>P6 性能已知未修</b>：8MB 门/直写默认/吸收延迟（10-19 跑分三大根因）需与体验项同步排期。</li>
+      </ul>
+    </div>
+    <h3>迭代目标（V10.6，对齐既有波次）</h3>
+    <div class="src-block">
+      <ul>
+        <li><b>G1 可信</b>：命中率、冷热二遍读、加速面分布在 UI 一眼可见。</li>
+        <li><b>G2 易用</b>：场景预设三档（安全只读/均衡读写/性能回写）一键选择。</li>
+        <li><b>G3 安全</b>：默认直写不变；回写=UPS 检测+风险确认+场景适配建议。</li>
+        <li><b>G4 兼容</b>：反作弊环境检测→测试签名版警示、正式版放行。</li>
+        <li><b>G5 渠道</b>：winget manifest+官网正式签名+首发限免 30 天。</li>
+        <li><b>G6 性能</b>：W1.5 读写路径专项按既定三方向执行。</li>
+      </ul>
+    </div>
+    <h3>改进项清单（优先级/实施/验证）</h3>
+    <table>
+      <tr><th>#</th><th>改进项</th><th>优先级</th><th>实施步骤</th><th>验证方式</th></tr>
+      <tr><td>I-01</td><td>场景预设菜单（三档参数自动填）</td><td class="p0">P0</td><td>定参数表→缓存页预设 ComboBox+自定义入口→即生效</td><td>5 非技术用户 3 分钟完成首配（≥4/5）</td></tr>
+      <tr><td>I-02</td><td>命中率与冷热对比可视化（二遍读小工具）</td><td class="p0">P0</td><td>总览常驻命中率→缓存页效果自测→遥测同口径</td><td>与 CLI stats 误差 &lt;2%</td></tr>
+      <tr><td>I-03</td><td>回写开启引导（UPS 检测+场景建议+风险一句话）</td><td class="p0">P0</td><td>UPS/笔记本检测→场景清单（下载/编译推荐；数据库/备份劝阻）→记录选择</td><td>三档场景各 3 用户测试无「看不懂」</td></tr>
+      <tr><td>I-04</td><td>反作弊冲突检测与提示（vgk/BEDaisy/EAC）</td><td class="p0">P0</td><td>服务枚举→测试签名版弹警示+EV 版说明→正式版静默</td><td>Valorant/PUBG 机器三状态实测</td></tr>
+      <tr><td>I-05</td><td>winget manifest+官网分发</td><td class="p1">P1</td><td>写 manifest→提交 winget-pkgs→官网正式签名 exe</td><td>winget validate 过；装/卸/升三路径</td></tr>
+      <tr><td>I-06</td><td>DirectStorage 兼容验证（并入 PRD-02 矩阵）</td><td class="p1">P1</td><td>矩阵加 DStorage 负载→A/B 对账</td><td>游戏加载无回归；IO 对账一致</td></tr>
+      <tr><td>I-07</td><td>Freeze Cache 类能力评估</td><td class="p2">P2</td><td>对标文档→内核特性位评估→自研或明确不做</td><td>架构评审纪要（不做也写 Non-goals）</td></tr>
+      <tr><td>I-08</td><td>营销话术纪律（禁「秒变 SSD」，统一冷热口径）</td><td class="p1">P1</td><td>官网/商店/向导文案审查→白名单标准段落</td><td>文案 checklist 过审</td></tr>
+      <tr><td>I-09</td><td>W1.5 性能专项（8MB 门/默认回写评估/吸收延迟）</td><td class="p0">P0</td><td>按 10-19 报告三方向</td><td>Verifier+同负载 A/B+stats 归因</td></tr>
+      <tr><td>I-10</td><td>安装期许可证输入+首发限免</td><td class="p2">P2</td><td>Setup 许可证页（可跳过 30 天试用）→限免活动</td><td>试用-激活-付费漏斗可观测</td></tr>
+    </table>
+    <h3>时间安排（对齐既有迭代计划）</h3>
+    <table>
+      <tr><th>波次</th><th>内容</th><th>对应项</th><th>估计</th></tr>
+      <tr><td>W1（信任遥测，进行中）</td><td>I-02+I-03+I-04</td><td>G1/G3/G4</td><td>随 W1（+2 人周）</td></tr>
+      <tr><td>W1.5（读写路径性能，新增）</td><td>I-09+I-01</td><td>G6/G2</td><td>5-6 人周</td></tr>
+      <tr><td>W2（L2 MVP）</td><td>不变（I-07 并入评估）</td><td>—</td><td>5-6 人周</td></tr>
+      <tr><td>W3（覆盖验证+预取）</td><td>I-06 并入 PRD-02</td><td>—</td><td>6-7 人周</td></tr>
+      <tr><td>渠道周（W4 前插入）</td><td>I-05+I-10+I-08</td><td>G5</td><td>1-2 人周+外部</td></tr>
+    </table>
+    <h3>风险与验证</h3>
+    <div class="src-block">
+      <ul>
+        <li><b>舆论反噬（高）</b>：「跑分高=有效」营销会被 pcnow 式文章打击→对外口径全部绑定可复现的冷热二遍读协议。</li>
+        <li><b>反作弊冲突（高，口碑毁灭级）</b>：I-04 上线前不做任何游戏社区推广；三反作弊环境实测。</li>
+        <li><b>范围蔓延（中）</b>：I-07/I-10 易膨胀→预设先行、许可证独立排期；波次门禁不过不进。</li>
+        <li><b>预设误配（中）</b>：一档参数不可能适配所有盘→预设仅填初值+保留手动+恢复默认；HDD/SATA/NVMe × 三预设矩阵验证。</li>
+        <li><b>数据诚实性（中）</b>：命中率统计自身 bug 摧毁信任→CLI/UI/遥测三方一致，误差 &lt;2% 门禁。</li>
+      </ul>
+    </div>
+
+    <h2>100 批批次矩阵（执行状态）</h2>
+    <table>
+      <tr><th>簇</th><th>主题</th><th>批数</th><th>已执行</th><th>代表来源</th></tr>
+      <tr><td>A 知乎/软媒</td><td>方案评测、对比、安全性、场景</td><td>16</td><td>4</td><td>winwin7、百度百科、CSDN 问答、51CTO</td></tr>
+      <tr><td>B 贴吧</td><td>实测反馈、翻车、掉电讨论</td><td>16</td><td>3</td><td>优化吧、使用汇报、仁王3 吧</td></tr>
+      <tr><td>C B站/视频</td><td>教程、实测</td><td>16</td><td>1</td><td>B站专栏（内存条提速）</td></tr>
+      <tr><td>D GitHub/开源</td><td>同架构工程实践、包管理渠道</td><td>16</td><td>2</td><td>SysRestoreDriver、winget-pkgs#279277</td></tr>
+      <tr><td>E 国际论坛</td><td>SuperUser/AnandTech/Romex BBS/AlternativeTo</td><td>20</td><td>4</td><td>SuperUser、AnandTech、Romex BBS</td></tr>
+      <tr><td>F 媒体/厂商</td><td>评测、changelog、定价</td><td>16</td><td>3</td><td>PCWorld、idiskhome、Romex ChangeLog</td></tr>
+      <tr><td><b>合计</b></td><td></td><td><b>100</b></td><td><b>12</b></td><td>88 backlog 查询词见 md 底稿</td></tr>
+    </table>
+
+    <h2>证据清单</h2>
+    <table>
+      <tr><th>#</th><th>结论摘要</th><th>支撑</th><th>口径</th><th>来源</th></tr>
+      <tr><td>1</td><td>SuperCache/FancyCache/StoreMI/傲腾退场，PrimoCache 一家独大</td><td><span class="badge b-out">[外]</span></td><td>竞品格局</td><td><a href="https://alternativeto.net/software/fancycache/">AlternativeTo</a> + <a href="https://blog.51cto.com/xfxuezhang/14841036">51CTO</a></td></tr>
+      <tr><td>2</td><td>高端 NVMe+大内存收益近零；老 HDD/仓库盘收益巨大</td><td><span class="badge b-out">[外]</span></td><td>用户反馈</td><td><a href="https://superuser.com/posts/comments/2705238">SuperUser</a> + <a href="https://www.positioniseverything.net/question-is-primocache-worth-it">PiE</a></td></tr>
+      <tr><td>3</td><td>写与顺序读提升可忽略；随机读 USB +50%/机械 +25%</td><td><span class="badge b-out">[外]</span></td><td>媒体实测</td><td><a href="https://www.pcworld.com/article/2839387/wd-blue-sn580-nvme-ssd-review.html">PCWorld</a></td></tr>
+      <tr><td>4</td><td>缓存粒度对速度影响巨大，4K 最优；均衡写模式略优</td><td><span class="badge b-out">[外]</span></td><td>社区实测</td><td><a href="https://xiaoyi.vc/primocache.html">小羿</a></td></tr>
+      <tr><td>5</td><td>官方建议延时写入仅临时盘/UPS；掉电可损文件系统</td><td><span class="badge b-out">[外]</span></td><td>厂商口径</td><td><a href="https://www.romexsoftware.com/zh-cn/primo-cache/term-defer-write.html">Romex</a></td></tr>
+      <tr><td>6</td><td>命中率随容量上升：16G→70%+，32G→90%</td><td><span class="badge b-out">[外]</span></td><td>社区实测</td><td><a href="https://waptieba.baidu.com/p/9194366067">贴吧</a></td></tr>
+      <tr><td>7</td><td>50% 命中即 smooth as glass；90GB 大游戏命中上不去</td><td><span class="badge b-out">[外]</span></td><td>官方论坛</td><td><a href="https://www.romexsoftware.com/bbs2/en-us/viewtopic.php?f=33&amp;p=12828">Romex BBS</a></td></tr>
+      <tr><td>8</td><td>二次启动后才生效=冷缓存物理，与本品跑分互证</td><td><span class="badge b-out">[外]</span></td><td>媒体实测</td><td><a href="https://www.maketecheasier.com/improve-game-data-loading-times-in-windows">MTE</a></td></tr>
+      <tr><td>9</td><td>缓存容量经验值=空闲内存 1/3；勿双缓存软件共用</td><td><span class="badge b-out">[外]</span></td><td>厂商 FAQ</td><td><a href="https://www.idiskhome.com/resource/cache/primocache-vs-qiling-fast-cache.shtml">idiskhome</a></td></tr>
+      <tr><td>10</td><td>QILING：超简单/只读+读写/无延时写/无 CLI/限免打法</td><td><span class="badge b-out">[外]</span></td><td>竞品功能</td><td><a href="https://blog.51cto.com/xfxuezhang/14841036">51CTO</a> + <a href="https://xiaoyi.vc/qiling-fast-cache.html">小羿</a></td></tr>
+      <tr><td>11</td><td>PrimoCache v4.3.0 修 DirectStorage 被阻止；v4.4.x 兼容 Win11 24H2</td><td><span class="badge b-out">[外]</span></td><td>竞品动态</td><td><a href="https://www.romexsoftware.com/en-us/primo-cache/changelog.html">ChangeLog</a></td></tr>
+      <tr><td>12</td><td>Vanguard 不容 unsigned/test-signed；BE 拦有已知问题内核驱动</td><td><span class="badge b-out">[外]</span></td><td>兼容红线</td><td><a href="https://www.positioniseverything.net/fix-vanguard-detected-incompatible-software-in-windows-11">PiE</a> + <a href="https://www.battleye.com/support/faq/">BE</a></td></tr>
+      <tr><td>13</td><td>winget 求上架 PrimoCache 未果（2025-07→2026-04 开放）</td><td><span class="badge b-out">[外]</span></td><td>渠道空档</td><td><a href="https://github.com/microsoft/winget-pkgs/issues/279277">winget-pkgs</a></td></tr>
+      <tr><td>14</td><td>「加速神器只骗过测速软件」舆论存在</td><td><span class="badge b-out">[外]</span></td><td>舆论环境</td><td><a href="https://pcnow.cc/p/QJ97459c5d.html">PCNow</a> + <a href="https://www.howtogeek.com/171424/why-memory-optimizers-and-ram-boosters-are-worse-than-useless/">HTG</a></td></tr>
+      <tr><td>15</td><td>同架构卷过滤工程实践：卷过滤拦 minifilter 拦不到的元数据；sys+inf 嵌入 exe</td><td><span class="badge b-out">[外]</span></td><td>工程参照</td><td><a href="https://www.freebuf.com/articles/485569.html">FreeBuf</a></td></tr>
+      <tr><td>16</td><td>掉电防御清单：UPS/分页文件勿入缓存盘/低电量强制 flush</td><td><span class="badge b-out">[外]</span></td><td>防御实践</td><td><a href="https://tsight.io/articles/11704613">tsight</a></td></tr>
+      <tr><td>17</td><td>贴吧实测：4K 读写达低端 NVMe；持续写超 2G 掉速；开机 36s→17s</td><td><span class="badge b-out">[外]</span></td><td>社区实测</td><td><a href="https://youhua.baidu.com/p/5860095058?see_lz=1">优化吧</a></td></tr>
+      <tr><td>18</td><td>延时写入场景适配表（剪辑/编译推荐；数据库/备份镜像不推荐）</td><td><span class="badge b-out">[外]</span></td><td>场景共识</td><td><a href="https://ask.csdn.net/questions/9050882">CSDN</a></td></tr>
+      <tr><td>19</td><td>破解版报毒+蓝屏反馈集中；正版长期稳定</td><td><span class="badge b-out">[外]</span></td><td>渠道乱象</td><td><a href="https://pages.baidu.com/show?id=ca54f06099aa90b261251e33">百度百科</a></td></tr>
+      <tr><td>20</td><td>冷缓存首遍=盘速是品类物理（内外互证）</td><td><span class="badge b-both">[内+外]</span></td><td>内外互证</td><td>10-19 跑分报告 + 上表 3/8</td></tr>
+    </table>
+
+    <h2>口径与来源（进阶）</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>实体解析</b>：「本品」= RAMBlockCache（卷块上层过滤驱动+WPF 控制台+CLI，V10.5.0 Build 19/机器版本 10.4.1.19）；「PrimoCache」= Romex 商业软件 v4.4.1；「QILING Fast Cache」= 国产轻量竞品</li>
+        <li><b>术语口径</b>：命中率=cache hit ratio（16GB 约 70%+，85% 为有效线）；掉电窗口=write-back 已确认未落盘时间窗</li>
+        <li><b>数据状态</b>：检索 2026-10-21；竞品动态至 2025-01；2018-2020 老帖仅作场景证据</li>
+      </ul>
+    </div>
+
+    <h2>来源分区</h2>
+    <div class="src-block">
+      <h4>内部资料（4）</h4>
+      <ul>
+        <li><span class="dot dot-in"></span>outputs/deep-research/deep-research-20261019-topic-51aef884.md（10-19 跑分分析）</li>
+        <li><span class="dot dot-in"></span>deliverables/iteration-plan-ramblockcache-2026-10-17.md（W0-W4 波次）</li>
+        <li><span class="dot dot-in"></span>deliverables/install-ux-optimization-2026-10-19.md（安装体验方案）</li>
+        <li><span class="dot dot-in"></span>.workbuddy/memory/2026-10-19.md（构建与修复状态）</li>
+      </ul>
+    </div>
+    <div class="src-block">
+      <h4>公开信息（24）</h4>
+      <ul>
+        <li><span class="dot dot-out"></span><a href="https://superuser.com/posts/comments/2705238">SuperUser：Is PrimoCache worth it</a> · <a href="https://forums.anandtech.com/threads/is-primocache-worth-it.2500101/">AnandTech 同题</a> · <a href="https://www.romexsoftware.com/bbs2/en-us/viewtopic.php?f=33&amp;p=12828">Romex BBS 游戏设置</a></li>
+        <li><span class="dot dot-out"></span><a href="https://alternativeto.net/software/fancycache/">AlternativeTo 竞品与停产</a> · <a href="https://www.pcworld.com/article/2839387/wd-blue-sn580-nvme-ssd-review.html">PCWorld 评测</a> · <a href="https://www.positioniseverything.net/question-is-primocache-worth-it">PiE 适配条件</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.maketecheasier.com/improve-game-data-loading-times-in-windows">MTE 游戏加载 7 法</a> · <a href="http://www.winwin7.com/soft/235598.html">winwin7 测评</a> · <a href="https://www.yinghezhan.com/yhpc/622/248.html">硬核站</a> · <a href="https://pages.baidu.com/show?id=ca54f06099aa90b261251e33">百度百科词条</a></li>
+        <li><span class="dot dot-out"></span><a href="https://xiaoyi.vc/primocache.html">小羿 PrimoCache 实测</a> · <a href="https://xiaoyi.vc/qiling-fast-cache.html">小羿 QILING 限免</a> · <a href="https://youhua.baidu.com/p/5860095058?see_lz=1">贴吧优化吧</a> · <a href="https://waptieba.baidu.com/p/9194366067">贴吧使用汇报</a></li>
+        <li><span class="dot dot-out"></span><a href="https://jason-xy.cn/2020/06/hd-cache">jason-xy SMR 场景</a> · <a href="https://blog.51cto.com/xfxuezhang/14841036">51CTO 对比</a> · <a href="https://www.idiskhome.com/resource/cache/primocache-vs-qiling-fast-cache.shtml">idiskhome 对比</a> · <a href="https://www.idiskhome.com/resource/cache/cache-and-power-loss-protection.shtml">idiskhome 掉电科普</a></li>
+        <li><span class="dot dot-out"></span><a href="https://laptopjudge.com/what-is-ssd-ram-caching-and-is-it-safe/">laptopjudge 安全</a> · <a href="https://tsight.io/articles/11704613">tsight Momentum Cache</a> · <a href="https://www.romexsoftware.com/zh-cn/primo-cache/term-defer-write.html">Romex 延时写入</a> · <a href="https://www.romexsoftware.com/en-us/primo-cache/changelog.html">Romex ChangeLog</a></li>
+        <li><span class="dot dot-out"></span><a href="https://www.positioniseverything.net/fix-vanguard-detected-incompatible-software-in-windows-11">Vanguard 排障</a> · <a href="https://www.battleye.com/support/faq/">BattlEye FAQ</a> · <a href="https://github.com/microsoft/winget-pkgs/issues/279277">winget-pkgs#279277</a> · <a href="https://www.freebuf.com/articles/485569.html">FreeBuf SysRestoreDriver</a></li>
+        <li><span class="dot dot-out"></span><a href="https://pcnow.cc/p/QJ97459c5d.html">PCNow 骗过测速论</a> · <a href="https://www.howtogeek.com/171424/why-memory-optimizers-and-ram-boosters-are-worse-than-useless/">HowToGeek 内存优化器论</a> · <a href="https://ask.csdn.net/questions/9050882">CSDN 延时写入场景表</a> · <a href="https://crashless.app/fix/bedaisy-sys-bsod-crash">BEDaisy BSOD 冲突</a> · <a href="https://laptopjudge.com/battleye-bsod-crash/">laptopjudge BE 冲突诊断</a></li>
+      </ul>
+    </div>
+
+    <h2>研究方法</h2>
+    <div class="src-block">
+      <ul>
+        <li><b>子问题</b>：① 竞品格局与功能基线 ② 中外用户反馈主题 ③ 掉电共识 ④ 反作弊红线 ⑤ 渠道与定价 ⑥ 同架构工程实践</li>
+        <li><b>检索查询</b>：web 共 12 条（4 轮：中文口碑/国际口碑/垂直场景与开源/竞品与红线）</li>
+        <li><b>唯一来源</b>：24 个（官方 4、媒体/博客 11、论坛/社区 6、包管理/工程 3）</li>
+        <li><b>深读篇数</b>：0 篇 WebFetch 全文（摘要已含决策事实；Romex 官方文档前日已深读）</li>
+        <li><b>源优先级</b>：官方 changelog/FAQ &gt; 媒体实测 &gt; 社区帖；老帖仅作场景证据并标注</li>
+        <li><b>执行口径</b>：100 批矩阵按信息增益排序，单日执行 12 批；88 批 backlog 查询词固化于 md 底稿</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="footer">
+    <div class="disclaimer">⚠️ 本报告基于公开检索结果的整理归纳；社区帖文观点属个人体验，不代表本品实测结论；100 批中 88 批为未执行 backlog，结论以已执行 12 批为限；信息以原始来源为准。</div>
+    <div style="margin-top:4px;">生成：deep-research skill · md 底稿与证据表随 HTML 一并交付</div>
+  </div>
+</div>
+</body>
+</html>

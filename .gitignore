@@ -13,6 +13,28 @@ x64/
 # Local tooling / memory
 .workbuddy/
 
+# Local package / tooling caches (machine-local, 500MB+)
+.nuget/
+.mimosa/
+.workbuddy-ai/
+
+# Distribution intermediates & backups (keep dist/RAMBlockCache.sys like remote)
+dist/backup-*
+dist/wpf/
+dist/RAMBlockCache-Setup.exe
+
+# Local QA scratch
+build/
+
+# Chinese-named docs whose paths git-on-Windows rejects (invalid path)
+src/docs/
+
 # OS junk
 Thumbs.db
 Desktop.ini
+
+# Installer 工程（全新增 26 文件）：Mimosa L3 对进程启动形态零容忍拦截 6 处，
+# 其中 ramboostsetup.exe 引擎子进程为结构性必需无法托管化——待专项安全波次
+# 处置（ServiceController/COM 化）后入库。远端基线本不含此目录。
+src/ui/installer/
+/src/ui/installer/

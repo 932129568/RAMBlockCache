@@ -12,13 +12,15 @@
       user explicitly lists them in -DataVolumes.
     * Backs up UpperFilters before any change; auto-rollback on failure.
 
-  [P1-8] 权威入口说明（两套语义并存，以此段为准）：
-    默认/权威安装入口 = src\scripts\install.cmd -> install.ps1
-      （编译 -> 签名 -> 注册服务 -> Volume UpperFilters + BOOT_START 挂栈模型，
-        与 deploy.ps1 / verify_deploy_signature.ps1 的 SHA256 门禁同一套）。
-    本脚本（ramboostsetup.ps1）= V9"零 UpperFilters、运行期 IOCTL attach"
-      备选模型：适合不允许引导期挂栈的保守场景，但默认缓存不覆盖开机过程。
-    二者语义互斥，请只选其一；混用会导致"以为在缓存、实际没挂栈"或相反。
+  [P1-8][FIX N-b 2026-10-21] 安装入口统一口径（原与 install.ps1 头注释互斥，已收敛）：
+    普通用户      = dist\RAMBlockCache-Setup.exe（GUI 五页向导 + 内嵌静默引擎，
+                    编译 -> 签名 -> 注册服务 -> UpperFilters + BOOT_START 挂栈模型，
+                    与 deploy.ps1 / verify_deploy_signature.ps1 的 SHA256 门禁同一套）。
+    开发者/脚本  = src\scripts\deploy.ps1（同套门禁，可脚本化）。
+    本脚本（ramboostsetup.ps1）= legacy 备选（V9"零 UpperFilters、运行期 IOCTL
+      attach"模型）：适合不允许引导期挂栈的保守场景，但默认缓存不覆盖开机过程。
+    三者为不同受众的不同入口，不构成"二选一"矛盾；boot 模型一次只用一套，
+    混用会导致"以为在缓存、实际没挂栈"或相反。
 
 .PARAMETER DataVolumes
   Optional drive letters to attach after install, e.g. "F:","D:". Default none.
@@ -50,7 +52,15 @@ $ErrorActionPreference = 'Stop'
 $svc     = 'RAMBlockCache'
 $volCls  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{71a27cdd-812a-11d0-bec7-08002be2092f}'
 $bakFile = Join-Path $PSScriptRoot 'UpperFilters.backup.json'
-$root    = Split-Path -Parent $PSScriptRoot
+# [FIX #7] 仓库根 = 脚本(src\setup\)的上两级：原 Split-Path -Parent $PSScriptRoot
+# 得到 src\，令 dist 下的 RAMBlockCache.sys / ramboostctl.exe 候选恒落空
+# （dist 在仓库根，不在 src\ 下）——实际静默回退 driver 构建目录下未签名产物。
+# [FIX #9 2026-10-21] 本注释块曾被转义解释污染：ramboostctl 一词的 \r 序列被
+# 解释为换行并吞掉 r，裂出裸行 amboostctl.exe——$ErrorActionPreference='Stop'
+# 下即 CommandNotFoundException，脚本启动即死；且 Split-Path -Parent 连写两次
+# 的双开关写法在 PS 5.1 报 ParameterAlreadyBound（qa_teeth.ps1 首发实测崩于同行）。
+# 两处均已修正：注释整块重写 + 上两级改嵌套调用。
+$root    = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 function Write-Step($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
 function Write-Ok($m){ Write-Host "[+] $m" -ForegroundColor Green }
@@ -122,6 +132,44 @@ $ctl = Find-First @(
 )
 if(-not $sysSrc){ Die "RAMBlockCache.sys not found. Build the driver first." }
 
+# [FIX #9 2026-10-21] 签名门禁（0x7B 红线：未签名/签名链无效的 sys 禁止部署）。
+# 原脚本零验签，且上方候选列表含 driver\x64\Release 未签名编译产物兜底——
+# 与 deploy.ps1 / 安装器 ramboostsetup.c 的 WinVerifyTrust 预检不同构
+# （round8 文档 §7 "第六轮低-2" 立项项，本轮闭环）。Get-AuthenticodeSignature
+# 走 WinVerifyTrust 链校验，Status 非 Valid 即 Die（fail-closed）。
+try { $auth = Get-AuthenticodeSignature -LiteralPath $sysSrc -ErrorAction Stop }
+catch { Die "Get-AuthenticodeSignature failed on ${sysSrc}: $($_.Exception.Message)" }
+Write-Host "[..] signature    : $sysSrc -> $($auth.Status)"
+if($auth.Status -ne 'Valid'){
+    Die "Authenticode signature is '$($auth.Status)' (not Valid). Deploying an unsigned driver risks a 0x7B boot loop. DO NOT install. (The signed artifact is dist\RAMBlockCache.sys; driver build-output fallbacks are unsigned by design.)"
+}
+# [FIX #9] signtool 解析同构 deploy.ps1 Resolve-SignTool：注意 env 变量名含
+# 括号必须用 ${env:ProgramFiles(x86)} 花括号语法——$env:ProgramFiles(x86) 在
+# 字符串里会被解析成 $env:ProgramFiles + 字面 "(x86)"（丢空格成错路径）。
+$signtool = $null
+$stCmd = Get-Command signtool.exe -ErrorAction SilentlyContinue
+if($stCmd){ $signtool = $stCmd.Source }
+else {
+    $roots = @()
+    if(${env:ProgramFiles(x86)}){ $roots += (Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin') }
+    if($env:ProgramFiles){ $roots += (Join-Path $env:ProgramFiles 'Windows Kits\10\bin') }
+    foreach($r in $roots){
+        if($r -and (Test-Path -LiteralPath $r)){
+            $hit = Get-ChildItem -LiteralPath $r -Recurse -Filter 'signtool.exe' -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+                   Sort-Object FullName -Descending | Select-Object -First 1
+            if($hit){ $signtool = $hit.FullName; break }
+        }
+    }
+}
+if($signtool){
+    & $signtool verify /pa $sysSrc | Out-Host
+    if($LASTEXITCODE -ne 0){ Die "signtool verify FAILED (exit $LASTEXITCODE). DO NOT install." }
+    Write-Ok "Authenticode signature verified (signtool /pa)."
+} else {
+    Write-Host "[!] signtool.exe not found - relied on Get-AuthenticodeSignature only." -ForegroundColor Yellow
+}
+
 # Testsigning
 $bcd = (& bcdedit /enum '{current}') -join "`n"
 if($EnableTestSigning){
@@ -168,12 +216,23 @@ try{
     }
 
     if(-not $NoStart){
+        # [FIX #9] sc start 结果必须验证：原样只看 Out-Null 不查退出码，ctl
+        # 缺失时更跳过全部启动验证（round8 §7 "第六轮低-2"）。服务 Running
+        # 状态是权威判据（覆盖"已在运行"重装情形；未签名驱动在非 testsigning
+        # 系统上正死于此处）。
         sc.exe start $svc | Out-Null
+        $scRc = $LASTEXITCODE
         Start-Sleep -Milliseconds 800
+        $svcState = (Get-Service -Name $svc -ErrorAction SilentlyContinue).Status
+        if($svcState -ne 'Running'){
+            throw "service not Running after start (sc exit=$scRc, state=$svcState)"
+        }
         if($ctl){
             $ver = & $ctl version 2>&1
             if($LASTEXITCODE -ne 0){ throw "control channel not responding" }
             Write-Ok "Control channel live"
+        } else {
+            Write-Host "[!] ramboostctl.exe not found - control-channel check skipped; service state verified." -ForegroundColor Yellow
         }
     }
 

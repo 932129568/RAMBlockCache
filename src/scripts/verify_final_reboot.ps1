@@ -22,7 +22,19 @@
 #       for D: auto-resume remains [562] + [1076] + D.Attached=1.
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$expectSys = 'ed1bd99cd56812a36c2adb2e6f60f79b87512886bd2d02214eb25840663ab68e'
+# [2026-11-06 23:2x, lead] DYNAMIC sys baseline.
+# The 19:22 acceptance pinned ed1bd99c... here. The 23:22 UAC rebuilt the
+# driver (63ad0fa8...), so a hardcoded hash would give a permanent false FAIL
+# after the reboot. Source of truth = the SIGNED dist sys; gate5 separately
+# proves its three deploy anchors agree. Fail-closed if missing/unsigned.
+$distSys = Join-Path $root 'dist\RAMBlockCache.sys'
+$expectSys = ''
+if (Test-Path -LiteralPath $distSys) {
+    $ds = Get-AuthenticodeSignature -LiteralPath $distSys -ErrorAction SilentlyContinue
+    if ($ds -and $ds.Status -eq 'Valid') {
+        $expectSys = (Get-FileHash -LiteralPath $distSys -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+    }
+}
 $base = 'http://127.0.0.1:5199'
 $markerPath = 'C:\ProgramData\rb-deploy\finalize-utc.txt'
 $fails = 0
@@ -79,18 +91,30 @@ if ($null -eq $mm) {
 
 # --- 3) running driver image ---
 $sys32 = 'C:\Windows\System32\drivers\RAMBlockCache.sys'
-if (Test-Path -LiteralPath $sys32) {
+if (-not $expectSys) {
+    G 'System32 sys' $false 'dist sys missing or not signed - cannot establish expected hash'
+} elseif (Test-Path -LiteralPath $sys32) {
     $h = (Get-FileHash -LiteralPath $sys32 -Algorithm SHA256).Hash.ToLower()
     $sg = (Get-AuthenticodeSignature -LiteralPath $sys32).Status
-    G 'System32 sys' ($h -eq $expectSys -and $sg -eq 'Valid') ("sha=" + $h + " sig=" + $sg)
+    G 'System32 sys' ($h -eq $expectSys -and $sg -eq 'Valid') ("sha=" + $h + " sig=" + $sg + " expected=" + $expectSys)
 } else { G 'System32 sys' $false 'file missing' }
 $svc = Get-Service RAMBlockCache -ErrorAction SilentlyContinue
 G 'service' ($null -ne $svc -and $svc.Status -eq 'Running' -and $svc.StartType -eq 'Boot') ("status=" + $svc.Status + " start=" + $svc.StartType)
 
 # --- 4) watchdog full cycle + resume policy (baseline for the post-RPC recheck) ---
 $k = 'HKLM:\SYSTEM\CurrentControlSet\Services\RAMBlockCache\Parameters'
-$p = Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue
-$watchOk = ($null -ne $p -and $p.DeploySeq -eq 10 -and $p.DeployAck -eq 10 -and $p.FilterArmed -eq 0 -and $p.LastBootHealthy -eq 1 -and $p.BootFailCount -eq 0)
+$p = $null
+try { $p = Get-ItemProperty -LiteralPath $k -ErrorAction Stop } catch { $p = $null }
+# [2026-11-06 23:2x, lead] Structural watchdog judgement, no hardcoded Seq.
+# The 19:22 cycle closed at Seq/Ack=10/10. deploy.ps1 increments DeploySeq on
+# every deployment, so the 23:22 replay armed Seq=11/Ack=10; after the reboot
+# the logon task disarms and Ack catches up to 11. The invariant is
+#   Seq == Ack (caught up) + Armed=0 (disarmed) + Healthy=1 + BootFails=0,
+# NOT a literal counter value. A failed registry read must FAIL (QA X1).
+$watchOk = ($null -ne $p -and
+            $null -ne $p.DeploySeq -and $null -ne $p.DeployAck -and
+            [int]$p.DeploySeq -eq [int]$p.DeployAck -and
+            $p.FilterArmed -eq 0 -and $p.LastBootHealthy -eq 1 -and $p.BootFailCount -eq 0)
 G 'watchdog' $watchOk ("Seq=" + $p.DeploySeq + " Ack=" + $p.DeployAck + " Armed=" + $p.FilterArmed + " Healthy=" + $p.LastBootHealthy + " BootFails=" + $p.BootFailCount)
 G 'bootcfg reg' ($null -ne $p -and $p.AutoAttach -eq 0 -and $p.ResumeOnBoot -eq 1 -and $p.ResumeLetters -eq 'D') ("AA=" + $p.AutoAttach + " RB=" + $p.ResumeOnBoot + " Letters=" + $p.ResumeLetters)
 $seqBefore = [string]$p.DeploySeq

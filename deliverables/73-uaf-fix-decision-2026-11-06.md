@@ -164,6 +164,36 @@ QA 以**独立复跑**（未复述主理人数字）确认：
 
 **结论**：73 号 §6 的代码层验收判据（改动面、4K 逐字等价、>4K 零 FAIL/零 ASan、回归面按 63 号口径、新门禁已注册）**全部满足**，且经作者（工程师）、独立验证者（QA）与主理人三层交叉复现。剩余仅 §5 全链重放第 2–9 步（发布层，UAC 脚本正在工程师手上编写）与 §6 的真机/性能覆盖。
 
+## 6.2 全链重放实况（23:21:03–23:22:04，主理人核验日志）
+
+用户双击 `RB-finalize-uaf-release.cmd`，一次 UAC 完成 73 号 §5 全部步骤。`C:\ProgramData\rb-deploy\finalize-uaf-release.log`（23,770 B）逐项证据：
+
+| 步 | 结果 |
+|---|---|
+| 1 前置 | `cache.c 8340f9ff…` 固定哈希断言 OK；dist sys `ed1bd99c…` Valid；Setup 旧 `6acb825f…` Valid；旧 marker `11:12:32Z` 早于 boot `11:20:21Z` → 反重启防护正确放行 |
+| 2 驱动重编 | 16 源（含 `cache.c`）`BUILD OK exit=0`，未签名产物 `22a70084…` / 158,720 B，哈希 ≠ 旧 sys、时间戳新鲜、NotSigned |
+| 3 签 sys | ASCII stage 覆盖校验 → signtool `exit=0` → stage Valid → 拷回 dist 一致 → **新 sys `63ad0fa8edb1355965a7bdf805e2b05188c89edacf63dec2fe6dafe27bd3377a`** / 160,992 B；sidecar `SHA256: 63ad0fa8…` 回读一致 |
+| 4 三锚点 | `sync_anchors.ps1 exit=0`，`deploy.ps1:42` / `verify_deploy_signature.ps1:27` / `README.txt:20` 全部 `63ad0fa8…`；README.txt 除哈希行外逐字未变（字节长度不变） |
+| 5 gate5 | 独立子进程 `exit=0` + `result: PASS (0 fail, 0 warn)` |
+| 6 Setup 重打包 | `build_setup.ps1 exit=0`，SPA 由 Node 27 + npm 12.2.1 重建（vite 2233 modules，906ms）；未签名基线**动态实算** `44b38cdc…` / 272,854,130 B；NotSigned、新鲜、非禁止集 |
+| 7 签 Setup | 四重哈希断言全过 → **新 Setup `0269fb503b893ec413461dd5bdc42b64cb65bb8344f99a7b44e6c2e83cfdabc3`** / 272,856,408 B / Valid；禁止复活集 `6acb825f…` + `7912d276…` 均未出现 |
+| 8 verifier + deploy | `verifier /reset exit=0` + registry 已清断言；`deploy.ps1 exit=0`，`source/deployed/expected` 三者皆 `63ad0fa8…`，Authenticode 0 warning / 0 error，`== Deploy complete. NEXT: reboot once. ==`；**未触发重启**；部署后 gate5 再 PASS |
+| 9 收尾 | `batch-hashes.txt` 追加 `FINAL_SETUP_SHA256` / `FINAL_SYS_SHA256`；marker `2026-11-06T15:22:04.570Z`；`ALL OK sys=63ad0fa8… setup=0269fb50…` |
+
+**`ABORT=0 / ALL_OK=1`**，零假绿、零中途退出。
+
+**UAC 后主理人接管项已完成**：`sync_setup_hash.ps1` → `UPDATED`，双源交叉 `FINAL_SETUP_SHA256` MATCH，README.md / 67 号「当前基线」回填 `0269fb50…` / `272,856,408 B`，`README.txt` sys 锚点与当前 dist sys 一致；gate5 复跑 `result: PASS`。
+
+### 验收脚本两处陈旧常量修复（主理人 dry-run 发现）
+
+首次跑 `verify_final_reboot.ps1` 得 `FAIL=3`，其中 `System32 sys` 明明 `sha=63ad0fa8… sig=Valid` 却判 FAIL。定位为**验收工具自身的陈旧常量，非产品回归**：
+1. `:25` `$expectSys` 仍硬编码 `ed1bd99c…`（19:22 周期的 sys），本次重编后必然假红。改为**从已签名的 `dist\RAMBlockCache.sys` 动态实算**，缺失/未签名则 fail-closed 直接 FAIL。
+2. `:93` 看门硬编码 `DeploySeq=10 / DeployAck=10`；`deploy.ps1` 每次部署递增 `DeploySeq`，本次武装态为 `Seq=11/Ack=10/Armed=1/Healthy=0`（重启前正常）。改为**结构性不变式** `Seq == Ack`（追平）+ `Armed=0`（解除武装）+ `Healthy=1` + `BootFails=0`，并把注册表读取改为 `-ErrorAction Stop` + 显式 `$null` 判（沿用 QA X1 纪律）。
+
+修后 BOM/CRLF 保持、AST 0 错、`check_ps_syntax` 65 文件 0 失败；复跑 `FAIL=2`，剩余两项**全部是重启前预期项**：① `reboot after finalize`（boot `11:20:21Z` < marker `15:22:04Z`，恰证明 X2 判据生效）② `watchdog`（`Seq=11/Ack=10/Armed=1/Healthy=0`，等重启由 logon 任务追平并解除武装）。其余 17 项全 PASS，含 `System32 sys` 已转 PASS、Verifier off、服务 Running/Boot、bootcfg、开机段 `[562]`/`[1076]`/零 ERROR、桥接 200 / node v27、`method=7` D.Attached=1、GET_CONFIG 24 字段含 TinyLFU=0、看门 RPC 前后不变、Setup/READMe 哈希同步。
+
+⇒ **用户侧只剩「重启一次」**。重启后 `boot_utc > marker` 成立、看门 `Ack` 追平 11 并解除武装，`verify_final_reboot.ps1` 应得 `FAIL=0 / VERDICT: PASS`。重启后**严禁**再双击 `RB-finalize-uaf-release.cmd`（ONE-SHOT + G10）。
+
 ## 7. 风险与口径限制
 
 - 修复是**静态落地 + 用户态 core 回归**，内核侧 >4K 非对齐写 + 并发驱逐的真机验证仍属未覆盖项；如需，另起 WDK/Verifier 周期。

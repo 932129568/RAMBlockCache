@@ -118,6 +118,8 @@
 | 工具链契约 | `check_node_contract.py` PASS (0 fail, 0 warn) |
 | 变异门禁 | `qa_teeth.ps1` PASS（3/3 KILLED + 6/6 SURVIVED-EXPECTED） |
 | 构建 | `build_setup.ps1` BUILD OK（Node 27 + npm 12.2.1 重建 SPA + 全内置）；Setup 签名 ALL OK |
+| GitHub CI | **实测转绿**：此前 4 次 push 全 `failure`（Gate2 UnicodeEncodeError）；修复后 `f76efb3` 又卡在证书导入（已取消），最终 `c4193aa` 的 run `42185110822` = `completed / success`，job `gates` 全绿 |
+| 回归 | Release **24/24** 构建 + 24/24 运行零报告；race **6/6 clean**；wsconc 10 轮 PASS；`test_tinylfu` PASS；变异门禁 PASS |
 | Web | `npm ci` + `npm run build` 在 Node 27/npm 12.2.1 与干净 checkout 双路径 PASS |
 | 产物 | Setup 276,153,688 B Valid；webconsole.zip 46,477 KB（node.exe + npm 全内置、开发垃圾剔除） |
 

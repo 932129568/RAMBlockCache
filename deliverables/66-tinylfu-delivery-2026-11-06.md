@@ -67,7 +67,8 @@
 `README.md` 全量重写到 F1 批最新状态：发布基线双哈希、安全默认值、功能特性表（新增 TinyLFU / ParallelFlush 五档 / MEM-ADAPT / 分位延迟 / 三重回滚网）、架构与目录、安装与使用（含 `set tinylfu=1`）、TinyLFU 语义说明、构建与门禁、红线纪律、最新文档导航。
 `README.txt` 的锚点括注更新为 F1 批（字节数 160,992）；哈希行由 `sync_anchors.ps1` 自动维护。
 
-> 关于仓库右侧 About 描述：属于 GitHub 仓库元数据（非仓库文件），需仓库管理员在设置页修改或用 GitHub API 更新；本轮未改动，README 已是最新。
+> 仓库右侧 **About 描述**（GitHub 元数据，非仓库文件）也已通过官方 REST API 同步为
+> 「Windows 卷块级 RAM 缓存过滤驱动 · 默认直写 · ParallelFlush 1/2/4/8/16 路 · TinyLFU 频率准入 · WPF/Web 控制台」（HTTP 200）。
 
 ## 6. 限制与下一步
 

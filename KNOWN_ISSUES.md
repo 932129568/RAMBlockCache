@@ -12,7 +12,7 @@
 | E3 | ✅ `test_tinylfu`：OFF 热集 0/64、rejects=0；**ON 热集 64/64**、rejects=98、admits=41；oracle/记账全净 | ✅ | Release + ASan 双构建 PASS |
 | E4 | ✅ 全量回归：Release 24/24 + ASan 24/24、race 6/6 clean、wsconc 10 轮、门禁五件套全 PASS（PS 语法 54 文件 0 失败）、驱动 16 源 / CLI / Web 构建 | ✅ | 66 号 §4 |
 | E5 | ✅ 发布：sys `ed1bd99c…`（160,992 B，Valid）、Setup `d4457ca4…`（301,794,648 B，Valid）、三锚点同步、System32 已换、`Seq=10/Armed=1` | ✅ 待重启 | `RB-finalize-tinylfu.cmd` 一次 UAC，日志 ALL OK |
-| E6 | ✅ GitHub `README.md` 全量同步（基线哈希/特性表/CLI/文档导航）+ `README.txt` 括注更新；仓库 About 元数据未改（需管理员在设置页/API 修改） | ✅ | 66 号 §5 |
+| E6 | ✅ GitHub `README.md` 全量同步（基线哈希/特性表/CLI/文档导航）+ `README.txt` 括注更新；**About 元数据**经官方 REST API 同步为「Windows 卷块级 RAM 缓存过滤驱动 · 默认直写 · ParallelFlush 1/2/4/8/16 路 · TinyLFU 频率准入 · WPF/Web 控制台」（HTTP 200） | ✅ | 66 号 §5 |
 | E7 | 🟡 内核真机验证未完成：需**重启一次**加载 `ed1bd99c…` 后才进入 Verifier 1h 收获周期；`TinyLFU` 默认 0，开启需显式设置 | 🟡 | 64 号协议；66 号 §6 |
 
 ## 0-D. 2026-11-06 13:50 交接收口（git 推送 + U-6 + 终态表）

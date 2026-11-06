@@ -4,6 +4,8 @@
 **触发**：用户指出 GitHub 停在 2 周前的 5 个 commit（未推送），并要求「交接文档没做完的全部做完，别遗留」；补充「历史的已经完成的不需要保留」。
 **结论**：**可在会话内闭环的全部完成并推送到 `origin/main`**；剩余 5 项需要真机周期 / 外部证据 / 第三方环境 / 下版本功能决策，逐项给出状态、依据与交付工具，不含糊、不假称已闭环。
 
+> **后续更新（14:45，用户 13:56 指令）**：§3 的 P2-10 TinyLFU「有意冻结」决策与 §4 对应行**已撤销** —— F1 TinyLFU 准入已完整实现、全量回归并签名发布，详见 `66-tinylfu-delivery-2026-11-06.md`（`sys ed1bd99c…` / `Setup d4457ca4…`）。因此「剩余 5 项」变为 4 项（Verifier 1h 周期、64K WinDbg 复现、U-8、U-9），U-10 仍为用户侧决策。GitHub `README.md` / `README.txt` 亦已同步到 F1 批最新状态。
+
 ---
 
 ## 1. 本次发布最终基线（U-6 补签后）
@@ -77,7 +79,7 @@ U-6 说明：58 号交接标 `ramboostsetup.exe` 未签名（影响 SmartScreen/
 - 提交范围：核心源码、驱动、CLI、安装器源码（46 文件）、Web 源码（318 文件）、`.github/workflows/ci.yml`、全部 11 月交付文档、脚本、`.gitignore`、`dist/RAMBlockCache.sys`（已签名，锚点同步）。`dist/RAMBlockCache-Setup.exe` 仍按设计排除（299MB+ 二进制，不入库）。
 - 门禁：五件套全 PASS（PS 语法 **53 文件 0 失败**；签名链 Valid + 三锚点一致）。
 - 最终暂存集 **301 文件 / 3.2 MB**（剔除 133.6MB 安装器载荷 zip 与 75.6MB Rust `target/` 产物后）；构成 = 168 新增 + 72 历史文档删除 + 61 修改。无 >90MB 文件、无排除项混入。
-- 提交 `7b4f5c3`：`feat+release: PF-16 ParallelFlush 1/2/4/8/16 + 62/63/64 batches + handover closure`；`git push -u origin main` **成功**（`02a1445..7b4f5c3  main -> main`），`main` 已跟踪 `origin/main`。GitHub 页面从 5 commits / 2 周前更新为 6 commits。
+- 提交 `7b4f5c3`：`feat+release: PF-16 ParallelFlush 1/2/4/8/16 + 62/63/64 batches + handover closure`；`git push -u origin main` **成功**（`02a1445..7b4f5c3  main -> main`），`main` 已跟踪 `origin/main`。随后终态表回填再提交 `22bf697` 推送成功（`7b4f5c3..22bf697`；首次重试撞代理 502，第二次成功）。GitHub 从 5 commits / 2 周前更新为 **7 commits**；工作区 0 未提交变更。
 
 > CI 备注（既有配置，非本轮引入）：`.github/workflows/ci.yml` 的 `check_repo.py` freshness 依赖 `*.out` / `*.obj` 证据，而这些被 `.gitignore` 排除，checkout 后可能报 stale；`check_signature` 注释里的旧哈希 `ca7a9c1f…` 只是注释。若推送后 CI 红，按下轮工程规范批次处理，不影响本机门禁与发布物。
 

@@ -106,6 +106,8 @@
 #define RB_DEFAULT_RESERVE_MB   0       /* [MEM-ADAPT 2026-11-06] 0=AUTO 按装机总内存推导保留量（5%，钳 512MB-8GB）；旧死值 4096 不再适配小/大内存机器 */
 #define RB_DEFAULT_AUTO_USEPCT  80      /* 最多使用“当前可用内存”的百分比 */
 #define RB_DEFAULT_BLOCK_SIZE   4096
+/* [F1 2026-11-06] TinyLFU 频率准入：默认 OFF（新特性默认全关红线） */
+#define RB_DEFAULT_TINYLFU      0
 #define RB_PROTOCOL_VERSION     9       /* [V10.1] 协议 8->9：纯追加（既有偏移不动，消息号追加不复用） */
 
 /* ---- 全局配置（用户态与内核共享布局，字段偏移冻结） ---- */
@@ -133,6 +135,7 @@ typedef struct RB_CONFIG_T {
     uint32_t MemReserveMB;
     uint32_t AutoUsePct;
     uint32_t BlockSize;
+    uint32_t TinyLFU;      /* [F1 2026-11-06] 0=OFF 1=ON（末尾纯追加，偏移冻结） */
 } RB_CONFIG;
 
 /* ---- 每卷策略设置（RB_MSG_SET_VOLUME）；新字段追加于末尾 ---- */

@@ -40,6 +40,8 @@ export interface RbConfig {
   MemReserveMB: number;
   AutoUsePct: number;
   BlockSize: number;
+  /** [F1 2026-11-06] TinyLFU 频率准入 0=OFF（默认） 1=ON */
+  TinyLFU: number;
 }
 
 /* ============================ 统计 ============================ */

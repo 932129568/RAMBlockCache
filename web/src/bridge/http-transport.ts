@@ -121,6 +121,7 @@ const configSchema = z.looseObject({
   WriteBack: z.number(),
   CacheSizeMB: z.number(),
   BlockSize: z.number(),
+  TinyLFU: z.number(),
 });
 
 /* ---------------- 传输实现 ---------------- */

@@ -238,6 +238,14 @@ export default function SettingsPage() {
                 ]}
                 {...form.register('ParallelFlush', { valueAsNumber: true })}
               />
+              <Select
+                label="TinyLFU 频率准入（防顺序扫描冲掉热集 · 默认关）"
+                options={[
+                  { value: 0, text: '关闭（默认，行为与旧版一致）' },
+                  { value: 1, text: '开启（内存压力态按访问频率准入）' },
+                ]}
+                {...form.register('TinyLFU', { valueAsNumber: true })}
+              />
             </Group>
 
             <Group title="开机行为（默认：不自动加速 · 恢复上次选择）">

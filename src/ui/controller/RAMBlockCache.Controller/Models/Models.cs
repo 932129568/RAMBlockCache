@@ -120,6 +120,7 @@ public struct RbConfigNative
     public uint CachePagingIo, WriteRelease, Frozen, IdleFlush;
     [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbP.MaxVolumes * 4)] public ushort[] VolumeFilter;
     public uint ReadaheadEnabled, ReadaheadWindowKB, AutoMemory, MemReserveMB, AutoUsePct, BlockSize;
+    public uint TinyLFU;   // [F1 2026-11-06] TinyLFU 准入（末尾纯追加）
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 8)]

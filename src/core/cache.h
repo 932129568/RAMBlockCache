@@ -83,6 +83,10 @@ typedef struct rb_config {
     rb_writeback_fn writeback;
     rb_readback_fn readback;
     rb_u32 block_size;
+    /* [F1 2026-11-06] TinyLFU 准入：0=OFF（默认，行为与旧版逐字等价）。
+     * 开启后仅在内存压力态对新块做频率准入，拒绝=本次读下盘/写直写，
+     * 不改变任何数据路径语义（不缓存 ≠ 丢数据）。 */
+    int tinylfu;
 } rb_config;
 typedef struct rb_stats {
     rb_u64 read_req, read_hit, read_bytes, read_hit_bytes;
@@ -94,6 +98,8 @@ typedef struct rb_stats {
     rb_u64 peak_bytes;
     rb_u64 readahead_bytes, readahead_hit_bytes, pressure_shrink_bytes;
     rb_u32 readahead_active;
+    /* [F1 2026-11-06] TinyLFU 准入观测（默认 OFF 时恒 0） */
+    rb_u64 tinylfu_rejects, tinylfu_admits;
 } rb_stats;
 typedef struct rb_engine rb_engine;
 typedef struct rb_stream rb_stream;
@@ -252,6 +258,8 @@ int rb_stream_has_dirty_range(rb_stream *s, rb_u64 offset, size_t len);
 void rb_engine_tick(rb_engine *eng, rb_u64 now_ms);
 void rb_engine_set_idle_reclaim(rb_engine *eng, rb_u64 ms);
 void rb_engine_set_write_release(rb_engine *eng, int enable);
+/* [F1 2026-11-06] TinyLFU 准入开关（运行期可切；SET_CONFIG 下发生效）。 */
+void rb_engine_set_tinylfu(rb_engine *eng, int on);
 void rb_engine_set_watermarks_pct(rb_engine *eng, rb_u32 high_pct, rb_u32 low_pct);
 int rb_engine_need_flush(rb_engine *eng);
 rb_u64 rb_stream_idle_reclaim(rb_stream *s);

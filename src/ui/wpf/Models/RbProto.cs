@@ -110,6 +110,7 @@ public struct RbConfig
     public uint MemReserveMB;
     public uint AutoUsePct;
     public uint BlockSize;   // 缓存块大小(字节), 4096/8192/16384/32768/65536/131072
+    public uint TinyLFU;    // [F1 2026-11-06] TinyLFU 频率准入（末尾纯追加）
 
     public string GetVolumeEntry(int i)
     {

@@ -17,10 +17,10 @@
 部署门禁哈希锚点（重要）
 ----------------------------------------------------------------
   scripts\deploy.ps1 / verify_deploy_signature.ps1 内置
-  DefaultExpectedSha256 = 4099b7fb046231fe279ad6f4e1f7af24a1dc90fd79e4fe5c99ad7dc9b096d423
-  该值对应本包 dist\RAMBlockCache.sys（2026-11-06 夜战批：视图世代门控 +
-  变更窗 + TRIM 范围失效 + 分页 IO 旁路 + ResumeOnBoot 冷启动修复，
-  157,408 字节）。（2026-10-21 更正：原文字误写 115,424；哈希才是唯一权威标识，字节数仅供人工核对）
+  DefaultExpectedSha256 = ed1bd99cd56812a36c2adb2e6f60f79b87512886bd2d02214eb25840663ab68e
+  该值对应本包 dist\RAMBlockCache.sys（2026-11-06 F1 TinyLFU 准入批：
+  Count-Min Sketch 频率准入 + 频率感知淘汰 + ParallelFlush 1/2/4/8/16 路，
+  160,992 字节）。（2026-10-21 更正：原文字误写 115,424；哈希才是唯一权威标识，字节数仅供人工核对）
   任何源码改动后必须重新编译 + 重新签名，
   新二进制哈希会变化 —— 若未同步更新该锚点，部署会"失败关闭"（拒绝部署），
   这是刻意设计，不要为了绕过而删掉校验。

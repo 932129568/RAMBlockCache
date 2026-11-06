@@ -141,6 +141,8 @@ VOID RbClampConfig(RB_CONFIG *c)
      * 旧代码 >64→64 只防脏值：配 8/16/64 都仍走编译期固定 4 路。 */
     if (c->ParallelFlush == 0) c->ParallelFlush = 1;
     if (c->ParallelFlush > RB_FLUSH_WORKERS) c->ParallelFlush = RB_FLUSH_WORKERS;
+    /* [F1 2026-11-06] TinyLFU 0/1 二值；非法值归 0（默认 OFF） */
+    if (c->TinyLFU > 1) c->TinyLFU = 0;
     /* [FIX F6→DECOUPLE 2026-11-02] BlockSize 解钳位：白名单 {4K,8K,16K,32K,64K,128K}
      * 与 core rb_engine_create 的 legal[] 完全同款（几何全派生：chunk=block*16、
      * sub_shift、chunk_mask——cache.c 无 4096 硬依赖；掩码 uint16 恰 16 子块）。
@@ -175,6 +177,8 @@ VOID RbApplyEngineConfig(const RB_CONFIG *cfg)
      * RbApplyConfig 的 BlockSize 同款"推迟+日志"纪律处理（见下 RbSetConfig 提示），
      * 此处不静默吞。 */
     rb_engine_set_write_release(g_Rb.Engine, cfg->WriteRelease ? 1 : 0);
+    /* [F1] 运行期可切：无需重建引擎 */
+    rb_engine_set_tinylfu(g_Rb.Engine, cfg->TinyLFU ? 1 : 0);
 }
 
 /* [FIX DATA-13 2026-11-04] 丢弃全部缓存视图（只丢干净块；调用前必须已刷脏）。

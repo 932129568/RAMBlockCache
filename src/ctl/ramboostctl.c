@@ -1439,6 +1439,7 @@ static int cli_print_config(void)
     printf("  空闲释放: %u (阈值 %u 秒)   并行回写: %u 路 (1=串行, 2/4/8/16=并行)\n",
            (unsigned)c.IdleReclaimEnabled,(unsigned)c.IdleReclaimSec,
            (unsigned)c.ParallelFlush);
+    printf("  TinyLFU 频率准入: %u (0=关 1=开)\n", (unsigned)c.TinyLFU);
     printf("  块大小: %uK\n", (unsigned)(c.BlockSize ? c.BlockSize/1024u : 4));
     printf("  缓存卷: ");
     for (i = 0; i < RB_MAX_VOLUMES; i++) {
@@ -1474,6 +1475,7 @@ static int cli_set(int argc, char **argv, int startIdx)
         { "idleOn",        &c.IdleReclaimEnabled },
         { "idleSec",       &c.IdleReclaimSec },
         { "parallel",      &c.ParallelFlush },
+        { "tinylfu",       &c.TinyLFU },
         { "writeRelease",  &c.WriteRelease },
         /* [FIX F3] frozen/idleFlush 已从表中移除：驱动侧零消费（设置后无任何
          * 行为差异=假成功）。字段保留在协议结构（历史兼容），CLI 不再暴露。 */

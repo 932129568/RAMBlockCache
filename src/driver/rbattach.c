@@ -380,6 +380,7 @@ NTSTATUS RbEnsureEngine(VOID)
         cfg.readback    = RbReadbackCb;
         cfg.readahead_enabled = g_Rb.Config.ReadaheadEnabled;
         cfg.readahead_window  = (rb_u64)g_Rb.Config.ReadaheadWindowKB * 1024;
+        cfg.tinylfu = (int)g_Rb.Config.TinyLFU;   /* [F1] 创建期初值；运行期 SET_CONFIG 下发 */
         g_Rb.Engine = rb_engine_create(&cfg);
         st = g_Rb.Engine ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
         if (g_Rb.Engine) created = TRUE;

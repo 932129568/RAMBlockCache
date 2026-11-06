@@ -18,7 +18,8 @@ $Tests = @(
   "test_release","test_v5","test_v6","test_bigread","test_flush_many",
   "edge_v3","edge_v4","stress_v3","stress_v4","bench_readhit","test_auditfix",
   "test_write_ex","test_wsconc","test_sparse_miss","test_exclude",
-  "test_flushpar"  # [PF-16] 1/2/4/8/16-way zone flush: zero data loss + rough throughput
+  "test_flushpar",  # [PF-16] 1/2/4/8/16-way zone flush: zero data loss + rough throughput
+  "test_tinylfu"   # [F1] TinyLFU admission: hot-set preservation + OFF parity
 )
 $ok=0; $fail=0; $runFail=0
 foreach ($t in $Tests) {

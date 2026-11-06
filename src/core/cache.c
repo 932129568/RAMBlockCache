@@ -517,8 +517,17 @@ struct rb_engine {
     struct { volatile rb_i64 v; char pad[56]; } stat_rd_bytes[RB_NSTRIPES];
     struct { volatile rb_i64 v; char pad[56]; } stat_rd_hit[RB_NSTRIPES];
     struct { volatile rb_i64 v; char pad[56]; } stat_rd_hitb[RB_NSTRIPES];
+    /* [F1 2026-11-06] TinyLFU 频率草图（4x1024 u16 = 8KB）+ 准入状态。
+     * cfg.tinylfu=0 时整块保持全零、所有 lfu_* 调用立即返回，旧行为逐字不变。 */
+    volatile rb_u32 lfu_ops;
+    volatile rb_u32 lfu_window;
+    volatile rb_u32 lfu_victim_freq;
+    volatile uint16_t lfu_sketch[4][1024];
     struct rb_slab slab;          /* [OPT-SLAB] chunk data block pool */
 };
+/* [F1 2026-11-06] 前向声明：rb_read / 读回填 / 写路径在 lfu_* 定义之前调用。 */
+static void lfu_note(rb_engine *eng, rb_u64 start);
+static int  lfu_admit(rb_engine *eng, rb_u64 start);
 #if defined(RB_SLAB_TEST_HOOK) && RB_SLAB_TEST_HOOK
 /* [F4/F5 测试钩子 2026-11-06] 仅在显式 /DRB_SLAB_TEST_HOOK=1 编译时存在
  * （RB_EVICT_HOOK_EXTERNAL 同款纪律：测试专用观测面，生产/内核构建零符号）。
@@ -1010,6 +1019,8 @@ void rb_engine_get_stats(rb_engine *eng, rb_stats *out)
         out->dirty_bytes         =(rb_u64)RB_ALOAD64(&eng->stats.dirty_bytes);
         out->chunk_count         =(rb_u64)RB_ALOAD64(&eng->stats.chunk_count);
         out->peak_bytes          =(rb_u64)RB_ALOAD64(&eng->stats.peak_bytes);
+        out->tinylfu_rejects      =(rb_u64)RB_ALOAD64(&eng->stats.tinylfu_rejects);
+        out->tinylfu_admits       =(rb_u64)RB_ALOAD64(&eng->stats.tinylfu_admits);
     }
 }
 int rb_engine_has_dirty(rb_engine *eng)
@@ -1285,6 +1296,7 @@ int rb_read(rb_stream *s, rb_u64 offset, void *buf, size_t len,
     if(miss_count)*miss_count=0;
     if(max_miss<1)max_miss=1;
     if(len>0 && end<offset) return -2;
+    lfu_note(eng, offset);          /* [F1] TinyLFU 频率记账（OFF 时立即返回） */
     { rb_u32 sk=stripe_of(offset);   /* [OPT-STATS R25] */
       RB_AADD64(&eng->stat_rd_req[sk].v,1);
       RB_AADD64(&eng->stat_rd_bytes[sk].v,(rb_i64)len); }
@@ -1477,7 +1489,7 @@ void rb_read_commit_gen(rb_stream *s, rb_u64 offset, const void *buf, size_t len
             /* [FIX M17] 读回填同样受容量上限约束（写路径两处创建均走 can_create，
              * 唯独此处裸建：内存压力期顺序大读可瞬时越过 hard_limit 大量分配）。
              * 超限跳过缓存——读不缓存不影响正确性。 */
-            if(!c && can_create(eng))c=chunk_create(s,cs);
+            if(!c && can_create(eng) && lfu_admit(eng,cs))c=chunk_create(s,cs);
             if(c){
                 if(!(c->dirty&(uint16_t)(1u<<idx))){
                     RB_SEQ_BUMP(c,idx);    /* [OPT-SPIN] 撕裂检测桩 */
@@ -1532,6 +1544,80 @@ static void direct_append(rb_direct_range *d, int *cnt, int max, rb_u64 off, siz
     else if(*cnt<max){ d[*cnt].offset=off; d[*cnt].len=len; (*cnt)++; }
     else *cnt=max+1;
 }
+/* ================= [F1 2026-11-06] TinyLFU 准入 =================
+ * 目标：一次性顺序扫描不把热集冲出缓存。频次用 4 行 x 1024 槽 Count-Min
+ * Sketch 估计（8KB/引擎），带周期性半衰；准入只在内存压力态生效，把新块
+ * 频率与 evict_select 选出的最旧候选频率比较，低于则拒绝建块——读下盘 /
+ * 写直写，数据语义完全不变（不缓存 != 丢数据）。每 8 次拒绝放行 1 次作为
+ * 新项窗口，避免冷启动把缓存「冻住」。cfg.tinylfu=0 时全部短路，行为与
+ * 旧版逐字等价。 */
+#define RB_LFU_ROWS         4
+#define RB_LFU_SLOTS        1024
+#define RB_LFU_DECAY_OPS    65536u
+#define RB_LFU_WINDOW_EVERY 8u
+
+static rb_u32 lfu_slot(rb_u64 start, rb_u32 row)
+{
+    rb_u64 x = (start >> 12) ^ ((rb_u64)(row + 1) * 0x9e3779b97f4a7c15ull);
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
+    return (rb_u32)(x & (RB_LFU_SLOTS - 1));
+}
+static void lfu_note(rb_engine *eng, rb_u64 start)
+{
+    rb_u32 r, s;
+    if (!eng || !eng->cfg.tinylfu) return;
+    start &= ~eng->chunk_mask;
+    for (r = 0; r < RB_LFU_ROWS; r++) {
+        volatile uint16_t *p = &eng->lfu_sketch[r][lfu_slot(start, r)];
+        if (*p < 0xffffu) *p = (uint16_t)(*p + 1);  /* 良性竞态：只影响收敛速度 */
+    }
+    if ((RB_AADD32(&eng->lfu_ops, 1) & (RB_LFU_DECAY_OPS - 1)) == 0)
+        for (r = 0; r < RB_LFU_ROWS; r++)
+            for (s = 0; s < RB_LFU_SLOTS; s++) {
+                volatile uint16_t *p = &eng->lfu_sketch[r][s];
+                *p = (uint16_t)(*p >> 1);
+            }
+}
+static rb_u32 lfu_est(rb_engine *eng, rb_u64 start)
+{
+    rb_u32 r, m = 0xffffu;
+    if (!eng) return 0;
+    start &= ~eng->chunk_mask;
+    for (r = 0; r < RB_LFU_ROWS; r++) {
+        rb_u32 v = eng->lfu_sketch[r][lfu_slot(start, r)];
+        if (v < m) m = v;
+    }
+    return m;
+}
+static int lfu_admit(rb_engine *eng, rb_u64 start)
+{
+    rb_u32 f, v;
+    if (!eng->cfg.tinylfu) return 1;
+    if (RB_ALOAD32(&eng->pressure_level) < RB_PRESSURE_MOD) return 1;
+    v = RB_ALOAD32(&eng->lfu_victim_freq);
+    if (v < 2) v = 2;                        /* 尚无淘汰对照时用最小频率门槛：
+                                             * 顺序扫描首访 f=1 必被挡，热集 f>=2 放行 */
+    f = lfu_est(eng, start);
+    if (f >= v || (RB_AADD32(&eng->lfu_window, 1) % RB_LFU_WINDOW_EVERY) == 0) {
+        RB_AADD64(&eng->stats.tinylfu_admits, 1);
+        return 1;                            /* 频率胜出 或 新项窗口放行 */
+    }
+    RB_AADD64(&eng->stats.tinylfu_rejects, 1);
+    return 0;
+}
+void rb_engine_set_tinylfu(rb_engine *eng, int on)
+{
+    rb_u32 r, s;
+    if (!eng) return;
+    eng->cfg.tinylfu = on ? 1 : 0;
+    if (!eng->cfg.tinylfu) {                 /* 关闭即复位，避免陈旧频率污染下次开启 */
+        RB_ASTORE32(&eng->lfu_victim_freq, 0);
+        RB_ASTORE32(&eng->lfu_window, 0);
+        for (r = 0; r < RB_LFU_ROWS; r++)
+            for (s = 0; s < RB_LFU_SLOTS; s++) eng->lfu_sketch[r][s] = 0;
+    }
+}
+
 static int can_create(const rb_engine *eng)
 {
     return (RB_ALOAD64(&eng->total_bytes) + eng->chunk_size) <= effective_create_limit((rb_engine*)eng);
@@ -1574,7 +1660,7 @@ static void rb_write_pass1(rb_stream *s, rb_u64 offset, rb_u64 end,
         if(!(pos & eng->chunk_mask) && (end-pos)>=(rb_u64)eng->chunk_size &&
            !excl_hit(s,pos) && !excl_hit(s,pos+(rb_u64)eng->chunk_size-1)){
             struct rb_chunk *cf=chunk_lookup(s,pos);
-            if(!cf && can_create(eng)) cf=chunk_create(s,pos);
+            if(!cf && can_create(eng) && lfu_admit(eng,pos)) cf=chunk_create(s,pos);
             if(cf){
                 if(pre_ok){
                     rb_u32 k;
@@ -1622,7 +1708,7 @@ static void rb_write_pass1(rb_stream *s, rb_u64 offset, rb_u64 end,
                 pre->mask[sub_i>>3] |= (uint8_t)(1u<<(sub_i&7));
         }
         if(full){
-            if(!c && can_create(eng))c=chunk_create(s,cs);
+            if(!c && can_create(eng) && lfu_admit(eng,cs))c=chunk_create(s,cs);
             if(!c){ direct_append(direct,dcount,max_direct,pos,n); }
             else{
                 RB_SEQ_BUMP(c,idx);    /* [OPT-SPIN] 撕裂检测桩 */
@@ -1692,6 +1778,7 @@ static void rb_write_pass2(rb_stream *s, RB_RMW *rmw, int rmw_n,
                 *cached+=it->n;
                 RB_AADD64((volatile rb_i64*)&eng->stripe_wb[k].v,(rb_i64)it->n);
             } else if(!c2 && can_create(eng) &&
+                      lfu_admit(eng,it->sub_start & ~eng->chunk_mask) &&
                       (c2=chunk_create(s,it->sub_start & ~eng->chunk_mask))!=NULL){
                 unsigned char *dst=c2->data+((size_t)it->idx<<eng->sub_shift);
                 RB_SEQ_BUMP(c2,it->idx);   /* [OPT-SPIN] 撕裂检测桩 */
@@ -1758,6 +1845,7 @@ int rb_write_ex(rb_stream *s, rb_u64 offset, const void *buf, size_t len,
     if(!s||!buf||!direct||!direct_count)return -2;
     eng=s->eng;
     end=offset+len;
+    lfu_note(eng, offset);          /* [F1] TinyLFU 频率记账（OFF 时立即返回） */
     if(pre){ pre->bits=0; pre->base=0; }   /* 默认：无快照（保守） */
     if(len==0){ *direct_count=0; return 0; }
     if(direct_count)*direct_count=0;
@@ -2607,7 +2695,15 @@ void rb_engine_mark_teardown(rb_engine *eng){ if(eng)eng->teardown_discard=1; }
 /* victim descriptor: by VALUE (start/last_access), never hold a raw chunk
  * pointer outside the chain lock -- clean_slot's write_release can chunk_destroy
  * a just-cleaned block between chain release and evict_victim's stripe lock. */
-struct rb_evict_vic{ rb_u64 start; rb_u64 last_access; rb_u64 epoch; };
+struct rb_evict_vic{ rb_u64 start; rb_u64 last_access; rb_u64 epoch; rb_u32 freq; };
+/* [F1 2026-11-06] 候选「谁更该被淘汰」：TinyLFU ON 时低频优先、同频再按 LRU；
+ * OFF 时退化为纯 last_access 比较，与旧实现逐字等价（逐分支短路）。 */
+static int vic_more_evictable(const struct rb_evict_vic *x,
+                              const struct rb_evict_vic *y, int on)
+{
+    if (on && x->freq != y->freq) return x->freq < y->freq;
+    return x->last_access < y->last_access;
+}
 /* [D2] 分片版 evict_select：16 片【升序取、逆序放】——本函数是唯一的多片
  * 持有者（对应旧单链锁全持），且全程不持条纹锁 → 锁序（stripe→片锁）无倒置。
  * 每片扫描上限 RB_EVICT_SCAN/RB_CHAIN_SHARDS=64，总预算 1024 不变。
@@ -2617,7 +2713,7 @@ struct rb_evict_vic{ rb_u64 start; rb_u64 last_access; rb_u64 epoch; };
  * 64 最旧之内，筛选结果一致。 */
 static int evict_select(rb_stream *s, struct rb_evict_vic *vics, int maxv)
 {
-    struct rb_chunk *c; int n=0, sh, i;
+    struct rb_chunk *c; int n=0, sh, i, on = s->eng->cfg.tinylfu ? 1 : 0;
     /* 升序取：0..15 全片同时持有（阻塞面与旧单链锁全持一致）；
      * 扫描全部 16 片后逆序放。全程不持条纹锁 → 锁序（stripe→片锁）无倒置。 */
     for(sh=0; sh<RB_CHAIN_SHARDS; sh++)
@@ -2630,20 +2726,44 @@ static int evict_select(rb_stream *s, struct rb_evict_vic *vics, int maxv)
             dup=0; for(d=0;d<n;d++){ if(vics[d].start==c->start){ dup=1; break; } }
             if(dup)continue;
             if(n<maxv){
-                vics[n].start=c->start; vics[n].last_access=c->last_access; vics[n].epoch=c->epoch; n++;
-                for(i=n-1;i>0 && vics[i-1].last_access>vics[i].last_access;i--){
+                vics[n].start=c->start; vics[n].last_access=c->last_access; vics[n].epoch=c->epoch;
+                vics[n].freq = on ? lfu_est(s->eng, c->start) : 0; n++;
+                for(i=n-1;i>0 && vic_more_evictable(&vics[i],&vics[i-1],on);i--){
                     struct rb_evict_vic t=vics[i]; vics[i]=vics[i-1]; vics[i-1]=t;
                 }
-            }else if(c->last_access < vics[maxv-1].last_access){
-                vics[maxv-1].start=c->start; vics[maxv-1].last_access=c->last_access; vics[maxv-1].epoch=c->epoch;
-                for(i=maxv-1;i>0 && vics[i-1].last_access>vics[i].last_access;i--){
-                    struct rb_evict_vic t=vics[i]; vics[i]=vics[i-1]; vics[i-1]=t;
+            }else{
+                struct rb_evict_vic cand;
+                cand.start=c->start; cand.last_access=c->last_access; cand.epoch=c->epoch;
+                cand.freq = on ? lfu_est(s->eng, c->start) : 0;
+                if(vic_more_evictable(&cand,&vics[maxv-1],on)){
+                    vics[maxv-1]=cand;
+                    for(i=maxv-1;i>0 && vic_more_evictable(&vics[i],&vics[i-1],on);i--){
+                        struct rb_evict_vic t=vics[i]; vics[i]=vics[i-1]; vics[i-1]=t;
+                    }
                 }
             }
         }
     }
     for(sh=RB_CHAIN_SHARDS-1; sh>=0; sh--)          /* 逆序放 */
         RB_M_UNLOCK(&s->chain[sh]);
+    /* [F1] TinyLFU ON：只把「低频带」候选交给回收，高频热集不参与淘汰。
+     * 排序后 vics[0] 是最低频，以它的 2 倍+1 为带宽过滤明显更热的块；
+     * 草图全零/全体同频时 bar=1 且 freq=0 -> 全保留（行为不变）。
+     * 保底至少 1 个候选，避免 stream_reclaim 的 while 循环停滞。 */
+    if (on && n > 0) {
+        rb_u32 bar = vics[0].freq * 2u + 1u;
+        int keep = 0;
+        for (i = 0; i < n; i++)
+            if (vics[i].freq <= bar) vics[keep++] = vics[i];
+        if (keep == 0) keep = 1;
+        n = keep;
+    }
+    /* [F1] 用最旧候选的频率做准入对照（EMA 平滑）；OFF 时零成本跳过。 */
+    if (s->eng->cfg.tinylfu && n > 0) {
+        rb_u32 vf = lfu_est(s->eng, vics[0].start);
+        rb_u32 old = RB_ALOAD32(&s->eng->lfu_victim_freq);
+        RB_ASTORE32(&s->eng->lfu_victim_freq, old ? (old*3u + vf)/4u : vf);
+    }
     return n;
 }
 static int evict_victim(rb_stream *s, rb_u64 start, rb_u64 epoch)
@@ -2837,8 +2957,17 @@ rb_u64 rb_engine_apply_pressure(rb_engine *eng, int level)
         for(i=0;i<n && RB_ALOAD64(&eng->total_bytes)>dl;i++){
             while(RB_ALOAD64(&eng->total_bytes)>dl){
                 struct rb_evict_vic vics[RB_EVICT_BATCH];
-                int cnt=0, k;
-                int m=evict_select(snap[i],vics,RB_EVICT_BATCH);
+                int cnt=0, k, m, cap=RB_EVICT_BATCH;
+                /* [F1 2026-11-06] TinyLFU ON：候选数按「还差多少字节」收敛，
+                 * 避免一次整批 64 个把高频热集也带走（频率排序才有意义）。
+                 * OFF 时 cap 恒为 RB_EVICT_BATCH，逐字等价旧行为。 */
+                if(eng->cfg.tinylfu){
+                    rb_u64 over=RB_ALOAD64(&eng->total_bytes)-dl;
+                    rb_u64 need=(over+eng->chunk_size-1)/eng->chunk_size;
+                    cap=(need>(rb_u64)RB_EVICT_BATCH)?RB_EVICT_BATCH:(int)need;
+                    if(cap<1)cap=1;
+                }
+                m=evict_select(snap[i],vics,cap);
                 if(m==0)break;
                 for(k=0;k<m;k++) cnt += (evict_victim(snap[i],vics[k].start,vics[k].epoch)==1);
                 if(!cnt)break;

@@ -270,6 +270,7 @@ static const struct { PCWSTR name; size_t off; } g_CfgTbl[] = {
     { L"IdleReclaimEnabled", offsetof(RB_CONFIG, IdleReclaimEnabled) },
     { L"IdleReclaimSec",     offsetof(RB_CONFIG, IdleReclaimSec) },
     { L"ParallelFlush",      offsetof(RB_CONFIG, ParallelFlush) },
+    { L"TinyLFU",             offsetof(RB_CONFIG, TinyLFU) },
     { L"CachePagingIo",      offsetof(RB_CONFIG, CachePagingIo) },
     { L"WriteRelease",       offsetof(RB_CONFIG, WriteRelease) },
     { L"Frozen",             offsetof(RB_CONFIG, Frozen) },
@@ -1353,6 +1354,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     g_Rb.Config.MemReserveMB = RB_DEFAULT_RESERVE_MB;
     g_Rb.Config.AutoUsePct = RB_DEFAULT_AUTO_USEPCT;
     g_Rb.Config.BlockSize = RB_DEFAULT_BLOCK_SIZE;
+    g_Rb.Config.TinyLFU = RB_DEFAULT_TINYLFU;
     /* FIX[P2-1]: 持久化配置覆盖默认值；读 AutoAttach */
     RbLoadConfig(&g_Rb.Config);
     /* [BUG3] AutoAttach 默认 1：开机即把数据卷挂入缓存（PrimoCache 式"开机即热"）。

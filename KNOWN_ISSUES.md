@@ -3,6 +3,18 @@
 > 截至 2026-11-06 13:50 · 交接收口完成（详见 deliverables/65-handover-closure-2026-11-06.md + 63/64 号）
 > 状态图例：✅ 已修复（有验证） · 🔧 已修复（待真机复验） · 🟡 已知限制/设计行为 · ⏳ 待评审/待做 · ⛔ 阻断
 
+## 0-E. 2026-11-06 14:45「F1 TinyLFU 准入」批（已发布，待重启加载）
+
+| # | 项 | 状态 | 证据/说明 |
+|---|---|---|---|
+| E1 | ✅ TinyLFU 频率准入完整落地：4×1024 Count-Min Sketch + 压力态准入 + 频率感知淘汰 + 回收候选按目标收敛；**默认 OFF 且 OFF 行为逐字等价**；拒绝只影响「是否缓存」，数据语义不变 | ✅ | `66-tinylfu-delivery` §2；`src/core/cache.c/h` |
+| E2 | ✅ 配置链路：`RB_CONFIG` 末尾追加 `TinyLFU` + 三 C# 镜像（`check_proto_sync --strict` PASS）+ 驱动注册表/clamp/默认 + 运行期 setter + CLI `tinylfu` + Web 下拉 | ✅ | 66 号 §3 |
+| E3 | ✅ `test_tinylfu`：OFF 热集 0/64、rejects=0；**ON 热集 64/64**、rejects=98、admits=41；oracle/记账全净 | ✅ | Release + ASan 双构建 PASS |
+| E4 | ✅ 全量回归：Release 24/24 + ASan 24/24、race 6/6 clean、wsconc 10 轮、门禁五件套全 PASS（PS 语法 54 文件 0 失败）、驱动 16 源 / CLI / Web 构建 | ✅ | 66 号 §4 |
+| E5 | ✅ 发布：sys `ed1bd99c…`（160,992 B，Valid）、Setup `d4457ca4…`（301,794,648 B，Valid）、三锚点同步、System32 已换、`Seq=10/Armed=1` | ✅ 待重启 | `RB-finalize-tinylfu.cmd` 一次 UAC，日志 ALL OK |
+| E6 | ✅ GitHub `README.md` 全量同步（基线哈希/特性表/CLI/文档导航）+ `README.txt` 括注更新；仓库 About 元数据未改（需管理员在设置页/API 修改） | ✅ | 66 号 §5 |
+| E7 | 🟡 内核真机验证未完成：需**重启一次**加载 `ed1bd99c…` 后才进入 Verifier 1h 收获周期；`TinyLFU` 默认 0，开启需显式设置 | 🟡 | 64 号协议；66 号 §6 |
+
 ## 0-D. 2026-11-06 13:50 交接收口（git 推送 + U-6 + 终态表）
 
 | # | 项 | 状态 | 证据/说明 |
@@ -11,7 +23,7 @@
 | D2 | ✅ **P3.14 git 提交推送**：`main` 原本无 upstream、停在 2 周前 `02a1445`；本轮提交 `7b4f5c3` 并 `push -u origin main` 成功，已建立跟踪 | ✅ | 301 文件 / 3.2MB；168 新增 + 72 删除 + 61 修改 |
 | D3 | ✅ `.gitignore` 重估：安装器 46 个源码入库、`bin/obj`/`Assets/payload`/Rust `target/` 排除；历史已完成文档与恢复快照按用户决定不保留（72 个删除保持、`archive/` 与 3 个大压缩包排除） | ✅ | 65 号 §5 |
 | D4 | ✅ 58 号交接 **U-1…U-11 与 P0…P3 共 15 项**逐项终态表落盘；C1 per-CPU 统计分片核实已落地（`rb_percpu.h` + `rbio.c:1060`） | ✅ | `deliverables/65-handover-closure-2026-11-06.md` |
-| D5 | ⛔ **TinyLFU 准入有意冻结**：全库无实现，属 P2 性能优化而非 bug；实现需改 core 数据路径 + 全量回归 + 第三次破锚点，会污染刚发布基线及未开始的 Verifier 归因周期 → 列入下版本功能批 | ⛔ 明确延期（非遗漏） | 65 号 §3/§4 |
+| D5 | ✅ **原「TinyLFU 有意冻结」决策已按用户 13:56 指令撤销并完成**（实现/回归/发布见 0-E 与 66 号文档） | ✅ | 66 号 §1–§4 |
 | D6 | 🟡 剩余均需真机周期 / 外部证据 / 第三方环境：Verifier 1h 负载与收网（64 号协议）、64K 根因 WinDbg 复现、U-8 旧二进制+PDB、U-9 360 环境、U-10 `D:\pagefile.sys` 64GB | 🟡 用户侧/环境限制 | 65 号 §4、§7 |
 
 ## 0-C. 2026-11-06「1/2/4/8/16 路可配」批（**已发布**，待重启加载 + Verifier 收获）

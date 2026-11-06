@@ -1,7 +1,22 @@
 # 已知 Bug 与遗留问题清单（KNOWN_ISSUES）
 
-> 截至 2026-11-06 18:4x · 收网脚本修复与重启验收工具就绪（详见 68/69/70/**71** 号文档）
+> 截至 2026-11-06 22:5x · >4K 几何内核态 UAF 已修（用户态 core 域闭环，发布层重放待 UAC；详见 **72/73/74** 号文档）
 > 状态图例：✅ 已修复（有验证） · 🔧 已修复（待真机复验） · 🟡 已知限制/设计行为 · ⏳ 待评审/待做 · ⛔ 阻断
+
+## 0-H. 2026-11-06 20:xx–22:5x · >4K 几何 UAF（详见 72/73/74 号）
+
+| # | 项 | 状态 | 证据/说明 |
+|---|---|---|---|
+| H1 | ✅ **产品缺陷（确证，非测试器具）**：`cache.c:1752` 的 `rb_write_pass2` 用 `stripe_of(it->sub_start)`（子块起点）取条纹锁，全库其余路径用 `stripe_of(cs)`（chunk 起点）；`bucket_of` 只由 `start>>16` 决定 → 4K 恒等、>4K 确定分叉（不匹配子块 4K 0/16、8K 8/16、16K 12/16、32K 14/16，主理人数值验算）。竞态：`chunk_create` 立即发布（ref=0/dirty=0/无构造中态）→ `chunk_mark_dirty` 前被另一写线程 `stream_reclaim/evict_victim/chunk_free` 锁外释放 → `heap-use-after-free`（ASan 224B offset 208 = `d_prev`）+ `total_dirty` 永久滞留（10 次 force flush 不收敛）。驱动侧 `rbio.c:790-813` 证明非测试专属 | ✅ 根因确证 | 72 号 §5；73 号 §1；74 号 |
+| H2 | ✅ **修复（候选 A，一行）**：`cache.c` +6 行 —— `rb_u64 cs = it->sub_start & ~eng->chunk_mask;` + `rb_u32 k=stripe_of(cs);` + 注释，3 处同式表达式换 `cs`；最终 sha `8340f9ff…`。4K 数值恒等 ⇒ 语义 no-op、中午 63 号基线逐字保持；不新增锁、无锁序倒置，且是恢复 R9-13 的前提（`stage_run:2256` 脏掩码复核依赖 WLOCK 排斥写者） | ✅ 已修（用户态 core 域） | 73 号 §2/§6.1 |
+| H3 | ✅ **三层独立验证全绿**：工程师 Release 360 次 + ASan 240 次零 FAIL/零报告；QA Release 330 次 + ASan 210 次 + 门禁全量 360 次零 FAIL；主理人 Release 180 次 + ASan 75 次零 FAIL。4K 等价五组 A/B 结构 diff 0 处（`775/775`、`235/235`）；`qa_geom_gate.ps1 -Rounds 30` `GATE: PASS` exit=0；缺基线负例 `GATE: FAIL` exit=1。回归面 `test_cache`/`test_wsconc`/`test_write_ex`/`test_geom`/`test_evict_wire`/`test_tinylfu`/`qa_teeth` 全绿 | ✅ 用户态闭环 | 74 号 §全 |
+| H4 | ✅ **阳性对照有区分力**：修复前 ASan 二进制（19:46，`035d12b0…`）同条件 `4 6 20261106 8192` 第 21/40 次复现 UAF；工程师 CONTROL 文件第 23/40 次命中，`dirty_insert @ 0x7ff7212fbaea` 与 72 号符号化栈逐字相同 ⇒ 同一修复前二进制，**不是修复版残留缺陷**，也证明检测链路仍敏感 | ✅ 已排除误判 | 73 号 §6.1；`fix_verify_CONTROL_ASAN_HIT_23.err` |
+| H5 | ✅ **K1 裁定**：73 号 §6 原文「`test_race1106` 各 mode 全绿」字面未达标（QA mode2 `exit=2 / churn_err=3878`、工程师 mode4 `churn_err=5024`）。裁为**口径一致性更正，不是放宽判据** —— 63 号 §6 / C7 早已把硬判据定为 `f_err=0 + final F sweep clean`、`churn_err` 单独跟踪、`exit 2` 不弱化；六模式全满足。铁证：`test_race1106.c:434/485` 固定 4096、`:206` 为 4096 对齐 full-sub ⇒ `rmw_n==0` ⇒ 修复所在的 `if(rmw_n)` 块根本不执行，4K 下锁键恒等，本修复语义 no-op；修复前/后对照 exe 两支 6/6 clean | ✅ 已裁定（按 C7 归档） | 73 号 §6 引注、§6.1；74 号 K1 |
+| H6 | ✅ **K2 门禁缺口闭环**：`check_geom_contract.py`（CI Gate7，静态只读防锁键回退/白名单漂移/门禁资产纪律）+ `ci.yml` 注册；本地动态入口 `qa_geom_gate.ps1 -Rounds 30`（QA 已实跑）。完整 30 轮矩阵约 9 分钟且依赖本机 MSVC/ASan/llvm-symbolizer/ASCII 中转，hosted runner 不具备 → CI 只做静态契约，如实分层。全套门禁复跑 8/8 PASS（`check_ps_syntax` 64 文件 0 失败） | ✅ 已闭环 | 73 号 §6.1；`check_geom_contract.py` |
+| H7 | ⏳ **发布层全链重放未完成**：驱动重编 → 重签 sys → 三锚点同步 → 重打并签名 Setup → 门禁/CI → 部署 → **一次 UAC + 一次重启** → `verify_final_reboot.ps1` → git push。用户已拍板「修根因并全链重放」；UAC 脚本由工程师编写中。**当前已签名产物 sys `ed1bd99c…` / Setup `6acb825f…` 仍是修复前二进制，不作废前不得宣称内核已修** | ⏳ 待 UAC | 73 号 §5/§5.1 |
+| H8 | 🟡 **未覆盖项（如实）**：① 内核侧 >4K 非对齐写 + 并发驱逐的**真机验证**未做（证据全为用户态 core 双构建）；② 72 号 >4K 性能矩阵整体标「已知缺陷阻塞、数字不可采信」，修复后若要性能结论须**重跑完整矩阵**，不得复用；③ `powercfg` 仍报「平衡」而用户自述性能模式，env 并列记录，吞吐仍只作同条件相对参考；④ `qa_teeth` expect-survive 字面 6/6 在工程师 4 次中 1 次 5/6（硬判据 `3/3 KILLED` 四次全过、exit=0，survive 段为 informational），记为观察项不扩改门禁 | 🟡 已知限制 | 73 号 §7；74 号 §9 |
+
+> **口径纪律**：H2/H3 的「已修」仅指**用户态 core 静态落地 + 回归验证**；内核代码未经 WDK 真机验证，一切「内核已修」须待 H7 的重启后 `verify_final_reboot.ps1` `FAIL=0` 才成立。任何 >4K 几何在 H7 完成前不得对外宣称可用。
 
 ## 0-G. 2026-11-06 18:1x-18:4x · 收网 UAC 中断修复（详见 71 号）
 

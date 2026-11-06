@@ -114,7 +114,14 @@ Write-Host ("  payload: controller.zip  {0} KB" -f [int]((Get-Item $ctlZip).Leng
 $wcZip = Join-Path $pay "webconsole.zip"
 Compress-Archive -Path (Join-Path $wcStage '*') -DestinationPath $wcZip -Force
 Write-Host ("  payload: webconsole.zip  {0} KB" -f [int]((Get-Item $wcZip).Length/1KB))
-Remove-Item $wcStage -Recurse -Force
+# [FIX 2026-11-06 22:5x] This staging dir is a fresh GUID folder under %TEMP%
+# and webconsole.zip is already complete. A safe-delete hook / AV can block a
+# recursive delete in an ELEVATED session (15:33 UAC interruption); with
+# $ErrorActionPreference='Stop' that abort would kill the whole build. The
+# 73-doc full-chain replay wrapper is ONE-SHOT, so a mid-run abort is costly.
+# Cleanup is best-effort only; leftover files are inert (unique path).
+try { Remove-Item -LiteralPath $wcStage -Recurse -Force -ErrorAction Stop }
+catch { Write-Host ("  [warn] staging cleanup skipped (harmless): " + $_.Exception.Message) }
 # web console launcher (installed alongside; shortcut points here).
 # [FIX 2026-11-06] Entry MUST be bridge\server\index.ts to match webconsole.zip:
 # zip top-level = bridge/ + dist/ + node.exe, there is NO server/ directory.

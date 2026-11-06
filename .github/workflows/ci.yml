@@ -85,6 +85,15 @@ jobs:
       - name: Assert Node 27 / npm 12.2.1 toolchain contract
         run: python src/scripts/check_node_contract.py
 
+      # —— >4K 条纹锁修复契约（2026-11-06，73 号）——
+      # 静态只读：断言 rb_write_pass2 用 stripe_of(cs) 而非子块起点、
+      # 几何白名单恰为 4096/8192/16384/32768、动态门禁资产合规、CI 持续调用本检查。
+      # 完整的 30 轮 Release+ASan 实跑由本机 qa_geom_gate.ps1 -Rounds 30 承担：
+      # hosted runner 无本机 MSVC cl / ASan 运行时 / llvm-symbolizer / ASCII 中转路径，
+      # 且全量约 9 分钟，故 CI 只做防回退的静态契约，不做动态压测。
+      - name: Gate7 check_geom_contract
+        run: python src/scripts/check_geom_contract.py
+
       # —— Web 类型检查 + 生产构建（41 号 §11.5 阶段 2 接入）——
       # --loglevel=error 抑制 Node 27 alpha 上 npm 12.2.1 的已知 engines 假警告
       # （CI 侧同时抑制 Node 22 与 package.json engines 的 EBADENGINE 提示）。

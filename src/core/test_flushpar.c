@@ -7,12 +7,36 @@
  *   （core 内部分区：zone_of(c->start) % nzones == zone_sel，见 cache.c
  *   flush_pass），并发写者 + 周期性 zoned flush + 收尾全盘逐字节比对。
  *
- * 用法：test_flushpar [lanes 1|2|4|8|16] [rounds] [seed]
+ * 用法：test_flushpar [lanes 1|2|4|8|16] [rounds] [seed] [block_size]
  *   · 无 argv[1]  -> 依次跑 1/2/4/8/16 五档（全量回归的免参数门禁姿态）；
  *   · argv[2]     -> 迭代轮数（默认 6，同时参与作业/写次数计算）；
- *   · argv[3]     -> 随机种子（默认 20261106，失败可复现）。
+ *   · argv[3]     -> 随机种子（默认 20261106，失败可复现）；
+ *   · argv[4]     -> BlockSize 几何（默认 4096；合法值仅 4096/8192/16384/32768，
+ *                    与 cache.c:955 的 legal[] 白名单一致）。非法值 fail-closed
+ *                    直接报错退出，绝不静默回落 4096 —— 产品 rb_engine_create
+ *                    对非法值是「静默回落 4096」（cache.c:958），测试侧必须
+ *                    在 create 之前先行拦截，否则「跑 8192」其实跑的是 4096。
  *   每档固定跑 8 个组合：track{concurrent,sentinel} x phase{full,sparse}
  *   x cfg{write-back,write-through}，任一组合 FAIL -> 进程退出码 1。
+ *
+ * ── 几何参数化（[72] 2026-11-06）────────────────────────────────────────
+ *   所有派生量随 block_size 联动，4K 取值与中午 63 号硬编码逐字相同：
+ *     SUB        = block_size
+ *     CHUNK      = block_size * 16                 (= cache.c eng->chunk_size)
+ *     WSPAN_B    = 4 * CHUNK                      (= 64 * SUB，固定每 zone 4 chunk)
+ *     TAIL       = block_size - 3                 (= 4093 @4K，卷尾非对齐注入)
+ *     WSPAN_A    = WSPAN_B + TAIL
+ *     LCM(4096, block_size) = block_size（白名单均为 4096 的整数倍）
+ *     WINCAP     = ceil(WSPAN_A / LCM) * LCM      (= 65 * block_size)
+ *                 恰好容纳「末子块 RMW 补读」：readback 在 WSPAN_B 处补读
+ *                 整整 block_size 字节 -> WSPAN_B + block_size == WINCAP。
+ *     WRITE_CAP_A= 3 * CHUNK + 8192               (= 200KB @4K，跨 chunk 上限)
+ *   zone_of(off) = off >> 28（256MB/zone）：WINCAP 最大 65*32768 = 2,129,920 B
+ *   (~2.03MB) 远小于 256MB，任意写区间 / RMW 补读 / 回写回调都既不越 zone
+ *   边界也不越窗口缓冲；truncate 尺寸 VOL_TOP = 4GB 是全部合法 block_size
+ *   的整数倍，不触发 cache.c:1219 的尾部清零分支。
+ *   双轨 oracle 语义不变：轨道 B 未落盘字节仍残留哨兵、wb_fn 逐字节校验仍
+ *   能抓静默写坏 / 陈旧 / 错偏移；不弱化任何断言。
  *
  * ── 双轨口径（为什么是两条轨道）──────────────────────────────────────────
  * 轨道 A「concurrent」：盘面初值 = f(off)（沿用 test_wsconc overlap/wb_fn 的
@@ -31,7 +55,8 @@
  *
  * ── 覆盖项 ───────────────────────────────────────────────────────────────
  *   · chunk 边界   : 轨道 A 非对齐起点 + 随机长；轨道 B 写长 1~3 个 64KB chunk；
- *   · 卷尾非对齐   : 轨道 A 应写区 WSPAN_A 非 4KB 对齐，注入卷尾 4093B 写；
+ *   · 卷尾非对齐   : 轨道 A 应写区 WSPAN_A 非 block_size 对齐，注入卷尾
+ *                    (block_size-3)B 写（4K 时 = 4093B），触发末子块 RMW；
  *   · 重叠写       : 多写者共享作业序列（轨道 B 每 chunk 每轮重写一次）+
  *                    轨道 A 随机区域可重叠；数据确定性 f(off) 保证收敛；
  *   · 失效/truncate: 写者周期性触发 rb_stream_invalidate_range（先镜像后失效，
@@ -60,8 +85,13 @@
  *   每路统计 rb_stream_flush_zoned 返回的落盘字节、pass 次数与实际忙时
  *   （QueryPerformanceCounter，不含让出核的 sleep），输出 MB/s；总耗时为
  *   该组合线程启动到收尾净帧的 wall time。
- *   【本机为安静模式且 Driver Verifier 仍开（VerifyDrivers=RAMBlockCache.sys）：
- *    所有数字只能作同条件相对粗测，绝对不作峰值宣称，也不作最优路数结论。】
+ *   【[72] 本轮环境：Verifier 已关闭（VerifyDrivers 空 / verifier /query
+ *     "No drivers are currently verified."），用户自述已切性能模式，但
+ *     powercfg /getactivescheme 仍显示「平衡」；两条如实并列记录。
+ *     任何 thr 数字仍只是同条件相对粗测：用户态 memcpy 模拟盘、无真实块
+ *     设备时延、短窗口下 lane 可能空转 —— 不作峰值宣称。】
+ *   程序输出首行在「免第 4 参」默认姿态下保留 63 号的历史 NOTE 逐字不变
+ *   （供与中午基线 A/B 等价取证）；显式传几何时改写为本轮真实环境口径。
  *
  * 纯 C，仅使用 cache.h 公开 API + 仓库既有 pthread.h/unistd.h shim；
  * 不新增生产面 API，不修改 cache.c/cache.h。编译单元 = test_flushpar.c + cache.c。
@@ -83,18 +113,60 @@
 #define ZSHIFT        28ull                 /* 与 cache.c RB_ZONE_SHIFT 一致：256MB/zone */
 #define ZSPAN         (1ull << ZSHIFT)
 #define VOL_TOP       ((rb_u64)NZ_MAX << ZSHIFT)   /* 4GB 逻辑卷顶：truncate 安全尺寸 */
-#define WSPAN_A       (256ull * 1024 + 4093ull)    /* 轨道 A 应写区：卷尾非对齐 */
-#define WSPAN_B       (256ull * 1024)              /* 轨道 B 应写区：4KB 对齐 */
-#define WINCAP        (((WSPAN_A + 4095ull) / 4096ull) * 4096ull) /* 窗口缓冲，4KB 对齐 */
-#define CHUNK         (64ull * 1024)               /* block_size*16 = 64KB */
-#define SUB           (4ull * 1024)                /* block_size */
-#define NCH_PER_ZONE  (WSPAN_B / CHUNK)            /* 4 */
+#define NCH_PER_ZONE  4ull                  /* 每 zone 的 chunk 数，固定（4K 时 = 4） */
 #define NW            4                            /* 并发写者 */
 #define MAXD          256                          /* direct 区间容量（>单写子块数） */
 #define MAX_LANES     16
 #define ROUNDS_DEF    6
 #define SEED_DEF      20261106u
-#define WRITE_CAP_A   (200u * 1024u)               /* 轨道 A 单次写长上限（跨 chunk） */
+#define BS_DEF        4096u                        /* 默认几何：保证向后兼容 */
+#define BS_MAX        32768u                       /* 白名单最大几何 */
+
+/* 合法几何白名单（与 cache.c:955 legal[] = {4096,8192,16384,32768} 一致；
+ * 65536/131072 已在 F1 批次摘除，测试侧同样不得重新引入）。
+ * 关键：cache.c rb_engine_create 对非法值【静默回落 4096】(cache.c:958)，
+ * 故测试必须在 create 之前自行 fail-closed 校验，否则「跑 8192」实为跑 4096。 */
+static int legal_block_size(unsigned long v)
+{
+    return v == 4096ul || v == 8192ul || v == 16384ul || v == 32768ul;
+}
+
+/* 运行期几何：main 解析 argv[4] 后一次性冻结，之后只读，无锁安全。
+ * 4K 取值全部与 63 号硬编码逐字相同（见文件头「几何参数化」推导）。 */
+typedef struct {
+    rb_u32   bs;            /* block_size */
+    rb_u64   sub;           /* = bs */
+    rb_u64   chunk;         /* = bs * 16 = cache.c eng->chunk_size */
+    rb_u64   wspan_b;       /* = NCH_PER_ZONE * chunk = 64 * bs */
+    rb_u64   tail;          /* = bs - 3 (4093 @4K)，卷尾非对齐注入长度 */
+    rb_u64   wspan_a;       /* = wspan_b + tail */
+    rb_u64   align;         /* = lcm(4096, bs) = bs（白名单内） */
+    rb_u64   wincap;        /* = ceil(wspan_a / align) * align = 65 * bs */
+    size_t   write_cap_a;   /* = 3 * chunk + 8192 (200KB @4K) */
+} Geom;
+static Geom GEOM;
+static int  G_geom_verbose = 0;   /* 显式传第 4 参时打印几何 + 引擎几何断言 */
+
+static rb_u64 gcd_u64(rb_u64 a, rb_u64 b)
+{
+    while (b) { rb_u64 t = a % b; a = b; b = t; }
+    return a;
+}
+
+static void geom_init(rb_u32 bs)
+{
+    GEOM.bs     = bs;
+    GEOM.sub    = (rb_u64)bs;
+    GEOM.chunk  = (rb_u64)bs * 16ull;                 /* = eng->chunk_size */
+    GEOM.wspan_b= (rb_u64)NCH_PER_ZONE * GEOM.chunk;  /* = 64 * bs */
+    GEOM.tail   = (rb_u64)bs - 3ull;                  /* 4093 @4K */
+    GEOM.wspan_a= GEOM.wspan_b + GEOM.tail;
+    /* 向上取整到 4096 与 block_size 的公倍数：合法 bs 均为 4096 整数倍，
+     * 故 lcm == bs；仍显式求 gcd 表达意图，不依赖隐含前提。 */
+    GEOM.align  = 4096ull / gcd_u64(4096ull, (rb_u64)bs) * (rb_u64)bs;
+    GEOM.wincap = ((GEOM.wspan_a + GEOM.align - 1ull) / GEOM.align) * GEOM.align;
+    GEOM.write_cap_a = (size_t)(3ull * GEOM.chunk + 8192ull);
+}
 
 /* oracle：与 test_wsconc wb_fn/pat 同源，盘面字节 = f(off) */
 static unsigned char fpat(rb_u64 off) { return (unsigned char)(off * 131u + 7u); }
@@ -133,6 +205,7 @@ typedef struct {
     unsigned   *job_order;
     unsigned    job_total;
     unsigned    wtotal;
+    unsigned char *meta_tmp;  /* 元数据事件临时缓冲（4*sub）；仅 wid==0 调用，独占 */
     /* 全局回调统计：用 cache.h 的 RB_AADD64/RB_ALOAD64（MSVC <stdatomic.h>
      * 不提供 atomic_uint_least64_t；该宏在 MSCV/gcc 分支均已定义） */
     volatile rb_i64 wb_calls, wb_bytes, mirror_bytes, wb_bad;
@@ -155,7 +228,7 @@ static int wb_fn(void *u, rb_u64 fid, rb_u64 off, const void *b, size_t n)
     size_t i;
     (void)u; (void)fid;
 
-    if (z >= NZ_MAX || !c->win[z] || n == 0 || w + n > WINCAP) {
+    if (z >= NZ_MAX || !c->win[z] || n == 0 || w + n > GEOM.wincap) {
         if (InterlockedExchangeAdd(&c->printed, 1) == 0)
             printf("  [FAIL] wb out-of-window: off=%llu len=%zu zone=%u lanes=%d seed=%u\n",
                    (unsigned long long)off, n, z, c->lanes, c->seed);
@@ -200,7 +273,7 @@ static int rb_fn(void *u, rb_u64 fid, rb_u64 off, void *b, size_t n)
     unsigned z = zid_of(off);
     rb_u64 w = off - zbase_of(off);
     (void)u; (void)fid;
-    if (z >= NZ_MAX || !c->win[z] || n == 0 || w + n > WINCAP) return -1;
+    if (z >= NZ_MAX || !c->win[z] || n == 0 || w + n > GEOM.wincap) return -1;
     pthread_mutex_lock(&c->zmx[z]);
     memcpy(b, c->win[z] + (size_t)w, n);
     pthread_mutex_unlock(&c->zmx[z]);
@@ -219,13 +292,13 @@ static void mirror(rb_u64 off, const unsigned char *buf, size_t len)
     RunCtx *c = G;
     unsigned z = zid_of(off);
     rb_u64 w = off - zbase_of(off);
-    if (z >= NZ_MAX || !c->win[z] || len == 0 || w + len > WINCAP) {
+    if (z >= NZ_MAX || !c->win[z] || len == 0 || w + len > GEOM.wincap) {
         /* 器具自检：镜像越界单独取证（与「落盘 oracle 违反」区分开，
          * 避免把测试夹具缺陷误报成产品静默写坏） */
         if (InterlockedExchangeAdd(&c->printed, 1) == 0)
             printf("  [FAIL] mirror out-of-window: off=%llu len=%zu zone=%u "
                    "cap=%llu lanes=%d seed=%u track=%d phase=%d cfg=%d\n",
-                   (unsigned long long)off, len, z, (unsigned long long)WINCAP,
+                   (unsigned long long)off, len, z, (unsigned long long)GEOM.wincap,
                    c->lanes, c->seed, c->track, c->phase, c->cfg);
         RB_AADD64(&c->wb_bad, 1);
         return;
@@ -275,13 +348,13 @@ static void meta_event(unsigned *s, rb_u64 base)
 {
     RunCtx *c = G;
     if ((nrand(s) & 1u) == 0) {
-        /* 失效区间必须完整落在窗口缓冲内（+16KB 不越过 WINCAP），
-         * 否则 mirror() 的器具自检会误报 wb_bad。 */
-        rb_u64 o = base + (rb_u64)(nrand(s) % (unsigned)(WSPAN_B / SUB - 4)) * SUB;
-        size_t l = SUB * 4;
-        unsigned char tmp[SUB * 4];
-        fill_f(tmp, o, l);
-        mirror(o, tmp, l);                       /* 直写取代：盘面已是最终语 */
+        /* 失效区间必须完整落在窗口缓冲内（+4*sub 不越过 WINCAP），
+         * 否则 mirror() 的器具自检会误报 wb_bad。wspan_b/sub 恒为 64，
+         * 故 (64-4)*sub + 4*sub = 64*sub = wspan_b < wincap，全几何安全。 */
+        rb_u64 o = base + (rb_u64)(nrand(s) % (unsigned)(GEOM.wspan_b / GEOM.sub - 4)) * GEOM.sub;
+        size_t l = (size_t)(GEOM.sub * 4);
+        fill_f(c->meta_tmp, o, l);
+        mirror(o, c->meta_tmp, l);               /* 直写取代：盘面已是最终语 */
         rb_stream_invalidate_range(c->st, o, l);
     } else {
         /* new_size >= 所有 chunk start -> 不销毁任何 chunk、不触发尾部清零，
@@ -299,7 +372,7 @@ static void *writer_a(void *p)
 {
     WArg *a = (WArg *)p;
     unsigned s = a->seed;
-    unsigned char *buf = (unsigned char *)malloc(WRITE_CAP_A);
+    unsigned char *buf = (unsigned char *)malloc(GEOM.write_cap_a);
     if (!buf) { InterlockedExchange(&G->stop, 1); return NULL; }
     while (!InterlockedCompareExchange(&G->stop, 0, 0)) {
         unsigned idx = (unsigned)InterlockedExchangeAdd(&G->wcount, 1);
@@ -314,11 +387,11 @@ static void *writer_a(void *p)
         z = idx % (unsigned)G->active_zones;
         base = (rb_u64)z << ZSHIFT;
         span = (rb_u64)(nrand(&s) % (unsigned)(G->wspan - 1));
-        len = 1 + (size_t)(nrand(&s) % WRITE_CAP_A);
+        len = 1 + (size_t)(nrand(&s) % (unsigned)GEOM.write_cap_a);
         pos = base + span;
         if (pos + len > base + G->wspan) len = (size_t)(base + G->wspan - pos);
         if (len == 0) continue;
-        if ((idx % 13) == 0) { pos = base + G->wspan - 4093; len = 4093; } /* 卷尾非对齐 */
+        if ((idx % 13) == 0) { pos = base + G->wspan - GEOM.tail; len = (size_t)GEOM.tail; } /* 卷尾非对齐 */
         fill_f(buf, pos, len);
         wrc = rb_write(G->st, pos, buf, len, dr, &dc, MAXD);
         handle_direct(pos, buf, len, dr, dc, wrc);
@@ -335,7 +408,7 @@ static void *writer_b(void *p)
 {
     WArg *a = (WArg *)p;
     unsigned s = a->seed;
-    unsigned char *buf = (unsigned char *)malloc((size_t)(3 * CHUNK));
+    unsigned char *buf = (unsigned char *)malloc((size_t)(3ull * GEOM.chunk));
     if (!buf) { InterlockedExchange(&G->stop, 1); return NULL; }
     while (!InterlockedCompareExchange(&G->stop, 0, 0)) {
         unsigned idx = (unsigned)InterlockedExchangeAdd(&G->job_idx, 1);
@@ -349,10 +422,10 @@ static void *writer_b(void *p)
         c = job % (unsigned)NCH_PER_ZONE;
         z = job / (unsigned)NCH_PER_ZONE;
         base = (rb_u64)z << ZSHIFT;
-        pos = base + (rb_u64)c * CHUNK;
+        pos = base + (rb_u64)c * GEOM.chunk;
         nch = 1 + (nrand(&s) % 3u);
         if (c + nch > (unsigned)NCH_PER_ZONE) nch = (unsigned)NCH_PER_ZONE - c;
-        len = (size_t)(nch * CHUNK);
+        len = (size_t)(nch * GEOM.chunk);
         fill_f(buf, pos, len);
         wrc = rb_write(G->st, pos, buf, len, dr, &dc, MAXD);
         handle_direct(pos, buf, len, dr, dc, wrc);
@@ -412,7 +485,7 @@ static int run_one(int lanes, int rounds, unsigned seed, int track, int phase, i
     c.lanes = lanes; c.rounds = rounds; c.seed = seed;
     c.track = track; c.phase = phase; c.cfg = cfg;
     c.active_zones = (phase == 0) ? NZ_MAX : (lanes < 3 ? lanes : 3);
-    c.wspan = (track == 0) ? WSPAN_A : WSPAN_B;
+    c.wspan = (track == 0) ? GEOM.wspan_a : GEOM.wspan_b;
     G = &c;
 
     printf("== lanes=%d track=%s phase=%s cfg=%s active_zones=%d seed=%u rounds=%d ==\n",
@@ -421,9 +494,9 @@ static int run_one(int lanes, int rounds, unsigned seed, int track, int phase, i
     /* 盘面窗口：active zone 用 f(轨道A)/sent(轨道B) 初值，其余 zone 填 f（不会被触碰） */
     for (z = 0; z < NZ_MAX; z++) {
         rb_u64 base = (rb_u64)z << ZSHIFT;
-        c.win[z] = (unsigned char *)malloc((size_t)WINCAP);
+        c.win[z] = (unsigned char *)malloc((size_t)GEOM.wincap);
         if (!c.win[z]) { printf("  [FAIL] OOM win[%u]\n", z); return 1; }
-        for (i = 0; i < (unsigned)WINCAP; i++) {
+        for (i = 0; i < (unsigned)GEOM.wincap; i++) {
             rb_u64 off = base + i;
             c.win[z][i] = (z < (unsigned)c.active_zones && track == 1) ? sent(off) : fpat(off);
         }
@@ -443,6 +516,8 @@ static int run_one(int lanes, int rounds, unsigned seed, int track, int phase, i
     c.job_total = (unsigned)c.active_zones * (unsigned)NCH_PER_ZONE * (unsigned)rounds;
     c.job_order = (unsigned *)malloc((size_t)c.job_total * sizeof(unsigned));
     if (!c.job_order) { printf("  [FAIL] OOM job_order\n"); return 1; }
+    c.meta_tmp = (unsigned char *)malloc((size_t)(GEOM.sub * 4));
+    if (!c.meta_tmp) { printf("  [FAIL] OOM meta_tmp\n"); return 1; }
     for (i = 0; i < c.job_total; i++) c.job_order[i] = i;
     s = seed ^ (unsigned)lanes * 7919u ^ (unsigned)(track * 131u + phase * 17u + cfg) * 104729u;
     for (i = c.job_total; i > 1; i--) {
@@ -453,10 +528,17 @@ static int run_one(int lanes, int rounds, unsigned seed, int track, int phase, i
     /* 引擎：轨道 A 小缓存强制驱逐/回写交织；轨道 B 大缓存专注丢写哨兵 */
     memset(&cc, 0, sizeof(cc));
     cc.max_bytes = (track == 0) ? (4ull * 1024 * 1024) : (512ull * 1024 * 1024);
-    cc.writeback = wb_fn; cc.readback = rb_fn; cc.block_size = 4096;
+    cc.writeback = wb_fn; cc.readback = rb_fn; cc.block_size = GEOM.bs;
     c.eng = rb_engine_create(&cc);
     c.st = c.eng ? rb_stream_create(c.eng, 0x464C5553ull) : NULL;   /* "FLUS" */
     if (!c.eng || !c.st) { printf("  [FAIL] engine/stream create\n"); return 1; }
+    /* 引擎几何硬断言：防 cache.c:958「非法值静默回落 4096」把一次 32K 回归
+     * 悄悄变成 4K 回归。仅在显式传第 4 参时打印，保证 4K 免参姿态与中午
+     * 输出逐字等价（4K 本身即回落值，无需该行亦可等价）。 */
+    if (G_geom_verbose)
+        CHECK(rb_engine_block_size(c.eng) == GEOM.bs,
+              "engine geometry honored block_size=%u (got %u)",
+              GEOM.bs, rb_engine_block_size(c.eng));
 
     /* cfg=1 直写：排除集覆盖所有 active zone 窗口 -> 写不进缓存、不产生回写 */
     if (cfg == 1) {
@@ -464,7 +546,7 @@ static int run_one(int lanes, int rounds, unsigned seed, int track, int phase, i
         int r;
         for (z = 0; z < (unsigned)c.active_zones; z++) {
             ents[z].start = (rb_u64)z << ZSHIFT;
-            ents[z].len = WINCAP;
+            ents[z].len = GEOM.wincap;
         }
         r = rb_stream_set_exclude(c.st, ents, c.active_zones);
         CHECK(r >= 0, "set_exclude(%d extents) ret=%d", c.active_zones, r);
@@ -508,9 +590,9 @@ static int run_one(int lanes, int rounds, unsigned seed, int track, int phase, i
           (unsigned long long)st.dirty_bytes);
     CHECK(rb_engine_has_dirty(c.eng) == 0,
           "has_dirty=0 (got %d)", rb_engine_has_dirty(c.eng));
-    CHECK(st.wb_bytes % 4096 == 0,
-          "wb accounting granularity wb_bytes%%4096=0 (got %llu)",
-          (unsigned long long)st.wb_bytes);
+    CHECK(st.wb_bytes % GEOM.bs == 0,
+          "wb accounting granularity wb_bytes%%%u=0 (got %llu)",
+          GEOM.bs, (unsigned long long)st.wb_bytes);
     CHECK((rb_u64)RB_ALOAD64(&c.wb_calls) >= st.wb_flush,
           "no double-count wb_flush(%llu)<=wb_calls(%llu)",
           (unsigned long long)st.wb_flush,
@@ -576,6 +658,7 @@ static int run_one(int lanes, int rounds, unsigned seed, int track, int phase, i
     printf("  RESULT: %s\n", bad ? "FAIL" : "PASS");
     /* 清理 */
     free(c.job_order);
+    free(c.meta_tmp);
     for (z = 0; z < NZ_MAX; z++) {
         free(c.win[z]);
         pthread_mutex_destroy(&c.zmx[z]);
@@ -601,18 +684,64 @@ int main(int argc, char **argv)
     static const int all[] = { 1, 2, 4, 8, 16 };
     int lanes = 0, rounds = ROUNDS_DEF, i, bad = 0, nruns = 0;
     unsigned seed = SEED_DEF;
+    rb_u32 bs = BS_DEF;
     QueryPerformanceFrequency(&g_qpf);
     if (argc > 1) lanes = atoi(argv[1]);
     if (argc > 2) { int r = atoi(argv[2]); if (r > 0 && r <= 64) rounds = r; }
     if (argc > 3) { unsigned long v = strtoul(argv[3], NULL, 0); if (v) seed = (unsigned)v; }
     if (lanes != 0 && lanes != 1 && lanes != 2 && lanes != 4 && lanes != 8 && lanes != 16) {
-        printf("usage: test_flushpar [lanes 1|2|4|8|16] [rounds] [seed]\n");
+        printf("usage: test_flushpar [lanes 1|2|4|8|16] [rounds] [seed] [block_size]\n");
+        printf("       block_size legal: 4096/8192/16384/32768 (default 4096); illegal = FAIL-CLOSED\n");
         printf("       (no args = sweep all 5 lanes for the no-arg regression gate)\n");
         return 2;
     }
-    printf("test_flushpar: start seed=%u rounds=%d lanes=%s "
-           "NOTE quiet-mode+Verifier: throughput is RELATIVE coarse only\n",
-           seed, rounds, lanes ? "single" : "1/2/4/8/16 sweep");
+    /* 第 4 参：几何白名单 fail-closed。cache.c:958 对非法值静默回落 4096，
+     * 若不在此拦截，「跑 8192/16384/32768」会悄悄退化成 4K 回归。 */
+    if (argc > 4) {
+        char *end = NULL;
+        unsigned long v = strtoul(argv[4], &end, 0);
+        if (!end || *end != '\0' || !legal_block_size(v)) {
+            printf("test_flushpar: FAIL illegal block_size '%s' "
+                   "(legal: 4096/8192/16384/32768)\n", argv[4]);
+            printf("  fail-closed: rb_engine_create silently falls back to 4096 "
+                   "for illegal values; refuse to run under a false geometry.\n");
+            return 2;
+        }
+        bs = (rb_u32)v;
+        G_geom_verbose = 1;
+    }
+    geom_init(bs);
+    /* 静态几何不变式（fail-closed）：窗口不得越过 256MB zone，chunk 不得吞掉
+     * 应写区，卷尾非对齐长度必须落在单个子块内 —— 任一不满足立即退出。 */
+    if (GEOM.wincap > ZSPAN || GEOM.wspan_a > GEOM.wincap ||
+        GEOM.chunk > GEOM.wspan_b || GEOM.tail == 0 || GEOM.tail >= GEOM.sub) {
+        printf("test_flushpar: FAIL geometry invariant violated "
+               "(bs=%u wincap=%llu zspan=%llu wspan_a=%llu chunk=%llu wspan_b=%llu)\n",
+               GEOM.bs, (unsigned long long)GEOM.wincap, (unsigned long long)ZSPAN,
+               (unsigned long long)GEOM.wspan_a, (unsigned long long)GEOM.chunk,
+               (unsigned long long)GEOM.wspan_b);
+        return 2;
+    }
+    /* 默认（无第 4 参）姿态：首行与 63 号中午基线逐字相同，供 A/B 等价取证。
+     * 显式几何运行流：改写为本次 [72] 的真实环境口径，避免误导读者。 */
+    if (G_geom_verbose)
+        printf("test_flushpar: start seed=%u rounds=%d lanes=%s "
+               "[72] Verifier=OFF, user self-reports performance mode (powercfg=Balanced); "
+               "throughput is RELATIVE coarse only (userland memcpy RAM disk, no peak claim)\n",
+               seed, rounds, lanes ? "single" : "1/2/4/8/16 sweep");
+    else
+        printf("test_flushpar: start seed=%u rounds=%d lanes=%s "
+               "NOTE quiet-mode+Verifier: throughput is RELATIVE coarse only\n",
+               seed, rounds, lanes ? "single" : "1/2/4/8/16 sweep");
+    if (G_geom_verbose)
+        printf("[geom] block_size=%u sub=%llu chunk=%llu wspan_b=%llu wspan_a=%llu "
+               "wincap=%llu align=%llu nch=%llu tail=%llu write_cap_a=%zu "
+               "zone_span=%llu\n",
+               GEOM.bs, (unsigned long long)GEOM.sub, (unsigned long long)GEOM.chunk,
+               (unsigned long long)GEOM.wspan_b, (unsigned long long)GEOM.wspan_a,
+               (unsigned long long)GEOM.wincap, (unsigned long long)GEOM.align,
+               (unsigned long long)NCH_PER_ZONE, (unsigned long long)GEOM.tail,
+               GEOM.write_cap_a, (unsigned long long)ZSPAN);
     if (lanes) {
         bad += run_lanes(lanes, rounds, seed);
         nruns = 8;

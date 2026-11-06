@@ -24,9 +24,29 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $setup = Join-Path $root 'dist\RAMBlockCache-Setup.exe'
-$oldSha = '7912d2760efc4249aafd6269a22e2e40fa1bdda39cdd4f888bc48d63c30867af'
-$oldSize = '276,153,688'
+# [2026-11-06 22:5x, lead] Dynamic current-baseline resolution.
+# The old script hardcoded $oldSha='7912d276...' / $oldSize='276,153,688'.
+# After the 19:05 UAC those rows were already rewritten to 6acb825f..., so a
+# SECOND release replay would fail preflight with "expected exactly 1 old row,
+# found 0". Parse the CURRENT rows from the two baseline docs instead, and
+# cross-check that both docs agree (fail-closed) before editing anything.
+# This makes the tool reusable for every future release without a constant edit.
 $hashLog = 'C:\ProgramData\rb-deploy\batch-hashes.txt'
+$readme  = Join-Path $root 'README.md'
+$d67     = Join-Path $root 'deliverables\67-freeze-closure-2026-11-06.md'
+foreach ($p in @($readme, $d67)) {
+    if (-not (Test-Path -LiteralPath $p)) { Write-Host ('[FAIL] baseline doc missing: ' + $p); exit 1 }
+}
+$rxReadme = [regex]'\|\s*`dist/RAMBlockCache-Setup\.exe`\s*\|\s*`([0-9a-fA-F]{64})`\s*·\s*\*\*签名 Valid\*\*\s*\|'
+$rx67     = [regex]'\|\s*Setup\s*\|\s*`([0-9a-fA-F]{64})`\s*·\s*([0-9,]+)\s*B\s*·\s*\*\*签名 Valid\*\*\s*\|'
+$rm = $rxReadme.Match([IO.File]::ReadAllText($readme, (New-Object Text.UTF8Encoding($false))))
+$m67 = $rx67.Match([IO.File]::ReadAllText($d67, (New-Object Text.UTF8Encoding($false))))
+if (-not $rm.Success -or -not $m67.Success) { Write-Host '[FAIL] cannot parse current Setup baseline rows'; exit 1 }
+$oldSha = $rm.Groups[1].Value.ToLower()
+$old67Sha = $m67.Groups[1].Value.ToLower()
+$oldSize = $m67.Groups[2].Value
+if ($oldSha -ne $old67Sha) { Write-Host ('[FAIL] baseline sha disagrees: README=' + $oldSha + ' 67=' + $old67Sha); exit 1 }
+Write-Host ('[info] current baseline: sha=' + $oldSha + ' size=' + $oldSize)
 
 if (-not (Test-Path -LiteralPath $setup)) { Write-Host '[FAIL] dist Setup missing'; exit 1 }
 $sig = Get-AuthenticodeSignature -LiteralPath $setup
@@ -108,17 +128,25 @@ foreach ($p in $byPath.Keys) {
 }
 
 # Read-back: new hash must appear, old hash must be gone from the two baseline
-# docs, and README.txt must be byte-identical to HEAD (sys anchor untouched).
+# docs. README.txt is one of the three SYS anchors: this tool must NEVER write
+# it, but after a driver rebuild sync_anchors.ps1 legitimately updates its
+# DefaultExpectedSha256. So verify the anchor against the CURRENT dist sys
+# hash instead of a hardcoded stale value (the 19:05 build used ed1bd99c...).
 $fail = 0
 foreach ($p in @($readme, $d67)) {
     $txt = [IO.File]::ReadAllText($p, $enc)
     if ($txt.IndexOf($newSha, [StringComparison]::Ordinal) -lt 0) { Write-Host ("[FAIL] read-back missing new sha in " + $p); $fail++ }
-    if ($txt.IndexOf($oldSha, [StringComparison]::Ordinal) -ge 0) { Write-Host ("[FAIL] read-back still has old sha in " + $p); $fail++ }
+    # Only assert the old hash is gone when a real change was requested.
+    # Idempotent re-run (oldSha == newSha) would otherwise flag its own baseline.
+    if ($oldSha -ne $newSha -and $txt.IndexOf($oldSha, [StringComparison]::Ordinal) -ge 0) {
+        Write-Host ("[FAIL] read-back still has old sha in " + $p); $fail++
+    }
 }
 $rt = Join-Path $root 'README.txt'
-$anchorLine = Select-String -LiteralPath $rt -Pattern 'ed1bd99cd56812a36c2adb2e6f60f79b87512886bd2d02214eb25840663ab68e' -SimpleMatch -Quiet
-if (-not $anchorLine) { Write-Host '[FAIL] README.txt sys anchor no longer present'; $fail++ }
-else { Write-Host '[ok] README.txt sys anchor intact (not modified)' }
+$sysShaNow = (Get-FileHash -LiteralPath (Join-Path $root 'dist\RAMBlockCache.sys') -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+$anchorLine = Select-String -LiteralPath $rt -Pattern $sysShaNow -SimpleMatch -Quiet
+if (-not $anchorLine) { Write-Host ('[FAIL] README.txt sys anchor does not match current dist sys ' + $sysShaNow); $fail++ }
+else { Write-Host ('[ok] README.txt sys anchor intact and matches current sys ' + $sysShaNow) }
 if ($fail -gt 0) { Write-Host ("[FAIL] read-back failed (" + $fail + ")"); exit 1 }
 
 Write-Host ("== sync_setup_hash: " + $(if ($changed -gt 0) { 'UPDATED' } else { 'ALREADY IN SYNC' }) + " ==")

@@ -1749,14 +1749,20 @@ static void rb_write_pass2(rb_stream *s, RB_RMW *rmw, int rmw_n,
         int qi;
         for(qi=0;tmp && qi<rmw_n;qi++){
             RB_RMW *it=&rmw[qi];
-            rb_u32 k=stripe_of(it->sub_start);
+            /* [FIX >4K-UAF 2026-11-06] pass2 必须用 chunk 起点 cs 取条纹锁，与
+             * chunk_lookup / chunk_create / evict_victim / stage_run /
+             * flush_pass / stage_revalidate 同式；用子块起点 it->sub_start 会在
+             * block_size>4096 时因 start>>16 进位取到另一把条纹锁。
+             * 4K 下两者同条纹，语义逐字等价。 */
+            rb_u64 cs = it->sub_start & ~eng->chunk_mask;
+            rb_u32 k=stripe_of(cs);
             struct rb_chunk *c2; int rr;
             rr=eng->cfg.readback(eng->cfg.user_ctx,s->file_id,it->sub_start,tmp,eng->block_size);
             /* FIX[R1]: 补读失败（盘错/坏道）绝不把未初始化数据写入缓存 —— 整段直写兜底 */
             if(rr!=0){ direct_append(direct,dcount,max_direct,it->pos,it->n); continue; }
             RB_AADD64(&eng->stats.rmw_reads,1);
             RB_RW_WLOCK(&s->stripes[k]);
-            c2=chunk_lookup(s,it->sub_start & ~eng->chunk_mask);
+            c2=chunk_lookup(s,cs);
             if(c2 && (c2->loaded&(uint16_t)(1u<<it->idx))){
                 /* 洞期间该子块已被并发加载（他人写/读回填）：缓存内容即权威，
                  * 只叠加本次写入字节，绝不用可能过期的盘上数据覆盖它 */
@@ -1778,8 +1784,8 @@ static void rb_write_pass2(rb_stream *s, RB_RMW *rmw, int rmw_n,
                 *cached+=it->n;
                 RB_AADD64((volatile rb_i64*)&eng->stripe_wb[k].v,(rb_i64)it->n);
             } else if(!c2 && can_create(eng) &&
-                      lfu_admit(eng,it->sub_start & ~eng->chunk_mask) &&
-                      (c2=chunk_create(s,it->sub_start & ~eng->chunk_mask))!=NULL){
+                      lfu_admit(eng,cs) &&
+                      (c2=chunk_create(s,cs))!=NULL){
                 unsigned char *dst=c2->data+((size_t)it->idx<<eng->sub_shift);
                 RB_SEQ_BUMP(c2,it->idx);   /* [OPT-SPIN] 撕裂检测桩 */
                 memcpy(dst,tmp,eng->block_size);

@@ -58,6 +58,23 @@ static volatile LONG s_RebuildInFlight = 0;
 static WORK_QUEUE_ITEM s_RebuildWork;
 static ULONG          s_PendingNewBs = 0;
 
+/* ---- [83 第二笔] 卸载 ↔ 重建 work item 互斥排空判据（实现 rb_common.h 声明） ----
+ * 三态任一非 0 都表示重建 work item 仍在飞：
+ *   Recreating                 —— RbMsgSetConfig CAS 抢主成功即置 1（最早）
+ *   GeometryRebuildInProgress —— 抢主后立刻置 1
+ *   s_RebuildInFlight         —— RbRequestGeometryRebuild 入队前置 1，
+ *                                RbRebuildWorkItem 末尾最后清零
+ * RbUnload 在停机序列最前据此有界等待；任一非 0 都不得销毁引擎
+ * （在飞 work item 会 rb_engine_destroy / RbCreateEngineOnly / 逐卷摘链重挂，
+ * 与卸载销毁并发 = heap UAF + 双重释放）。IRQL 无关：纯 volatile 读。 */
+BOOLEAN RbRebuildIsActive(VOID)
+{
+    if (InterlockedCompareExchange(&g_Rb.Recreating, 0, 0) != 0) return TRUE;
+    if (InterlockedCompareExchange(&g_Rb.GeometryRebuildInProgress, 0, 0) != 0) return TRUE;
+    if (InterlockedCompareExchange(&s_RebuildInFlight, 0, 0) != 0) return TRUE;
+    return FALSE;
+}
+
 /* ---- 工具：注册表回读确认（防 RbRegSetDW 是 VOID、写失败只打日志的假成功） ---- */
 static BOOLEAN RbRebuildVerifyPersistedBs(ULONG expected)
 {
@@ -100,11 +117,19 @@ static ULONG RbRebuildSnapshotVolumes(RB_REBUILD_VOL *out, ULONG cap)
     return n;
 }
 
-/* ---- 工具：全部卷 Stream 已摘链（销毁前硬判据） ---- */
+/* ---- 工具：全部卷 Stream 已摘链 + 引擎 stream 表为空（销毁前双硬判据） ----
+ * [83 收窄#4] cache.c:1125-1146 rb_stream_destroy 有 60s 超时 leak-by-design
+ * 路径：超时后 stream 已从 ext 摘下但仍挂在 eng->streams 链表上。若此时销毁
+ * 引擎，rb_engine_destroy 会二次遍历该表 → UAF/双重释放。故必须同时验证
+ * ① 每卷 ext->Stream==NULL ② rb_engine_snapshot_streams(eng,...) 返回 0。
+ * snapshot 会给每个流加 io_users 引用，必须逐个 rb_stream_release_io 归还。 */
 static BOOLEAN RbRebuildAllStreamsDetached(VOID)
 {
     PLIST_ENTRY link;
     BOOLEAN ok = TRUE;
+    rb_engine *eng;
+    rb_stream *snap[RB_FLUSH_SNAP_MAX];
+    int n, k;
     PAGED_CODE();
     ExAcquireFastMutex(&g_Rb.DevListLock);
     for (link = g_Rb.DevList.Flink; link != &g_Rb.DevList; link = link->Flink) {
@@ -112,7 +137,17 @@ static BOOLEAN RbRebuildAllStreamsDetached(VOID)
         if (e->Stream != NULL) { ok = FALSE; break; }
     }
     ExReleaseFastMutex(&g_Rb.DevListLock);
-    return ok;
+    if (!ok) return FALSE;
+
+    eng = (rb_engine *)InterlockedCompareExchangePointer((PVOID *)&g_Rb.Engine, NULL, NULL);
+    if (!eng) return TRUE;                  /* 引擎已销毁：无表可查 */
+    n = rb_engine_snapshot_streams(eng, snap, RB_FLUSH_SNAP_MAX, 0);
+    for (k = 0; k < n; k++) rb_stream_release_io(snap[k]);
+    if (n != 0) {
+        RbLog(2, __LINE__, (LONG)n, L"rebuild: engine still has streams, abort (destroy would UAF)");
+        return FALSE;
+    }
+    return TRUE;
 }
 
 /* ---- 工具：逐卷软摘链 ---- */
@@ -157,11 +192,13 @@ static ULONG RbRebuildReattachAll(RB_REBUILD_VOL *vols, ULONG count)
 }
 
 /* ---- 屏障：6 项在途判据全部归零（30/60s 有界） ----
- * 主 IO 路径在途用「每卷 ext->Refs 回落」表达（既有引用计数，4K 热路径零新增
- * 原子，满足 R10）；g_Rb.DataPathInFlight 作为可供诊断读取的镜像，由本函数
- * 每轮从各卷 Refs 汇总写入，不在任何 IO 热路径上做增减。
- * 其余 5 项：FallbackInFlight / ZombiePending / s_PrefInFlight / FlushJobs /
- * 旁路作业早退（M5 各入口 RbIsDataPathFrozen）。 */
+ * [83 收窄#1] DataPathInFlight 是 RbCtxAlloc/RbCtxFree 严格配对的**真实计数**
+ * （只统计重建窗口内分配的 ctx）。窗口前置入的 ctx 由「每卷 ext->Refs
+ * 回基准」判据兜底。故此处**只读不写** DataPathInFlight，判据 =
+ *   DataPathInFlight==0 && refsQuiet && FallbackInFlight==0 &&
+ *   ZombiePending==0 && s_PrefInFlight==0 && FlushJobs==0（6 项）。
+ * 旁路作业由 M5 各入口 RbIsDataPathFrozen 早退，不新增计数。
+ * R10：4K 常态两值皆 0 时 RbCtxAlloc 只做 volatile 读分支，零原子写。 */
 NTSTATUS RbWaitDataPathQuiesce(ULONG timeoutMs)
 {
     LARGE_INTEGER tick;
@@ -174,20 +211,18 @@ NTSTATUS RbWaitDataPathQuiesce(ULONG timeoutMs)
     for (spins = 0; spins < maxSpins; spins++) {
         PLIST_ENTRY link;
         BOOLEAN refsQuiet = TRUE;
-        LONG inflight = 0;
 
         ExAcquireFastMutex(&g_Rb.DevListLock);
         for (link = g_Rb.DevList.Flink; link != &g_Rb.DevList; link = link->Flink) {
             PRB_DEV_EXT e = CONTAINING_RECORD(link, RB_DEV_EXT, ListEntry);
             LONG r = InterlockedCompareExchange(&e->Refs, 0, 0);
             /* owner 基准 1；重建期间已关 inflow 且旁路早退，Refs 不会新增。 */
-            if (r > 1) { refsQuiet = FALSE; inflight += (r - 1); }
+            if (r > 1) { refsQuiet = FALSE; break; }
         }
         ExReleaseFastMutex(&g_Rb.DevListLock);
 
-        InterlockedExchange(&g_Rb.DataPathInFlight, inflight);
-
-        if (refsQuiet &&
+        if (InterlockedCompareExchange(&g_Rb.DataPathInFlight, 0, 0) == 0 &&
+            refsQuiet &&
             InterlockedCompareExchange(&g_Rb.FallbackInFlight, 0, 0) == 0 &&
             InterlockedCompareExchange(&g_Rb.ZombiePending, 0, 0) == 0 &&
             RbPrefInFlightCount() == 0 &&
@@ -391,21 +426,27 @@ static VOID RbRebuildWorkItem(PVOID Parameter)
         InterlockedIncrement(&g_Rb.GeometryRebuildCount);
 }
 
-/* ---- SET_CONFIG 侧：校验 + 入队 + 立即返回（绝不阻塞控制面） ---- */
+/* ---- SET_CONFIG 侧：校验 + 入队 + 立即返回（绝不阻塞控制面） ----
+ * 前置：调用方 RbMsgSetConfig 已用 CAS 抢到 g_Rb.Recreating=1 并置
+ * GeometryRebuildInProgress=1（补裁 A「单主同源」）。本函数不再二次 CAS Recreating
+ * （否则必然失败），只以 s_RebuildInFlight 做第二道防御；失败时外层会清门控。
+ * 门控三件套最终由 RbRebuildWorkItem 末尾统一清零。 */
 NTSTATUS RbRequestGeometryRebuild(ULONG newBlockSize)
 {
     PAGED_CODE();
     if (newBlockSize != 4096u && newBlockSize != 8192u &&
         newBlockSize != 16384u && newBlockSize != 32768u)
         return STATUS_INVALID_PARAMETER;
-    /* 单主：并发重建请求直接拒绝（控制面 Recreating 门是第一道，这里是第二道）。 */
+    /* [83 第二笔] 卸载窗口拒绝：RbUnload 已置 Unloading=1 并正在等待本 work
+     * item 排空；此时若再入队一个，会在卸载销毁引擎/删池/删控制设备时并发
+     * rb_engine_destroy + 逐卷摘链 → UAF。与 RbMsgSetConfig 的 Recreating
+     * CAS 双保险：那条挡「重建窗口内并发 set」，这条挡「卸载窗口内新 set」。 */
+    if (InterlockedCompareExchange(&g_Rb.Unloading, 0, 0) != 0)
+        return STATUS_DEVICE_NOT_READY;
+    /* 第二道单主防御：控制面 Recreating 抢主是第一道；此处防止 work item 已排队但
+     * 尚未执行完时再次入队覆盖 s_PendingNewBs。 */
     if (InterlockedCompareExchange(&s_RebuildInFlight, 1, 0) != 0)
         return STATUS_DEVICE_BUSY;
-    if (InterlockedCompareExchange(&g_Rb.Recreating, 1, 0) != 0) {
-        InterlockedExchange(&s_RebuildInFlight, 0);
-        return STATUS_DEVICE_BUSY;
-    }
-    InterlockedExchange(&g_Rb.GeometryRebuildInProgress, 1);
 
     s_PendingNewBs = newBlockSize;
     ExInitializeWorkItem(&s_RebuildWork, RbRebuildWorkItem, NULL);

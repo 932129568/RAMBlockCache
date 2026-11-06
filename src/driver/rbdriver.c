@@ -1109,6 +1109,38 @@ VOID RbUnload(PDRIVER_OBJECT drv)
 
     InterlockedExchange(&g_Rb.Unloading, 1);   /* [83] 原子发布序：重建/卸载窗口统一走此门 */
 
+    /* [83 第二笔 2026-11-07] 卸载 ↔ 运行期几何重建 work item 互斥排空。
+     * rbrebuild.c 的 s_RebuildWork 是静态 WORK_QUEUE_ITEM + ExQueueWorkItem
+     * (DelayedWorkQueue)；现有 FallbackInFlight(:1238) 只覆盖 IO ctx、
+     * ZombiePending(:1218) 只覆盖僵尸卷，都**不覆盖**它。若带着在飞 work item
+     * 继续 :1259 rb_engine_destroy，会与 work item 内的 rb_engine_destroy /
+     * RbCreateEngineOnly / 逐卷软摘链重挂并发 → heap UAF + 双重释放 + 0xC4。
+     * 硬判据：卸载时「要么等重建完成、要么中止卸载」，绝不带着在飞 work item
+     * 继续销毁。20ms×3000=60s，与 :1218/:1238 同款有界等待纪律。
+     * 判据 RbRebuildIsActive()：Recreating / GeometryRebuildInProgress /
+     * s_RebuildInFlight 三者任一非 0 即视为在飞（s_RebuildInFlight 由入队前置 1、
+     * work item 末尾最后清零，故返回 FALSE 时必无已排队或执行中的 work item）。
+     * 超时：恢复数据路径（Unloading=0）+ 保留服务直接 return（不停池/不删控制
+     * 设备/不销毁引擎），等下次 sc stop 或重启回收；与 [FIX R2-W5] 禁哑服役一致。
+     * 成功：在飞 work item 末尾(rbrebuild.c:400)把 Unloading 清成 0，故此处必须
+     * 重新断言 1，保证后续整个停机序列数据路径保持冻结。
+     * 配套：RbRequestGeometryRebuild 在 Unloading!=0 时拒绝新重建入队，防止
+     * 等待窗口内又排进一个 work item。 */
+    {
+        LARGE_INTEGER tick;
+        ULONG spin = 0;
+        tick.QuadPart = -200000LL;             /* 20ms */
+        while (RbRebuildIsActive() && spin++ < 3000)
+            KeDelayExecutionThread(KernelMode, FALSE, &tick);
+        if (RbRebuildIsActive()) {
+            RbLog(2, __LINE__, 0,
+                  L"unload aborted: geometry rebuild work item in flight, service kept");
+            InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] 中止即恢复数据路径 */
+            return;
+        }
+    }
+    InterlockedExchange(&g_Rb.Unloading, 1);   /* 重新断言：在飞 work item 尾部曾清 0 */
+
     /* 1) 先把全部脏数据落盘（工作线程停止前，回写通道完整） */
     RbFlushAllDirty();
 

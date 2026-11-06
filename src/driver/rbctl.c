@@ -345,12 +345,44 @@ static VOID RbMsgSetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
                   ? L"system volume opt-in ON by user (write-through still forced)"
                   : L"system volume opt-in OFF by user");
 
-    /* [83 2026-11-07] BlockSize 变化 => 运行期卷级重建。
-     * 几何合法值由 RbClampConfig 保证（非法值回落 4096，不会产生伪重建）。 */
+    /* [83 补裁 A] 单主同源：与下方 :1008 的拒绝门共用 g_Rb.Recreating 这把锁。
+     * 抢主必须在 RbApplyConfig 之前：抢到者才放行并入队；抢不到（并发/窗口内
+     * 第二个 SET_CONFIG）直接 STATUS_DEVICE_BUSY，且**不应用配置、不回滚**——
+     * 旧实现「先 ApplyConfig 再 CAS、失败再回滚」有竞态：第二个 SET_CONFIG 会
+     * 用自己带来的旧几何把第一个刚持久化的新几何抹回。CAS 前置后无此窗口。
+     * 几何合法值由 RbClampConfig 保证（非法值回落 4096，不产生伪重建）。 */
     newBs = msg->Data.Config.BlockSize;
     if (g_Rb.Engine && newBs != g_Rb.Config.BlockSize &&
         (newBs == 4096u || newBs == 8192u || newBs == 16384u || newBs == 32768u))
         isRebuildRequest = TRUE;
+
+    if (isRebuildRequest) {
+        /* [83 第二笔] 卸载窗口前置门：RbUnload 已置 Unloading=1 并正在排空在飞
+         * work item。此时直接拒绝，连配置都不动——否则 RbApplyConfig 会先把新
+         * BlockSize 写进注册表、再由入队失败回滚写回旧值，产生一次无意义的
+         * 注册表抖动。与 rbrebuild.c RbRequestGeometryRebuild 的 Unloading 门
+         * 双保险（那条兜住任何绕过本函数的入队路径）。 */
+        if (InterlockedCompareExchange(&g_Rb.Unloading, 0, 0) != 0) {
+            if (pst) *pst = STATUS_DEVICE_NOT_READY;
+            RbLog(1, __LINE__, 0, L"SET_CONFIG: unload in progress, rebuild request rejected");
+            ExAcquireFastMutex(&g_Rb.CfgLock);
+            msg->Data.Config = g_Rb.Config;   /* 回显运行配置副本 */
+            ExReleaseFastMutex(&g_Rb.CfgLock);
+            *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_CONFIG);
+            return;
+        }
+        if (InterlockedCompareExchange(&g_Rb.Recreating, 1, 0) != 0) {
+            /* 并发重建 / 窗口内第二个 set：如实写回 *pst（M2 收窄），不改配置。 */
+            if (pst) *pst = STATUS_DEVICE_BUSY;
+            RbLog(1, __LINE__, 0, L"SET_CONFIG: rebuild already in progress, request rejected");
+            ExAcquireFastMutex(&g_Rb.CfgLock);
+            msg->Data.Config = g_Rb.Config;   /* 回显运行配置副本 */
+            ExReleaseFastMutex(&g_Rb.CfgLock);
+            *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_CONFIG);
+            return;
+        }
+        InterlockedExchange(&g_Rb.GeometryRebuildInProgress, 1);
+    }
 
     /* 先应用配置（含持久化）；CfgLock 短锁、RbSaveConfig 内部 PASSIVE 守卫。 */
     RbApplyConfig(&msg->Data.Config);
@@ -358,9 +390,11 @@ static VOID RbMsgSetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     if (isRebuildRequest) {
         NTSTATUS qst = RbRequestGeometryRebuild(newBs);
         if (!NT_SUCCESS(qst)) {
-            /* 入队失败：运行几何保持旧值，配置副本回滚到旧几何并重新持久化，
-             * 避免「注册表新、引擎旧、且重建没排队」的永久不一致。 */
+            /* 抢主已成功但入队失败（s_RebuildInFlight 冲突 / E5 注入）：清门控 +
+             * 回滚配置副本到旧引擎几何并重新持久化，避免「注册表新、引擎旧、没排队」。 */
             RB_CONFIG rollback;
+            InterlockedExchange(&g_Rb.Recreating, 0);
+            InterlockedExchange(&g_Rb.GeometryRebuildInProgress, 0);
             ExAcquireFastMutex(&g_Rb.CfgLock);
             rollback = g_Rb.Config;
             rollback.BlockSize = (ULONG)(g_Rb.Engine ? rb_engine_block_size(g_Rb.Engine) : 4096u);
@@ -862,6 +896,21 @@ NTSTATUS RbDispatchDeviceControl(PDEVICE_OBJECT dev, PIRP irp)
     ULONG outLen = sp->Parameters.DeviceIoControl.OutputBufferLength;
     NTSTATUS st = STATUS_SUCCESS;
     ULONG info = 0;
+    ULONG ioCode0 = sp->Parameters.DeviceIoControl.IoControlCode;
+
+    /* [83 补裁 A] 独立功能码窗口门：IOCTL_RB_BOOTCFG / IOCTL_RB_EXCLUDE 不进
+     * 下方 RB_MSG switch（下方 :1008 的门只覆盖 msg->Type）。BOOTCFG 会改
+     * AutoAttach/ResumeOnBoot/ResumeLetters，EXCLUDE 会改排除集——重建窗口内
+     * 放任会污染 E2 的 Attached 集合判据与 snapshot 基线。改状态类一律拒绝；
+     * GET/LOGQ/只读统计（RB_MSG GET_*、IOCTL_RB_LOGQ、RB2_* STATS）放行，
+     * QA 需在窗口内采 GET_STATS/GET_EVENTS/LOGQ 的中间态。
+     * 注意：不把 Unloading 加到控制设备分支；本门只看 Recreating。 */
+    if (InterlockedCompareExchange(&g_Rb.Recreating, 0, 0) != 0 &&
+        (ioCode0 == IOCTL_RB_BOOTCFG || ioCode0 == IOCTL_RB_EXCLUDE)) {
+        RbLog(1, __LINE__, (LONG)ioCode0,
+              L"rebuild window: independent ioctl rejected (config mutation blocked)");
+        return RbCtlFail(irp, STATUS_DEVICE_BUSY);
+    }
 
     /* 仅控制设备处理本 IOCTL；卷设备上的同类请求透传 */
     if (dev != g_Rb.ControlDevice) {

@@ -148,7 +148,10 @@ typedef struct _RB_IOCTX {
     PRB_DEV_EXT      Ext;
     UCHAR            Major;
     UCHAR            Passthru;  /* [P0-1] 透传写：worker 内先失效缓存区间再前转（rbio.c） */
-    UCHAR            Rsvd[2];   /* 对齐保留；lookaside 分配不清零，dispatch 侧逐字段显式赋值，Rsvd 只占位不读取 */
+    /* [83 收窄#1] Rsvd[0] = g_Rb.DataPathInFlight 计数标记（RbCtxAlloc 显式置
+     * 1/0，RbCtxFree 读它决定是否 decrement）；Rsvd[1] 占位。lookaside 复用
+     * 不清零，故 RbCtxAlloc 必须显式赋值（见 rbio.c），不能依赖旧值。 */
+    UCHAR            Rsvd[2];
     LARGE_INTEGER    Offset;
     ULONG            Length;
 } RB_IOCTX, *PRB_IOCTX;
@@ -525,6 +528,12 @@ NTSTATUS RbRecreateEngineGeometry(ULONG newBlockSize);
 NTSTATUS RbWaitDataPathQuiesce(ULONG timeoutMs);
 BOOLEAN  RbIsDataPathFrozen(VOID);        /* 入口一次 volatile 读：Unloading||Recreating */
 ULONG    RbPrefInFlightCount(VOID);       /* 实现见 rbpref.c：导出静态计数快照 */
+/* ---- [83 第二笔 2026-11-07] 卸载 ↔ 重建 work item 互斥排空判据 ----
+ * RbRebuildIsActive：Recreating / GeometryRebuildInProgress / 静态
+ * s_RebuildInFlight 任一非 0 即表示重建 work item 仍在飞（含「已抢主未入队」、
+ * 「已入队未执行」、「执行中」、「尾部统一清零之前」）。RbUnload 在停机序列
+ * 最前据此有界等待，超时即中止卸载，绝不带着在飞 work item 销毁引擎。 */
+BOOLEAN  RbRebuildIsActive(VOID);
 
 /* ---- [V10.1] failsafe 接口（实现见 rbdriver.c / rbio.c） ---- */
 VOID    RbSetPanic(PCWSTR reason);                 /* 任意 IRQL：原子置位 + 唤醒 flush 线程 */

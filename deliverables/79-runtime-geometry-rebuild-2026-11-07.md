@@ -130,10 +130,11 @@ QA 在 78 号 §10 指出 B1：**若 `RbEngineGeometry()` 只存在于驱动内�
 1. `src/ctl/rb_proto.h:208` 前追加四个字段（末尾纯追加、不升 ProtocolVersion）。
 2. `src/driver/rbctl.c:41` `RbFillStats()` 填充：`EngineBlockSize` 读 `g_Rb.Engine ? rb_engine_block_size(g_Rb.Engine) : 0`；其余三个读新增的 `g_Rb` 状态。
 3. `src/ctl/ramboostctl.c:1969-1985` `statval` 白名单加 `engine_bs` / `rebuild_count` / `rebuild_status` / `rebuild_utc`，并同步 `:1935` 的 usage 文本与错误提示字段列表。
-4. `web/bridge/server/proto-decode.ts:49-88` `decodeStats` 加**长度守卫**：`p.length >= 1284` 才读 `EngineBlockSize`，否则填 0；其余新字段同理。这是 66 号白屏的同款防线（旧驱动回包更短时不得抛 `RangeError`）。
-5. `web/src/protocol/types.ts:49` `RbStats` 接口 + `web/src/bridge/http-transport.ts` 的 `statsSchema` 同步（新增字段设 `.default(0)`，与 TinyLFU 修复同款）。
-6. C# 三副本同步：`src/ui/controller/RAMBlockCache.Controller/Models/Models.cs`、`.../Services/DriverService.cs`、`src/ui/wpf/Models/RbProto.cs`。
-7. `python src/scripts/check_proto_sync.py --strict` 必过（三副本字段名/顺序/偏移/结构大小）。
+4. `web/bridge/server/proto-decode.ts:49-88` `decodeStats` 加**分级长度守卫**：4 个 u32 各自 `p.length>=off+4` 才读，`LastGeometryRebuildUtc`（u64@1296）用 `p.length>=1304` 才 `readU64(p,1296)`；不足一律填 0，绝不抛 `RangeError`（66 号白屏同款防线）。~~`p.length>=1284`~~ **【83 号修订 2026-11-07：正式作废**——1284 是第二个字段 `GeometryRebuildCount` 的偏移，照抄会读错；实算值为 `EngineBlockSize@1280 / GeometryRebuildCount@1284 / GeometryRebuildLastStatus@1288 / GeometryRebuildInProgress@1292 / LastGeometryRebuildUtc@1296，`sizeof(RB_STATS)=1304`（`check_proto_sync.py --strict` Pack=8 实算）。**」**
+5. `web/src/protocol/types.ts:49` `RbStats` 接口 + `web/src/bridge/http-transport.ts` 的 `statsSchema` 同步（新增字段设 `.default(0)`，与 TinyLFU 修复同款）；`web/src/state/stats-history.test.ts` 夹具补五字段零值。
+6. C# 三副本同步：`src/ui/controller/RAMBlockCache.Controller/Models/Models.cs`、`.../Services/DriverService.cs`、`src/ui/wpf/Models/RbProto.cs`；`src/ctl/ramboostctl.c:1969-1985` `statval` 白名单加 5 键并同步 `:1935` usage。
+7. `python src/scripts/check_proto_sync.py --strict` 必过（三副本字段名/顺序/偏移/结构大小）。83 号第一批已 `PASS (0 fail, 0 warn)`。
+8. 协议向后兼容双层兜底（83 号实测）：`ramboostctl.c:103 rb_send memcpy(reply,msg,sizeof(RB_MSG))` + `:123 rb_get_stats memset(&msg,0,...)` ⇒ 旧驱动短回包时五字段在 CLI 侧天然为 0；桥接长度守卫是第二层。
 
 **E1-c 判据改写**：`ramboostctl statval engine_bs` 与 `GET_STATS.EngineBlockSize` 必须等于目标几何；**只查注册表 / `GET_CONFIG` 配置副本 / `[rebuild]` 日志一律不算数**。E2 补 `DeploySeq` 不因重建递增；E8 用 `GeometryRebuildCount` 递增 + `LastGeometryRebuildUtc` 变化作为「重建确实发生」的正面证据（QA 盲区 B8）。
 
@@ -156,7 +157,7 @@ QA 在 78 号 §10 指出 B1：**若 `RbEngineGeometry()` 只存在于驱动内�
 | R7 | `CachePagingIo=0` 分页 IO 透传 | 重建窗口内 pagefile/转储 IO 本就透传，不受影响；仍须复核无遗漏路径 |
 | R8 | 并发 attach/detach 与重建竞争 | `rbattach.c:1231` 已有 `Unloading` 拒绝 attach；detach 路径需补 `Recreating` 检查 |
 | R9 | 控制面阻塞 | 重建必须在 PASSIVE work item 内；`SET_CONFIG` 立即返回 |
-| R10 | 4K 热路径回归 | **不得**在 4K 读写路径新增任何原子/分支；门控只在入口判断一次，且 4K 默认态不触发重建 |
+| R10 | 4K 热路径回归 | **不得**在 4K 读写路径新增原子写或锁；正确性所必需的失效允许（82 号 §4.7.2 方案 A），但须 4K A/B 结构 diff 0 + 吞吐回归留证。门控只在入口判断一次，4K 默认态不触发重建 |
 
 ---
 

@@ -106,9 +106,41 @@ static PVOID RbMapIrpBuffer(PIRP irp)
     return irp->AssociatedIrp.SystemBuffer;
 }
 
-/* [CTX-1] RB_IOCTX 非分页旁视池（dispatch 热路径每 IO 一次分配的替代） */
-PVOID RbCtxAlloc(VOID)   { return ExAllocateFromNPagedLookasideList(&g_Rb.IoCtxLa); }
-VOID  RbCtxFree(PVOID p) { if (p) ExFreeToNPagedLookasideList(&g_Rb.IoCtxLa, p); }
+/* [CTX-1] RB_IOCTX 非分页旁视池（dispatch 热路径每 IO 一次分配的替代）。
+ * [83 收窄#1] DataPathInFlight 落点按最终裁定：RbCtxAlloc 成功后 +1、
+ * RbCtxFree 内部 -1（覆盖 alloc→submit→worker 完成窗口，预检②证实
+ * RbCtxAlloc/RbCtxFree 严格配对）。与 R10「4K 热路径零新增原子写」调和：
+ * 用 Recreating 门控——4K 常态 Recreating=0 时只做一次 volatile 读分支，
+ * 零 InterlockedIncrement；只有重建窗口内分配的 ctx 才计数并打标记。
+ * 窗口前置入的 ctx 不计入 DataPathInFlight，但 RbWaitDataPathQuiesce 的
+ * 「每卷 ext->Refs 回基准」判据兜底（ext->Refs 由 dispatch 入口 :1420 无条件
+ * 递增，覆盖窗口前置入 ctx。双判据：DataPathInFlight==0 && refsQuiet）。
+ * Rsvd[0] 显式赋值（lookaside 复用不清零）。
+ * RbFlushSubmit 用既有 FlushJobs 计数，不并入 DataPathInFlight，避免双重计数。 */
+PVOID RbCtxAlloc(VOID)
+{
+    PRB_IOCTX c = (PRB_IOCTX)ExAllocateFromNPagedLookasideList(&g_Rb.IoCtxLa);
+    if (c) {
+        if (InterlockedCompareExchange(&g_Rb.Recreating, 0, 0) != 0) {
+            c->Rsvd[0] = 1;
+            InterlockedIncrement(&g_Rb.DataPathInFlight);
+        } else {
+            c->Rsvd[0] = 0;
+        }
+    }
+    return (PVOID)c;
+}
+VOID  RbCtxFree(PVOID p)
+{
+    PRB_IOCTX c = (PRB_IOCTX)p;
+    if (c) {
+        if (c->Rsvd[0]) {
+            c->Rsvd[0] = 0;
+            InterlockedDecrement(&g_Rb.DataPathInFlight);
+        }
+        ExFreeToNPagedLookasideList(&g_Rb.IoCtxLa, p);
+    }
+}
 
 /* [83 2026-11-07 M5] 重建窗口数据面冻结判定（入口一次 volatile 读）。
  * 用于旁路回调/池作业的早退门：这些作业在 Unloading/Recreating 期间可能
@@ -941,11 +973,31 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
          * 线程已过 RbIsWriteBack 判定而吸收后于切换 flush 的末趟扫描）会在
          * 缓存遗留脏块，本分支原先不触碰缓存脏态——在途回写/周期回写随后把
          * 旧脏数据落盘，覆盖本直写已 ack 的新数据（盘面+缓存终态均为旧值）。
-         * 正常态 write-through 无脏 → has_dirty_range=0 → 零开销。 */
+         *
+         * [83 2026-11-07 / 81 号 QA 复现确证 / 82 号 §4.7 方案 A] BLOCKER 2：
+         * 原实现「仅当有脏时失效」，直写稳态无脏 ⇒ 不失效；>4K 几何下 4K 写
+         * 只覆盖子块的一部分，:944 的 rb_read_commit_gen 因 full_cover=FALSE
+         * 直接跳过回填也不失效 ⇒ 缓存 clean 块保留旧内容 ⇒ 后续读命中即
+         * silent stale read（QA v2：8K/16K/32K STALE、4K+512B 扇区尾也 STALE）。
+         * 缺陷本质是「任何几何下的非整子块写」，不限于 >4K，故采用**无条件**
+         * 失效（否决「bs>4096 && 非整子块写」门控版：QA --mode post-cond 实证
+         * 门控版漏 4K/tail512）。
+         * 改法：保留「有脏先 rb_stream_flush(stream,1)」子步骤（语义是先刷脏再
+         * 失效，不是有脏才失效）；随后无条件 RbInvalidateAfterFlush。:951
+         * RbSyncIo 与 :956 rb_read_commit_gen 一律不动——失效升 view_gen 后，
+         * :957 的 rb_stream_view_gen 在失效之后捕获新世代，4K 档 full_cover=TRUE
+         * 会把 B 填回 clean 子块（4K 正常写零命中率损失）；>4K 档跳过回填但
+         * loaded 已清，下次读 miss 下盘拿新值。cache.c 零改动。
+         * 同文件另 4 条直写/透传路径（:727-743 Passthru、:757-766 RbFeatAdmit
+         * 排除、分页 WRITE、FSCTL/簇重排 DATA-15）都是无条件失效，本改动让纪律统一。
+         * 代价（79 号 §5 R10 收窄口径）：每次非整子块写升 view_gen + wb_drain，
+         * 在途预取按世代失配放弃回填 ⇒ 命中率下降属预期；S4 五路吞吐与修复前
+         * 不可比，只作同机同批相对参考。 */
         LARGE_INTEGER o;
         o.QuadPart = off;
-        if (ext->Stream && rb_stream_has_dirty_range(ext->Stream, (rb_u64)off, (size_t)len)) {
-            rb_stream_flush(ext->Stream, 1);
+        if (ext->Stream) {
+            if (rb_stream_has_dirty_range(ext->Stream, (rb_u64)off, (size_t)len))
+                rb_stream_flush(ext->Stream, 1);
             RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
         }
         s = RbSyncIo(ext, TRUE, &o, tgt, len, NULL);

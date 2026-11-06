@@ -161,6 +161,67 @@
 
 ---
 
+## 4.6 RISK（条件 GO）后的补充裁定（02:0x）
+
+工程师明细复核给出 **RISK（条件 GO，5 项硬前置全可满足）**，与 §4.5 及已发出的实施单收敛一致。它另交 **B3 逐入口静态核查清单**（17 行）：10 处 `Unloading` 检查只挡新 IO 准入，8 类在途/回调路径无屏障（`RbSubmitIo` 已入队 ctx、`Rb2_PortFill` 裸读 `ext->Stream`、`RbPrefIssueJob` / `RbHotPrewarmJob` / `RbEvictJob` 异步作业、周期 flusher、resume sweep、内联快路径、`FallbackInFlight`）。该清单作为 E6/E8 输入，由 QA 做第二层逐入口复核。
+
+主理人补充裁定 5 条（已同步两名成员）：
+
+| # | 裁定 |
+|---|---|
+| **A · 控制面门控精确化** | 不能一刀切。按 `msg->Type` 过滤：**拒** `SET_CONFIG`（发起重建者除外）/ `ATTACH_VOLUME` / `SET_VOLUME` / `PANIC*`，返回 `STATUS_DEVICE_BUSY`；**放行** `GET_CONFIG` / `GET_STATS` / `GET_LOG` / `GET_EVENTS` / `LOGQ` —— 否则 QA 在重建窗口内采不到 `GeometryRebuildInProgress=1` 与 `EngineBlockSize=0`，E1/E8 无证据。单主同源：`RbMsgSetConfig` 检测 `BlockSize` 变化先 CAS 抢主，抢到者放行并入队，其余见 `Recreating!=0` 拒。`IOCTL_RB_BOOTCFG`（`rbctl.c:855-890`）与 `IOCTL_RB_EXCLUDE`（`:914-920`）不进 RB_MSG switch，窗口内拒绝或至少 WARN，防污染 E2 卷集合判据。 |
+| **B · 补 `reply.Status` 校验** | `rb_set_config`（`ramboostctl.c:165-175`）只校验 `reply.Type` 不校验 `Status`；`RbMsgSetConfig`（`rbctl.c:311-332`）`:313 UNREFERENCED_PARAMETER(pst)` 恒成功 ⇒ 驱动正确返回 BUSY 时 CLI 仍报「配置已应用」，**E5 失败回滚注入从 CLI 侧看不到失败**。实施单补：CLI 校验 `reply.Status` + 驱动如实写回 `*pst`。`reg query` 双证据只证明注册表，不能替代。 |
+| **C · BLOCKER 2 修复方案 → 主理人撤回「条件式」裁定，改采 QA 方案 A（无条件失效）** | 见下方 §4.7。**放行前置已成立**：`deliverables/81-directwrite-stale-repro-2026-11-07.md` + 主理人独立复跑确认复现。修复改为 `rbio.c:935` 无条件 `RbInvalidateAfterFlush`，**不动 `cache.c`**；并入同批第二笔提交。 |
+| **D · 锁范围澄清** | 工程师条件 GO 第 4 条「全程持 `s_AttachMutex`」与「不得回调 `RbAttachVolumeByLetter`（KMUTEX 自死锁）」并存有歧义。按 M4 执行：该锁**只覆盖快照 + 逐卷摘链 + 引擎销毁/重建，重挂前释放**；重挂走既有 `RbAttachVolumeByLetter`（不持锁），并发由 `Recreating` 门（M1 三处补门）挡住。若坚持全程持锁须给出不自死锁的实现与锁序证据。 |
+| **E · QA 用例保留两套断言** | 修复后的驱动两段式会多一步「写盘 + 失效（升 `view_gen`）+ 短 len commit」。`test_directwrite_stale.c` 须用 `--mode pre|post` 表达两种行为：PRE_FIX 期望 >4K 档 STALE/FAIL，POST_FIX 期望全档 CLEAN/PASS。否则「驱动已修、用例仍断言旧行为 FAIL」会在 E3/E4 制造假红。 |
+
+**口径污染（写入 78 号 §5）**：修复后每次 >4K 几何下的 4K 覆盖写会 `RbInvalidateAfterFlush` → 升 `view_gen` + `wb_drain`，预取 `rb_read_commit_gen` 因世代失配放弃回填、命中率下降属预期代价，**S4 五路吞吐与修复前（72/75 号）不可比**，只作同机同批相对参考，不作峰值/最优路数宣称。
+
+**当前分工（并行、文件不冲突）**：工程师执行实施单第一批（卷级重建骨架 + 门控 + 停机可逆补丁 + `RB_STATS` 五字段与协议三副本 + 8 类回归用例 + 6 项开工预检，交付 `deliverables/83-*`）；QA 完成 BLOCKER 2 四档复现（`src/core/test_directwrite_stale.c` + `deliverables/81-*`），并修订 78 号口径限制。两者均不碰真机卷/配置/签名/git。
+
+---
+
+## 4.7 BLOCKER 2 复现确证与修复方案裁定（02:1x）
+
+### 4.7.1 复现确证（作者≠验证者，两层独立）
+
+QA 交付 `src/core/test_directwrite_stale.c`（16,579 B / sha `37f810ed…`）、`build/qa_stale_directwrite.exe`（168,960 B / `59762e33…`）、`deliverables/81-directwrite-stale-repro-2026-11-07.md`（24,884 B / `3ae119a6…`）。用例严格模拟驱动 `rbio.c:925-946` 直写两段式：`RbSyncIo` 写模拟盘 + `rb_read_commit_gen` 传原始 IRP 长度，**不用 `rb_write_ex`**（直写下不可达，用了会测到回写 RMW 路径、结论无效）。
+
+主理人 01:39 独立复跑结果（未采信单一来源）：
+
+| 几何 | COVER_PCT | MAIN（修复前） | CONTROL（模拟失效后） |
+|---|---|---|---|
+| 4096 | 100% | **CLEAN** `MISMATCH_COUNT=0` | CLEAN |
+| 8192 | 50% | **STALE** `MISMATCH_COUNT=4079` | CLEAN |
+| 16384 | 25% | **STALE** `MISMATCH_COUNT=4079` | CLEAN |
+| 32768 | 12.5% | **STALE** `MISMATCH_COUNT=4079` | CLEAN |
+
+汇总 `MAIN_STALE=3 MAIN_CLEAN=1 CONTROL_CLEAN=4 HARNESS_ERRORS=0`。关键证据链：`STEP1_PRELOAD try_cache_hit=1 preload_match=1`（clean+loaded 前置成立）、`STEP4_READ try_cache_hit=1 miss_count=0 read_hit_bytes_delta>0`（**确实从缓存服务，不是 miss 下盘读**）、16K 单档 `STALE_SHAPE=1` + `FIRST_MISMATCH_EXPECTED=0x35 / ACTUAL=0xc8`（期望 B 实际 A，全部差异落在 `[0,4096)`）。4K 单档 CLEAN 对照成立。
+
+⇒ **BLOCKER 2 从【推断】升级为【用户态 core 域确证】**：>4K 几何 + 直写 + 4K 非整子块覆盖写 ⇒ 缓存 clean 块静默陈旧读。80 号 §2.3「运行时后果待复现」至此闭环。
+
+### 4.7.2 撤回条件式修复，改采方案 A（无条件失效）
+
+我先前在 §4.6 C 裁定「`bs>4096 && 非整子块写` 的条件式失效」，**现撤回**。QA 的证伪理由成立：
+
+1. 缺陷本质是「**任何几何下的非整子块写**」，不只在 >4K；4K 几何下 512B 扇区尾写同样 `full_cover=FALSE`。条件式只修一半。
+2. 同文件另外 4 条直写/透传路径（`rbio.c:727-743` Passthru、`:757-766` RbFeatAdmit 排除、`:1346-1348`/`:737-738` 分页 WRITE、FSCTL/簇重排 DATA-15）**都是无条件失效**，方案 A 让纪律统一。
+3. `CONTROL_CLEAN=4` 直接实证无条件失效有效。
+4. **性能顾虑被大幅削弱**：`:944` 的 `rb_read_commit_gen` 可原样保留 —— 失效升 `view_gen` 后 `:945` 在失效之后捕获新世代，4K 档 `full_cover=TRUE` 会把新数据 B 重新填回缓存，**4K 正常 4K 写仍被正确预热、零命中率损失**；只损失在途预取回填，那是正确性必需。
+
+**裁定**：`rbio.c:935` 改为无条件 `RbInvalidateAfterFlush`（保留 `:944` commit）；**否决方案 B**（`cache.c:1486` 改 `c->loaded &= ~(1<<idx)` 会丢掉该子块其余 12K 有效 clean 数据，且触碰 74 号三层验证的基准文件）。`cache.c` **零改动**。
+
+**79 号 §5 R10 再次收窄**：「不得在 4K 读写路径新增原子写或锁；正确性所必需的失效允许，但须 4K A/B 结构 diff 0 + 吞吐回归留证」。修复后每次 >4K 4K 覆盖写升 `view_gen` + `wb_drain`，在途预取按世代失配放弃回填 ⇒ 命中率下降属预期，S4 五路吞吐与修复前（72/75 号）不可比，只作同机同批相对参考。
+
+### 4.7.3 时序与 QA 用例的两套断言
+
+- **第一批**（工程师实施单）仍不动 `rbio.c:925-946`；放行前置现已成立 ⇒ **方案 A 作为同批第二笔提交并入**，不重开全链。
+- QA 用例已内置 MAIN（修复前，期望 >4K STALE）与 CONTROL（修复后模拟，期望全档 CLEAN）两套断言，恰好满足 §4.6 E 的「两套断言」要求，无需返工。81 号报告已给出两列结果表。
+- 修复落盘后，`test_directwrite_stale.c` 的 CONTROL 断言成为 E3/E4 回归的输入；工程师的 8 类回归用例须补一条「>4K 直写陈旧读」正向断言（修复后全档 CLEAN）。
+- **口径边界**：以上是用户态 core 域确证；驱动侧 `rbio.c:935` 的实际修复效果仍须 S2 全链重放 + 重启验收后由真机证据确认，不得提前宣称「内核已修」。
+
+---
+
 ## 5. 口径限制
 
 - §3 折中路径为**基于代码阅读的设计推断**，尚未经工程师 GO 裁决，**不得当作已确认可行**；P1–P6 均待答。

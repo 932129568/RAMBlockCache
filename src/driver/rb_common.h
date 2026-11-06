@@ -208,7 +208,11 @@ typedef struct _RB_GLOB {
     LARGE_INTEGER    LastMemTick;
     ULONG            DynamicLimitMB;
     WCHAR            SystemDriveLetter;
-    BOOLEAN          Unloading;
+    /* [83 2026-11-07] BOOLEAN -> volatile LONG：重建窗口需 InterlockedExchange
+     * 发布序（原 BOOLEAN 裸写在多核下无发布屏障）。所有既有读点（rbio.c
+     * :1425/:1569/:352/:1322/:1329、rbctl.c:789/:825、rbattach.c:1231、
+     * rbio_ports.c:40） semantics 不变：非 0 即真；IF 判定用 !=0 而非 ==TRUE。 */
+    volatile LONG    Unloading;
     UNICODE_STRING   RegPath;
     /* ---- V8.1 多核池 ---- */
     RB_IOWORKER      IoWorkers[RB_IO_WORKERS_MAX];
@@ -310,6 +314,21 @@ typedef struct _RB_GLOB {
      * L2 重建（B-8）待 W2 路径就绪后在重建循环发布（Phase 字段已备）。 */
     RB_EVENT_REC    EvRing[RB_EVENT_MAX];
     volatile LONG   EvSeq;              /* 已发布事件的最大 Seq（0=无） */
+    /* ---- [83 2026-11-07] 运行期几何重建（末尾纯追加；非协议面）----
+     * Recreating：CAS 单主，0/1。1=重建窗口内，控制面拒绝并发 SET_CONFIG、
+     * 主 attach/detach/resume sweep 拒绝插队、旁路作业入口早退。
+     * DataPathInFlight：主 IO 路径全局在途计数。RbCtxAlloc 成功后 +1，
+     * RbCtxFree -1（严格配对，覆盖「已分配未入队」窗口）；zone 回写作业
+     * 由既有 FlushJobs 计数，不并入此处，避免双重计数。
+     * GeometryRebuild* / LastGeometryRebuildUtc：GET_STATS 五字段数据源。
+     * 全部为驱动内部状态，不进 RB_CONFIG / RB_MSG，不影响 ProtocolVersion。 */
+    volatile LONG   Recreating;
+    volatile LONG   DataPathInFlight;
+    volatile LONG   GeometryRebuildCount;
+    volatile LONG   GeometryRebuildLastStatus;   /* NTSTATUS；0=成功 */
+    volatile LONG   GeometryRebuildInProgress;
+    volatile LONG   GeometryRebuildOldBs;        /* 重建发起时旧引擎几何，供回滚 */
+    LARGE_INTEGER   LastGeometryRebuildUtc;     /* KeQuerySystemTimePrecise FILETIME */
 } RB_GLOB;
 
 extern RB_GLOB g_Rb;
@@ -454,6 +473,23 @@ DRIVER_UNLOAD RbUnload;                /* 干净卸载：支持 sc stop / 免重
 /* ---- V9 rbattach.c：运行时定向附加 / 硬排除 / 全卷枚举 ---- */
 NTSTATUS RbEnsureEngine(VOID);
 NTSTATUS RbAttachVolumeByLetter(WCHAR letter);
+/* [83 2026-11-07] 重建 worker 专用重挂：绕过 Recreating 门，其余检查与常规
+ * attach 相同。rbrebuild.c 逐卷重挂时调用；控制面/巡检禁止调用。 */
+NTSTATUS RbReattachVolumeForRebuild(WCHAR letter);
+/* [83 2026-11-07] 只建引擎不启池（重建用）：RbEnsureEngine 会在 created 时
+ * RbStartIoWorkers/RbStartFlushers/RbStartFlushThread 二次启动正在服役的池。
+ * 参数 newBs 已 clamp 到白名单；失败返回 STATUS_INSUFFICIENT_RESOURCES。 */
+NTSTATUS RbCreateEngineOnly(ULONG newBs);
+/* [83 2026-11-07] 软摘链原语：置 IsAttached=FALSE、等 Refs 回基准、flush+discard、
+ * 原子摘除并销毁 stream；不删设备、不清 Magic、不摘 DevList、不置 Removed。
+ * selfRefs = 调用方额外持有的引用数（RbFindExtByLetter 返回带引用 = 1）；
+ * 排空判据为 Refs <= 1(owner) + selfRefs，与 RbVolumeRemove 同款纪律。
+ * 返回 FALSE 表示排空超时或脏数据未落盘，调用方必须回滚重建（禁止销毁引擎）。 */
+BOOLEAN  RbDetachStreamForRebuild(PRB_DEV_EXT ext, LONG selfRefs);
+/* [83 2026-11-07] 快照当前 Attached 卷的 read/write/wm 标志，重挂后复原。
+ * 供 rbrebuild.c 调用（内部持 DevListLock 快照，PASSIVE）。 */
+VOID     RbSnapshotVolumeFlags(WCHAR letter, PLONG rd, PLONG wr, PLONG wm, PBOOLEAN found);
+VOID     RbRestoreVolumeFlags(WCHAR letter, LONG rd, LONG wr, LONG wm);
 /* [FIX B-U0-8] TestMode 运行时挂栈卷孤儿巡检（Rb2Tick 周期调）：卷意外消失
  * （USB 拔出/盘符易主，无 REMOVE IRP 到达）→ 强制重解析失败超 30s 即完整拆除。 */
 VOID     RbJanitorSweepRuntimeAttached(VOID);
@@ -475,6 +511,20 @@ NTSTATUS RbPnpRemoveComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID ctx);
 NTSTATUS RbAttachVolumeRuntime(WCHAR letter);
 static __inline BOOLEAN RbTestModeEnabled(VOID)   /* 热路径内联版：一次 volatile 读 */
 { return (BOOLEAN)g_Rb.TestMode; }
+
+/* ---- [83 2026-11-07] 运行期几何重建（实现见 rbrebuild.c） ----
+ * RbRequestGeometryRebuild：SET_CONFIG 命中 BlockSize 变化时调用；PASSIVE，
+ *   只做「校验 + 入队 + 立即返回」，30s 级 join / 引擎销毁必须在 work item 内
+ *   （RbApplyConfig 持 CfgLock=FastMutex 会抬到 APC_LEVEL）。
+ * RbRecreateEngineGeometry：work item 内 PASSIVE 执行的完整重建序列（含回滚）。
+ * RbWaitDataPathQuiesce：有界等待 6 项在途判据全归零；超时禁止销毁引擎。
+ * RbDetachStreamForRebuild / RbReattachVolumesForRebuild：软摘链/重挂原语
+ *   （不删设备、不清 Magic、不摘 DevList；与 RbVolumeRemove 的完整拆除区分）。 */
+NTSTATUS RbRequestGeometryRebuild(ULONG newBlockSize);
+NTSTATUS RbRecreateEngineGeometry(ULONG newBlockSize);
+NTSTATUS RbWaitDataPathQuiesce(ULONG timeoutMs);
+BOOLEAN  RbIsDataPathFrozen(VOID);        /* 入口一次 volatile 读：Unloading||Recreating */
+ULONG    RbPrefInFlightCount(VOID);       /* 实现见 rbpref.c：导出静态计数快照 */
 
 /* ---- [V10.1] failsafe 接口（实现见 rbdriver.c / rbio.c） ---- */
 VOID    RbSetPanic(PCWSTR reason);                 /* 任意 IRQL：原子置位 + 唤醒 flush 线程 */

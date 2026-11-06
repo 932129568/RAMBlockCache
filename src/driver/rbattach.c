@@ -362,6 +362,111 @@ static ULONG64 RbQueryVolId(PRB_DEV_EXT ext)
 /* =====================================================================
  * [R5] 惰性引擎：首次 attach 才创建引擎并启动工作池
  * ===================================================================== */
+/* [83 2026-11-07] 只建引擎、不启池、不下发运行期配置项以外的东西。
+ * 与 RbEnsureEngine 的区别：created 时不调 RbStartIoWorkers/RbStartFlushers/
+ * RbStartFlushThread（这三个会在池仍在服役时二次初始化链表/覆盖 Thread 引用）。
+ * 重建路径中 worker/flusher 池与 flush 线程全程不停，故这里只需装配 rb_config
+ * 并 rb_engine_create；RbApplyEngineConfig/RbRefreshMemoryBudget 由调用方随后调。
+ * 必须在 EngineMutex 内发布 g_Rb.Engine（与 RbEnsureEngine 同一把锁）。 */
+NTSTATUS RbCreateEngineOnly(ULONG newBs)
+{
+    rb_config cfg;
+    NTSTATUS st = STATUS_SUCCESS;
+    PAGED_CODE();
+    ExAcquireFastMutex(&g_Rb.EngineMutex);
+    if (g_Rb.Engine) { ExReleaseFastMutex(&g_Rb.EngineMutex); return STATUS_SUCCESS; }
+    RtlZeroMemory(&cfg, sizeof(cfg));
+    cfg.max_bytes         = (rb_u64)g_Rb.Config.CacheSizeMB * 1024 * 1024;
+    cfg.block_size        = newBs;
+    cfg.user_ctx          = NULL;
+    cfg.writeback         = RbWritebackCb;
+    cfg.readback          = RbReadbackCb;
+    cfg.readahead_enabled = g_Rb.Config.ReadaheadEnabled;
+    cfg.readahead_window  = (rb_u64)g_Rb.Config.ReadaheadWindowKB * 1024;
+    cfg.tinylfu           = (int)g_Rb.Config.TinyLFU;
+    g_Rb.Engine = rb_engine_create(&cfg);
+    st = g_Rb.Engine ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
+    ExReleaseFastMutex(&g_Rb.EngineMutex);
+    RbLog(0, __LINE__, (LONG)newBs, L"rebuild: engine created (pools kept running)");
+    return st;
+}
+
+/* [83 2026-11-07] 卷标志快照/复原（重建重挂后 read/write/wm 保持不变）。
+ * 内部持 DevListLock 遍历，PASSIVE；未找到时 found=FALSE，调用方跳过复原。 */
+VOID RbSnapshotVolumeFlags(WCHAR letter, PLONG rd, PLONG wr, PLONG wm, PBOOLEAN found)
+{
+    PLIST_ENTRY link;
+    if (!rd || !wr || !wm || !found) return;
+    *found = FALSE; *rd = 0; *wr = 0; *wm = RB_WRITEMODE_GLOBAL;
+    ExAcquireFastMutex(&g_Rb.DevListLock);
+    for (link = g_Rb.DevList.Flink; link != &g_Rb.DevList; link = link->Flink) {
+        PRB_DEV_EXT e = CONTAINING_RECORD(link, RB_DEV_EXT, ListEntry);
+        if (RtlUpcaseUnicodeChar(e->Letter) == RtlUpcaseUnicodeChar(letter)) {
+            *rd = e->ReadEnabled; *wr = e->WriteEnabled; *wm = e->WriteMode;
+            *found = TRUE;
+            break;
+        }
+    }
+    ExReleaseFastMutex(&g_Rb.DevListLock);
+}
+
+VOID RbRestoreVolumeFlags(WCHAR letter, LONG rd, LONG wr, LONG wm)
+{
+    PLIST_ENTRY link;
+    ExAcquireFastMutex(&g_Rb.DevListLock);
+    for (link = g_Rb.DevList.Flink; link != &g_Rb.DevList; link = link->Flink) {
+        PRB_DEV_EXT e = CONTAINING_RECORD(link, RB_DEV_EXT, ListEntry);
+        if (RtlUpcaseUnicodeChar(e->Letter) == RtlUpcaseUnicodeChar(letter)) {
+            e->ReadEnabled = rd; e->WriteEnabled = wr; e->WriteMode = wm;
+            break;
+        }
+    }
+    ExReleaseFastMutex(&g_Rb.DevListLock);
+}
+
+/* [83 2026-11-07] 软摘链原语（重建专用）。
+ * 与 RbVolumeRemove 的完整拆除不同：保留 FilterDevice/PDO/DevList/Magic/
+ * Removed/RemoveDone 原样，只摘并销毁缓存流，使 RbReattachVolumeForRebuild
+ * 能通过 RbFindExtByLetter 找回同一 ext 并 rb_stream_create 重建流。
+ * 顺序照 RbVolumeRemove :681-750：先关 inflow、再等 Refs 排空、再 flush、
+ * 最后原子摘链 + rb_stream_destroy。排空超时返回 FALSE（禁止销毁引擎）。 */
+BOOLEAN RbDetachStreamForRebuild(PRB_DEV_EXT ext, LONG selfRefs)
+{
+    LARGE_INTEGER tick;
+    ULONG i;
+    rb_stream *st;
+    LONG base;
+    PAGED_CODE();
+    if (!ext) return TRUE;
+
+    /* owner 基准 1 + 调用方额外引用（RbFindExtByLetter 带 1 引用）。
+     * 窗口内 Unloading=1 已挡新 IO、旁路作业早退，Refs 只会下降不会新增。 */
+    base = 1 + selfRefs;
+    ext->IsAttached = FALSE;
+    KeMemoryBarrier();
+    tick.QuadPart = -200000LL;                 /* 20ms/步 */
+    for (i = 0; i < 3000; i++) {               /* 60s 上限 */
+        if (InterlockedCompareExchange(&ext->Refs, 0, 0) <= base) break;
+        KeDelayExecutionThread(KernelMode, FALSE, &tick);
+    }
+    if (InterlockedCompareExchange(&ext->Refs, 0, 0) > base) {
+        RbLog(2, __LINE__, 0, L"rebuild: detach drain timeout, abort (engine kept)");
+        return FALSE;
+    }
+    st = (rb_stream *)InterlockedExchangePointer((PVOID *)&ext->Stream, NULL);
+    if (st) {
+        /* 排空已完成、无并发访问：先保证脏数据落盘（E4），再销毁流。
+         * rb_stream_destroy 内部先摘 eng->streams 表，之后 rb_engine_destroy
+         * 不会再遍历到它，无双重释放。刷脏失败如实留痕（回滚时旧引擎仍在，
+         * 但本卷流已丢弃——回滚路径会逐卷重挂建新流，缓存冷一轮）。 */
+        rb_stream_flush(st, 1);
+        if (rb_stream_dirty_bytes(st) != 0)
+            RbLog(2, __LINE__, 0, L"rebuild: dirty data could not be flushed before detach");
+        rb_stream_destroy(st);
+    }
+    return TRUE;
+}
+
 NTSTATUS RbEnsureEngine(VOID)
 {
     NTSTATUS st = STATUS_SUCCESS; BOOLEAN created = FALSE;
@@ -573,6 +678,10 @@ VOID RbAutoAttachSweep(VOID)
     static LONG busy = 0;
 
     PAGED_CODE();
+    /* [83 2026-11-07 M1] 重建窗口拒绝 resume sweep：Rb2Tick 每 30s 调本函数，
+     * 重建期间必须通过这里（而不只是主 attach 入口）判门，否则 :639 会在
+     * 引擎半初始化时插入 RbAttachVolumeByLetter，几何错配 / UAF。 */
+    if (InterlockedCompareExchange(&g_Rb.Recreating, 0, 0)) return;
     /* [USER-REQ 2026-11-05] 三种开机行为（优先级从上到下）：
      *   1. AutoAttach=1  → 全自动挂载所有数据卷（旧行为，需用户显式开启）
      *   2. AutoAttach=0 且 ResumeOnBoot=1 → **只恢复上次加速过的卷**
@@ -955,7 +1064,7 @@ VOID RbAttachLockInit(VOID)
     s_AttachReady = TRUE;
 }
 
-NTSTATUS RbAttachVolumeByLetter(WCHAR letter)
+static NTSTATUS RbAttachVolumeByLetterImpl(WCHAR letter, BOOLEAN forRebuild)
 {
     PRB_DEV_EXT ext;
     NTSTATUS st = STATUS_SUCCESS;
@@ -963,6 +1072,14 @@ NTSTATUS RbAttachVolumeByLetter(WCHAR letter)
 
     PAGED_CODE();
     if (letter < L'A' || letter > L'Z') return STATUS_INVALID_PARAMETER;
+    /* [83 2026-11-07 M1] 重建窗口拒绝插队：79 号 §5 R8 误引的 :1231 只是
+     * TestMode 专用 RbAttachVolumeRuntime；主路径原先只查 Panic/BootLoopGuard。
+     * 重建中引擎可能已销毁/半初始化，此处插入会 :1063 RbEnsureEngine /
+     * :1066 rb_stream_create 造成几何错配或 UAF。
+     * forRebuild=TRUE 仅由重建 worker（持 Recreating=1 单主、已快照卷集合）
+     * 通过 RbReattachVolumeForRebuild 调用，是唯一放行路径。 */
+    if (!forRebuild && InterlockedCompareExchange(&g_Rb.Recreating, 0, 0))
+        return STATUS_DEVICE_NOT_READY;
 
     /* [FIX-3] attach 串行化：消除并发 attach 的瞬时 0x5 / 重入半挂。
      * 本锁为最外层短锁；持有期间只取 DevListLock 等内部短锁，禁止反向再取本锁。PASSIVE_LEVEL。 */
@@ -1085,6 +1202,20 @@ out:
     return st;
 }
 
+/* 控制面 / resume sweep 走此入口：重建窗口内拒绝。 */
+NTSTATUS RbAttachVolumeByLetter(WCHAR letter)
+{
+    return RbAttachVolumeByLetterImpl(letter, FALSE);
+}
+
+/* [83 2026-11-07] 重建 worker 专用重挂入口：绕过 Recreating 门（单主已持有），
+ * 其余全部检查（Removed / 几何 / L2 / 重复盘符 / RbEnsureEngine / RbResumeTrack）
+ * 与常规 attach 逐字相同。不得由控制面或周期巡检调用。 */
+NTSTATUS RbReattachVolumeForRebuild(WCHAR letter)
+{
+    return RbAttachVolumeByLetterImpl(letter, TRUE);
+}
+
 /* =====================================================================
  * [R1] 运行时按盘符 DETACH —— V10 语义：
  * 关热开关（新 I/O 立即透传）→ 脏数据落盘 → 销毁缓存流；
@@ -1094,6 +1225,9 @@ NTSTATUS RbDetachVolumeByLetter(WCHAR letter)
 {
     PRB_DEV_EXT ext;
     PAGED_CODE();
+    /* [83 2026-11-07 M1] 重建窗口拒绝并发 detach：软摘链期间 ext->Stream
+     * 正在被原子置 NULL，并发 detach 的 flush/discard 会读到半状态。 */
+    if (InterlockedCompareExchange(&g_Rb.Recreating, 0, 0)) return STATUS_DEVICE_NOT_READY;
     /* [P2-3] 与 attach 共用 s_AttachMutex：旧代码 detach 无锁，与并发 attach
      * 交错可留下 IsAttached/Stream 不一致态（双方都会 create/destroy 同一
      * ext->Stream）。锁序与 attach 一致：s_AttachMutex 最外层，内部只取

@@ -83,6 +83,12 @@ const statsSchema = z.looseObject({
   DiskReadLatP99Us: z.number(),
   // [F2 2026-11-06] TRIM 计数（状态页消费）
   TrimCount: z.number(),
+  // [83 2026-11-07] 几何重建统计：旧驱动短回包无这些字段，default(0) 防白屏
+  EngineBlockSize: z.number().default(0),
+  GeometryRebuildCount: z.number().default(0),
+  GeometryRebuildLastStatus: z.number().default(0),
+  GeometryRebuildInProgress: z.number().default(0),
+  LastGeometryRebuildUtc: z.number().default(0),
 });
 
 const eventListSchema = z.object({

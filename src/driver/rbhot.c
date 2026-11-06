@@ -55,6 +55,10 @@ VOID RbHotPrewarmJob(PVOID Ctx)
     PRB_DEV_EXT ext = (PRB_DEV_EXT)Ctx;
     static const WCHAR base[] = L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\RAMBlockCache";
     RB2_HZ snap[64]; UNICODE_STRING u; PVOID d = NULL; ULONG sz = 0, ty = 0, i, n;
+    /* [83 2026-11-07 M5] 重建窗口：作业已入队但尚未执行时，必须早退并归还
+     * RbHotPrewarm 持有的引用，绝不 Rb2VolRead -> rb_read_commit_gen 触碰
+     * 可能已销毁的 stream/engine。RbIsDataPathFrozen 是入口一次 volatile 读。 */
+    if (RbIsDataPathFrozen()) { RbDerefExt(ext); return; }
     if (ext->Removed) { RbDerefExt(ext); return; }
     RtlInitUnicodeString(&u, base);
     if (NT_SUCCESS(RbRegQueryValue(&u, L"HotZones", &d, &sz, &ty)) && ty == REG_BINARY) {

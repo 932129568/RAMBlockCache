@@ -1932,7 +1932,9 @@ int main(int argc, char **argv)
         printf("可视化界面请使用 WPF 控制台（RamBoostFS.Wpf.exe）。\n");
         printf("用法:\n");
         printf("  ramboostctl status                查看实时统计\n");
-        printf("  ramboostctl statval <字段>        机器可读数字: dirty_bytes/cur_bytes/wb_bytes\n");
+        printf("  ramboostctl statval <字段>        机器可读数字:\n");
+        printf("    dirty_bytes/cur_bytes/wb_bytes\n");
+        printf("    engine_bs/rebuild_count/rebuild_status/rebuild_in_progress/rebuild_utc\n");
         printf("  ramboostctl get-config            查看当前配置\n");
         printf("  ramboostctl set key=value ...     修改配置（自动回读实际生效值）\n");
         printf("    可选键: enabled read write wb size flush high low sys\n");
@@ -1972,7 +1974,7 @@ int main(int argc, char **argv)
          * 区分"命令拼错"与"参数缺失"；未知字段也与"驱动连接失败"同返回
          * -1/1，机器可读契约不完整。此处显式报错，退出码 2（用法错误）。 */
         if (argc < 3) {
-            fprintf(stderr, "[错误] statval 缺少字段名: dirty_bytes | cur_bytes | wb_bytes\n");
+            fprintf(stderr, "[错误] statval 缺少字段名: dirty_bytes | cur_bytes | wb_bytes | engine_bs | rebuild_count | rebuild_status | rebuild_in_progress | rebuild_utc\n");
             return 2;
         }
         RB_STATS st;
@@ -1980,7 +1982,14 @@ int main(int argc, char **argv)
         if (!strcmp(argv[2], "dirty_bytes")) { printf("%llu\n", (unsigned long long)st.DirtyBytes); return 0; }
         if (!strcmp(argv[2], "cur_bytes")) { printf("%llu\n", (unsigned long long)st.CurBytes); return 0; }
         if (!strcmp(argv[2], "wb_bytes")) { printf("%llu\n", (unsigned long long)st.WbBytes); return 0; }
-        fprintf(stderr, "[错误] statval 未知字段: %s（可选: dirty_bytes / cur_bytes / wb_bytes）\n", argv[2]);
+        /* [83 2026-11-07] 几何重建统计（RB_STATS 末尾纯追加；旧驱动短回包由
+         * rb_get_stats 的 zero-init 兜底为 0，见下方兼容性说明）。 */
+        if (!strcmp(argv[2], "engine_bs")) { printf("%u\n", (unsigned)st.EngineBlockSize); return 0; }
+        if (!strcmp(argv[2], "rebuild_count")) { printf("%u\n", (unsigned)st.GeometryRebuildCount); return 0; }
+        if (!strcmp(argv[2], "rebuild_status")) { printf("%u\n", (unsigned)st.GeometryRebuildLastStatus); return 0; }
+        if (!strcmp(argv[2], "rebuild_in_progress")) { printf("%u\n", (unsigned)st.GeometryRebuildInProgress); return 0; }
+        if (!strcmp(argv[2], "rebuild_utc")) { printf("%llu\n", (unsigned long long)st.LastGeometryRebuildUtc); return 0; }
+        fprintf(stderr, "[错误] statval 未知字段: %s（可选: dirty_bytes / cur_bytes / wb_bytes / engine_bs / rebuild_count / rebuild_status / rebuild_in_progress / rebuild_utc）\n", argv[2]);
         return 2;
     }
     if (!strcmp(argv[1], "get-config")) { return cli_print_config(); }   /* [FIX R6-CLI1] */

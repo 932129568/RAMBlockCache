@@ -16,6 +16,9 @@ function mkStats(over: Partial<RbStats>): RbStats {
     // [U1 2026-11-06] RB_STATS 末尾纯追加：夹具补齐分位字段（0=尚无样本）
     CacheReadLatP50Us: 0, CacheReadLatP95Us: 0, CacheReadLatP99Us: 0,
     DiskReadLatP50Us: 0, DiskReadLatP95Us: 0, DiskReadLatP99Us: 0,
+    // [83 2026-11-07] RB_STATS 末尾纯追加：几何重建五字段夹具补齐
+    EngineBlockSize: 0, GeometryRebuildCount: 0, GeometryRebuildLastStatus: 0,
+    GeometryRebuildInProgress: 0, LastGeometryRebuildUtc: 0,
     ...over,
   };
 }

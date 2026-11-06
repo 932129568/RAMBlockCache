@@ -205,6 +205,19 @@ typedef struct RB_STATS_T {
     uint32_t DiskReadLatP50Us;     /* 1268：含下盘读 P50 */
     uint32_t DiskReadLatP95Us;     /* 1272 */
     uint32_t DiskReadLatP99Us;     /* 1276 */
+    /* ---- [83 2026-11-07] 运行期几何重建统计（末尾纯追加；不升 ProtocolVersion）----
+     * 兼容纪律同 U1：驱动回拷按调用方缓冲容量截断（rbctl.c RbMsgGetStats
+     * local+min 模式），老客户端收到短回包不受影响；桥接 decodeStats 对
+     * 每个新字段按 p.length 做长度守卫，旧驱动短回包填 0 而非抛 RangeError。
+     * Pack=8 实算（check_proto_sync.py --strict）：
+     *   EngineBlockSize u32@1280, GeometryRebuildCount u32@1284,
+     *   GeometryRebuildLastStatus u32@1288, GeometryRebuildInProgress u32@1292,
+     *   LastGeometryRebuildUtc u64@1296, sizeof(RB_STATS)=1304。 */
+    uint32_t EngineBlockSize;          /* 引擎真实几何（rb_engine_block_size）；NULL 引擎=0 */
+    uint32_t GeometryRebuildCount;     /* 成功重建次数，单调递增 */
+    uint32_t GeometryRebuildLastStatus;/* 上次重建 NTSTATUS（0=成功；失败回滚也留痕） */
+    uint32_t GeometryRebuildInProgress;/* 1=重建窗口内（此态 EngineBlockSize 允许为 0） */
+    uint64_t LastGeometryRebuildUtc;   /* KeQuerySystemTimePrecise FILETIME（UTC） */
 } RB_STATS;
 
 /* ---- 卷枚举（V8 扩展，新字段追加于末尾） ---- */

@@ -98,6 +98,13 @@ export interface RbStats {
   DiskReadLatP50Us: number;
   DiskReadLatP95Us: number;
   DiskReadLatP99Us: number;
+  /** [83 2026-11-07] 运行期几何重建统计（RB_STATS 末尾纯追加）。
+   *  EngineBlockSize=引擎真实几何（重建窗口内允许 0）；旧驱动短回包由桥接填 0。 */
+  EngineBlockSize: number;
+  GeometryRebuildCount: number;
+  GeometryRebuildLastStatus: number;
+  GeometryRebuildInProgress: number;
+  LastGeometryRebuildUtc: number;
 }
 
 /* ============================ 卷 ============================ */

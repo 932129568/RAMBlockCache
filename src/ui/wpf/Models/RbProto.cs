@@ -212,6 +212,12 @@ public struct RbStats
     public uint DiskReadLatP50Us;   // 含下盘读 P50
     public uint DiskReadLatP95Us;   // 含下盘读 P95
     public uint DiskReadLatP99Us;   // 含下盘读 P99
+    /* ---- [83 2026-11-07] 运行期几何重建统计（末尾纯追加；三副本同步；Pack=8）---- */
+    public uint EngineBlockSize;            // 引擎真实几何；NULL 引擎=0
+    public uint GeometryRebuildCount;       // 成功重建次数（单调递增）
+    public uint GeometryRebuildLastStatus;  // 上次重建 NTSTATUS（0=成功）
+    public uint GeometryRebuildInProgress;  // 1=重建窗口内
+    public ulong LastGeometryRebuildUtc;    // UTC FILETIME
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 8)]

@@ -139,6 +139,28 @@ NTSTATUS Rb2PoolInit(VOID)
     }
     return STATUS_SUCCESS;
 }
+NTSTATUS RbFeatQuiesce(VOID)
+{
+    NTSTATUS st;
+    PAGED_CODE();
+    /* [83 2026-11-07] 重建窗口的「排空 + 恢复」配对原语。
+     * 只做 Rb2PoolShutdown（30s 有界 join 排空在途预取/淘汰/预热作业，这些
+     * 作业 rbpref.c:119 直接解引用 g_Rb.Engine，不排空会在引擎销毁后 UAF），
+     * 然后必须 Rb2PoolInit() 解 s_Stop 闩并重建线程——否则 Rb2PoolSubmit
+     * 入口（:68）永久返回 STATUS_SHUTDOWN_IN_PROGRESS，特性层静默死亡。
+     * 与 RbFeatShutdown 的区别：不 RbL2Close()、不 RbEtwShutdown()、不动
+     * s_Init/s_TickObj/s_Stop(feat)，Rb2Tick 线程全程存活。
+     * 前置：调用方已置 Unloading=1 挡新 IO、Recreating=1 挡旁路作业入队。 */
+    st = Rb2PoolShutdown();
+    if (!NT_SUCCESS(st)) return st;      /* 超时：leak-by-design，调用方必须回滚 */
+    st = Rb2PoolInit();                  /* 解闩 + 重建 worker */
+    if (!NT_SUCCESS(st)) {
+        RbLog(2, __LINE__, st, L"rebuild: feat pool re-init failed after quiesce");
+        return st;
+    }
+    return STATUS_SUCCESS;
+}
+
 /* [FIX C5] 返回 NTSTATUS：join 超时（线程仍在途）如实上报，
  * RbFeatShutdown/RbUnload 据此中止卸载——原 VOID 吞掉超时，
  * 卸载继续删设备/毁引擎/卸映像，驻留线程执行已卸载代码（0xC4/0x1） */

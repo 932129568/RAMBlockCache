@@ -58,6 +58,21 @@ static void RbFillStats(RB_STATS *out)
     out->DiskReadLatP50Us  = RbLatPercentile(g_Rb.ReadLatHist[1], 5000);
     out->DiskReadLatP95Us  = RbLatPercentile(g_Rb.ReadLatHist[1], 9500);
     out->DiskReadLatP99Us  = RbLatPercentile(g_Rb.ReadLatHist[1], 9900);
+    /* [83 2026-11-07] 几何重建统计：与引擎无关的驱动侧状态，必须放在
+     * :61 `if (!g_Rb.Engine) return` **之前**（重建窗口内 Engine 可能为 NULL，
+     * 此时 EngineBlockSize=0，但重建计数/进度/时间戳仍须可读，供 E1/E8 取证）。
+     * eng 指针先快照一次，避免「判非空 -> 另一线程置 NULL -> 解引用悬空」TOCTOU；
+     * rb_engine_block_size(cache.c:979) 自带判空。 */
+    {
+        rb_engine *eng = (rb_engine *)InterlockedCompareExchangePointer(
+                            (PVOID *)&g_Rb.Engine, NULL, NULL);
+        out->EngineBlockSize = eng ? rb_engine_block_size(eng) : 0u;
+    }
+    out->GeometryRebuildCount = (uint32_t)InterlockedCompareExchange(&g_Rb.GeometryRebuildCount, 0, 0);
+    out->GeometryRebuildLastStatus = (uint32_t)InterlockedCompareExchange(&g_Rb.GeometryRebuildLastStatus, 0, 0);
+    out->GeometryRebuildInProgress = (uint32_t)InterlockedCompareExchange(&g_Rb.GeometryRebuildInProgress, 0, 0);
+    out->LastGeometryRebuildUtc = (uint64_t)g_Rb.LastGeometryRebuildUtc.QuadPart;
+
     if (!g_Rb.Engine) return;
     rb_engine_get_stripe_stats(g_Rb.Engine, out->StripeRead, out->StripeWrite, RB_STRIPES);
 
@@ -226,14 +241,16 @@ static void RbApplyConfig(const RB_CONFIG *cfg)
                   ? L"cfg: Enabled 1->0, dirty flushed + cache view dropped before passthrough"
                   : L"cfg: WriteBack 1->0, dirty flushed + cache view dropped before write-through");
     }
-    /* [FIX W12] 引擎存活期禁止改 BlockSize：引擎几何在 create 时冻结，
-     * 运行期改它会与运行引擎分片/L2 块粒度门（block*16==64KB）脱节。
-     * [S-建议] 运行时保持旧值，但新值照常持久化——引擎销毁重建后真正生效
-     * （原实现连注册表一起回退，"重建后生效"永不发生，注释自相矛盾） */
-    if (g_Rb.Engine && c.BlockSize != g_Rb.Config.BlockSize) {
-        RbLog(1, __LINE__, 0, L"cfg: BlockSize deferred until engine recreate");
-        c.BlockSize = g_Rb.Config.BlockSize;
-    }
+    /* [FIX W12 -> 83 2026-11-07 运行期几何重建]
+     * 旧 W12 在这里把 c.BlockSize 回滚成旧值（只持久化、运行值不变），导致
+     * 「重建后生效」永不发生。本批改为：配置副本立即写入新值，引擎几何由
+     * PASSIVE work item 卷级重建后跟上（rbrebuild.c）。
+     * 推迟窗内 config 与 engine 几何短暂不一致是安全的：
+     *   - rbio.c:796 切块用 rb_engine_block_size(g_Rb.Engine)（F10，引擎几何）
+     *   - RbApplyEngineConfig（本文件 :166）不触碰 block_size
+     *   - GET_STATS.EngineBlockSize 暴露引擎真实几何，避免 UI 假象
+     * 引擎销毁/重建等 30s 级动作由 RbMsgSetConfig 入队，绝不在持 CfgLock
+     * （FastMutex -> APC_LEVEL）的本函数内执行。 */
     /* [P2-3] 持 CfgLock 完成 >100B 整体赋值：旧代码裸赋值与并发 GET_CONFIG/
      * 统计读可撕裂（读到半新半旧配置）。锁外再做引擎下发与注册表持久化
      * （内部可能阻塞，FastMutex 持锁期间禁止长阻塞）。 */
@@ -242,7 +259,7 @@ static void RbApplyConfig(const RB_CONFIG *cfg)
     ExReleaseFastMutex(&g_Rb.CfgLock);
     RbApplyEngineConfig(&g_Rb.Config);
     RbSaveConfig(&saved);              /* FIX[P2-1]: 持久化（内部有 PASSIVE 守卫）；
-                                        * [S-建议] 持久化用户请求值（含被推迟的 BlockSize） */
+                                        * 重建 worker 会 RbRegQueryValue 回读复核，防 void 写假成功 */
     KeSetEvent(&g_Rb.FlushWake, IO_NO_INCREMENT, FALSE);
 }
 
@@ -310,7 +327,11 @@ static VOID RbMsgGetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 
 static VOID RbMsgSetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
-    UNREFERENCED_PARAMETER(pst);
+    ULONG newBs;
+    BOOLEAN isRebuildRequest = FALSE;
+    /* [83 2026-11-07 M2] 入队失败/并发拒绝必须如实写回 *pst：
+     * 旧实现 UNREFERENCED_PARAMETER(pst) 恒返成功，重建被拒时 CLI 会误判。 */
+    if (pst) *pst = STATUS_SUCCESS;
     /* [P2-4] VolumeFilter（缓存卷白名单）当前【无消费点】：卷缓存由
      * ATTACH_VOLUME 逐卷控制。旧代码接受该字段后既不持久化也不生效，
      * CLI 却打印成功——静默空操作。此处显式告警（失败可观测）。 */
@@ -323,8 +344,35 @@ static VOID RbMsgSetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
               msg->Data.Config.SystemVolumeCached
                   ? L"system volume opt-in ON by user (write-through still forced)"
                   : L"system volume opt-in OFF by user");
+
+    /* [83 2026-11-07] BlockSize 变化 => 运行期卷级重建。
+     * 几何合法值由 RbClampConfig 保证（非法值回落 4096，不会产生伪重建）。 */
+    newBs = msg->Data.Config.BlockSize;
+    if (g_Rb.Engine && newBs != g_Rb.Config.BlockSize &&
+        (newBs == 4096u || newBs == 8192u || newBs == 16384u || newBs == 32768u))
+        isRebuildRequest = TRUE;
+
+    /* 先应用配置（含持久化）；CfgLock 短锁、RbSaveConfig 内部 PASSIVE 守卫。 */
     RbApplyConfig(&msg->Data.Config);
-    /* FIX[audit 假回读]: 应答回填 clamp 后的实际生效配置，而非回显输入 */
+
+    if (isRebuildRequest) {
+        NTSTATUS qst = RbRequestGeometryRebuild(newBs);
+        if (!NT_SUCCESS(qst)) {
+            /* 入队失败：运行几何保持旧值，配置副本回滚到旧几何并重新持久化，
+             * 避免「注册表新、引擎旧、且重建没排队」的永久不一致。 */
+            RB_CONFIG rollback;
+            ExAcquireFastMutex(&g_Rb.CfgLock);
+            rollback = g_Rb.Config;
+            rollback.BlockSize = (ULONG)(g_Rb.Engine ? rb_engine_block_size(g_Rb.Engine) : 4096u);
+            g_Rb.Config = rollback;
+            ExReleaseFastMutex(&g_Rb.CfgLock);
+            RbSaveConfig(&rollback);
+            RbLog(2, __LINE__, qst, L"SET_CONFIG: rebuild enqueue failed, config rolled back");
+            if (pst) *pst = qst;
+        }
+    }
+    /* FIX[audit 假回读]: 应答回填 clamp 后的实际生效配置，而非回显输入。
+     * 注意：这是配置副本语义；引擎真实几何请读 GET_STATS.EngineBlockSize。 */
     ExAcquireFastMutex(&g_Rb.CfgLock);
     msg->Data.Config = g_Rb.Config;
     ExReleaseFastMutex(&g_Rb.CfgLock);
@@ -947,6 +995,36 @@ NTSTATUS RbDispatchDeviceControl(PDEVICE_OBJECT dev, PIRP irp)
     }
 
     msg->Status = 0;
+
+    /* [83 2026-11-07 M2] 重建窗口控制面门：按 msg->Type 精确过滤。
+     * 拒：SET_CONFIG（防 Q1-2 陷阱 B——重建窗口内任意 set 读运行值回写会
+     *     抹掉刚持久化的新几何）、ATTACH_VOLUME、SET_VOLUME、FLUSH、
+     *     PANIC/PANIC_CLEAR（避免与 Unloading 闸门互踩）、INVALIDATE_RANGE。
+     * 放：GET_CONFIG / GET_STATS / GET_VOLUMES / GET_LOG / GET_EVENTS /
+     *     GET_VERSION / EXIT_SAFE_MODE —— QA 必须在窗口内采到
+     *     GeometryRebuildInProgress=1 与 EngineBlockSize=0 的中间态（E8）。
+     * 注意：不把 Unloading 加到控制设备分支（rbio_ports.c:40 只是 Rb2_PortShrink，
+     * 不是控制入口）；本门用独立的 Recreating，与数据面 Unloading 分离。 */
+    if (InterlockedCompareExchange(&g_Rb.Recreating, 0, 0) != 0) {
+        switch (msg->Type) {
+        case RB_MSG_SET_CONFIG:
+        case RB_MSG_FLUSH:
+        case RB_MSG_EXIT_SAFE_MODE:
+        case RB_MSG_PANIC:
+        case RB_MSG_PANIC_CLEAR:
+        case RB_MSG_SET_VOLUME:
+        case RB_MSG_ATTACH_VOLUME:
+        case RB_MSG_INVALIDATE_RANGE:
+            st = STATUS_DEVICE_BUSY;
+            msg->Status = (int32_t)st;
+            irp->IoStatus.Status = st;
+            irp->IoStatus.Information = 0;
+            IoCompleteRequest(irp, IO_NO_INCREMENT);
+            return st;
+        default:
+            break;   /* GET 类放行 */
+        }
+    }
 
     switch (msg->Type) {
     case RB_MSG_GET_STATS:      RbMsgGetStats(msg, &st, &info, outLen);  break;

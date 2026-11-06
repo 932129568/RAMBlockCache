@@ -569,7 +569,10 @@ VOID RbEvictJob(PVOID Ctx)
     if (j) {
         /* [FIX S7-04b] 异步执行期间卷可能已拆除：Ext 引用由提交方 CAS 加引用
          * （拒绝 0→1 复活，同 RbGetExt 纪律），用完在此归还。 */
-        RbL2Store(j->Ext, j->Lba, j->Len, j->Buf);   /* PASSIVE：内部同步拷贝入容器 */
+        /* [83 2026-11-07 M5] 重建窗口早退：跳过 RbL2Store（它可能触碰已销毁
+         * 引擎/L2 容器），但引用/内存必须按既有纪律成对归还。 */
+        if (!RbIsDataPathFrozen())
+            RbL2Store(j->Ext, j->Lba, j->Len, j->Buf);   /* PASSIVE：内部同步拷贝入容器 */
         RbDerefExt((PRB_DEV_EXT)j->Ext);
         Rb2Free(j->Buf);
         Rb2Free(j);
@@ -590,6 +593,7 @@ VOID RbFeatOnEvict(PVOID Ext, ULONG64 Lba, ULONG Len, PVOID Src, ULONG64 Hits)
     if ((g_Rb2Flags & RB2F_L2) == 0)        return;
     if (RbL2State() != 1)                   return;
     if (RbPanicActive())                    return;
+    if (RbIsDataPathFrozen())               return;   /* [83 M5] 重建窗口不再提交淘汰作业 */
     if (Ext == NULL || Src == NULL || Len == 0) return;
     if (Hits < 2)                           return;   /* 冷块不进 L2 */
     /* [FIX S7-04] PASSIVE 也一律走池异步：原 PASSIVE 分支内联同步 RbL2Store

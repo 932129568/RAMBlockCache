@@ -86,6 +86,11 @@ public struct RbStats
      * rb_proto.h RB_STATS 末尾纯追加；MainViewModel 分位明细展示消费。 */
     public uint CacheReadLatP50Us, CacheReadLatP95Us, CacheReadLatP99Us;
     public uint DiskReadLatP50Us, DiskReadLatP95Us, DiskReadLatP99Us;
+    /* ---- [83 2026-11-07] 运行期几何重建统计（末尾纯追加；三副本同步；Pack=8）----
+     * 与 rb_proto.h RB_STATS 末尾五字段逐字对应：u32@1280/1284/1288/1292 + u64@1296。
+     * check_proto_sync.py --strict 把关字段名/顺序/偏移/sizeof(=1304)。 */
+    public uint EngineBlockSize, GeometryRebuildCount, GeometryRebuildLastStatus, GeometryRebuildInProgress;
+    public ulong LastGeometryRebuildUtc;
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 8)]

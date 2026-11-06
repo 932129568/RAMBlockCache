@@ -70,6 +70,11 @@ VOID     Rb2PortFillGen(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa, rb_
 NTSTATUS RbFeatInit(VOID);       /* DriverEntry/rbio 初始化尾部一次（幂等 CAS） */
 NTSTATUS RbFeatShutdown(VOID);   /* Unload 中、引擎停止之后；[FIX C5] 池 join 超时返回失败，调用方中止卸载 */
 VOID     RbFeatRecover(VOID);    /* [FIX R2-W10] 卸载中止后复活特性层（解闩+重建 Rb2Tick，幂等） */
+/* [83 2026-11-07] 重建窗口专用：只排空特性层 worker 池（Rb2PoolShutdown 的
+ * 30s 有界 join），随后必须 Rb2PoolInit() 解闩恢复；**不得**调 RbFeatShutdown
+ * （它会 RbL2Close()+RbEtwShutdown()，而 RbFeatRecover 只重建 Rb2Tick，
+ * L2/ETW 永久关且不可恢复）。返回非成功时调用方必须回滚重建、禁止销毁引擎。 */
+NTSTATUS RbFeatQuiesce(VOID);
 VOID     RbFeatPanic(VOID);     /* RbSetPanic 内一行 */
 VOID     RbFeatPanicClear(VOID); /* [P0-1] 仅由 rbctl.c panic-clear 在自愈握手成功后调用 */
 

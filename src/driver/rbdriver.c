@@ -1107,7 +1107,7 @@ VOID RbUnload(PDRIVER_OBJECT drv)
 
     RbDeregisterCrashHooks();                  /* [V10.1] 最早处注销崩溃回调，防野指针二次蓝屏 */
 
-    g_Rb.Unloading = TRUE;
+    InterlockedExchange(&g_Rb.Unloading, 1);   /* [83] 原子发布序：重建/卸载窗口统一走此门 */
 
     /* 1) 先把全部脏数据落盘（工作线程停止前，回写通道完整） */
     RbFlushAllDirty();
@@ -1123,7 +1123,8 @@ VOID RbUnload(PDRIVER_OBJECT drv)
          * 且 FlushStop 闩锁保持置位使下次卸载"秒过"（join 已终止线程立即成功）
          * 掩盖真实状态。已终止则清理后重启；仍在途则清闩放行继续服务。 */
         if (g_Rb.FlushThread) {
-            NTSTATUS tl = KeWaitForSingleObject(g_Rb.FlushThread, Executive, KernelMode, FALSE, NULL);
+            LARGE_INTEGER probe; probe.QuadPart = -10000000LL;  /* [83 M6] 1s 有界探测，原 NULL=无限等待可挂死 */
+            NTSTATUS tl = KeWaitForSingleObject(g_Rb.FlushThread, Executive, KernelMode, FALSE, &probe);
             if (tl == STATUS_SUCCESS) {          /* 线程已终止：引用清理后可重建 */
                 ObDereferenceObject(g_Rb.FlushThread);
                 g_Rb.FlushThread = NULL;
@@ -1131,25 +1132,30 @@ VOID RbUnload(PDRIVER_OBJECT drv)
             }
         }
         KeClearEvent(&g_Rb.FlushStop);
+        /* [83 2026-11-07 M6] 补一致性：RbStartFlushThread 的 ObReference 失败分支
+         * 曾置 Thread=NULL 但仍写 FlushRunning=1（半死服役）；或线程已退出被清理
+         * 而 FlushRunning 残留 1。Thread==NULL 即无在途线程对象，强制归零使下面
+         * 的重启分支可达。Thread!=NULL 则保留 FlushRunning（线程仍在服役）。 */
+        if (g_Rb.FlushThread == NULL) g_Rb.FlushRunning = 0;
         if (!g_Rb.FlushRunning) {
             if (NT_SUCCESS(RbStartFlushThread()))
                 RbLog(1, __LINE__, 0, L"flush thread restarted after aborted unload");
             else
                 RbLog(2, __LINE__, 0, L"flush thread restart FAILED - periodic writeback degraded");
         }
-        g_Rb.Unloading = FALSE;   /* [FIX R2-W5] 中止即恢复数据路径，禁哑服役 */
+        InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] 中止即恢复数据路径，禁哑服役 */
         return;
     }
     if (!NT_SUCCESS(RbStopFlushers())) {
         RbLog(2, __LINE__, 0, L"unload aborted: flusher join timeout");
         RbRestartDeadFlushers();   /* [FIX S7-13] 重启已终止者：禁半死服役（回写退串行） */
-        g_Rb.Unloading = FALSE;   /* [FIX R2-W5] */
+        InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] */
         return;
     }
     if (!NT_SUCCESS(RbStopIoWorkers())) {
         RbLog(2, __LINE__, 0, L"unload aborted: io worker join timeout");
         RbRestartDeadIoWorkers();   /* [FIX S7-13] 重启已终止者：禁半死服役（I/O 退系统队列） */
-        g_Rb.Unloading = FALSE;   /* [FIX R2-W5] */
+        InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] */
         return;
     }
     /* [FIX C5] 特性层池 join 超时同样中止卸载（原 VOID 吞掉超时，
@@ -1157,7 +1163,7 @@ VOID RbUnload(PDRIVER_OBJECT drv)
     if (!NT_SUCCESS(RbFeatShutdown())) {
         RbLog(2, __LINE__, 0, L"unload aborted: feature pool join timeout");
         RbFeatRecover();          /* [FIX R2-W10] 特性层复活（解闩+重建 Rb2Tick），防僵尸态静默死亡 */
-        g_Rb.Unloading = FALSE;   /* [FIX R2-W5] */
+        InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] */
         return;
     }
 
@@ -1218,7 +1224,7 @@ VOID RbUnload(PDRIVER_OBJECT drv)
              * 此刻释放它们=UAF/蓝屏。提前返回，保留引擎/池/控制设备/PDO
              * 不释放（宁可泄漏，不可崩溃）；等待下次卸载或重启回收。 */
             RbLog(2, __LINE__, 0, L"unload aborted: volumes in flight, engine/pool kept");
-            g_Rb.Unloading = FALSE;   /* [FIX R2-W5] */
+            InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] */
             return;
         }
     }
@@ -1233,7 +1239,7 @@ VOID RbUnload(PDRIVER_OBJECT drv)
             KeDelayExecutionThread(KernelMode, FALSE, &tick);
         if (g_Rb.FallbackInFlight) {
             RbLog(2, __LINE__, 0, L"unload aborted: fallback workitems in flight, ctx pool kept");
-            g_Rb.Unloading = FALSE;   /* [FIX R2-W5] */
+            InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] */
             return;
         }
     }

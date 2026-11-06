@@ -110,6 +110,18 @@ static PVOID RbMapIrpBuffer(PIRP irp)
 PVOID RbCtxAlloc(VOID)   { return ExAllocateFromNPagedLookasideList(&g_Rb.IoCtxLa); }
 VOID  RbCtxFree(PVOID p) { if (p) ExFreeToNPagedLookasideList(&g_Rb.IoCtxLa, p); }
 
+/* [83 2026-11-07 M5] 重建窗口数据面冻结判定（入口一次 volatile 读）。
+ * 用于旁路回调/池作业的早退门：这些作业在 Unloading/Recreating 期间可能
+ * 持有已摘链 stream 的裸指针，必须在触碰前退出并归还引用。
+ * 注意：4K 常态两值皆 0，本函数只在旁路作业入口（非每 IO 热路径）调用；
+ * 主 dispatch 入口仍用既有 !g_Rb.Unloading 判断，不新增热路径分支。 */
+BOOLEAN RbIsDataPathFrozen(VOID)
+{
+    if (InterlockedCompareExchange(&g_Rb.Unloading, 0, 0) != 0) return TRUE;
+    if (InterlockedCompareExchange(&g_Rb.Recreating, 0, 0) != 0) return TRUE;
+    return FALSE;
+}
+
 /* [STAGE-1] miss staging 复用：每 worker 独占一块，按需求涨，不逐 IO 分配释放 */
 #define RB_STAGE_MAX (32u << 20)
 static PVOID RbStageGet(PRB_IOWORKER w, SIZE_T need)
@@ -1049,6 +1061,14 @@ void RbStartIoWorkers(VOID)
     ULONG i;
     if (n == 0 || n > 1024) n = 8;                 /* 异常兜底 */
     if (n > RB_IO_WORKERS_MAX) n = RB_IO_WORKERS_MAX;
+    /* [83 2026-11-07 M6] 幂等/防二次启动：池仍在服役时重入会重初始化
+     * QueueHead/SpinLock（链表损坏 + 在途 IRP 悬挂）并二次 PsCreateSystemThread
+     * 覆盖 Thread 引用。重建路径下池全程不停，本函数不应被调用；此处作为
+     * fail-closed 防御，任何非预期重入一律直接返回，不扰动在服役的池。 */
+    if (g_Rb.IoWorkerCount != 0) {
+        RbLog(1, __LINE__, 0, L"rebuild: RbStartIoWorkers reentry ignored (pool already running)");
+        return;
+    }
     /* [FIX S7-14] IoWorkerCount 发布推迟到全部 worker 结构初始化之后：
      * 原先在此提前发布，并发 dispatch 可见 count!=0 并向尚未初始化
      * QueueHead/SpinLock 的 worker 入队（链表损坏/IRP 悬挂）。 */
@@ -1733,11 +1753,30 @@ static ULONG RbEnsureFlushers(ULONG want)
     if (want > RB_FLUSH_WORKERS) want = RB_FLUSH_WORKERS;
     cur = (ULONG)InterlockedCompareExchange(&g_Rb.FlushWorkerActive, 0, 0);
     if (cur == 0 || cur > RB_FLUSH_WORKERS) cur = 1;
-    for (i = cur; i < want; i++) {
+    /* [83 2026-11-07 M6] 修 :1738 原 `if (f->Thread) continue` 的死线程复用：
+     * RbStopFlushers 成功 join 后只置 Alive=0、Thread=NULL；但若中途异常留下
+     * 「Thread 非 NULL 而 Alive=0」（停机竞态/重启窗），原逻辑直接复用死 worker，
+     * 且 want==cur 时循环体一次都不执行，池永久死亡被非零 FlushWorkerActive 掩盖。
+     * 改为：遍历 [0,want) 全区间，凡 Alive==0 者一律重新 spawn（不依赖 cur）。 */
+    for (i = 0; i < want; i++) {
         RB_FLUSHER *f = &g_Rb.Flushers[i];
-        if (f->Thread) continue;   /* 曾启动过（收缩后保留）：仍在服役，直接复用 */
+        KIRQL qirql;
+        BOOLEAN alive;
+        PVOID thread;
+        KeAcquireSpinLock(&f->Lock, &qirql);
+        alive = (BOOLEAN)f->Alive;
+        thread = f->Thread;
+        KeReleaseSpinLock(&f->Lock, qirql);
+        if (alive && thread) continue;         /* 仍在服役：复用 */
+        if (thread) {
+            /* 超时残留（RbStopFlushers :1863 保留引用、线程仍在途）：
+             * 绝不 ObDereferenceObject / 重初始化 Lock（在途线程正持有它），
+             * 只留痕跳过，等下次 join 成功后由 RbStopFlushers 清理。 */
+            RbLog(2, __LINE__, (LONG)i, L"rebuild: fluster worker still in flight, skip respawn");
+            continue;
+        }
         f->CpuIndex = i;
-        (void)RbSpawnFlusher(f);
+        (void)RbSpawnFlusher(f);               /* Thread==NULL：可安全重建 */
     }
     if (want != cur) {
         InterlockedExchange(&g_Rb.FlushWorkerActive, (LONG)want);
@@ -2112,16 +2151,33 @@ static VOID RbFlushThread(VOID *ctx)
 
 NTSTATUS RbStartFlushThread(VOID)
 {
-    HANDLE h;
-    NTSTATUS s = PsCreateSystemThread(&h, THREAD_ALL_ACCESS, NULL, NULL, NULL,
-                                      RbFlushThread, NULL);
+    HANDLE h = NULL;
+    PETHREAD obj = NULL;
+    NTSTATUS s;
+    PAGED_CODE();
+    /* [83 2026-11-07 M6] 防二次启动：RbUnload 中止恢复(:1135)与重建回滚都可能
+     * 在旧线程对象引用仍在时重入。旧实现 :2121 直接把 ObReferenceObjectByHandle
+     * 结果写进 g_Rb.FlushThread（覆盖 => 泄漏旧引用 + 双 flush 线程）。
+     * 先断言 Thread==NULL；再清 FlushStop 闩（否则新线程首轮即自退，init 假成功）。 */
+    if (g_Rb.FlushThread != NULL) {
+        RbLog(1, __LINE__, 0, L"rebuild: RbStartFlushThread reentry ignored (thread exists)");
+        return STATUS_DEVICE_BUSY;
+    }
+    KeClearEvent(&g_Rb.FlushStop);
+    s = PsCreateSystemThread(&h, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+                             RbFlushThread, NULL);
     if (NT_SUCCESS(s)) {
-        /* [FIX S-ObRef] 返回值必检（同 IO worker） */
-        if (!NT_SUCCESS(ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
-                                  (PVOID *)&g_Rb.FlushThread, NULL)))
-            g_Rb.FlushThread = NULL;
+        /* [FIX S-ObRef] 返回值必检（同 IO worker）；绝不裸覆盖 g_Rb.FlushThread */
+        s = ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType,
+                                      KernelMode, (PVOID *)&obj, NULL);
         ZwClose(h);
-        g_Rb.FlushRunning = 1;
+        if (NT_SUCCESS(s)) {
+            g_Rb.FlushThread = obj;
+            g_Rb.FlushRunning = 1;
+        } else {
+            g_Rb.FlushThread = NULL;
+            RbLog(2, __LINE__, s, L"rebuild: flush thread ObReference failed");
+        }
     }
     return s;
 }

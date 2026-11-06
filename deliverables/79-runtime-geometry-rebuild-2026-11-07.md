@@ -95,7 +95,9 @@
 
 ### 4.4 SET_CONFIG 侧改动（`rbctl.c`）
 - 现有 W12 分支（`:229-235`）改为：检测到 `BlockSize` 变化 → 仍 `RbSaveConfig` 持久化新值 → **入队重建 work item** → 返回 `STATUS_SUCCESS`（或 `STATUS_PENDING` 语义），不再只打 deferred 日志。
-- `GET_CONFIG` 在重建窗口内应返回**运行引擎的真实几何**（新增 `RbEngineGeometry()` 读 `rb_engine_block_size(g_Rb.Engine)`），而不是注册表/配置副本，避免 UI 显示「已切到 16K」但引擎还是 4K 的假象。
+- ~~`GET_CONFIG` 在重建窗口内应返回**运行引擎的真实几何**（新增 `RbEngineGeometry()` 读 `rb_engine_block_size(g_Rb.Engine)`），而不是注册表/配置副本~~。
+  **【83 号修订 2026-11-07】此句与本文 §4.6 裁定自相矛盾，已作废**：不改 `RB_CONFIG` 的 24 字段、不动 SET_CONFIG 编码与 Web 设置页表单（66 号 `TinyLFU@152` 白屏同链）。
+  最终口径：**`GET_CONFIG` 保持配置副本语义**（`SET_CONFIG` 后立即为新值）；**引擎真实几何只走 `GET_STATS.EngineBlockSize`**（`rb_engine_block_size(g_Rb.Engine)` 快照读，`Engine==NULL` 时为 0），配套字段 `GeometryRebuildCount` / `GeometryRebuildLastStatus` / `GeometryRebuildInProgress` / `LastGeometryRebuildUtc`。避免 UI 假象靠的是 E1 三判据同时成立，而非改 `GET_CONFIG`。
 - 白名单 clamp（`rbctl.c:157` / `cache.c:955`）不变；64K/128K 仍拒绝。
 
 ### 4.5 数据面门控点补齐
@@ -208,14 +210,14 @@ QA 在 78 号 §10 指出 B1：**若 `RbEngineGeometry()` 只存在于驱动内�
 
 | 门 | 判据 |
 |---|---|
-| E1 即时生效 | `set block=16` 返回后 **不重启**，`GET_CONFIG BlockSize=16384` 且 `RbEngineGeometry()==16384`；日志 `[rebuild] geometry 4096->16384 done, N streams restored` |
-| E2 卷不丢 | 重建前后 `method=7` 的 Attached 集合完全一致（D=1、C/E/F=0），读/写/wm 标志不变 |
-| E3 数据不丢 | canary `D:\rbc-e2e-canary.bin` SHA256 前后一致；unbuffered 工作文件写读逐字节一致（QA 的 `rbc_e2e_verify`） |
-| E4 回写态安全 | 在 `WriteBack=1` 的隔离测试用例中，重建前 `total_dirty` 必须归零；未归零必须拒绝切换（**用户态 core 域验证，不在真机切回写**） |
-| E5 失败回滚 | 注入「停机超时 / 引擎重建失败」两个故障，必须回到旧几何继续服务、`Unloading=FALSE`、无哑服役、无蓝屏 |
+| E1 即时生效 | `set block=16` 返回后 **不重启**：`GET_CONFIG BlockSize=16384`（配置副本证据）且 `GET_STATS.EngineBlockSize==16384` **且** `GeometryRebuildCount` 递增 **且** `GeometryRebuildInProgress==0`（三者同时成立才算数）；日志 `[rebuild] geometry 4096->16384 done, N streams restored`。只查注册表 / `GET_CONFIG` 配置副本 / `[rebuild]` 日志一律不算数 |
+| E2 卷不丢 | **重建完成后** `method=7` 的 Attached 集合与基线一致（D=1、C/E/F=0），读/写/wm 标志不变；**切换瞬间集合短暂为 0 属预期**（卷级重建 = 全卷摘链再重挂，不是引擎原地热换），不得据瞬间快照判 FAIL |
+| E3 数据不丢 | canary `D:\rbc-e2e-canary.bin` SHA256 前后一致；unbuffered 工作文件写读逐字节一致（QA 的 `rbc_e2e_verify`）。另需覆盖「先读满 16K 子块 → 4K 覆盖写 → 读回比对」的陈旧读序列（80 号 BLOCKER 2 判据） |
+| E4 回写态安全 | 在 `WriteBack=1` 的隔离测试用例中，重建前 `total_dirty` 必须归零；未归零必须拒绝切换（**用户态 core 域验证，不在真机切回写**）。`rb_engine_flush(eng,1)` 与 `rb_engine_destroy` 内部 `cache.c:1170` 重复两次属无害空操作；**校验到销毁之间不得有新写入**（由 `Unloading=1` + `RbWaitDataPathQuiesce` 六项屏障保证） |
+| E5 失败回滚 | 注入「停机超时 / 引擎重建失败」两个故障，必须回到旧几何继续服务、`Unloading=FALSE`、无哑服役、无蓝屏；**另须复核 `GET_CONFIG`/注册表在异步回滚后已回写旧几何**（83 号 C2 用例暴露的缺陷已修） |
 | E6 4K 零回归 | 74 号全部回归面（`test_wsconc` / `test_race1106` / `test_geom` / `qa_teeth` / `qa_geom_gate -Rounds 30`）逐项重跑全绿；4K 与中午 63ref 结构 diff 0 |
 | E7 门禁 | 五件套 + Gate7 + CI 全绿；sys/Setup 签名 Valid、三锚点一致 |
-| E8 真机 | S3 与 S5 的 `verify_final_reboot.ps1` 均 `FAIL=0 / VERDICT: PASS`；S4 驱动日志零 ERROR、无 BugCheck、看门不变 |
+| E8 真机 | S3 与 S5 的 `verify_final_reboot.ps1` 均 `FAIL=0 / VERDICT: PASS`；S4 驱动日志零 ERROR、无 BugCheck、看门不变。**重建窗口内 `GeometryRebuildInProgress==1` 时 `EngineBlockSize` 允许为 0，E1/E8 不得据此误判** |
 
 ---
 

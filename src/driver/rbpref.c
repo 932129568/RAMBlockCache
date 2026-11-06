@@ -41,6 +41,14 @@ static volatile LONG s_PrefInFlight = 0;
 static volatile LONG s_PrefLeaked = 0;   /* [FIX R2-W9] M13 泄漏作业累计（组） */
 static volatile LONG s_PrefLeakLogged = 0;
 
+/* [83 2026-11-07 M5] 供 RbWaitDataPathQuiesce 读取在途预取作业数（PASSIVE 轮询）。
+ * 只做一次 volatile 快照读，不参与热路径。 */
+ULONG RbPrefInFlightCount(VOID)
+{
+    LONG n = InterlockedCompareExchange(&s_PrefInFlight, 0, 0);
+    return (n > 0) ? (ULONG)n : 0UL;
+}
+
 /* [POL-1] 每卷策略 10s 缓存（无锁，良性竞态） */
 static struct { WCHAR Letter; ULONG RA; ULONG WI; LARGE_INTEGER At; } s_PolC[16];
 
@@ -73,6 +81,14 @@ VOID RbPrefIssueJob(PVOID Ctx)
     PRB_DEV_EXT ext = (PRB_DEV_EXT)p->Ext;
     PDEVICE_OBJECT low = ext->LowerDevice;
 
+    /* [83 2026-11-07 M5] 重建窗口早退：归还 RbPrefIssue 加的引用、减在途计数、
+     * 释放作业内存。绝不下盘读再 Rb2PortFillGen 触碰已销毁的 stream/引擎。 */
+    if (RbIsDataPathFrozen()) {
+        InterlockedDecrement(&ext->Refs);
+        InterlockedDecrement(&s_PrefInFlight);
+        Rb2Free(p->Raw); Rb2Free(p);
+        return;
+    }
     if (!ext->Removed && low) {
         PIO_STACK_LOCATION io;
         p->Irp = IoAllocateIrp(low->StackSize, FALSE);

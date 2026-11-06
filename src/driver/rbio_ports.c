@@ -23,6 +23,10 @@ static VOID Rb2_PortFill(PVOID Extp, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa, r
     PRB_DEV_EXT ext = RbGetExt(Extp);
     rb_stream *st;
     if (!ext || !SrcVa || Len == 0) return;
+    /* [83 2026-11-07 M5] 重建窗口：必须在读 ext->Stream 之前判门，并在归还
+     * RbGetExt 引用后早退。原路径裸读 Stream 后直接 rb_read_commit_gen，
+     * 引擎销毁后会解引用已释放的 stream（heap UAF）。 */
+    if (RbIsDataPathFrozen()) { RbDerefExt(ext); return; }
     st = ext->Stream;
     /* [FIX 2026-11-06 视图世代门控] 预取回填按读前捕获世代校验 */
     if (st) rb_read_commit_gen(st, (rb_u64)LbaBytes, SrcVa, (size_t)Len, ViewGen);

@@ -86,6 +86,14 @@ export function decodeStats(p: Buffer) {
   s.DiskReadLatP50Us = p.readUInt32LE(1268);
   s.DiskReadLatP95Us = p.readUInt32LE(1272);
   s.DiskReadLatP99Us = p.readUInt32LE(1276);
+  /* [83 2026-11-07] RB_STATS 末尾五字段（u32@1280/1284/1288/1292 + u64@1296，
+   * sizeof=1304）。旧驱动回包可能只有 1280 字节：每个字段按实际长度守卫，
+   * 不足则填 0，绝不 readUInt32LE/readBigUInt64LE 抛 RangeError（66 号白屏同款防线）。 */
+  s.EngineBlockSize = p.length >= 1284 ? p.readUInt32LE(1280) : 0;
+  s.GeometryRebuildCount = p.length >= 1288 ? p.readUInt32LE(1284) : 0;
+  s.GeometryRebuildLastStatus = p.length >= 1292 ? p.readUInt32LE(1288) : 0;
+  s.GeometryRebuildInProgress = p.length >= 1296 ? p.readUInt32LE(1292) : 0;
+  s.LastGeometryRebuildUtc = p.length >= 1304 ? readU64(p, 1296) : 0;
   return s;
 }
 

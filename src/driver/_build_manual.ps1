@@ -49,7 +49,7 @@ $clCommon = @(
 
 $srcs = @("rbdriver.c","rbattach.c","rbio.c","rbctl.c","rb_stub.c","rbfeat.c",
           "rbpools.c","rbpref.c","rbhot.c","rbL2.c","rbwback.c","rbio_ports.c",
-          "rbthermal.c","rbetw.c","..\core\cache.c","..\core\read_plan.c")
+          "rbthermal.c","rbetw.c","rbrebuild.c","..\core\cache.c","..\core\read_plan.c")
 
 Push-Location (Join-Path $root "src\driver")
 try {

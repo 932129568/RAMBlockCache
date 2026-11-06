@@ -48,6 +48,9 @@ internal struct RbStats
     public uint CacheReadLatencyUs, DiskReadLatencyUs;   // [V10.6/B-12] 读延迟 EWMA（微秒；0=无样本）
     public uint CacheReadLatP50Us, CacheReadLatP95Us, CacheReadLatP99Us;   // [U1 2026-11-06] 命中读分位（log2 桶近似；0=无样本）
     public uint DiskReadLatP50Us, DiskReadLatP95Us, DiskReadLatP99Us;      // [U1 2026-11-06] 含下盘读分位
+    /* [83 2026-11-07] 运行期几何重建统计（末尾纯追加；与 rb_proto.h / Models.cs / RbProto.cs 同步） */
+    public uint EngineBlockSize, GeometryRebuildCount, GeometryRebuildLastStatus, GeometryRebuildInProgress;
+    public ulong LastGeometryRebuildUtc;
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 8)]

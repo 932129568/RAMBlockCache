@@ -42,7 +42,7 @@
 ### 1.4 CI 四次全红的修复（真实遗留，A 类核心）
 - 现象：4 次 push 的 Actions 全部 `failure`，Gate2 挂。
 - 实锤：日志 `check_proto_sync.py:277 UnicodeEncodeError: 'charmap' codec` —— windows-latest 的 Python stdout 是 cp1252，门禁中文输出炸掉；本机用 `PYTHONIOENCODING=cp1252` 精确复现、`utf-8` 下 PASS。
-- 修复：workflow 顶层 `PYTHONIOENCODING: utf-8` + `PYTHONUTF8: 1`；接入 `check_node_contract.py`；Web 步骤接 `npm ci + npm run build`（干净 checkout 预验 PASS）；Gate6 前用纯 .NET 把 `certs/RAMBoostFS-Root.cer` 公钥导入 runner 的 CurrentUser\Root（无私钥）；清理过时注释（旧哈希 `ca7a9c1f…`、"46 文件"、web 暂缓）。
+- 修复（两轮）：① workflow 顶层 `PYTHONIOENCODING: utf-8` + `PYTHONUTF8: 1`，接入 `check_node_contract.py` 契约守卫、Web `npm ci + npm run build`、清理过时注释（旧哈希 `ca7a9c1f…`、"46 文件"、web 暂缓）；② 首个修复 run 卡在「导入根证书」步骤 >4 分钟（hosted runner 非交互会话里 `X509Store.Add` 到 Root 挂起），已取消该 run 并改为 CI 专用 `check_signature.ps1 -AllowUntrustedRoot`：只容忍「链不受信任」，**绝不放过 `NotSigned` / `HashMismatch`**，哈希与三锚点照常强校验；本机门禁⑤不带该开关，仍强制 `Status == Valid`（红线不变）。
 
 ## 2. A 类：会话内已闭环的冻结/暂缓项（11 项）
 

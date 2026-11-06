@@ -222,6 +222,36 @@ QA 交付 `src/core/test_directwrite_stale.c`（16,579 B / sha `37f810ed…`）�
 
 ---
 
+## 4.8 开工预检发现的 3 个规格级阻断（02:3x，主理人核实并批准修正）
+
+工程师解除只读后先做 6 项预检，发现**我的实施单 §12.d / §12.f / M3 三处按字面实施会造成真机卷丢失或池重复启动**。主理人逐行独立核实，**三项全部成立**，明确不叫停、批准修正。
+
+### A · `RbVolumeRemove` 是完整拆除，不是软摘链（最严重）
+`rbattach.c:679 RbDevListUnlink`、`:685 IsAttached=FALSE`、`:740 Removed=1`、`:748-750 Stream 摘除 + rb_stream_destroy`、`:752 Magic=0`、`IoDetachDevice` + `ObDereferenceObject(ext->Pdo)` + `IoDeleteDevice(ext->FilterDevice)` ⇒ 照 §12.d 走完，`RbAttachVolumeByLetter` 的 `RbFindExtByLetter` 必 NOT_FOUND，**所有加速卷永久丢失、只能重启**。`RbDetachVolumeByLetter`（`:1149`）是软分离但**保留 Stream**（「不摘除：保留供重新热开启」），也不满足 `Stream==NULL` 判据。
+⇒ **批准新增 `RbDetachStreamForRebuild(ext)` 软摘除原语**：只 `IsAttached=FALSE` → 有界等 `ext->Refs` 回 owner 基准（照 `:696-711` 20ms×3000，但**不** `RbZombieQueueExt`）→ `rb_stream_flush(st,1)` + `rb_stream_discard_all(st)` → `InterlockedExchangePointer(&ext->Stream,NULL)` + `rb_stream_destroy(st)`；**不**置 `Removed`、**不**清 `Magic`、**不**摘 DevList、**不**删设备、**不**释放 PDO、**不**动 `RemoveDone`。这样 `RbAttachVolumeByLetter` 才能找到卷重挂。
+附带：`rb_stream_destroy`（`cache.c:1125-1146`）60s 超时 leak-by-design ⇒ 软摘除后须检查引擎 stream 表为空（`nstreams==0`）才允许 `rb_engine_destroy`，否则拒绝切换并回滚。
+
+### B · `RbEnsureEngine()` 会二次启动池，与「池全程不停」矛盾
+`rbattach.c:391-396`：`created` 时 `RbStartIoWorkers()` + `RbStartFlushers()` + `RbStartFlushThread()`。§12.f 写「`g_Rb.Engine=NULL` → `RbEnsureEngine()`」会在池仍服役时二次 `RbStartIoWorkers()`（`rbio.c:1055 IoWorkerCount=0` + 重初始化 `QueueHead`/`SpinLock` = 链表损坏/IRP 悬挂），并二次 `PsCreateSystemThread` 覆盖 `FlushThread`（`:2121` 不判空）。
+⇒ **批准新增 `RbCreateEngineOnly(newBs)`**：照 `:374-384` 装配 `rb_config`（`max_bytes` / `block_size=newBs` / `writeback` / `readback` / `readahead_*` / `tinylfu`），`EngineMutex` 内 `g_Rb.Engine = rb_engine_create(&cfg)`，**不启任何池/线程**；随后单独 `RbApplyEngineConfig(&g_Rb.Config)` + `RbRefreshMemoryBudget()`。
+
+### C · `Rb2PoolShutdown()` 置 `s_Stop` 闩，M3「只调它」会永久杀死特性层
+`rbpools.c:148 InterlockedExchange(&s_Stop,1)`；`:68 Rb2PoolSubmit` 见闩返 `STATUS_SHUTDOWN_IN_PROGRESS`；`RbFeatRecover()`（`rbfeat.c:401-420`）只解 `s_Stop` + 重建 `Rb2Tick`，**不调 `Rb2PoolInit()`** ⇒ 重建后预取/淘汰/预热/L2 落盘作业永久被拒，`Rb2Tick` 每 30s 空转。
+⇒ **批准 `RbFeatQuiesce()` = `Rb2PoolShutdown()` → 有界等 `s_PrefInFlight==0` → `Rb2PoolInit()` 配对解闩**，返回 NTSTATUS，任一失败即回滚（禁止销毁引擎）。`Rb2PoolShutdown` 本身不碰 L2/ETW ✅。
+
+### 追加批准的 4 条收窄
+1. **`DataPathInFlight` 落点**：`RbCtxAlloc()` 成功后 +1、`RbCtxFree()` 内部 -1（覆盖 alloc→submit 窗口，比实施单 §5 的 `RbSubmitIo` 落点更严）；`RbFlushSubmit` 用已有 `FlushJobs` 计数，**不并入** `DataPathInFlight`，避免双重计数。
+2. **五个新字段偏移实算**（`check_proto_sync.py --strict` 布局引擎）：`EngineBlockSize@1280` / `GeometryRebuildCount@1284` / `GeometryRebuildLastStatus@1288` / `GeometryRebuildInProgress@1292` / `LastGeometryRebuildUtc@1296`(u64, 1296%8==0) / `sizeof=1304`。`proto-decode.ts` 长度守卫**分级**：4 个 u32 各自 `p.length>=off+4`，u64 用 `p.length>=1304` 才 `readU64(p,1296)`。**79 号 §4.6 的「`p.length>=1284` 建议值」正式作废** —— 1284 是第二字段偏移，照抄会读错。
+3. `Rb2_PortFill` 的门加在 `RbDerefExt` **之前**并归还引用，否则泄漏。
+4. `RbResumeTrack` 在重建窗口内崩溃会丢 resume 记录 ⇒ 记入 83 号残余风险。
+
+### 工具链核实（更正工程师预检结论）
+`_build_manual.ps1:19` 硬编码 `C:\Program1\VC\Tools\MSVC\14.44.35207` —— **实测该目录存在且 `bin\Hostx64\x64\cl.exe` 可用**；PATH 上的 `14.51.36231`（VS 18 BuildTools / cl 19.51）是另一个并存工具集，与脚本的绝对路径无关。WinSDK `10.0.26100.0`、WDK NuGet `10.0.26100.6584` 的 `km\ntddk.h` 与 `km\x64` lib 均在。23:21 全链重放正是用此脚本编出 `63ad0fa8…` sys 并真机验收 PASS。⇒ **脚本无需修改**，工程师不得改 `_build_manual.ps1`，也不得把「工具链路径不匹配」写进 83 号未覆盖项；若编译失败另找原因并留完整 cl/link 输出。
+
+**83 号报告须如实标注与实施单 §12.d / §12.f / M3 的偏差**，并把 6 项预检结论作为附录。
+
+---
+
 ## 5. 口径限制
 
 - §3 折中路径为**基于代码阅读的设计推断**，尚未经工程师 GO 裁决，**不得当作已确认可行**；P1–P6 均待答。

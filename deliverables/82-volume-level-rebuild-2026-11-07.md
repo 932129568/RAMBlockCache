@@ -111,6 +111,56 @@
 
 ---
 
+## 4.5 用户拍板与明细复核强制修订（01:5x）
+
+**用户拍板**：选项 A ——「改驱动」继续，改走卷级重建；BLOCKER 2 复现结论作为放行前置；H8 目标降级。
+
+**双向验证**：`software-engineer` 的明细版复核在未见 82 号的情况下**独立收敛到同一条替代路径**（「先 detach 全部卷 → 复用排水链 → 重建 → 走既有 attach 逐卷恢复」，判定 CONDITIONAL GO），并明确「若坚持 §4.2 原序列（不 detach 卷、手写 stream 摘链/恢复）＝重写整个停机/在途屏障子系统，blast radius 远超 S1 预算，不建议」。故 §3 路径成立，但必须吸收下列修正。
+
+### M1 · 第 4 个阻断：主 attach 路径不查 `Unloading`（79 号 §5 R8 引用错误）
+`rbattach.c:1231` 只在 **TestMode 专用** `RbAttachVolumeRuntime()` 里；**主路径 `RbAttachVolumeByLetter()`（`:958`）只查 `RbPanicActive()`（`:977`）与 `BootLoopGuard`（`:983`），全函数无 `Unloading` 检查**。`RbDetachVolumeByLetter`（`:1093`）、`RbAutoAttachSweep`（`:568-648`，30s 周期、`:639` 调主 attach）同样无门。⇒ 重建窗口内 resume sweep 与控制面 `attach` IOCTL 都能插队，在引擎半初始化时 `:1063 RbEnsureEngine()` / `:1066 rb_stream_create` ⇒ 几何错配 / UAF。**实施必须给主 attach、detach、resume sweep 三处补 `Recreating` 门**。
+
+### M2 · 控制面方向纠正（79 号 §9.6 担忧反了）
+`rbio_ports.c:40` **不是**控制 IOCTL 入口，只是 `Rb2_PortShrink()`（内存压力收缩回调）。`GET_CONFIG`/`GET_STATS`/`SET_CONFIG`/`ATTACH`/`FLUSH` 全走 `RbDispatchDeviceControl`（`rbctl.c:809`），**控制设备分支 `:819` 起完全不检查 `Unloading`** ⇒ 窗口内 GET 类不会被拒；真正风险是 `GET_STATS` 读到 `Engine==NULL`、`SET_CONFIG` 二次触发重建、`ATTACH` 插队。⇒ **用独立 `Recreating` 门做控制面拒绝 + 暴露 `GeometryRebuildInProgress`，不要把 `Unloading` 加到控制设备分支**。SET_CONFIG 上下文确为 PASSIVE（`rbctl.c:6-9`），但 `RbApplyConfig` 内 `ExAcquireFastMutex`（`:240`）会抬到 APC_LEVEL ⇒ **30s 级 join / 引擎销毁必须放进 work item**，且 `RbMsgSetConfig :311-332` 当前 `UNREFERENCED_PARAMETER(pst)` 恒返成功，入队失败/并发拒绝必须如实写回 `*pst`。
+
+### M3 · `RbFeatShutdown` 不可逆（§3 原写「复用完整排水链」需收窄）
+`rbfeat.c:360-396` 的 `RbFeatShutdown()` 会 `RbL2Close()`（`:394`）+ `RbEtwShutdown()`（`:395`）；`RbFeatRecover()`（`:401-430`）只重建 `Rb2Tick`（`:418`），注释 `:399-400` 明写「保持 s_Init=1，不重走池初始化」⇒ **L2 与 ETW 永久关闭且无法恢复**。但省略它则 `Rb2PoolSubmit` 的在途预取/淘汰作业（`rbpref.c:70-127`，`:119` 直接解引用 `g_Rb.Engine`）没排空。⇒ 实施须新增 **`RbFeatQuiesce()`（只调 `Rb2PoolShutdown()` 排空池、不关 L2/ETW）**，或论证可单独调用。
+
+### M4 · 锁序：不得持 `s_AttachMutex` 调 `RbAttachVolumeByLetter`
+`rbattach.c:1097-1102` 规定 `s_AttachMutex` 最外层、内部只取 `DevListLock`、禁止反向嵌套。重建 worker 若全程持该锁再调 `RbAttachVolumeByLetter`（KMUTEX 重入语义复杂）有自死锁风险。⇒ **§3.1 第 7 步修订**：不全程持锁；改为**快照阶段持锁**，摘除/重建/重挂阶段靠 `Recreating` 门（M1）挡并发，逐卷操作走既有 `RbVolumeRemove` / `RbAttachVolumeByLetter` 内部自身的取锁，锁序由已验证路径保证。
+
+### M5 · 在途屏障（§3 最关键的补齐）
+全库无覆盖主 IO 路径的全局计数。实施须新增 `volatile LONG g_Rb.DataPathInFlight`：`RbSubmitIo`（`rbio.c:1201-1251`）、`RbFlushSubmit`（`:1651-1688`）等提交点递增，worker 完成与 `RbCtxFree` 严格配对递减；`Rb2_PortFill`（`rbio_ports.c:19-30`，裸读 `ext->Stream` 后直调 `rb_read_commit_gen`）、`RbPrefIssueJob`、`RbHotPrewarmJob`、`RbEvictJob` 各入口加 `if (Unloading || Recreating) { 归还引用; return; }`。`Unloading` 从 `BOOLEAN`（`rb_common.h:211`）升 `volatile LONG`、写点改 `InterlockedExchange` 保证发布序。**有界等待判据**：`DataPathInFlight==0 && FallbackInFlight==0 && ZombiePending==0 && s_PrefInFlight==0 && FlushJobs==0 && 每卷 ext->Refs 回基准`，30/60s；任一非零 ⇒ 禁止销毁引擎、走回滚。
+
+### M6 · 停机可逆性补丁（Q2 四处）
+① `RbStartIoWorkers` 前断言所有 `w->Thread==NULL && Alive==0 && 队列空`；② `RbStartFlushThread` 前 `KeClearEvent(&FlushStop)` + 断言 `FlushThread==NULL`（现 `rbio.c:2121` 直接覆盖）；③ `RbStartFlushers` 修 `:1738 if (f->Thread) continue` 为「`Thread` 非 NULL 但 `Alive=0` ⇒ 重新 spawn」；④ `RbStopFlushThread` 超时态 `:1133-1139` 恢复路径补「已观测退出但 `FlushRunning` 仍 1」的清理。停机超时一律回滚到旧几何、旧引擎、`Unloading=FALSE`，禁止哑服役。
+
+### M7 · L2 反向静默降级
+`rbL2.c:309-312` 粒度门在 4K→16K 时自动 `s_State=3`（refused）✓；但 **16K→4K 回退不会自动重开**（`RbL2LazyOpen()` 只由 REFRESH IOCTL / 数据路径探测触发）⇒ 重建第 9 步须显式 `RbL2LazyOpen()`（PASSIVE）并复核 `RbL2State()==1`，失败记 WARN 不阻断。另：粒度门读的是 `g_Rb.Config.BlockSize`（配置副本），改造后运行值=引擎几何，此不一致自然消失。
+
+### M8 · B1 定稿（79 号 §4.6 的三处修正）
+- **新增第 5 个字段 `GeometryRebuildInProgress`（u32）**：第 1 步置 1、复机完成后清 0。E1 判据改为三者同时成立 —— `GET_STATS.EngineBlockSize==目标` **且** `GeometryRebuildCount` 递增 **且** `GeometryRebuildInProgress==0`；单看任一字段不算数。
+- `RbFillStats`（`rbctl.c:41`）四个/五个字段放 `:45 RtlZeroMemory` 之后、`:61 if(!g_Rb.Engine) return` 之前；`eng` 指针必须**先快照一次**（`InterlockedCompareExchangePointer`）避免 TOCTOU；`rb_engine_block_size`（`cache.c:979-980`）自带判空 ✓。
+- 时钟源用 `KeQuerySystemTimePrecise`（`rbio.c:2072` 既有用例），**不用** `RbInterruptMs()`（单调中断时间、非 UTC、重启归零）或 QPC。
+- **79 号 §4.4 与 §4.6 自相矛盾**：「GET_CONFIG 返回运行引擎真实几何」须改为「GET_CONFIG 保持配置副本语义；真实几何只走 `GET_STATS.EngineBlockSize`」。E1 里的 `GET_CONFIG BlockSize=16384` 标注为配置副本证据，不作真实几何证据。
+- `proto-decode.ts` 的长度守卫阈值 **`p.length>=1284` 是建议值，必须按 `check_proto_sync.py --strict` 的 Pack=8 布局实算**，不得照抄。
+
+### M9 · 验收判据修订
+- **E2 放宽**：切换瞬间 `method=7` 的 Attached 集合短暂为 0 ⇒ 判据改为「**重建完成后**集合与 read/write/wm 标志一致」，79 号 §8 E2 原写「重建前后完全一致」需同步改。
+- **E4 补**：`rb_engine_flush(eng,1)` 与 `rb_engine_destroy` 内部 `cache.c:1170` 重复两次；第 3 步后必须校验所有卷 `rb_stream_dirty_bytes()==0` 并拒绝切换，校验到销毁之间不得有新写入。
+- **E8 中间态**：`GeometryRebuildInProgress=1` 时 `EngineBlockSize` 允许为 0，判据不得误判。
+- **8 类用户态回归用例**（实施单必须落地）：五类在途并发注入 ASan 零 UAF；30s join 强制超时回旧几何；新几何失败+旧几何回建成功；两次都失败保持 passthrough；并发两个 `set block` 只重建一次；4K↔16K 往返 100 次逐次校验五字段+stream 数+L2；4K 热路径 A/B 结构 diff 0；重建窗口 `GET_STATS` 中间态。
+
+### M10 · 实施分批（与 QA 并行不冲突）
+- **第一批**：卷级重建骨架 + M1–M9 全部补齐 + `RB_STATS` 五字段与协议三副本 + 用户态回归用例。
+- **暂不动** `rbio.c:925-946` / `cache.c:1486`（BLOCKER 2 的修复位），等 QA `test_directwrite_stale.c` 复现结论；若成立，作为同批第二笔提交并入，不重开全链。
+- 实施者不得触碰签名/部署/git/运行态；不升 `ProtocolVersion`；不改 `RB_CONFIG` 24 字段、不动 SET_CONFIG 编码与 Web 设置页表单。
+
+### 实施前 6 项只读预检（交工程师）
+① 全库 `ext->Stream` 读写点清单（哪些持 `s_AttachMutex`/`DevListLock`/`Refs`，哪些裸读 —— `rbio_ports.c:26` 是裸读）；② `RbCtxFree`/`RbSubmitIo`/`FallbackInFlight` 计数严格配对审计；③ `Rb2PoolShutdown` 能否单独调用而不关 L2/ETW；④ `RbVolumeRemove` 幂等性与重建后重新 attach 的可行性（`ext->Magic`/`Removed`/`RemoveDone` 复位）；⑤ `RbL2LazyOpen` 触发条件；⑥ `check_proto_sync.py --strict` 实算五个新字段偏移。
+
+---
+
 ## 5. 口径限制
 
 - §3 折中路径为**基于代码阅读的设计推断**，尚未经工程师 GO 裁决，**不得当作已确认可行**；P1–P6 均待答。

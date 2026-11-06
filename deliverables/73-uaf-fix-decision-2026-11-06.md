@@ -194,6 +194,30 @@ QA 以**独立复跑**（未复述主理人数字）确认：
 
 ⇒ **用户侧只剩「重启一次」**。重启后 `boot_utc > marker` 成立、看门 `Ack` 追平 11 并解除武装，`verify_final_reboot.ps1` 应得 `FAIL=0 / VERDICT: PASS`。重启后**严禁**再双击 `RB-finalize-uaf-release.cmd`（ONE-SHOT + G10）。
 
+## 6.3 重启后最终验收（23:31:49，`FAIL=0` / `VERDICT: PASS`，收网闭环）
+
+用户 23:29:00 重启（开机 125s 后采样，满足 60–90s 窗口）。`src/scripts/verify_final_reboot.ps1`（只读）：
+
+```
+[INFO] boot_local=2026-11-06 23:29:00 boot_utc=2026-11-06T15:29:00.500Z
+== RESULT: FAIL=0 WARN=0 ==
+VERDICT: PASS - harvest closed, Verifier off, D: auto-resumed, bridge healthy
+```
+
+**19 个 PASS gate、0 FAIL、0 WARN、0 运行时异常**：
+
+| 组 | 判据 |
+|---|---|
+| 重启 / Verifier | `reboot after finalize`（boot `15:29:00.500Z` > marker `15:22:04.570Z`，X2 生效、证明确实重启）；`Verifier off`（`VerifyDrivers=[]`、`VerifyDriverLevel=` 空） |
+| 驱动 / 服务 / 看门 | `System32 sys` `63ad0fa8…` Valid 且与已签名 dist sys 一致；`service` Running/Boot；**`watchdog` `Seq=11 Ack=11 Armed=0 Healthy=1 BootFails=0`** —— 重启后 Ack 追平 11、看门自动解除武装，全周期闭环（§6.2 改的结构性判据正确） |
+| 开机段 / 恢复 | `bootcfg reg` `AA=0 RB=1 Letters=D`；新开机段 24 行含 `[562] resume list loaded` + `[1076] volume attached` + **zero ERROR**；`boot-critical allowed` 条件 INFO 本次命中 |
+| 桥接 / RPC | `bridge health` pid=8376 / `native=true` / `node=v27.0.0-alpha.0.0.0`（keeper 23:30:05 随 ONSTART 自启）；`GET /rb/bootcfg`；`method=7` `D.Attached=1` 且 C/E/F 仍 0；`GET_CONFIG` **24 字段含 `TinyLFU=0`**；RPC 后看门 `11/11/0` 不变 |
+| 发布物 | `Setup signed` `0269fb50…` Valid；`README Setup hash in sync` |
+
+⇒ §6 全部验收判据达成：**修复后的内核镜像已真机加载并稳定运行、Verifier 关闭、D: 自动恢复、TinyLFU 配置链在活体桥接生效、看门全周期闭环**。19:22 的旧收网（`ed1bd99c…`/`6acb825f…`）已被本轮新签名产物取代。
+
+**口径边界（如实）**：本轮证明的是**修复版驱动真机加载 + 配置链/恢复链/桥接链可用 + 无崩溃证据**；**不构成缓存数据面峰值性能或回写数据正确性的真机验证**。>4K 几何的内核侧非对齐写 + 并发驱逐真机验证仍未覆盖（证据为用户态 core 双构建 + ASan）；72 号 >4K 性能矩阵已归档为「已知缺陷阻塞、数字不可采信」，若要性能结论须重跑完整矩阵。安静模式/性能模式差异（`powercfg` 仍报「平衡」而用户自述性能模式）并列记录，吞吐只作同条件相对参考。
+
 ## 7. 风险与口径限制
 
 - 修复是**静态落地 + 用户态 core 回归**，内核侧 >4K 非对齐写 + 并发驱逐的真机验证仍属未覆盖项；如需，另起 WDK/Verifier 周期。

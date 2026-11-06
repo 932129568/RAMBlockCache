@@ -309,6 +309,8 @@ catch { L ("HEALTH FAILED: " + $_.Exception.Message); exit 1 }
 
 **口径限制沿用 §7**：本轮证明的是驱动稳定性 + 配置链 / 恢复链 / 桥接链真机可用，**不构成缓存数据面峰值性能或回写数据正确性的真机验证**；最佳性能档 1/2/4/8/16 路与 S2 16K 端到端复测仍属收网后独立事项。
 
+**发布与 CI**：`d67d917` 已推送 `origin/main`（25 文件，+2188 / −17，`git status` 干净）；GitHub Actions run **`42209976292`**（run #8，head `d67d9173…`）`status=completed / conclusion=success`（11:24:07Z → 11:25:22Z），六门禁全绿。上一版 `f84796f` 的 run `42185453757` 亦为 success。团队成员已全部关停。
+
 ---
 
 ## 7. 口径限制（沿用 64 号 / KNOWN_ISSUES F2）

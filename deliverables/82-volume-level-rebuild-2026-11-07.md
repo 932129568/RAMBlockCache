@@ -252,6 +252,34 @@ QA 交付 `src/core/test_directwrite_stale.c`（16,579 B / sha `37f810ed…`）�
 
 ---
 
+## 4.9 QA v2 四模式矩阵与「门控版」时序冲突（02:4x）
+
+### 背景：一次时序交叉造成的口径冲突（已澄清）
+QA 的 v2 用例按我**更早一条、已撤回**的「`bs>4096 && 非整子块写` 门控版」裁定实现了 `--mode post-cond`，并曾据此向工程师发过「按门控版实施」的更正。当前唯一有效裁定是 §4.7.2 的**无条件方案 A**。我已向两名成员分别发出覆盖指令：工程师按无条件方案 A 实施；QA 不再按门控版推进、不再发同类更正、81 号措辞改回无条件方案。**这是消息时序问题，不是成员判断错误**，QA 的 v1 原本就推荐无条件失效。
+
+### 主理人 01:48 独立复跑（作者≠验证者）
+v2 产物 `src/core/build/qa_stale_directwrite.exe` = 172,032 B / sha `3ba03e57…`。用法：`--mode pre|post|post-cond|all [--geom N] [--case main|off4096|tail512|all]`。
+
+| 模式 | 语义 | 实测结果 |
+|---|---|---|
+| `--mode pre` | 当前代码（写盘 + 短 len commit，不失效） | >4K 三档 STALE / 4K CLEAN（v1 已确证） |
+| `--mode post-cond` | **门控版**（`bs>4096` 才失效，我已撤回） | 12 格中**仅 `4096 / tail512` = STALE**，其余 11 格 CLEAN；程序 `INTERPRETATION` 行自证「gated fix does NOT cover 4K sector-tail writes」 |
+| `--mode post` | **无条件失效 = 方案 A** | **12 格全 `RESULT: CLEAN`**，`exit=0` |
+
+两者均 `exit=0`、零运行异常。矩阵为 4 几何 × 3 case（main / off4096 / tail512）= 12 格。
+
+### 结论：无条件方案 A 是唯一全覆盖解
+`--mode post-cond` 的 `4K/tail512 STALE` 是**决定性证据**：缺陷本质是「任何几何下的非整子块写」，`bs>4096` 门槛会漏掉 4K 几何下的 512B 扇区尾写；只有无条件 `RbInvalidateAfterFlush` 能让 12 格全 CLEAN。这与 §4.7.2 撤回条件式的四条理由完全吻合，且由数据而非推理坐实。
+
+**完整证据链**：`pre`（缺陷存在）→ `post-cond`（门控不足）→ `post`（方案 A 完全修复）。QA v2 已把矩阵跑全，**无需新增 `--mode post-uncond`** —— 我已撤回该要求，避免重复劳动；`--mode post` 即 E3/E4 修复后正向断言模板，工程师 8 类回归里「>4K 直写陈旧读」直接引用它、要求 12/12 CLEAN。
+
+### 措辞与文档归属
+- 81 号报告由 QA 把「方案 A = 门控版」全部改为「方案 A = `rbio.c:935` 无条件 `RbInvalidateAfterFlush`（等价 `--mode post`）」，`--mode post-cond` 保留为负面对照，并补主理人独立复跑附录。
+- **79 号 §4.4 / §4.6 / §5 R10 的最终措辞由主理人统一改**：`GET_CONFIG` 保持配置副本语义、真实几何走 `GET_STATS.EngineBlockSize`；`p.length>=1284` 作废、按 §4.8 实算偏移分级守卫；R10 = 「不得在 4K 读写路径新增原子写或锁；正确性所必需的失效允许，但须 4K A/B 结构 diff 0 + 吞吐回归留证」。
+- 78 号 §4.3.1 / §6 预热覆写序列补强、§5 吞吐不可比两条验收通过，不再改动。
+
+---
+
 ## 5. 口径限制
 
 - §3 折中路径为**基于代码阅读的设计推断**，尚未经工程师 GO 裁决，**不得当作已确认可行**；P1–P6 均待答。

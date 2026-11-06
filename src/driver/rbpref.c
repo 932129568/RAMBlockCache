@@ -34,6 +34,7 @@ static RB2_ST s_St[RB2_SLOTS]; static KSPIN_LOCK s_Lk;
 typedef struct _RB2_PRD {
     PVOID Ext; PIRP Irp; PMDL Mdl; PVOID Va, Raw;
     ULONG Len; ULONG64 Lba; KEVENT Ev; NTSTATUS St;
+    rb_u64 ViewGen;   /* [FIX 2026-11-06] 计划时视图世代（回填门控） */
 } RB2_PRD;
 
 static volatile LONG s_PrefInFlight = 0;
@@ -66,7 +67,7 @@ static NTSTATUS NTAPI RbPrefComplete(PDEVICE_OBJECT d, PIRP irp, PVOID c)
     return STATUS_MORE_PROCESSING_REQUIRED;
 }
 
-static VOID RbPrefIssueJob(PVOID Ctx)
+VOID RbPrefIssueJob(PVOID Ctx)
 {
     RB2_PRD *p = (RB2_PRD *)Ctx;
     PRB_DEV_EXT ext = (PRB_DEV_EXT)p->Ext;
@@ -112,7 +113,10 @@ static VOID RbPrefIssueJob(PVOID Ctx)
                 }
                 if (NT_SUCCESS(p->St)) {
                     Rb2Count(4, 1); Rb2Count(5, (LONG64)p->Len);
-                    Rb2IoEnter(); Rb2PortFill(ext, p->Lba, p->Len, p->Va); Rb2IoLeave();
+                    Rb2IoEnter(); Rb2PortFillGen(ext, p->Lba, p->Len, p->Va, p->ViewGen); Rb2IoLeave();
+                    /* [FIX F1/F5] 预读填充接线：激活位 + 填充字节统计
+                     * （readahead_active 原本只有清零无置位——prefetch check 永远假阴性） */
+                    rb_readahead_note_fill(g_Rb.Engine, (rb_u64)p->Len);
                 }
             }
             p->Irp->MdlAddress = NULL;
@@ -154,6 +158,7 @@ static VOID RbPrefIssue(PRB_DEV_EXT ext, ULONG64 lba, ULONG len)
     if (!p->Raw) { Rb2Free(p); return; }
     p->Va  = (PVOID)(((ULONG_PTR)p->Raw + al - 1) & ~(ULONG_PTR)(al - 1));
     p->Len = In; p->Lba = a0; p->Ext = ext;
+    p->ViewGen = rb_stream_view_gen(ext->Stream);   /* [FIX 2026-11-06] 读前捕获 */
     KeInitializeEvent(&p->Ev, NotificationEvent, FALSE);
 
     InterlockedIncrement(&s_PrefInFlight);   /* 先占额度，防提交间隙超发 */
@@ -179,7 +184,11 @@ VOID RbPrefStream(PVOID Extp, ULONG64 lba, ULONG len)
      * 直接 return 不进跟踪表（缺省键=16 默认开；非法非零值 RbPolGetFor 已回退 16）。 */
     if (pol.ReadAheadMB == 0) return;
     mb = pol.ReadAheadMB;
-    if (mb > 64) mb = 64;                    /* 防御性截断（RbPolGetFor 已保证合法档） */
+    if (mb > 64) mb = 64;                    /* 防御性截断（RbPolGetFor 已保证合法档）。
+                                              * [回滚 2026-10-24] 扩档(128/256/512)+前沿
+                                              * 流水线整体撤回：部署后三次整机崩溃
+                                              * (0x7B/0x7E, dump: 基址+0xBCC 特权指令异常)，
+                                              * 二分定位先回退本改动，归因后再议扩档。 */
 
     KeQuerySystemTimePrecise(&now);
     /* 持 s_Lk 保护"槽位查找/分配 + Seq/Last 更新"的原子性：两核对同一 ext

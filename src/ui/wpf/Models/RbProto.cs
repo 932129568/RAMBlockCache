@@ -73,9 +73,10 @@ public static class RbProtoDefs
 
     /* V8 消息头: Type@0 / Size@4 / Status(int)@8 / Reserved@12 / Data 联合体@16。
      * payload 起始偏移 = 16 (V7 为 8, 必须改)。
-     * RbMsg 总大小 = 16(头) + 联合体最大成员 RbLogList(7688) = 7704。 */
+     * [FIX 2026-10-24] RbMsg 总大小 = 16(头) + 联合体最大成员 RbEventList(8208) = 8224
+     * （B-7 事件环加入后超越 RbLogList 7688；三副本同步）。 */
     public const int RbMsgDataOffset = 16;
-    public const int RbMsgSize = 7704;
+    public const int RbMsgSize = 8224;
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 8)]
@@ -203,6 +204,13 @@ public struct RbStats
     /* ---- [V10.6/B-12] 读延迟 EWMA（微秒；末尾纯追加；0=尚无样本） ---- */
     public uint CacheReadLatencyUs; // 全命中读 EWMA（采样 1/64，1/8 权重）
     public uint DiskReadLatencyUs;  // 含 miss 下盘读 EWMA（同采样）
+    /* ---- [U1 2026-11-06] 读延迟分位数（微秒；log2 桶近似；0=尚无样本） ---- */
+    public uint CacheReadLatP50Us;  // 全命中读 P50
+    public uint CacheReadLatP95Us;  // 全命中读 P95
+    public uint CacheReadLatP99Us;  // 全命中读 P99
+    public uint DiskReadLatP50Us;   // 含下盘读 P50
+    public uint DiskReadLatP95Us;   // 含下盘读 P95
+    public uint DiskReadLatP99Us;   // 含下盘读 P99
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 8)]
@@ -335,7 +343,7 @@ public struct RbLogList
 /// V8 通用消息头 (rb_proto.h RB_MSG_T): Type@0 / Size@4 / Status(int)@8 / Reserved@12 / Data 联合体@16。
 /// 不再把含引用数组的结构放进 union (CLR 不允许带 ByValArray 的对象字段与非对象字段重叠,
 /// 会 TypeLoadException)。真正的 Data 区由发送侧按消息类型单独 StructureToPtr 到 offset 16;
-/// 接收侧按 Type 单独 PtrToStructure。整个缓冲区仍为 RbMsgSize (7704) 字节。
+/// 接收侧按 Type 单独 PtrToStructure。整个缓冲区仍为 RbMsgSize (8224) 字节（[FIX 2026-10-24]）。
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 8)]
 public struct RbMsg

@@ -17,12 +17,19 @@ $Tests = @(
   "test_cache","test_counter","test_geom","test_mixed","test_parflush","test_regress",
   "test_release","test_v5","test_v6","test_bigread","test_flush_many",
   "edge_v3","edge_v4","stress_v3","stress_v4","bench_readhit","test_auditfix",
-  "test_write_ex","test_wsconc"
+  "test_write_ex","test_wsconc","test_sparse_miss","test_exclude",
+  "test_flushpar"  # [PF-16] 1/2/4/8/16-way zone flush: zero data loss + rough throughput
 )
 $ok=0; $fail=0; $runFail=0
 foreach ($t in $Tests) {
   $exe = Join-Path $core "build\asan_$t.exe"
-  & cl /nologo /Od /Zi /W4 /utf-8 /I. /fsanitize=address (Join-Path $core "$t.c") cache.c /Fe:$exe /Fo:build\ > "build\asan_$t.rc.log" 2>&1
+  $sources = @((Join-Path $core "$t.c"), "cache.c")
+  $extra = @()
+  if ($t -eq "test_sparse_miss") { $sources += "read_plan.c" }
+  # [F4/F5 2026-11-06] test_geom slab assertions need the test-only hook surface
+  # (same discipline as test_evict_wire's RB_EVICT_HOOK_EXTERNAL define).
+  if ($t -eq "test_geom") { $extra += "/DRB_SLAB_TEST_HOOK=1" }
+  & cl /nologo /Od /Zi /W4 /utf-8 /I. /fsanitize=address $extra $sources /Fe:$exe /Fo:build\ > "build\asan_$t.rc.log" 2>&1
   if (Test-Path $exe) { $ok++ } else { $fail++; Write-Output "[FAIL-asan] $t"; Get-Content "build\asan_$t.rc.log" | Select-Object -First 6 }
 }
 $exe = Join-Path $core "build\asan_test_evict_wire.exe"

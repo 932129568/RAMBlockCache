@@ -1,0 +1,471 @@
+@import "tailwindcss";
+
+/* =========================================================================
+ * 设计令牌 —— 唯一事实源是 src/ui/controller/RAMBlockCache.Controller/Theme/Dark.xaml
+ * 本文件由该 XAML 手工映射生成，颜色值逐条对应（2026-10-31 核对）。
+ * 修改令牌时：先改 Dark.xaml，再同步本文件，禁止单方面漂移。
+ *
+ * 纪律：零死令牌。没有消费方的令牌不入库（沿用 Dark.xaml 的 [FIX B26] 约定）。
+ * ========================================================================= */
+
+/* ---- Tailwind 4 规范注册：令牌 → 原子类（bg-surface/text-secondary/...）----
+ * [适配 2026-10-31] 与下方 :root 变量同源：@theme 生成工具类，:root 供
+ * style={} 与 echarts/运行时取值。两侧必须一致，改动同步。
+ * [亮色化 2026-10-31] 决策人拍板弃纯黑——Web 控制台采用亮色调色板；
+ * Dark.xaml 映射仅保留语义名对应（web 侧色值独立演化，XAML 不动）。 */
+@theme {
+  --color-app: #f3f5f9;
+  --color-sidebar: #ffffff;
+  --color-statusbar: #ffffff;
+  --color-surface: #ffffff;
+  --color-surface-hover: #eef2f8;
+  --color-elevated: #ffffff;
+  --color-input: #f6f8fb;
+  --color-border: #e4e8ef;
+  --color-border-default: #d4dbe6;
+  --color-border-strong: #bcc6d6;
+  --color-primary: #17233c;
+  --color-secondary: #5a6880;
+  --color-tertiary: #8b97ac;
+  --color-disabled: #b9c2d2;
+  --color-on-accent: #ffffff;
+  --color-accent: #0f86e0;
+  --color-accent-hover: #2f9af0;
+  --color-accent-active: #0b6fbd;
+  --color-accent-subtle: #e3f2fe;
+  --color-success-fg: #0e8a56;
+  --color-success-bg: #e6f7ef;
+  --color-success-border: #b7e4cf;
+  --color-warning-fg: #a06e08;
+  --color-warning-bg: #fdf3dd;
+  --color-warning-border: #eed9a4;
+  --color-danger-fg: #d0443b;
+  --color-danger-bg: #fdedec;
+  --color-danger-border: #f3c4c0;
+  --color-danger-solid: #e05248;
+  --color-info-fg: #0f6fbe;
+  --color-info-bg: #e6f3fd;
+  --color-neutral-fg: #5a6880;
+  --color-neutral-bg: #eef1f6;
+  --color-neutral-border: #d4dbe6;
+  --color-chart-1: #0f86e0;
+  --color-chart-2: #7c5cf0;
+  --color-track: #e7ebf2;
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+    "Microsoft YaHei", sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, monospace;
+}
+
+:root {
+  /* ---- [亮色化 2026-10-31] 背景层级 ---- */
+  --rbc-bg-app: #f3f5f9;
+  --rbc-bg-sidebar: #ffffff;
+  --rbc-bg-statusbar: #ffffff;
+  --rbc-bg-surface: #ffffff;
+  --rbc-bg-surface-hover: #eef2f8;
+  --rbc-bg-elevated: #ffffff;
+  --rbc-bg-input: #f6f8fb;
+
+  /* ---- 描边 ---- */
+  --rbc-border: #e4e8ef;
+  --rbc-border-default: #d4dbe6;
+  --rbc-border-strong: #bcc6d6;
+
+  /* ---- 文字层级 ---- */
+  --rbc-text-primary: #17233c;
+  --rbc-text-secondary: #5a6880;
+  --rbc-text-tertiary: #8b97ac;
+  --rbc-text-disabled: #b9c2d2;
+  --rbc-text-on-accent: #ffffff;
+
+  /* ---- 强调（只表达交互身份，禁止表达状态） ---- */
+  --rbc-accent: #0f86e0;
+  --rbc-accent-hover: #2f9af0;
+  --rbc-accent-active: #0b6fbd;
+  --rbc-accent-subtle: #e3f2fe;
+  --rbc-focus-ring: #8c0f86e0;
+
+  /* ---- 语义五色（三件套 + 实心） ---- */
+  --rbc-success-fg: #0e8a56;
+  --rbc-success-bg: #e6f7ef;
+  --rbc-success-border: #b7e4cf;
+  --rbc-success-solid: #12945e;
+
+  --rbc-warning-fg: #a06e08;
+  --rbc-warning-bg: #fdf3dd;
+  --rbc-warning-border: #eed9a4;
+
+  --rbc-danger-fg: #d0443b;
+  --rbc-danger-bg: #fdedec;
+  --rbc-danger-border: #f3c4c0;
+  --rbc-danger-solid: #e05248;
+  --rbc-danger-solid-hover: #ea6a61;
+
+  --rbc-info-fg: #0f6fbe;
+  --rbc-info-bg: #e6f3fd;
+  --rbc-info-border: #bcdcf7;
+
+  --rbc-neutral-fg: #5a6880;
+  --rbc-neutral-bg: #eef1f6;
+  --rbc-neutral-border: #d4dbe6;
+
+  /* ---- 进度轨道 ---- */
+  --rbc-track-bg: #e7ebf2;
+
+  /* ---- 图表专用色 ----
+   * 数据系（青蓝+紫）只表达"量"；语义系直引 Rbc*Fg，不设独立键。
+   * 禁第三色系；禁语义色画中性趋势；禁强调色画状态点。 */
+  --rbc-chart-1: #0f86e0;
+  --rbc-chart-2: #7c5cf0;
+  --rbc-chart-grid: #e7ebf2;
+  --rbc-chart-axis-text: #8b97ac;
+  --rbc-chart-area-fill: #1f0f86e0;
+  --rbc-chart-track: #e7ebf2;
+  --rbc-chart-heat-1: #dceafb;
+  --rbc-chart-heat-2: #6db6ef;
+  --rbc-chart-heat-3: #0f86e0;
+
+  /* ---- 字体 ---- */
+  --rbc-font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+    "Microsoft YaHei", sans-serif;
+  --rbc-font-mono: "Cascadia Mono", Consolas, monospace;
+
+  /* ---- 间距 / 圆角 / 布局常量 ---- */
+  --rbc-pad-card: 16px;
+  --rbc-pad-btn-x: 12px;
+  --rbc-pad-btn-y: 8px;
+  --rbc-pad-statusbar-x: 12px;
+  --rbc-radius-xs: 4px;
+  --rbc-radius-sm: 6px;
+  --rbc-radius-md: 10px;
+  --rbc-radius-lg: 12px;
+  --rbc-radius-pill: 999px;
+  --rbc-sidebar-width: 216px;
+  --rbc-statusbar-height: 40px;
+
+  /* ---- 动效令牌（来源：Controls/Motion.cs，此处只做时长映射） ---- */
+  --rbc-dur-90: 90ms;
+  --rbc-dur-120: 120ms;
+  --rbc-dur-180: 180ms;
+  --rbc-dur-240: 240ms;
+  --rbc-dur-320: 320ms;
+  --rbc-dur-480: 480ms;
+}
+
+/* ---- 全局视觉层（UI 重设计 2026-10-31）----
+ * 焦点环 / 文本选中 / 滚动条 / 控件过渡：一处定义，全站生效。 */
+:focus-visible {
+  outline: 2px solid var(--rbc-accent);
+  outline-offset: 2px;
+  border-radius: var(--rbc-radius-xs);
+}
+::selection {
+  background: var(--rbc-accent-subtle);
+  color: var(--rbc-text-primary);
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--rbc-border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--rbc-border-strong);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+button,
+select,
+input,
+[role="button"] {
+  transition:
+    background-color var(--rbc-dur-120) ease,
+    border-color var(--rbc-dur-120) ease,
+    color var(--rbc-dur-120) ease,
+    opacity var(--rbc-dur-120) ease;
+}
+
+/* =========================================================================
+ * UI 重设计层（2026-10-31）—— 现代控制台视觉语言：
+ * 玻璃拟态 / 分层光影 / 渐变强调 / 微交互 / 入场动效。
+ * 页面只消费 .rbc-* 类，不再各自手写内联视觉。
+ * ========================================================================= */
+
+:root {
+  /* 光影令牌（亮色系：柔和漫射影 + 极浅内高光） */
+  --rbc-shadow-card: 0 1px 2px rgba(16, 24, 40, 0.05), 0 4px 14px rgba(16, 24, 40, 0.06);
+  --rbc-shadow-card-hover: 0 2px 4px rgba(16, 24, 40, 0.06), 0 12px 30px rgba(16, 24, 40, 0.1);
+  --rbc-shadow-pop: 0 16px 48px rgba(16, 24, 40, 0.16), 0 4px 12px rgba(16, 24, 40, 0.1);
+  --rbc-glow-accent: 0 0 0 1px rgba(15, 134, 224, 0.3), 0 0 14px rgba(15, 134, 224, 0.14);
+  --rbc-surface-glass: rgba(255, 255, 255, 0.78);
+  --rbc-elevated-glass: rgba(255, 255, 255, 0.92);
+}
+
+/* 应用级渐变背景：冷灰底 + 左上品牌蓝晕 + 右下紫晕，营造光源纵深 */
+.rbc-app-bg {
+  background:
+    radial-gradient(1100px 480px at 12% -8%, rgba(15, 134, 224, 0.07), transparent 62%),
+    radial-gradient(900px 420px at 96% 108%, rgba(124, 92, 240, 0.05), transparent 60%),
+    var(--rbc-bg-app);
+}
+
+/* 卡片：白面 + 悬停浮起 + 品牌描边 */
+.rbc-card {
+  position: relative;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(255, 255, 255, 0.75) 46%),
+    var(--rbc-bg-surface);
+  border: 1px solid var(--rbc-border);
+  border-radius: var(--rbc-radius-lg);
+  padding: var(--rbc-pad-card);
+  box-shadow: var(--rbc-shadow-card);
+  transition:
+    border-color var(--rbc-dur-180) ease,
+    box-shadow var(--rbc-dur-180) ease,
+    transform var(--rbc-dur-180) ease;
+}
+.rbc-card::before {
+  /* 顶缘 1px 高光：白卡上以极浅描边模拟光源 */
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.9), transparent);
+  pointer-events: none;
+}
+.rbc-card:hover {
+  border-color: var(--rbc-border-strong);
+  box-shadow: var(--rbc-shadow-card-hover);
+  transform: translateY(-1px);
+}
+.rbc-card-accent {
+  border-color: rgba(76, 194, 255, 0.28);
+  background:
+    linear-gradient(180deg, rgba(76, 194, 255, 0.05), transparent 46%),
+    var(--rbc-bg-surface);
+}
+
+/* 按钮：渐变主键 / 描边次键 / 幽灵键 / 危险键，统一按压回弹 */
+.rbc-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--rbc-radius-sm);
+  padding: var(--rbc-pad-btn-y) var(--rbc-pad-btn-x);
+  font-size: 12px;
+  line-height: 1.2;
+  border: 1px solid transparent;
+  transition:
+    transform var(--rbc-dur-90) ease,
+    box-shadow var(--rbc-dur-180) ease,
+    border-color var(--rbc-dur-180) ease,
+    background-color var(--rbc-dur-180) ease,
+    color var(--rbc-dur-180) ease;
+  cursor: pointer;
+}
+.rbc-btn:active:not(:disabled) {
+  transform: scale(0.965);
+}
+.rbc-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.rbc-btn-primary {
+  background: linear-gradient(180deg, var(--rbc-accent-hover), var(--rbc-accent) 55%, var(--rbc-accent-active));
+  color: #ffffff;
+  border-color: rgba(15, 134, 224, 0.55);
+  font-weight: 600;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.3) inset, 0 2px 10px rgba(15, 134, 224, 0.25);
+}
+.rbc-btn-primary:hover:not(:disabled) {
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.3) inset, var(--rbc-glow-accent);
+}
+.rbc-btn-secondary {
+  background: var(--rbc-bg-surface);
+  color: var(--rbc-text-primary);
+  border-color: var(--rbc-border-strong);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+}
+.rbc-btn-secondary:hover:not(:disabled) {
+  border-color: rgba(76, 194, 255, 0.45);
+  box-shadow: var(--rbc-glow-accent);
+  color: var(--rbc-accent);
+}
+.rbc-btn-ghost {
+  background: transparent;
+  color: var(--rbc-text-secondary);
+  border-color: transparent;
+}
+.rbc-btn-ghost:hover:not(:disabled) {
+  background: var(--rbc-bg-surface-hover);
+  color: var(--rbc-text-primary);
+}
+.rbc-btn-danger {
+  background: linear-gradient(180deg, var(--rbc-danger-solid-hover), var(--rbc-danger-solid));
+  color: #fff;
+  border-color: var(--rbc-danger-border);
+  font-weight: 600;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.18) inset, 0 2px 12px rgba(179, 56, 47, 0.3);
+}
+.rbc-btn-danger:hover:not(:disabled) {
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.22) inset, 0 0 16px rgba(242, 122, 114, 0.3);
+}
+
+/* 输入控件：内凹质感 + 聚焦辉光 */
+.rbc-input {
+  background: var(--rbc-bg-input);
+  color: var(--rbc-text-primary);
+  border: 1px solid var(--rbc-border-strong);
+  border-radius: var(--rbc-radius-sm);
+  padding: 4px 8px;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.28);
+  transition: border-color var(--rbc-dur-120) ease, box-shadow var(--rbc-dur-120) ease;
+}
+.rbc-input:focus {
+  outline: none;
+  border-color: rgba(76, 194, 255, 0.55);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.28), var(--rbc-glow-accent);
+}
+
+/* 玻璃面板（侧栏/状态栏/弹层） */
+.rbc-glass {
+  background: var(--rbc-surface-glass);
+  backdrop-filter: blur(14px) saturate(150%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
+}
+
+/* 导航项：悬停滑移 + 活动指示 */
+.rbc-nav-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-radius: var(--rbc-radius-sm);
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--rbc-text-secondary);
+  overflow: hidden;
+  transition:
+    color var(--rbc-dur-120) ease,
+    background-color var(--rbc-dur-120) ease;
+}
+.rbc-nav-item:hover {
+  background: var(--rbc-bg-surface-hover);
+  color: var(--rbc-text-primary);
+}
+
+/* KPI 数值：渐变强调文字（亮色系：深蓝→灰蓝） */
+.rbc-value-glow {
+  background: linear-gradient(180deg, #17233c, #43536e);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.rbc-value-accent {
+  background: linear-gradient(180deg, var(--rbc-accent-hover), var(--rbc-accent-active));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* 入场动效（纯 CSS，供非 motion 元素使用） */
+@keyframes rbc-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.rbc-fade-up {
+  animation: rbc-fade-up var(--rbc-dur-240) ease both;
+}
+.rbc-fade-up-late {
+  animation: rbc-fade-up var(--rbc-dur-320) ease both;
+  animation-delay: 60ms;
+}
+
+/* SLO 违约 shimmer 扫光（亮色系：暖黄浅底） */
+@keyframes rbc-shimmer {
+  0% {
+    background-position: -140% 0;
+  }
+  100% {
+    background-position: 240% 0;
+  }
+}
+.rbc-breach {
+  background: linear-gradient(
+    100deg,
+    rgba(160, 110, 8, 0.05) 30%,
+    rgba(160, 110, 8, 0.14) 50%,
+    rgba(160, 110, 8, 0.05) 70%
+  );
+  background-size: 220% 100%;
+  animation: rbc-shimmer 2.2s linear infinite;
+}
+
+/* 弹层入场上抛（radix data-state 驱动） */
+.rbc-pop-in[data-state="open"] {
+  animation: rbc-fade-up var(--rbc-dur-180) ease both;
+}
+
+/* IoctlMatrix 单元格悬停辉光 */
+.rbc-iom-cell {
+  transition: border-color var(--rbc-dur-120) ease, box-shadow var(--rbc-dur-120) ease;
+}
+.rbc-iom-cell:hover {
+  border-color: rgba(15, 134, 224, 0.45);
+  box-shadow: var(--rbc-glow-accent);
+}
+
+/* 连接徽标呼吸点（亮色系微动效） */
+@keyframes rbc-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.82);
+  }
+}
+.rbc-pulse-dot {
+  animation: rbc-pulse 2s ease-in-out infinite;
+}
+
+/* ---- 高对比度支持（对应 P1-5 WCAG 2.1 AA）----
+ * Windows 高对比度模式会强制覆盖颜色，语义令牌不应再参与判定。
+ * 焦点环与状态点改用系统色，保证讲述人/高对比度用户可辨。 */
+@media (forced-colors: active) {
+  :root {
+    --rbc-accent: Highlight;
+    --rbc-focus-ring: Highlight;
+    --rbc-success-fg: ButtonText;
+    --rbc-danger-fg: ButtonText;
+  }
+}
+
+/* ---- 尊重系统减弱动效设置 ---- */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --rbc-dur-90: 0ms;
+    --rbc-dur-120: 0ms;
+    --rbc-dur-180: 0ms;
+    --rbc-dur-240: 0ms;
+    --rbc-dur-320: 0ms;
+    --rbc-dur-480: 0ms;
+  }
+}

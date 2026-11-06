@@ -1,6 +1,7 @@
 using System;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Shapes;
@@ -201,6 +202,21 @@ public partial class StateBar : UserControl
         PulseDot(DotDriver, false, ref _pulseDriver);
         PulseDot(DotAccel, panic && healing, ref _pulseAccel);
         PulseDot(DotRisk, panic && healing, ref _pulseRisk);
+    }
+
+    /// <summary>键盘与鼠标共用导航：Enter/Space 激活当前状态段。</summary>
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter || e.Key == Key.Space)
+        {
+            if (ReferenceEquals(e.OriginalSource, SegDriver)) NavigateRequested?.Invoke("诊断");
+            else if (ReferenceEquals(e.OriginalSource, SegStack)) NavigateRequested?.Invoke("加速");
+            else if (ReferenceEquals(e.OriginalSource, SegAccel)) NavigateRequested?.Invoke("状态");
+            else if (ReferenceEquals(e.OriginalSource, SegRisk)) NavigateRequested?.Invoke("应急");
+            else { base.OnKeyDown(e); return; }
+            e.Handled = true;
+        }
+        base.OnKeyDown(e);
     }
 
     // [FIX M25] 段点击导航映射到真实页面：原导航"诊断/加速/应急"在 NavItems 与

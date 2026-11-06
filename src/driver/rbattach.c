@@ -173,6 +173,13 @@ BOOLEAN RbIsBootCriticalPdo(PDEVICE_OBJECT pdo)
     NTSTATUS st;
 
     PAGED_CODE();
+    /* [FIX AUTOATTACH-4 2026-11-01] 纵深防御：本函数及其下游
+     * （IoGetDeviceObjectPointer / IoVolumeDeviceToDosName / 注册表 Zw*）
+     * 全部是 PASSIVE-only。任何调用方在抬升 IRQL 的临界区（FastMutex /
+     * spinlock / DPC）里误调，Verifier 立刻 0xC4（实测 0x12000E，真机蓝屏）。
+     * 非 PASSIVE 一律按"引导关键"保守返回 TRUE：代价仅是自动挂载跳过该卷，
+     * 换掉一次整机蓝屏。 */
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) return TRUE;
     RbEnsureSystemVolumeInfo();
 
     /* 1) 设备节点级精确比对 */
@@ -449,12 +456,205 @@ VOID RbJanitorSweepRuntimeAttached(VOID)
     }
 }
 
+/* =====================================================================
+ * [FIX AUTOATTACH-2 2026-11-01] 开机自动挂载的"迟到盘符"补偿巡检
+ *
+ * 缺陷（真机实测 verify-now.log）：AutoAttach 唯一触发点是 RbGeoWorkRoutine，
+ * 即每卷 PnP START 完成后的一次性工作项。开机时盘符由 mount manager 后分配，
+ * 此刻 ext->Letter==0（或几何实测失败）→ 该卷永久跳过，**全工程无任何重试**：
+ * GET_VOLUMES 显示 7 卷 bound=1 但 attached=0，ReadReq=0，黑盒 1.00×。
+ *
+ * 本函数由 Rb2Tick 每 30s 调用（PASSIVE），对"已绑定未挂载"的卷补齐
+ * 几何实测与挂载；条件与 RbGeoWorkRoutine 完全同源，安全闸门一致：
+ * 系统卷/引导关键卷/L2 卷/boot-loop 一律不动（自动路径只碰数据卷）。
+ * 幂等：IsAttached 的卷不进候选；attach 成功后自然退出候选集。
+ * ===================================================================== */
+/* [USER-REQ 2026-11-05] 上次加速卷列表（注册表 Parameters\ResumeLetters，
+ * 形如 "DE"）。控制面在 attach 成功后写入，驱动开机读一次用于恢复。 */
+static WCHAR s_ResumeLetters[32] = { 0 };
+static LONG  s_ResumeLoaded = 0;
+
+/* [USER-REQ 2026-11-05] 维护"上次加速卷"列表（Parameters\ResumeLetters）。
+ * 驱动侧跟踪比控制面更可靠：无论 attach 来自 GUI / CLI / 自动恢复，都一致更新。
+ * 调用点：attach 成功（加）、软分离 detach（去）。PASSIVE。 */
+static void RbResumeTrack(WCHAR letter, BOOLEAN add)
+{
+    UNICODE_STRING key = RTL_CONSTANT_STRING(RB_REG_PARAMS);   /* [FIX 2026-11-05] 原手写 L"\R... 单反斜杠转义坏（见 rb_common.h） */
+    WCHAR cur[32], out[32];
+    ULONG n = 0, i, j = 0;
+    WCHAR up = RtlUpcaseUnicodeChar(letter);
+    NTSTATUS st;
+
+    /* 读当前值（与 s_ResumeLetters 不同：这里要实时读，避免与自身缓存脱节） */
+    {
+        UNICODE_STRING val; OBJECT_ATTRIBUTES oa; HANDLE h; UCHAR buf[256]; ULONG len = 0;
+        static const WCHAR nm[] = L"ResumeLetters";
+        val.Buffer = (PWSTR)nm; val.Length = (USHORT)(sizeof(nm) - sizeof(WCHAR)); val.MaximumLength = (USHORT)sizeof(nm);
+        InitializeObjectAttributes(&oa, &key, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        cur[0] = 0;
+        if (NT_SUCCESS(ZwOpenKey(&h, KEY_QUERY_VALUE, &oa))) {
+            st = ZwQueryValueKey(h, &val, KeyValuePartialInformation, buf, sizeof(buf), &len);
+            if (NT_SUCCESS(st)) {
+                PKEY_VALUE_PARTIAL_INFORMATION k = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+                if (k->Type == REG_SZ && k->DataLength >= sizeof(WCHAR)) {
+                    n = k->DataLength / sizeof(WCHAR);
+                    if (n > 31) n = 31;
+                    { PWCH pw = (PWCH)k->Data;
+                      for (i = 0; i < n && pw[i]; i++) cur[i] = RtlUpcaseUnicodeChar(pw[i]);
+                      cur[i] = 0; n = i; }
+                }
+            }
+            ZwClose(h);
+        }
+    }
+
+    /* 重建：保留其它字母，按需加入/移除目标字母 */
+    for (i = 0; i < n; i++) {
+        if (cur[i] == up) continue;                 /* 去重（add 时后面的追加会补回） */
+        if (j < 30) out[j++] = cur[i];
+    }
+    if (add && j < 31) out[j++] = up;
+    out[j] = 0;
+
+    if (j == 0) {
+        /* 列表空：写空串（保留值存在，避免读回错误） */
+        st = RbRegSetValue(&key, L"ResumeLetters", REG_SZ, out, (ULONG)(sizeof(WCHAR)));
+    } else {
+        st = RbRegSetValue(&key, L"ResumeLetters", REG_SZ, out, (ULONG)((j + 1) * sizeof(WCHAR)));
+    }
+    if (NT_SUCCESS(st)) {
+        RtlStringCchCopyW(s_ResumeLetters, 32, out);
+        RbLog(0, __LINE__, (LONG)(add ? 1 : 0), L"resume list updated");
+    }
+}
+
+/* [USER-REQ] 供控制面查询当前跟踪列表 */
+PCWSTR RbGetResumeLetters(VOID) { return s_ResumeLetters; }
+
+VOID RbLoadResumeLetters(VOID)
+{
+    UNICODE_STRING key = RTL_CONSTANT_STRING(RB_REG_PARAMS);   /* [FIX 2026-11-05] 原手写转义坏 */
+    UNICODE_STRING val; OBJECT_ATTRIBUTES oa; HANDLE h; NTSTATUS st;
+    UCHAR buf[256]; ULONG len = 0;
+    if (InterlockedExchange(&s_ResumeLoaded, 1)) return;
+    RtlZeroMemory(s_ResumeLetters, sizeof(s_ResumeLetters));
+    { /* 本地初始化（RbInitUS 是 rbdriver.c 的 static，不可跨文件） */
+      static const WCHAR nm[] = L"ResumeLetters";
+      val.Buffer = (PWSTR)nm;
+      val.Length = (USHORT)(sizeof(nm) - sizeof(WCHAR));
+      val.MaximumLength = (USHORT)sizeof(nm); }
+    InitializeObjectAttributes(&oa, &key, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    st = ZwOpenKey(&h, KEY_QUERY_VALUE, &oa);
+    if (!NT_SUCCESS(st)) return;
+    st = ZwQueryValueKey(h, &val, KeyValuePartialInformation, buf, sizeof(buf), &len);
+    if (NT_SUCCESS(st)) {
+        PKEY_VALUE_PARTIAL_INFORMATION k = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+        if (k->Type == REG_SZ && k->DataLength >= sizeof(WCHAR)) {
+            ULONG n = k->DataLength / sizeof(WCHAR);
+            ULONG i;
+            if (n > 31) n = 31;
+            for (i = 0; i < n; i++) {
+                WCHAR c = ((PWCH)k->Data)[i];
+                s_ResumeLetters[i] = (c >= L'a' && c <= L'z') ? (WCHAR)(c - 32) : c;
+            }
+            s_ResumeLetters[n] = 0;
+            RbLog(0, __LINE__, 0, s_ResumeLetters[0] ? L"resume list loaded" : L"resume list empty");
+        }
+    }
+    ZwClose(h);
+}
+
+VOID RbAutoAttachSweep(VOID)
+{
+    PRB_DEV_EXT snap[RB_MAX_VOLUMES];
+    PLIST_ENTRY link;
+    ULONG n = 0, k, tried = 0;
+    static LONG busy = 0;
+
+    PAGED_CODE();
+    /* [USER-REQ 2026-11-05] 三种开机行为（优先级从上到下）：
+     *   1. AutoAttach=1  → 全自动挂载所有数据卷（旧行为，需用户显式开启）
+     *   2. AutoAttach=0 且 ResumeOnBoot=1 → **只恢复上次加速过的卷**
+     *      （列表由控制面 attach 成功后写入 Parameters\ResumeLetters，
+     *        如 "DE"；本巡检逐字母匹配才挂）
+     *   3. AutoAttach=0 且 ResumeOnBoot=0 → 完全不自动挂载（纯手动）
+     * 默认配置 = 2（既满足"开机不默认全开"，又保留用户上次的选择）。 */
+    RbLoadResumeLetters();   /* 幂等：首次进本函数时读一次 */
+    if (g_Rb.BootLoopGuard || RbPanicActive()) return;
+    if (!g_Rb.AutoAttach && !g_Rb.ResumeOnBoot) return;
+    /* 重入防护：本函数会经 RbAttachVolumeByLetter 进入 attach 串行锁，
+     * 若同一时刻 tick 重入会造成 attach 排队堆积 */
+    if (InterlockedExchange(&busy, 1)) return;
+
+    /* [FIX AUTOATTACH-3] 必须先解析盘符：ext->Letter 只在 GET_VOLUMES / ATTACH
+     * 入口被刷新，开机后若无人查询控制面，Letter 恒为 0 → 本巡检恒空转
+     * （真机二次实测：5 分钟内 14 条日志无 sweep 记录，attached 仍全 0）。 */
+    RbResolveAllLetters();
+
+    ExAcquireFastMutex(&g_Rb.DevListLock);
+    for (link = g_Rb.DevList.Flink;
+         link != &g_Rb.DevList && n < RB_MAX_VOLUMES; link = link->Flink) {
+        PRB_DEV_EXT e = CONTAINING_RECORD(link, RB_DEV_EXT, ListEntry);
+        if (e->Removed || e->RuntimeAttached || e->IsAttached) continue;
+        if (e->Letter < L'A' || e->Letter > L'Z') continue;   /* [LETTER-1] 无盘符/垃圾字母 */
+        /* [USER-REQ] 恢复模式：只挂上次加速过的字母（用户显式选择过）；
+         * 全自动模式（AutoAttach=1）仍跳过系统卷——系统卷只允许手动开启。 */
+        if (!g_Rb.AutoAttach) {
+            if (!s_ResumeLetters[0]) { RbDerefExt(e); continue; }   /* 空列表=无记录 */
+            if (!wcsrchr(s_ResumeLetters, RtlUpcaseUnicodeChar(e->Letter))) { RbDerefExt(e); continue; }
+        } else if (e->Letter == g_Rb.SystemDriveLetter) continue;
+        InterlockedIncrement(&e->Refs);        /* 锁外使用保活 */
+        snap[n++] = e;
+    }
+    ExReleaseFastMutex(&g_Rb.DevListLock);
+
+    for (k = 0; k < n; k++) {
+        PRB_DEV_EXT e = snap[k];
+        /* [FIX AUTOATTACH-4 2026-11-01] PASSIVE-only 判定必须在锁外！
+         * 原实现在上面的 FastMutex（APC_LEVEL）临界区内调 RbIsBootCriticalPdo
+         * → 内部 RbEnsureSystemVolumeInfo → IoGetDeviceObjectPointer，被 Verifier
+         * 直接判违规：DV_RULE_INFO 0x12000E "IoGetDeviceObjectPointer should only
+         * be called at IRQL = PASSIVE_LEVEL"，真机 0xC4 实测（16:07 蓝屏）。
+         * RbFeatRefuseLetter 同理（内部 RbRegGetDW 走 Zw*，PASSIVE-only）。
+         * 现在：锁内只做快照+加引用，全部 PASSIVE-only 判定在锁外做。 */
+        /* [FIX 2026-11-06 ResumeOnBoot×boot-critical] 恢复模式（用户显式选择
+         * 的字母）不套用 boot-critical 跳过：D: 载有 pagefile.sys →
+         * RbIsBootCriticalPdo=TRUE → 旧逻辑静默跳过 → 恢复永不挂载（真机
+         * 实测 sweep 有 [561] 无 attach、tried=0）。安全论证：恢复挂载发生在
+         * 开机后 30s（运行时挂栈，无引导路径），0x7B 风险不适用；写模式
+         * 默认跟随全局直写（回写需用户另行知情开启）。AutoAttach=1 的
+         * 全自动模式维持原跳过（防未知卷引导风险）。 */
+        if (!g_Rb.AutoAttachAll && !(!g_Rb.AutoAttach && g_Rb.ResumeOnBoot) &&
+            e->Pdo && RbIsBootCriticalPdo(e->Pdo)) { RbDerefExt(e); continue; }
+        if (!g_Rb.AutoAttach && g_Rb.ResumeOnBoot && e->Pdo && RbIsBootCriticalPdo(e->Pdo))
+            RbLog(1, __LINE__, 0,
+                  L"resume: boot-critical volume in user resume list (pagefile/dump) - allowed");
+        if (!e->Letter || RbFeatRefuseLetter(e->Letter)) { RbDerefExt(e); continue; }
+        /* 几何未实测（开机 START 时卷未就绪/查询失败）：此处 PASSIVE 重试。
+         * 失败保持 FALSE，下轮 30s 再来——绝不带着未知几何建流。 */
+        if (!e->GeometryValid) RbRefreshVolumeGeometry(e);
+        if (!e->Removed && e->GeometryValid && e->DiskSize > 0 && !e->IsAttached && e->Letter) {
+            tried++;
+            RbAttachVolumeByLetter(e->Letter);  /* 内部自带全部拒绝闸门与日志 */
+        }
+        RbDerefExt(e);
+    }
+
+    if (tried) {
+        RbLog(0, __LINE__, 0, L"auto-attach sweep: late letters resolved, attach attempted");
+    }
+    InterlockedExchange(&busy, 0);
+}
+
 VOID RbVolumeRemove(PRB_DEV_EXT ext, LONG SelfRefs)
 {
     LARGE_INTEGER tick; ULONG i;
 
     PAGED_CODE();                 /* [NEW-02] 本函数自此声明 PASSIVE-only */
 
+    RbDiagRecord(RB_DIAG_KIND_ATTACH, RB_DIAG_PHASE_START, STATUS_SUCCESS,
+                 RB_DIAG_FLAG_UNKNOWN, NULL, NULL, ext, ext->Stream,
+                 ext->LowerDevice, NULL);
     /* SelfRefs = 调用方当前额外持有的引用数（不含 owner 基准 1）：
      * 排空判定须为 Refs <= 1 + SelfRefs，否则调用方自身引用恒使 Refs>=2，
      * 60s 宽限必然超时、拆除永远走不到。 */
@@ -489,6 +689,9 @@ VOID RbVolumeRemove(PRB_DEV_EXT ext, LONG SelfRefs)
     RbEvPublish(RB_OP_UNMOUNT, 0, 0, 0, 0, L"正在停止缓存并卸载（等待在途 I/O 排空）…");
 
     /* 2) 先等在途 worker 排空（Refs 回落到 owner=1 + 本调用方 SelfRefs），宽限 60s */
+    RbDiagRecord(RB_DIAG_KIND_ATTACH, RB_DIAG_PHASE_DRAIN, STATUS_SUCCESS,
+                 RB_DIAG_FLAG_UNKNOWN, NULL, NULL, ext, ext->Stream,
+                 ext->LowerDevice, NULL);
     tick.QuadPart = -200000LL;                          /* 20ms/步 */
     for (i = 0; i < 3000; i++) {                        /* 60s 上限 */
         if (InterlockedCompareExchange(&ext->Refs, 1, 1) <= 1 + SelfRefs) break;
@@ -496,6 +699,9 @@ VOID RbVolumeRemove(PRB_DEV_EXT ext, LONG SelfRefs)
     }
     if (InterlockedCompareExchange(&ext->Refs, 1, 1) > 1 + SelfRefs) {
         /* [V10.1] 超时不强删（强删=UAF/蓝屏），转僵尸队列延迟删除（不毁流，留僵尸收尾） */
+        RbDiagRecord(RB_DIAG_KIND_ATTACH, RB_DIAG_PHASE_END, STATUS_TIMEOUT,
+                     RB_DIAG_FLAG_UNKNOWN, NULL, NULL, ext, ext->Stream,
+                     ext->LowerDevice, NULL);
         RbZombieQueueExt(ext);
         /* 释放本调用方引用：入队后 reaper 即可按 Refs<=1（仅 owner 基准）判定就绪。
          * 必须先释放再返回，否则 reaper 永远看到 Refs>=2 → 僵尸永不回收。 */
@@ -508,12 +714,33 @@ VOID RbVolumeRemove(PRB_DEV_EXT ext, LONG SelfRefs)
      * 不会有新脏数据产生。surprise removal 不受影响（盘已物理消失，flush
      * 回写失败按既有记账路径处理）。此后 destroy 内无脏可写。 */
     RbEvPublish(RB_OP_UNMOUNT, 0, 0, 0, 0, L"正在回写脏数据到磁盘…");
-    if (ext->Stream) rb_stream_flush(ext->Stream, 1);
-    RbEvPublish(RB_OP_UNMOUNT, 100, 0, 0, 0, L"卸载完成（脏数据已全部落盘）");
+    /* [FIX DATA-1 2026-11-01] 卸载回写结果必须如实上报。
+     * 原实现无条件发布"卸载完成（脏数据已全部落盘）"——写回失败（坏盘 / 盘已
+     * 物理移除 / 回写被 Removed 拒绝）时脏数据随后由 rb_stream_destroy 丢弃，
+     * 而用户界面显示"安全卸载完成"，事后无任何线索可查：这是本项目最危险的
+     * 一条"丢数且谎报"路径。现在以 rb_stream_dirty_bytes 为唯一判据。 */
+    {
+        rb_u64 left = 0;
+        if (ext->Stream) {
+            rb_stream_flush(ext->Stream, 1);
+            left = rb_stream_dirty_bytes(ext->Stream);
+        }
+        if (left) {
+            RbLog(2, __LINE__, STATUS_UNSUCCESSFUL,
+                  L"unmount: dirty data could not be written back, will be discarded");
+            RbEvPublish(RB_OP_UNMOUNT, 100, 0, 0, 0,
+                        L"卸载完成，但有脏数据未能落盘（详见日志，可能已丢失）");
+        } else {
+            RbEvPublish(RB_OP_UNMOUNT, 100, 0, 0, 0, L"卸载完成（脏数据已全部落盘）");
+        }
+    }
 
     /* 2c) 停接新 I/O（语义保持）：Removed=1 后回调拒绝（拆除中）。 */
     InterlockedExchange(&ext->Removed, 1);
 
+    RbDiagRecord(RB_DIAG_KIND_ATTACH, RB_DIAG_PHASE_REMOVE, STATUS_SUCCESS,
+                 RB_DIAG_FLAG_UNKNOWN, NULL, NULL, ext, ext->Stream,
+                 ext->LowerDevice, NULL);
     /* 3b) [NEW-03] 销毁缓存流（脏数据已落盘，无并发访问）。
      *     [FIX M2] 原子摘除（与 detach 同款）：防窗口内新读者拿到正销毁的流 */
     {
@@ -527,6 +754,9 @@ VOID RbVolumeRemove(PRB_DEV_EXT ext, LONG SelfRefs)
      *    IoDeleteDevice 之后 ext 所在内存随设备扩展销毁，函数内不得再访问 ext。 */
     while (SelfRefs-- > 0) RbDerefExt(ext);
 
+    RbDiagRecord(RB_DIAG_KIND_ATTACH, RB_DIAG_PHASE_END, STATUS_SUCCESS,
+                 RB_DIAG_FLAG_UNKNOWN, NULL, NULL, ext, NULL,
+                 ext->LowerDevice, NULL);
     if (ext->LowerDevice) { IoDetachDevice(ext->LowerDevice); ext->LowerDevice = NULL; }
     if (ext->Pdo)         { ObDereferenceObject(ext->Pdo);    ext->Pdo = NULL; }
     IoDeleteDevice(ext->FilterDevice);
@@ -552,18 +782,58 @@ static VOID RbGeoWorkRoutine(PDEVICE_OBJECT DeviceObject, PVOID Context)
     ExFreePoolWithTag(gw, RB_POOL_TAG);
     if (!ext->Removed && ext->LowerDevice) {
         RbRefreshVolumeGeometry(ext);      /* PASSIVE：可阻塞 */
-        /* [AUTOATTACH-1] 死配置落地：attach 路径自带系统卷/引导关键卷/L2 卷/panic 拒绝
-         * [BUG3] 自动挂载排除系统卷与引导关键卷（页面文件/转储/休眠）：手动 attach
-         * （GUI 打勾）仍允许任何卷（用户显式知情 + 三重回滚兜底），但开机自动路径
-         * 只覆盖数据卷——0x7B 防线不依赖用户决策。 */
-        /* [FIX A-9] 排除集合补 L2 存储卷：原仅靠 attach 内层 RbFeatRefuseLetter
-         * 兜底（功能正确但每次多一轮注册表读，且注释与代码不符）。 */
-        if (!ext->Removed && ext->GeometryValid && ext->Letter &&
-            g_Rb.AutoAttach && !ext->IsAttached &&
-            ext->Letter != g_Rb.SystemDriveLetter &&
-            (!ext->Pdo || !RbIsBootCriticalPdo(ext->Pdo)) &&
-            !RbFeatRefuseLetter(ext->Letter))
-            RbAttachVolumeByLetter(ext->Letter);
+        /* [FIX AUTOATTACH-7 2026-11-01] 收敛等待 + 全路径留痕
+         *
+         * AUTOATTACH-6 失败的实证：日志出现 "drive letter arrived late"，
+         * 但 attached 仍为 0 —— 说明"等到盘符"之后还有静默退出点：
+         *   ① 首次几何实测在卷 ready 之前就跑了，GeometryValid=FALSE，
+         *      之后的挂载判据直接短路（无日志）；
+         *   ② 旧顺序先算 bootCritical 再等盘符：而 RbIsBootCriticalPdo 在
+         *      "盘符未知"时按保守口径返回 TRUE（rbattach.c:198 不可判定即拒绝），
+         *      于是开机阶段**所有**卷都被判成引导关键卷，自动挂载被自己的防线锁死。
+         *
+         * 本版策略：盘符与几何都进同一个收敛循环（≤20s，250ms 步进），
+         * 两者同时就绪才做判定；bootCritical 只在盘符已知后计算（此时它的
+         * 保守口径才有意义）；每个卷无论挂不挂都留一条带原因的日志。 */
+        if (g_Rb.AutoAttach && !ext->IsAttached) {
+            ULONG waited = 0;
+            for (;;) {
+                if (ext->Removed) break;
+                if (!ext->Letter)       RbResolveAllLetters();
+                /* 几何重测按 1s 节流（每 4 轮一次）：每次实测含 3 条同步 IOCTL，
+                 * 卷始终未 ready 时 250ms 一轮会打出 240 条无用 IOCTL */
+                if (!ext->GeometryValid && (waited % 4) == 0) RbRefreshVolumeGeometry(ext);
+                if ((ext->Letter && ext->GeometryValid) || waited >= 80) break;
+                {
+                    LARGE_INTEGER d;
+                    d.QuadPart = -2500000LL;                 /* 250ms */
+                    KeDelayExecutionThread(KernelMode, FALSE, &d);
+                }
+                waited++;
+            }
+            if (ext->Removed) {
+                /* 拆除中：不记录不动作 */
+            } else if (!ext->Letter || !ext->GeometryValid) {
+                RbLog(1, __LINE__, 0,
+                      L"auto-attach skip: letter/geometry not ready within 20s");
+            } else if (ext->Letter < L'A' || ext->Letter > L'Z') {
+                RbLog(0, __LINE__, 0, L"auto-attach skip: no drive letter (recovery/oem volume)");
+            } else if (ext->Letter == g_Rb.SystemDriveLetter) {
+                RbLog(0, __LINE__, 0, L"auto-attach skip: system volume");
+            } else if (ext->DiskSize <= 0) {
+                RbLog(0, __LINE__, 0, L"auto-attach skip: zero capacity (no media)");
+            } else if (!g_Rb.AutoAttachAll && ext->Pdo && RbIsBootCriticalPdo(ext->Pdo)) {
+                RbLog(0, __LINE__, 0,
+                      L"auto-attach skip: boot-critical (pagefile/dump); set AutoAttachAll=1 to allow");
+            } else if (RbFeatRefuseLetter(ext->Letter)) {
+                RbLog(1, __LINE__, 0, L"auto-attach skip: L2 storage volume");
+            } else {
+                NTSTATUS ast = RbAttachVolumeByLetter(ext->Letter);
+                RbLog(NT_SUCCESS(ast) ? 0 : 2, __LINE__, ast,
+                      NT_SUCCESS(ast) ? L"auto-attach ok: volume attached"
+                                      : L"auto-attach FAILED: attach rejected");
+            }
+        }
     }
     IoFreeWorkItem(wi);
     RbDerefExt(ext);                       /* 抵消 completion 里加的引用 */
@@ -575,6 +845,9 @@ NTSTATUS RbPnpStartComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID ctx)
 
     if (irp->PendingReturned) IoMarkIrpPending(irp);   /* [FIX M3] 传播下层异步完成语义 */
     if (NT_SUCCESS(irp->IoStatus.Status) && dev) {
+        RbDiagRecord(RB_DIAG_KIND_PNP, RB_DIAG_PHASE_START, irp->IoStatus.Status,
+                     RB_DIAG_FLAG_UNKNOWN, irp, NULL, ext, ext->Stream,
+                     ext->LowerDevice, NULL);
         PRB_GEOW gw = (PRB_GEOW)ExAllocatePool2(POOL_FLAG_NON_PAGED,
                                                 sizeof(RB_GEOW), RB_POOL_TAG);
         PIO_WORKITEM wi = gw ? IoAllocateWorkItem(dev) : NULL;
@@ -627,6 +900,9 @@ NTSTATUS RbPnpRemoveComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID ctx)
 
     if (irp->PendingReturned) IoMarkIrpPending(irp);   /* [FIX M3] 传播下层异步完成语义 */
     if (!ext || !dev) return STATUS_CONTINUE_COMPLETION;
+    RbDiagRecord(RB_DIAG_KIND_PNP, RB_DIAG_PHASE_REMOVE, irp->IoStatus.Status,
+                 RB_DIAG_FLAG_UNKNOWN, irp, NULL, ext, ext->Stream,
+                 ext->LowerDevice, NULL);
 
     rw = (PRB_REMOVE_W)ExAllocatePool2(POOL_FLAG_NON_PAGED,
                                        sizeof(RB_REMOVE_W), RB_POOL_TAG);
@@ -689,7 +965,11 @@ NTSTATUS RbAttachVolumeByLetter(WCHAR letter)
 
     /* [FIX-3] attach 串行化：消除并发 attach 的瞬时 0x5 / 重入半挂。
      * 本锁为最外层短锁；持有期间只取 DevListLock 等内部短锁，禁止反向再取本锁。PASSIVE_LEVEL。 */
-    if (!s_AttachReady) { st = STATUS_DEVICE_NOT_READY; goto out; }
+    if (!s_AttachReady) {
+        /* [AUTOATTACH-7] 原为静默返回：开机自动挂载若撞上未初始化，现场无任何证据 */
+        RbLog(2, __LINE__, STATUS_DEVICE_NOT_READY, L"attach refused: attach lock not initialized");
+        st = STATUS_DEVICE_NOT_READY; goto out;
+    }
     KeWaitForMutexObject(&s_AttachMutex, Executive, KernelMode, FALSE, NULL);   /* [FIX 0xA-2026-10-17] KMUTEX 不升 IRQL */
     locked = TRUE;
 
@@ -707,7 +987,11 @@ NTSTATUS RbAttachVolumeByLetter(WCHAR letter)
 
     RbResolveAllLetters();                 /* [V10.2] 先解析盘符/系统卷身份 */
     ext = RbFindExtByLetter(letter);      /* 带引用 */
-    if (!ext) { st = STATUS_NOT_FOUND; goto out; }   /* 盘符尚未挂载/不存在 */
+    if (!ext) {
+        /* [AUTOATTACH-7] 原为静默 NOT_FOUND：盘符解析抖动时现场无证据 */
+        RbLog(1, __LINE__, STATUS_NOT_FOUND, L"attach failed: no volume device for this letter");
+        st = STATUS_NOT_FOUND; goto out;
+    }
 
     do {
         if (ext->Removed) { st = STATUS_DEVICE_REMOVED;    break; }
@@ -728,10 +1012,16 @@ NTSTATUS RbAttachVolumeByLetter(WCHAR letter)
          * `optin system` 开启；opt-in 后仍强制直写，见 rbio.c RbIsWriteBack）。
          * 旧版 [用户要求：允许缓存系统卷 C:] 注释一度移除此门；B-10 契约以显式
          * opt-in 取代"默认放行"：默认拒绝、知情开启、留证（SET_CONFIG 日志）。 */
-        if (ext->IsSystem && !g_Rb.Config.SystemVolumeCached) {
-            RbLog(1, __LINE__, STATUS_ACCESS_DENIED,
-                  L"attach refused: system volume not opted in (B-10; set sys=1 or optin system)");
-            st = STATUS_ACCESS_DENIED; break;
+        /* [USER-REQ 2026-11-05] 系统卷允许手动加速（解除 B-10 硬拒绝）。
+         * 用户明确要求"C 盘可手动打开"。安全边界仍在驱动侧兜底：
+         *   · RbIsWriteBack 对 IsSystem 恒返回 FALSE → 系统卷**强制直写**
+         *     （写立即落盘，缓存只做只读加速，不存在丢脏/回写覆盖风险）；
+         *   · 开机自动挂载的巡检（RbAutoAttachSweep）仍跳过系统卷，
+         *     只有用户显式 attach 才会缓存 C:。
+         * 因此放开手动 attach 不引入数据风险，只增加"只读加速 C 盘"能力。 */
+        if (ext->IsSystem) {
+            RbLog(0, __LINE__, 0,
+                  L"attach: system volume manual opt-in (forced write-through, read-cache only)");
         }
 
         /* [契约 B-9] 重复盘符防御纵深：同盘符存在多个 ext（盘符易主/解析竞态残余）
@@ -781,6 +1071,7 @@ NTSTATUS RbAttachVolumeByLetter(WCHAR letter)
         ext->IsAttached = TRUE;
         RbHotPrewarm(ext);              /* [V10.3] 热区预热（HOT 关则空转） */
         st = STATUS_SUCCESS;
+        RbResumeTrack(ext->Letter, TRUE);   /* [USER-REQ] 记入开机恢复列表 */
         RbLog(0, __LINE__, 0, L"volume attached (hot switch on)");
     } while (0);
 
@@ -836,37 +1127,40 @@ NTSTATUS RbDetachVolumeByLetter(WCHAR letter)
         return STATUS_SUCCESS;
     }
 
-    ext->IsAttached = FALSE;                      /* 先关热开关：新 IO 一律透传 */
-
-    /* [DETACH-1] 等在飞 ctx 排空（Refs 回落到 owner(1) + 本次 RbFindExtByLetter 持有的引用(1) = 2），
-     * 60s 上限；排不空则本次不销毁流（引擎 flush 线程继续落盘），下次重试 */
+    /* [FIX DETACH-SOFT 2026-11-04] 热停用 = 软分离（立即生效，绝不失败）。
+     *
+     * 原实现：关热开关 → 等 in-flight 引用排空（60s 上限）→ 摘流 → flush →
+     * destroy。真机实测稳态 ext->Refs 恒 >4（该计数是"生命周期"计数：owner +
+     * find + 在途 IO + 历史泄漏），DETACH-3/R5 收紧到 <=4 后**恒超时回滚**：
+     * 用户点"热停用"必失败（日志 3× detach aborted），只能关总开关。
+     *
+     * 语义修正：热停用 = 停止对本卷加速。这件事只需要①关热开关（新 IO 一律
+     * 透传，瞬时生效）②把缓存里已 ack 的脏数据落盘（数据安全）。**不需要
+     * 销毁流**——流/缓存的销毁只属于卷移除与驱动卸载路径（RbVolumeRemove）。
+     * 保留流还有两个好处：重新热开启只是把开关拨回（0 成本）；不再有
+     * "worker 持旧流指针"的 UAF 面（流不释放）。
+     *
+     * 刷脏失败（坏盘）不阻止停用：如实记日志，脏块留在缓存由后续 flusher
+     * 重试；用户意图"立刻停止加速"优先。 */
+    ext->IsAttached = FALSE;                      /* 先关热开关：新 IO 一律透传（瞬时） */
+    KeMemoryBarrier();
     {
-        LARGE_INTEGER tick; ULONG i;
-        tick.QuadPart = -200000LL;                /* 20ms */
-        for (i = 0; i < 3000; i++) {
-            if (InterlockedCompareExchange(&ext->Refs, 1, 1) <= 2) break;
-            KeDelayExecutionThread(KernelMode, FALSE, &tick);
-        }
-        if (InterlockedCompareExchange(&ext->Refs, 1, 1) > 2) {
-            RbLog(1, __LINE__, STATUS_IO_TIMEOUT, L"detach deferred (io in flight), stream kept");
-            RbDerefExt(ext);
-            KeReleaseMutex(&s_AttachMutex, FALSE);   /* [FIX 0xA-2026-10-17] KMUTEX 不降 IRQL，无 APC 交付窗口 */
-            return STATUS_DEVICE_BUSY;
-        }
-    }
-    /* [FIX M2] 原子摘除 Stream 再 flush/destroy：原"flush→destroy→置 NULL"窗口内，
-     * 透传写 IRP（IsAttached 已关但 worker 在途 ctx 仍读 ext->Stream）可对正在
-     * destroy 的流执行 invalidate = UAF；且 destroy 内 flush 会把旧脏块覆盖
-     * 透传写刚直写的新数据 = 静默数据损坏。摘除后新读者即见 NULL。 */
-    {
-        rb_stream *st = (rb_stream *)InterlockedExchangePointer((PVOID *)&ext->Stream, NULL);
+        rb_stream *st = (rb_stream *)ext->Stream;  /* 不摘除：保留供重新热开启 */
         if (st) {
+            /* 两趟：第一趟落盘既有脏；关开关瞬间的在途吸收可能在第一趟之后
+             * 才标脏，第二趟收敛尾窗（与 panic 自愈同款纪律）。 */
             rb_stream_flush(st, 1);
-            rb_stream_destroy(st);
+            if (rb_stream_dirty_bytes(st))
+                rb_stream_flush(st, 1);
+            /* [FIX DATA-13] 丢缓存视图：停用期所有写直落盘，残留的干净块
+             * 全部可能陈旧——不丢的话重新热开启后读命中即返回旧内容
+             * （应用读到自己更新前的 DLL → 打不开）。脏已落盘，丢弃零风险。 */
+            rb_stream_discard_all(st);
         }
     }
     RbDerefExt(ext);
-    RbLog(0, __LINE__, 0, L"volume detached (filter kept, passthrough)");
+    RbResumeTrack(ext->Letter, FALSE);   /* [USER-REQ] 从开机恢复列表移除 */
+    RbLog(0, __LINE__, 0, L"volume detached (soft: hot switch off, stream kept, dirty flushed)");
     KeReleaseMutex(&s_AttachMutex, FALSE);   /* [FIX 0xA-2026-10-17] KMUTEX 不降 IRQL，无 APC 交付窗口 */
     return STATUS_SUCCESS;
 }
@@ -961,15 +1255,24 @@ NTSTATUS RbAttachVolumeRuntime(WCHAR letter)
     pdo = IoGetDeviceAttachmentBaseRef(top);
     if (!pdo) { st = STATUS_NOT_FOUND; goto out; }
 
-    /* 3) 测试模式运行时路径保守闸门：系统卷/引导关键卷拒绝（锁外完成）。
-     *    与手动 attach 允许 C: 的口径不同：本路径未经 Verifier 且 TestMode 无
-     *    boot_guard 安全网——缓存页面文件/转储卷可能动摇活动系统；数据卷 dev
-     *    loop 不受影响。 */
-    if (letter == g_Rb.SystemDriveLetter || RbIsBootCriticalPdo(pdo)) {
+    /* 3) 测试模式运行时路径闸门（锁外完成）。
+     * [FIX 2026-10-24] 口径与生产模式对齐：生产挂载路径（AddDevice 挂栈后
+     * attach）不查硬表——页面文件/转储卷（如 D:\pagefile.sys）在生产可挂且
+     * 一直如此（块层缓存 paging IO 是 V8 既定架构，实测页面文件卷长期在跑）。
+     * 原 TestMode 整体调 RbIsBootCriticalPdo 把页面文件卷也拒了——比生产更
+     * 严、口径矛盾且挡测试（实测 D: 因 ExistingPageFiles 被拒）。
+     * 现仅拒绝真正的系统/引导卷本体（SystemVolumePdo / 系统盘符）；硬表
+     * 命中（页面文件/转储卷）记警告放行，与生产一致。 */
+    RbEnsureSystemVolumeInfo();
+    if (pdo == g_Rb.SystemVolumePdo || letter == g_Rb.SystemDriveLetter) {
         RbLog(1, __LINE__, STATUS_ACCESS_DENIED,
-              L"runtime attach refused: boot-critical volume (data volumes only in TestMode)");
+              L"runtime attach refused: boot/system volume (data volumes only in TestMode)");
         st = STATUS_ACCESS_DENIED;
         goto out;
+    }
+    if (RbIsBootCriticalPdo(pdo)) {
+        RbLog(1, __LINE__, 0,
+              L"runtime attach: pagefile/dump volume allowed in TestMode (production parity)");
     }
 
     /* [FIX R6-01] 运行时挂栈同款 L2 单卷闸（与热开关路径同口径） */
@@ -1206,5 +1509,20 @@ VOID RbVolumeEnumerateAll(RB_VOLUME_LIST *out)
         if (e->PhysicalSector) vi->PhysicalSectorBytes = e->PhysicalSector;
     }
     for (k = 0; k < n; k++) RbDerefExt(snap[k]);   /* [ENUM-1] 释放快照引用 */
+
+    /* [FEAT-ENUM 2026-11-05] 过滤"无盘符且未加速"的实例：OEM 恢复分区/EFI
+     * 系统分区/未分配盘符的卷在列表里显示为空的"•"行，界面噪声且无操作价值
+     * （没有盘符就无法 attach/detach）。已加速的保留（用户可能靠它排障）。 */
+    {
+        ULONG w = 0;
+        for (k = 0; k < n; k++) {
+            RB_VOLUME_INFO *src = &out->Items[k];
+            if (src->Letter == 0 && src->Attached == 0) continue;
+            if (w != k) out->Items[w] = *src;
+            w++;
+        }
+        out->Count = w;
+        return;
+    }
     out->Count = n;
 }

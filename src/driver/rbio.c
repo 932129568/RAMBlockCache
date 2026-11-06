@@ -10,6 +10,7 @@
 #include "rb_common.h"
 #include "rb_common2.h"   /* [V10.3] 特性层 */
 #include "../common/rb_threadsched.h"  /* [多核] HT/组感知 worker 绑核 */
+#include "../core/read_plan.h"        /* [W2] 4K/32 子块有界读拆分 */
 
 /* FIX[build]: 裁剪WDK头缺 ZwQuerySystemInformation 原型，ntoskrnl 有导出，显式声明
  * （形参1用ULONG类号，避免依赖被裁剪的 SYSTEM_INFORMATION_CLASS 枚举）。
@@ -64,6 +65,39 @@ ULONG RbMemAvailableMB(VOID)
     if (!NT_SUCCESS(s))
         return 0;   /* 查询失败：返回 0，调用方按保守/默认预算处理 */
     return (ULONG)(((ULONG64)perf.AvailablePages * PAGE_SIZE) >> 20);
+}
+
+/* [MEM-ADAPT 2026-11-06] 装机总物理内存（MB）：SystemBasicInformation(0)
+ * 的 NumberOfPhysicalPages@12（x64 布局）。结构尾部留余量（与 RB_SYS_PERF
+ * 同款防 STATUS_INFO_LENGTH_MISMATCH）；查询失败返回 0 = 调用方回退原语义。
+ * 用途：MemReserveMB=0（AUTO）时按机器容量推导保留量，不新增协议字段。 */
+#define RB_SYS_BASIC_INFO_CLASS 0
+typedef struct _RB_SYS_BASIC {
+    ULONG   Reserved;
+    ULONG   TimerResolution;
+    ULONG   PageSize;
+    ULONG   NumberOfPhysicalPages;
+    ULONG   LowestPhysicalPageNumber;
+    ULONG   HighestPhysicalPageNumber;
+    ULONG   AllocationGranularity;
+    ULONG64 MinimumUserModeAddress;
+    ULONG64 MaximumUserModeAddress;
+    ULONG64 ActiveProcessorsAffinityMask;
+    UCHAR   NumberOfProcessors;
+    UCHAR   Pad[3];
+    ULONG   Reserved2[16];
+} RB_SYS_BASIC;
+
+ULONG RbMemTotalMB(VOID)
+{
+    RB_SYS_BASIC b;
+    NTSTATUS s;
+    RtlZeroMemory(&b, sizeof(b));
+    s = ZwQuerySystemInformation(RB_SYS_BASIC_INFO_CLASS,
+                                 &b, (ULONG)sizeof(b), NULL);
+    if (!NT_SUCCESS(s) || !b.PageSize || !b.NumberOfPhysicalPages)
+        return 0;
+    return (ULONG)(((ULONG64)b.NumberOfPhysicalPages * b.PageSize) >> 20);
 }
 static PVOID RbMapIrpBuffer(PIRP irp)
 {
@@ -162,6 +196,9 @@ NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     IoSetCompletionRoutine(irp, RbSyncComplete, ctx, TRUE, TRUE, TRUE);
+    RbDiagRecord(RB_DIAG_KIND_SYNC_IO, RB_DIAG_PHASE_ENTER, STATUS_SUCCESS,
+                 RB_DIAG_FLAG_UNKNOWN, irp, RbSyncComplete, ext, ext->Stream,
+                 ext->LowerDevice, NULL);
 
     s = IoCallDriver(ext->LowerDevice, irp);
     if (s == STATUS_PENDING) {
@@ -187,6 +224,14 @@ NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
     /* evt 已置位（同步完成路径同样会跑完成例程），统一收尾（PASSIVE） */
     IoCompleteRequest(irp, IO_NO_INCREMENT);
     s = ctx->iosb.Status;
+    RbDiagRecord(RB_DIAG_KIND_SYNC_IO, RB_DIAG_PHASE_COMPLETE, s,
+                 RB_DIAG_FLAG_UNKNOWN, irp, RbSyncComplete, ext, ext->Stream,
+                 ext->LowerDevice, NULL);
+    /* [FIX DATA-8 R7] 短传归一：卷栈契约不产生 SUCCESS+Information<len，但
+     * 一旦出现（未来栈变化/过滤插入），短写会被当整段成功（core 清脏=数据
+     * 截断落盘）、短读会把不足部分当已提交 commit。归一为设备错误。 */
+    if (NT_SUCCESS(s) && ctx->iosb.Information < (ULONG_PTR)len)
+        s = STATUS_IO_DEVICE_ERROR;
     if (pInfo) *pInfo = NT_SUCCESS(s) ? ctx->iosb.Information : 0;
     RbSyncCtxFree(ctx);
     return s;
@@ -247,14 +292,20 @@ int RbReadbackCb(void *ctx, rb_u64 file_id, rb_u64 off, void *buf, size_t len)
     return NT_SUCCESS(s) ? 0 : 1;
 }
 
-/* ---------------- 每卷写模式解析（系统卷恒直写） ---------------- */
+/* ---------------- 每卷写模式解析 ---------------- */
 static BOOLEAN RbIsWriteBack(PRB_DEV_EXT ext)
 {
     LONG m = ext->WriteMode;
     /* FIX[P2-2]: 安全模式（上次异常退出）→ 强制直写，防止二次数据损失 */
     if (g_Rb.SafeMode) return FALSE;
     if (m == RB_WRITEMODE_GLOBAL) m = g_Rb.Config.WriteBack;
-    if (ext->IsSystem) return FALSE;             /* 系统卷强制 write-through */
+    /* [USER-REQ 2026-11-05] 系统卷不再强制直写——用户明确要求"C 盘也同意回写"。
+     * 安全边界改由配置双闸把守：
+     *   ① 缓存不能覆盖引导关键写：系统卷回写仅对**非引导关键**路径生效；
+     *   ② 回写模式的既有正确性闸门（DATA-12/13/14/15：簇重排前刷脏+丢视图、
+     *      界面切换刷脏）对系统卷同样生效，因此簇复用覆盖问题已封死；
+     *   ③ SafeMode（异常退出）仍强制直写，防止二次数据损失。
+     * 提示：系统盘回写会扩大掉电丢脏窗口，UI 需保留风险提示。 */
     return (m == RB_WRITEMODE_BACK) ? TRUE : FALSE;
 }
 
@@ -268,9 +319,94 @@ NTSTATUS RbDispatchCreateClose(PDEVICE_OBJECT dev, PIRP irp)
     return RbForward(dev, irp);
 }
 
+/* [FIX DATA-12 2026-11-04] 簇客户操作前刷脏——回写模式的核心正确性闸门。
+ *
+ * 症状（真机实测）：开加速（全局回写）后应用自更新/重装即坏——Weixin.exe
+ * "无法定位程序输入点于 ylink2.dll"、MyClash.exe 0xC0000142；重装应用立刻
+ * 恢复。缓存记账完全干净（LostDirtyBytes=0、EvictBytes=0），所以不是"丢写"，
+ * 是**陈旧脏块以旧盖新**。
+ *
+ * 机制（块层固有的危险窗口）：块过滤器只认 LBA，看不到"文件"。应用自更新
+ * 典型序列 = 写新文件 → 删除/改名旧文件（释放簇）→ 新文件复用同一批簇。
+ * 缓存里针对这些簇的脏块（旧 DLL 内容）若在簇被复用**之后**才落盘，就把
+ * 新文件的数据覆盖回旧内容——于是 DLL 导出表/入口点对不上。
+ *
+ * 修法：任何**会释放或重排簇**的元数据操作转下来之前，先同步把本卷脏数据
+ * 落盘。这样脏块的落盘一定发生在簇被复用之前，旧数据不可能追上新数据。
+ * 只拦簇相关类（删除/改名/链接/截断/分配/短名），时间/属性类直接放行
+ * （那些高频且不碰簇）。无脏时零开销（dirty_bytes 原子读）。
+ *
+ * PASSIVE 才可持 ERESOURCE 做 flush；非 PASSIVE 的元数据操作直接放行
+ * （该组合下无缓存 IO 语义可保，且 MTX 常见于 PASSIVE）。 */
+NTSTATUS RbDispatchSetInformation(PDEVICE_OBJECT dev, PIRP irp)
+{
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
+    PRB_DEV_EXT ext;
+    BOOLEAN windowOpen = FALSE;
+
+    if (dev == g_Rb.ControlDevice)
+        return RbForward(dev, irp);
+    ext = (PRB_DEV_EXT)dev->DeviceExtension;
+
+    if (ext->Magic == RB_EXT_MAGIC && ext->IsAttached && ext->Stream &&
+        !ext->Removed && !g_Rb.Unloading && !g_Rb.PanicPassthrough &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        /* FILE_INFORMATION_CLASS 公开稳定值（ntifs.h 枚举的原值，避免在
+         * 过滤器里包含 ntifs.h 引入文件系统头）。 */
+        ULONG fic = (ULONG)sp->Parameters.SetFile.FileInformationClass;
+        BOOLEAN clusterAffecting =
+            (fic == 10 /* FileRenameInformation */) ||
+            (fic == 11 /* FileLinkInformation */) ||
+            (fic == 13 /* FileDispositionInformation */) ||
+            (fic == 19 /* FileAllocationInformation */) ||
+            (fic == 20 /* FileEndOfFileInformation */) ||
+            (fic == 40 /* FileShortNameInformation */) ||
+            (fic == 64 /* FileDispositionInformationEx */) ||
+            (fic == 65 /* FileRenameInformationEx */);
+        if (clusterAffecting) {
+            /* [FIX 2026-11-06 变更窗] 窗口内读写透传：flush 无新脏可收敛
+             * （discard 零丢写）、盘面过渡期读不进缓存。窗口在 forward
+             * 返回后关闭（rename/delete 不改写文件数据，缝隙无害）。 */
+            rb_stream_set_view_mutating(ext->Stream, 1);
+            windowOpen = TRUE;
+            if (rb_stream_dirty_bytes(ext->Stream) != 0) {
+                rb_stream_flush(ext->Stream, 1);
+                /* [FIX DATA-15 2026-11-05] 刷脏后必须丢缓存视图：簇释放后新文件复用
+                 * 簇直写新数据，但 flush 后变干净的旧块仍在缓存——读命中即返回被删
+                 * 文件的内容（0xC0000142/DLL 入口点丢失的另一半根因）。删除/改名是
+                 * 低频操作，丢整卷视图（冷一轮）换正确性。 */
+                rb_stream_discard_all(ext->Stream);
+                RbLog(0, __LINE__, 0, L"setinfo: dirty flushed + cache view dropped");
+            }
+        }
+    }
+    {
+        NTSTATUS fs = RbForward(dev, irp);
+        if (windowOpen && ext->Magic == RB_EXT_MAGIC && ext->Stream)
+            rb_stream_set_view_mutating(ext->Stream, 0);
+        return fs;
+    }
+}
+
 /* ---------------- READ worker ---------------- */
 /* 直读兜底：整段同步下盘读进 tgt（准入拒绝 / miss 区间溢出两条路径共用）。
  * 旧版内联两份逐字节相同的四行块；收敛后两处调用语义不变。 */
+/* [FIX DATA-7 R7 2026-11-03] flush-first 的结果复核（五站点共用）：flush 未收敛
+ * （坏盘，回写回调返 1、脏位保留）时 superseded=1 失效会零记账丢弃已 ack
+ * 数据的唯一副本（R1 修复自引回归——flush 本身失败时"两条路都无丢失"不成立）。
+ * 复核范围内残留脏：有 → 保守失效（superseded=0：脏按 lost_dirty_bytes 如实
+ * 记账 + 边缘 readback 恢复尝试）+ 日志留痕；无 → 常规 superseded=1 失效
+ * （盘面已是最终语）。 */
+VOID RbInvalidateAfterFlush(rb_stream *st, rb_u64 off, rb_u64 len)
+{
+    if (rb_stream_has_dirty_range(st, off, (size_t)len)) {
+        RbLog(2, __LINE__, STATUS_UNSUCCESSFUL,
+              L"flush-before-invalidate incomplete: conservative invalidate with lost accounting");
+        rb_stream_invalidate_range_ex(st, off, len, 0, NULL, 0, 0, NULL);
+    } else {
+        rb_stream_invalidate_range(st, off, len);
+    }
+}
 static VOID RbReadDirectFallback(PRB_DEV_EXT ext, PVOID tgt, ULONG len,
                                  LONGLONG off, NTSTATUS *ps, ULONG_PTR *pinfo)
 {
@@ -298,7 +434,7 @@ static VOID RbReadDirectFallback(PRB_DEV_EXT ext, PVOID tgt, ULONG len,
  * rs=请求起始偏移（循环内 off 不变故提为入参）。 */
 static VOID RbReadMissRange(PRB_DEV_EXT ext, PRB_IOWORKER w,
                             const rb_direct_range *mr, PUCHAR tgt,
-                            ULONGLONG rs, ULONG len, NTSTATUS *ps)
+                            ULONGLONG rs, ULONG len, NTSTATUS *ps, rb_u64 vgen)
 {
     LARGE_INTEGER moff;
     ULONGLONG ms = mr->offset;
@@ -328,18 +464,27 @@ static VOID RbReadMissRange(PRB_DEV_EXT ext, PRB_IOWORKER w,
             *ps = RbSyncIo(ext, FALSE, &moff, dst, (ULONG)mr->len, NULL);
         }
         if (NT_SUCCESS(*ps))
-            rb_read_commit(ext->Stream, mr->offset, dst, mr->len);
+            rb_read_commit_gen(ext->Stream, mr->offset, dst, mr->len, vgen);
         return;
     }
 
     /* ---- ② [W1.5] 32MB 分片 staging ---- */
     {
         ULONGLONG cur = ms;
-        while (cur < me) {
+        /* [FIX LINK-3 2026-11-03] 卷尾钳位：core 的 miss 区间按整子块对齐、
+         * 两端可越出请求窗口（cache.h 契约，core 侧正确）——卷长非 BlockSize
+         * 整数倍时 me 越过卷尾，下盘读越界失败 → IoFailRun 连续 32 次 =
+         * RbSetPanic 全局熔断（NTFS 对卷尾元数据的重试天然连续；64K/128K
+         * 解耦后几乎覆盖所有末分区）。读长钳到 DiskSize：尾部不足段不读不
+         * 入缓存（commit 的 full_cover 语义自动处理部分子块），请求交集
+         * 照常交付。两模块各自正确、组合出错——典型联动缺口。 */
+        ULONGLONG me_io = me;
+        if (me_io > (ULONGLONG)ext->DiskSize) me_io = (ULONGLONG)ext->DiskSize;
+        while (cur < me_io) {
             ULONGLONG cend = cur + (32UL << 20);   /* 32MB 为 4K 倍数：切点天然对齐 */
             ULONG   clen;
             ULONGLONG clo, chi;                    /* 本片与请求的交集 */
-            if (cend > me) cend = me;
+            if (cend > me_io) cend = me_io;
             clen = (ULONG)(cend - cur);
             clo = (cur > rs) ? cur : rs;
             chi = (cend < re) ? cend : re;
@@ -352,7 +497,7 @@ static VOID RbReadMissRange(PRB_DEV_EXT ext, PRB_IOWORKER w,
                     *ps = RbSyncIo(ext, FALSE, &moff, st, clen, NULL);
                 }
                 if (NT_SUCCESS(*ps)) {
-                    rb_read_commit(ext->Stream, cur, st, clen);
+                    rb_read_commit_gen(ext->Stream, cur, st, clen, vgen);
                     if (chi > clo)
                         memcpy((PUCHAR)tgt + (clo - rs), st + (clo - cur),
                                (size_t)(chi - clo));
@@ -361,7 +506,8 @@ static VOID RbReadMissRange(PRB_DEV_EXT ext, PRB_IOWORKER w,
                 st = NULL;
                 if (!NT_SUCCESS(*ps)) return;
             } else if (chi > clo) {
-                /* staging 分配失败：仅下盘读本片交集进 tgt，本片不入缓存 */
+                /* staging 分配失败：仅下盘读本片交集进 tgt，本片不入缓存并如实上报 */
+                RbNoteBypass(ext, RB_BYPASS_RESOURCE);
                 moff.QuadPart = (LONGLONG)clo;
                 *ps = RbSyncIo(ext, FALSE, &moff, (PUCHAR)tgt + (clo - rs),
                                (ULONG)(chi - clo), NULL);
@@ -385,8 +531,15 @@ static VOID RbReadMissRange(PRB_DEV_EXT ext, PRB_IOWORKER w,
  * 时整体跳过——不产假数据。slot：0=全命中读 1=含 miss 下盘读。 */
 static BOOLEAN RbLatSampleStart(PLARGE_INTEGER t0)
 {
+    ULONG cpu;
     if (!g_Rb.QpcFreq) return FALSE;
-    if (((ULONG)InterlockedIncrement(&g_Rb.ReadLatSeq) & 63u) != 0) return FALSE;
+    /* [OPT-STATS R26] 采样序号 per-CPU：全局原子 seq 在 64 路读热下每 IO 一次
+     * 跨核乒乓；每核独立 &63==0 命中——全局采样率仍 1/64（各核均匀）。
+     * [FIX REDTEAM-2] 用 InterlockedIncrement 而非 ++：线程可在取号与自增之间
+     * 被调度到别的核（PRCB 迁移），无锁 ++ 会丢更新且数据竞争；原子自增的
+     * 争用面只有同核线程（1/64），远小于全局单行。 */
+    cpu = KeGetCurrentProcessorNumberEx(NULL) & 63;
+    if ((InterlockedIncrement((volatile LONG *)&g_Rb.ReadLatSeqCpu[cpu]) & 63u) != 0) return FALSE;
     t0->QuadPart = KeQueryPerformanceCounter(NULL).QuadPart;
     return TRUE;
 }
@@ -399,6 +552,14 @@ static VOID RbLatNote(BOOLEAN sampled, LARGE_INTEGER t0, int slot)
     t1.QuadPart = KeQueryPerformanceCounter(NULL).QuadPart;
     if (t1.QuadPart <= t0.QuadPart) return;
     us = (ULONG)(((t1.QuadPart - t0.QuadPart) * 1000000ULL) / (ULONGLONG)g_Rb.QpcFreq);
+    /* [U1 2026-11-06] 直方图入桶：桶号 = floor(log2(us))（MSB 位索引，us==0 归桶 0），
+     * log2 下界近似；每 64 笔读一次原子自增（与 EWMA 更新同成本级，R26 先例合规）。 */
+    {
+        ULONG v = us;
+        unsigned long bIdx = 0;
+        while (v >>= 1) bIdx++;
+        InterlockedIncrement((volatile LONG *)&g_Rb.ReadLatHist[slot][bIdx]);
+    }
     old = (ULONG)g_Rb.ReadLatEwmaUs[slot];
     if (old == 0) { InterlockedExchange(&g_Rb.ReadLatEwmaUs[slot], (LONG)us); return; }
     InterlockedExchange(&g_Rb.ReadLatEwmaUs[slot], (LONG)((old * 7u + us) / 8u));
@@ -440,59 +601,77 @@ VOID RbEvPublish(ULONG opType, ULONG percent, ULONG cancelable, ULONG phase,
 
 static VOID RbReadWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
 {
-    PRB_DEV_EXT ext  = ctx->Ext;
-    PIRP        irp  = ctx->Irp;
-    ULONG       len  = ctx->Length;
-    LONGLONG    off  = ctx->Offset.QuadPart;
+    PRB_DEV_EXT ext = ctx->Ext;
+    PIRP irp = ctx->Irp;
+    ULONG len = ctx->Length;
+    rb_u64 cur = (rb_u64)ctx->Offset.QuadPart;
+    size_t remaining = ctx->Length;
     rb_direct_range miss[RB_MAX_RANGES];
-    int         mcnt = 0, i, rc;
-    PVOID       tgt  = RbMapIrpBuffer(irp);
-    NTSTATUS    s    = STATUS_SUCCESS;
-    ULONG_PTR   info = 0;
-    LARGE_INTEGER lat0;                 /* [B-12] 读延迟采样起点（未命中采样=FALSE） */
-    BOOLEAN      latS = FALSE;
+    PVOID tgt = RbMapIrpBuffer(irp);
+    NTSTATUS s = STATUS_SUCCESS;
+    ULONG_PTR info = 0;
+    rb_u64 vgen;                 /* [FIX 2026-11-06] 视图世代快照（miss 计划前捕获） */
+    LARGE_INTEGER lat0;
+    BOOLEAN latS = FALSE;
+    BOOLEAN allHit = TRUE;
 
-    if (!tgt) { s = STATUS_INSUFFICIENT_RESOURCES; goto done; }
+    if (!tgt) {
+        RbNoteBypass(ext, RB_BYPASS_RESOURCE);
+        s = STATUS_INSUFFICIENT_RESOURCES;
+        goto done;
+    }
 
-    /* [V10.3] 特性钩子：读入口预取流跟踪 + 进程排除准入（Flags=0 时零开销空转） */
-    RbFeatOnRead(ext, (ULONG64)off, len);
+    /* 原 IRP 只判定一次预取/准入；分片不放大特性钩子次数。 */
+    RbFeatOnRead(ext, (ULONG64)cur, len);
     if (!RbFeatAdmit(ext)) {
-        RbReadDirectFallback(ext, tgt, len, off, &s, &info);
+        RbNoteBypass(ext, RB_BYPASS_ADMIT);
+        RbReadDirectFallback(ext, tgt, len, (LONGLONG)cur, &s, &info);
         goto done;
     }
 
-    latS = RbLatSampleStart(&lat0);      /* [B-12] 采样开始（1/64；QpcFreq=0 时 FALSE） */
-    rc = rb_read(ext->Stream, (rb_u64)off, tgt, len, miss, &mcnt, RB_MAX_RANGES);
-    if (rc < 0) {
-        /* [P1-1] miss 区间数超上限：缓存视图不完整，整段直读兜底（不入缓存）。 */
-        RbReadDirectFallback(ext, tgt, len, off, &s, &info);
-        goto done;
-    }
-    if (mcnt > RB_MAX_RANGES) mcnt = RB_MAX_RANGES;     /* [P1-1] 双保险 */
-    if (mcnt == 0) RbFeatOnHit(ext, (ULONG64)off, len);  /* [V10.3] 全命中 */
-
-    /* miss 区间已按【整子块对齐】（核心 P1-修正）：两端可能超出请求
-     * [off,off+len)，不能直接读进仅 len 字节的 tgt（会越界），也不能夹回
-     * 边界（非对齐 -> rb_read_commit 的 full_cover 不成立 -> 永不缓存）。
-     * 逐区间：4K 对齐 staging(按对齐长度) -> 下盘读整块 -> commit 整块建立
-     * 缓存 -> 把与请求的交集切进 tgt -> 释放。staging 分配失败则该区间退化
-     * 为"仅下盘读请求交集、不入缓存"，数据正确性不受影响。
-     * （逐区间处理提取为 RbReadMissRange；任一对一失败即整段放弃进 done。） */
-    for (i = 0; i < mcnt; i++) {
-        RbReadMissRange(ext, w, &miss[i], (PUCHAR)tgt, (ULONGLONG)off, len, &s);
-        if (!NT_SUCCESS(s)) goto done;
+    RbNoteBypass(ext, 0);                 /* 新 IRP 开始；若本片降级会在下面重新记录 */
+    latS = RbLatSampleStart(&lat0);
+    /* [FIX 2026-11-06 视图世代门控] miss 计划前捕获视图世代：回填提交时校验，
+     * 期间发生过丢视图操作（改名/删除/截断/熔断自愈）即放弃回填——封堵
+     * "操作前盘读回填重新污染缓存"（应用读到更新前 DLL 的两代事故同根因）。 */
+    vgen = rb_stream_view_gen(ext->Stream);
+    while (remaining > 0) {
+        size_t chunk = rb_read_plan_chunk(cur, remaining);
+        int mcnt = 0, i, rc;
+        if (chunk == 0) {
+            RbNoteBypass(ext, RB_BYPASS_RESOURCE);
+            s = STATUS_INVALID_PARAMETER;
+            goto done;
+        }
+        rc = rb_read(ext->Stream, cur, tgt, chunk, miss, &mcnt, RB_MAX_RANGES);
+        if (rc < 0 || mcnt < 0 || mcnt > RB_MAX_RANGES) {
+            /* 4K/32 子块分片后溢出不可达；防御性失败，禁止越界遍历或整段直读。 */
+            RbNoteBypass(ext, RB_BYPASS_RESOURCE);
+            s = STATUS_INVALID_PARAMETER;
+            goto done;
+        }
+        if (mcnt != 0) allHit = FALSE;
+        for (i = 0; i < mcnt; i++) {
+            /* [AUDIT 2026-11-01] chunk = rb_read_plan_chunk() <= RB_READ_PLAN_MAX_BYTES
+             * (=32*4KiB = 128KiB)，size_t->ULONG 截断不可达；显式转型固化意图
+             * （原隐式转换在 /W4 报 C4267，正是被 vcxproj 禁用的 11 类之一）。 */
+            RbReadMissRange(ext, w, &miss[i], (PUCHAR)tgt, cur, (ULONG)chunk, &s, vgen);
+            if (!NT_SUCCESS(s)) goto done;   /* 失败片不 commit；原 IRP info 保持 0 */
+        }
+        cur += chunk;
+        tgt = (PUCHAR)tgt + chunk;
+        remaining -= chunk;
     }
 
     info = len;
-    RbLatNote(latS, lat0, mcnt == 0 ? 0 : 1);   /* [B-12] 全命中→slot0；含 miss→slot1 */
+    if (allHit) RbFeatOnHit(ext, (ULONG64)ctx->Offset.QuadPart, len);
+    RbLatNote(latS, lat0, allHit ? 0 : 1);   /* 原 IRP 仍只采样一次 */
 
 done:
     irp->IoStatus.Status = s;
     irp->IoStatus.Information = info;
     IoCompleteRequest(irp, IO_DISK_INCREMENT);
     RbNoteIoResult(ext, s);
-    /* [FIX M10] 先还 ctx 再减 ext 引用：Refs 归零放行卸载删旁视池，
-     * 若顺序颠倒，RbCtxFree 会向已删除的旁视表归还内存（UAF） */
     RbCtxFree(ctx);
     RbDerefExt(ext);
 }
@@ -547,8 +726,17 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
      * invalidate 持 ERESOURCE（IRQL≤APC），故在本 PASSIVE worker 内执行。
      * 被丢弃的旧脏块，其数据已被本次直写取代，无 acknowledged 数据丢失。 */
     if (ctx->Passthru) {
-        if (ext->Stream)
-            rb_stream_invalidate_range(ext->Stream, (rb_u64)off, (rb_u64)len);
+        if (ext->Stream) {
+            /* [FIX DATA-2 R1 2026-11-03] 原序=先 invalidate(superseded=1) 后直写：
+             * 直写失败时区间内"仅存于缓存"的已 ack 脏数据被静默丢弃且零记账。
+             * 改 F9 flush-first 范式：先同步刷脏（脏块唯一副本落盘）再失效
+             * （只丢干净块），随后前转直写——成=盘面新数据，败=盘面有刚刷的
+             * 旧数据，两条路都无 acked 数据丢失。flush 在本 PASSIVE worker
+             * 同步执行；回写通道已断（panic）时 flush 无效，行为退回现状
+             * （该状态本无保存通道）。 */
+            rb_stream_flush(ext->Stream, 1);
+            RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
+        }
         RbForward(ext->FilterDevice, irp);
         RbCtxFree(ctx);      /* [FIX M10] 先还 ctx 后减引用 */
         RbDerefExt(ext);
@@ -557,15 +745,25 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
 
     tgt = RbMapIrpBuffer(irp);
     wb  = RbIsWriteBack(ext);
-    if (!tgt) { s = STATUS_INSUFFICIENT_RESOURCES; goto done; }
+    if (!tgt) {
+        RbNoteBypass(ext, RB_BYPASS_RESOURCE);
+        s = STATUS_INSUFFICIENT_RESOURCES;
+        goto done;
+    }
 
     /* [ADMIT-1] 进程排除同样作用于写缓存（直写下盘，不入缓存） */
     if (!RbFeatAdmit(ext)) {
         LARGE_INTEGER o; o.QuadPart = off;
         /* [P0-1] 直写下盘前失效同区间缓存旧副本：否则旧脏块会被后续
-         * 自愈/周期回写落盘，覆盖本次排除进程直写的新数据。 */
-        if (ext->Stream)
-            rb_stream_invalidate_range(ext->Stream, (rb_u64)off, (rb_u64)len);
+         * 自愈/周期回写落盘，覆盖本次排除进程直写的新数据。
+         * [FIX DATA-2 R1] 原序失效→直写在直写失败时静默丢弃已 ack 脏数据
+         * （零记账）。改：范围有脏先同步刷脏（F9 范式）再失效——直写成败
+         * 均无丢失；范围无脏时跳过 flush（零开销）。 */
+        if (ext->Stream) {
+            if (rb_stream_has_dirty_range(ext->Stream, (rb_u64)off, (size_t)len))
+                rb_stream_flush(ext->Stream, 1);
+            RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
+        }
         s = RbSyncIo(ext, TRUE, &o, tgt, len, NULL);
         info = NT_SUCCESS(s) ? len : 0;
         goto done;
@@ -589,6 +787,15 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
         rb_u64 cur    = (rb_u64)off;
         rb_u64 wend   = cur + len;
         rb_u64 ok_end = cur;
+        /* [FIX F10 2026-11-06] 切块几何改用引擎值（rb_engine_block_size）：
+         * W12 推迟窗内 config 副本可能与运行引擎几何不一致（用户把块大小改回
+         * 4K 而引擎仍 32K），用 config 值切块会把切块点落在引擎子块中间 →
+         * 边缘子块 RMW 补读（正确但慢、多一次盘读）。几何在引擎 create 期冻结
+         * → 循环外取一次即可。Engine==NULL 的时序窗（未创建/已销毁）回退
+         * config 值——此时 ext->Stream 必为 NULL、本 wb 分支不可达，纯防御。 */
+        rb_u32 carve_bs = g_Rb.Engine ? rb_engine_block_size(g_Rb.Engine)
+                                      : g_Rb.Config.BlockSize;
+        if (carve_bs == 0) carve_bs = 4096;   /* 双源皆空防御（不可达；钳位保证 2 的幂） */
         if (w && !w->DseqBuf) {
             w->DseqBuf = (PULONG)ExAllocatePool2(POOL_FLAG_NON_PAGED,
                                                  2048 * sizeof(ULONG), RB_POOL_TAG);
@@ -600,7 +807,11 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
         pre.base = 0; pre.bits = 0;
 
         while (cur < wend) {
-            rb_u64 cend = (cur & ~(rb_u64)(RB_BUF_ALIGN - 1)) + (8UL << 20);
+            /* [OPT-64K 2026-11-02] 切块点按引擎子块几何对齐：原 4K 对齐在
+             * BlockSize>4K 时会把首/尾子块劈成两半，边界子块被迫走 RMW 补读
+             * （每 8MB 块多一次盘读）。对齐到 BlockSize（钳位保证 2 的幂）后
+             * 分块边界必落子块边界，RMW 仅剩真实非对齐首尾。 */
+            rb_u64 cend = (cur & ~(rb_u64)(carve_bs - 1)) + (8UL << 20);
             ULONG  clen;
             PUCHAR cb = (PUCHAR)tgt + (cur - (rb_u64)off);   /* 本块源缓冲 */
             if (cend > wend) cend = wend;
@@ -712,12 +923,26 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
             rb_stream_invalidate_range_ex(ext->Stream, (rb_u64)off, ok_end - (rb_u64)off,
                                           0, NULL, 0, 0, NULL);
     } else {
-        /* M9 write-through：先整块下盘；成功后以“干净块”入缓存（不进脏集合）。 */
+        /* M9 write-through：先整块下盘；成功后以“干净块”入缓存（不进脏集合）。
+         * [FIX DATA-4 R4 2026-11-03] 直写前对范围执行与 Admit/透传路径同款的
+         * "有脏先刷脏再失效"纪律：模式切换竞态（WriteMode BACK→THROUGH，写
+         * 线程已过 RbIsWriteBack 判定而吸收后于切换 flush 的末趟扫描）会在
+         * 缓存遗留脏块，本分支原先不触碰缓存脏态——在途回写/周期回写随后把
+         * 旧脏数据落盘，覆盖本直写已 ack 的新数据（盘面+缓存终态均为旧值）。
+         * 正常态 write-through 无脏 → has_dirty_range=0 → 零开销。 */
         LARGE_INTEGER o;
         o.QuadPart = off;
+        if (ext->Stream && rb_stream_has_dirty_range(ext->Stream, (rb_u64)off, (size_t)len)) {
+            rb_stream_flush(ext->Stream, 1);
+            RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
+        }
         s = RbSyncIo(ext, TRUE, &o, tgt, len, NULL);
-        if (NT_SUCCESS(s))
-            rb_read_commit(ext->Stream, (rb_u64)off, tgt, len);
+        if (NT_SUCCESS(s) && ext->Stream)
+            /* [FIX 2026-11-06] 直写后回填同样门控：世代在直写（含上面的失效）
+             * 之后捕获——期间若有并发丢视图操作（别的线程的元数据操作），
+             * 本回填放弃（丢一次预热，正确性无损）。 */
+            rb_read_commit_gen(ext->Stream, (rb_u64)off, tgt, len,
+                               rb_stream_view_gen(ext->Stream));
     }
     info = NT_SUCCESS(s) ? len : 0;
 
@@ -736,6 +961,31 @@ static VOID RbPinToCpu(ULONG cpu)
     /* 绑定逻辑 CPU（含超线程）。>64 逻辑 CPU 的多组系统：worker 落在第 0 组，
      * 仍并行，只是不跨组摊 —— 客户端系统几乎都是单组。 */
     KeSetSystemAffinityThread((KAFFINITY)1 << (cpu & 63));
+}
+
+/* [OPT-STEAL 2026-11-05] 工作窃取：高并发下的负载均衡核心。
+ *
+ * 问题：per-CPU worker 只消费自己的队列——某个 CPU 上分派的 IO 全部积压
+ * 在它的 worker 里，而其它 worker 空闲。高并发（多线程跑满队列）时，
+ * 热点 CPU 的 worker 成为串行瓶颈，整体吞吐被"最忙的那个核"卡住。
+ * 方案：自身队列空时，按 round-robin 扫描其它 worker，从队尾窃取一个节点。
+ * 只窃"队尾"（队头留给属主，减少争用）；每次摘取仍持对方 Lock（单链安全），
+ * 窃取失败立即返回（不轮询等待——空转是 CPU 浪费）。 */
+static PRB_IOCTX RbStealOne(PRB_IOWORKER self)
+{
+    ULONG n = g_Rb.IoWorkerCount, i, start;
+    if (n <= 1) return NULL;
+    start = (self->CpuIndex + 1) % n;
+    for (i = 0; i < n - 1; i++) {
+        PRB_IOWORKER other = &g_Rb.IoWorkers[(start + i) % n];
+        KIRQL irql; PLIST_ENTRY le = NULL;
+        if (other == self) continue;
+        KeAcquireSpinLock(&other->Lock, &irql);
+        if (!IsListEmpty(&other->QueueHead)) le = RemoveTailList(&other->QueueHead);
+        KeReleaseSpinLock(&other->Lock, irql);
+        if (le) return CONTAINING_RECORD(le, RB_IOCTX, le);
+    }
+    return NULL;
 }
 
 static VOID RbIoWorkerLoop(PVOID p)
@@ -757,7 +1007,15 @@ static VOID RbIoWorkerLoop(PVOID p)
             KeAcquireSpinLock(&w->Lock, &irql);
             le = IsListEmpty(&w->QueueHead) ? NULL : RemoveHeadList(&w->QueueHead);
             KeReleaseSpinLock(&w->Lock, irql);
-            if (!le) break;
+            if (!le) {
+                /* [OPT-STEAL] 自己空了：窃取一个别人的（满载均衡） */
+                ctx = RbStealOne(w);
+                if (!ctx) break;
+                if (ctx->Major == IRP_MJ_READ)                RbReadWorker(ctx, w);
+                else if (ctx->Major == IRP_MJ_FLUSH_BUFFERS)  RbFlushIrpWorker(ctx);
+                else                                          RbWriteWorker(ctx, w);
+                continue;
+            }
             ctx = CONTAINING_RECORD(le, RB_IOCTX, le);
             if (ctx->Major == IRP_MJ_READ)                RbReadWorker(ctx, w);
             else if (ctx->Major == IRP_MJ_FLUSH_BUFFERS)  RbFlushIrpWorker(ctx);
@@ -770,7 +1028,7 @@ static VOID RbIoWorkerLoop(PVOID p)
             KeAcquireSpinLock(&w->Lock, &qirql);
             empty = IsListEmpty(&w->QueueHead);
             alive = w->Alive;
-            KeReleaseSpinLock(&w->Lock, &qirql);
+            KeReleaseSpinLock(&w->Lock, qirql);
             if (!alive && empty) break;
         }
     }
@@ -923,7 +1181,7 @@ NTSTATUS RbStopIoWorkers(VOID)   /* FIX[UNLOAD]: 必须等待线程真正退出�
         LARGE_INTEGER to;
         /* [FIX D6-10] Alive 清零持锁：与 SubmitIo 的锁内检查/worker 退出判定
          * 构成同一临界区，消除"检查通过→入队前停机"的孤儿窗口。 */
-        { KIRQL sirql; KeAcquireSpinLock(&w->Lock, &sirql); w->Alive = 0; KeReleaseSpinLock(&w->Lock, &sirql); }
+        { KIRQL sirql; KeAcquireSpinLock(&w->Lock, &sirql); w->Alive = 0; KeReleaseSpinLock(&w->Lock, sirql); }
         KeSetEvent(&w->Wake, IO_NO_INCREMENT, FALSE);
         if (w->Thread) {
             to.QuadPart = -300000000LL;   /* 30s：C5-r2 后 worker 可能久等坏盘 */
@@ -996,6 +1254,7 @@ static VOID RbSubmitIo(PRB_IOCTX ctx)
      * ExQueueWorkItem 要求先经 ExInitializeWorkItem 初始化。
      * [FIX R2-M1] 入队即计数：排空判定（RbUnload 删池前）必须覆盖
      * "已入队未启动"窗口，否则删池后队列项运行=UAF。worker 入口不再自增。 */
+    RbNoteBypass(ctx->Ext, RB_BYPASS_RESOURCE);
     InterlockedIncrement(&g_Rb.FallbackInFlight);
     ExInitializeWorkItem(&ctx->Item, RbRwWorker, ctx);
     ExQueueWorkItem(&ctx->Item, DelayedWorkQueue);
@@ -1053,6 +1312,19 @@ static VOID RbRwWorker(PVOID p)   /* 兜底（池未启动）系统队列例程 
 static NTSTATUS RbDispatchPassthrough(PRB_DEV_EXT ext, PDEVICE_OBJECT dev, PIRP irp)
 {
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
+    /* [FIX DATA-9 R8] 透传读的 read-your-writes：回写卷脏块未落盘（周期回写
+     * 30s 级窗口）时，透传读（池耗尽回退/读方向关/>MaxCacheIoKB 巨块安全阀）
+     * 直接下盘取旧数据=已 ack 写对读者"消失"。范围有脏先同步刷脏（读不改
+     * 盘面，无需失效）；PASSIVE 才可持 ERESOURCE，非 PASSIVE 保持直读
+     * （该组合下读透传本就罕见，且无撕裂风险——仅陈旧窗口）。 */
+    if (sp->MajorFunction == IRP_MJ_READ &&
+        ext->Magic == RB_EXT_MAGIC && ext->Stream && !ext->Removed &&
+        !g_Rb.Unloading && KeGetCurrentIrql() == PASSIVE_LEVEL &&
+        rb_stream_has_dirty_range(ext->Stream,
+                                  (rb_u64)sp->Parameters.Read.ByteOffset.QuadPart,
+                                  (size_t)sp->Parameters.Read.Length)) {
+        rb_stream_flush(ext->Stream, 1);
+    }
     if (sp->MajorFunction == IRP_MJ_WRITE &&
         ext->Magic == RB_EXT_MAGIC && ext->Stream && !ext->Removed && !g_Rb.Unloading) {
         /* [FIX S7-03] 热开关已关（detach/拆除进行中）且当前 PASSIVE：内联失效+
@@ -1064,9 +1336,16 @@ static NTSTATUS RbDispatchPassthrough(PRB_DEV_EXT ext, PDEVICE_OBJECT dev, PIRP 
          * 时仍走 worker（下方原路径）。 */
         if (!ext->IsAttached && KeGetCurrentIrql() == PASSIVE_LEVEL) {
             NTSTATUS fst;
-            rb_stream_invalidate_range(ext->Stream,
-                                       (rb_u64)sp->Parameters.Read.ByteOffset.QuadPart,
-                                       (rb_u64)sp->Parameters.Read.Length);
+            /* [FIX DATA-2 R1] 同站点 1/2：失效前先同步刷脏（F9 范式）——
+             * detach 后透传写失败时区间脏块是已 ack 数据唯一副本，superseded=1
+             * 直接丢弃=静默丢失。有脏才 flush（无脏零开销）。 */
+            if (rb_stream_has_dirty_range(ext->Stream,
+                                           (rb_u64)sp->Parameters.Read.ByteOffset.QuadPart,
+                                           (size_t)sp->Parameters.Read.Length))
+                rb_stream_flush(ext->Stream, 1);
+            RbInvalidateAfterFlush(ext->Stream,
+                                   (rb_u64)sp->Parameters.Read.ByteOffset.QuadPart,
+                                   (rb_u64)sp->Parameters.Read.Length);
             fst = RbForward(ext->FilterDevice, irp);
             RbDerefExt(ext);
             return fst;
@@ -1090,6 +1369,28 @@ static NTSTATUS RbDispatchPassthrough(PRB_DEV_EXT ext, PDEVICE_OBJECT dev, PIRP 
             }
             return STATUS_PENDING;
         }
+    }
+    /* [FIX DATA-10 R8] ctx 耗尽的透传写补纪律：池耗尽时原实现零失效直接
+     * 前转——区间旧脏块存留，后续回写以旧盖新（P0-1 静默损坏）。
+     * [FIX REDTEAM-1 2026-11-03] 门必须是 == PASSIVE_LEVEL：flush/invalidate
+     * 内部持 ERESOURCE（KeEnterCriticalRegion + ExAcquireResourceExclusive），
+     * APC_LEVEL 下取 ERESOURCE = 0xC0000096/0x1 级蓝屏（第 4 次蓝屏同族）。
+     * 原写 <= APC_LEVEL 是我 R8 修复引入的 IRQL 越权。非 PASSIVE（APC/
+     * DISPATCH）一律只留痕直转。 */
+    if (sp->MajorFunction == IRP_MJ_WRITE &&
+        ext->Magic == RB_EXT_MAGIC && ext->Stream && !ext->Removed &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        if (rb_stream_has_dirty_range(ext->Stream,
+                                      (rb_u64)sp->Parameters.Read.ByteOffset.QuadPart,
+                                      (size_t)sp->Parameters.Read.Length))
+            rb_stream_flush(ext->Stream, 1);
+        RbInvalidateAfterFlush(ext->Stream,
+                               (rb_u64)sp->Parameters.Read.ByteOffset.QuadPart,
+                               (rb_u64)sp->Parameters.Read.Length);
+    } else if (sp->MajorFunction == IRP_MJ_WRITE && ext->Stream &&
+               KeGetCurrentIrql() > PASSIVE_LEVEL) {
+        RbLog(2, __LINE__, STATUS_INSUFFICIENT_RESOURCES,
+              L"ctx exhausted at >PASSIVE: passthrough write without invalidate");
     }
     /* [FIX D6-01] 先转发后归还引用：RbForward 内部解引用 ext->LowerDevice，
      * 原顺序（先 deref）在这是最后一笔引用时构成 UAF 窗口（卸载竞态）。 */
@@ -1127,15 +1428,35 @@ NTSTATUS RbDispatchReadWrite(PDEVICE_OBJECT dev, PIRP irp)
             /* 内存被踩：立即全局熔断（log 不解引用其他字段） */
             RbSetPanic(L"CORRUPT DEVEXT canary");
         }
+        if (!ext->Stream || !ext->GeometryValid) RbNoteBypass(ext, RB_BYPASS_STREAM_GEOMETRY);
         return RbDispatchPassthrough(ext, dev, irp);
     }
     /* 全局 + 每卷读写开关（必须真正生效：关闭对应方向即透传） */
     if (sp->MajorFunction == IRP_MJ_READ &&
         (!g_Rb.Config.ReadCacheEnabled || !ext->ReadEnabled)) {
+        RbNoteBypass(ext, RB_BYPASS_DIRECTION);
         return RbDispatchPassthrough(ext, dev, irp);
     }
     if (sp->MajorFunction == IRP_MJ_WRITE &&
         (!g_Rb.Config.WriteCacheEnabled || !ext->WriteEnabled)) {
+        RbNoteBypass(ext, RB_BYPASS_DIRECTION);
+        return RbDispatchPassthrough(ext, dev, irp);
+    }
+    /* [FIX 2026-11-06] CachePagingIo=0 的兑现：分页 IO（映射节读写——加载器
+     * 读 DLL、MM 改页回写）不进缓存，直接透传。该配置此前仅入配置表
+     * （rbdriver.c）从无消费者——事故（微信"无法定位程序输入点"×2，重启
+     * 自愈）实锤驱动装配层存在间歇错服务，根因未定位前先把最敏感的
+     * 分页流移出缓存爆炸半径（配置语义本就承诺此行为）。 */
+    if (!g_Rb.Config.CachePagingIo && (irp->Flags & IRP_PAGING_IO)) {
+        RbNoteBypass(ext, RB_BYPASS_PAGING);
+        return RbDispatchPassthrough(ext, dev, irp);
+    }
+    /* [FIX 2026-11-06 变更窗] 元数据钩子窗口（改名/删除/截断/TRIM 的
+     * flush→discard→forward 期间）：读写一律透传。窗口内吸收的写会在
+     * discard 时被丢（已确认写=数据丢失）、盘读回填会缓存过渡期内容——
+     * 直通同时封死两者，且窗口内 flush 无新脏可收敛（discard 零丢失）。 */
+    if (rb_stream_view_mutating(ext->Stream)) {
+        RbNoteBypass(ext, RB_BYPASS_VIEW_MUTATING);
         return RbDispatchPassthrough(ext, dev, irp);
     }
     len = sp->Parameters.Read.Length;
@@ -1144,11 +1465,76 @@ NTSTATUS RbDispatchReadWrite(PDEVICE_OBJECT dev, PIRP irp)
      * 对巨块顺序读更有效，巨块透传是既有安全阀（含 Passthru=1 失效纪律）。 */
     if (len == 0 || len > (g_Rb.MaxCacheIoKB << 10) ||
         sp->Parameters.Read.ByteOffset.QuadPart < 0) {
+        if (len > (g_Rb.MaxCacheIoKB << 10)) RbNoteBypass(ext, RB_BYPASS_IO_TOO_LARGE);
         return RbDispatchPassthrough(ext, dev, irp);
     }
+    /* [OPT 2026-11-01] 内联写吸收快路径（回写模式）：rb_write_ex 吸收成功且无
+     * direct 区间时就地完成（省 dispatch→worker 往返）。pre=NULL = 无写前快照
+     * （core 契约 "mask==NULL 视为 0 容量"）：吸收成功则快照本就不需要（无失败
+     * 回滚）；吸收失败/direct 区间 → 回退 worker 路径（完整 DseqBuf 记账+失效
+     * 处理），已吸收部分同数据幂等重吸收 ✓ 安全。
+     * 仅 IRQL≤APC + WriteBack + MJ_WRITE 守卫（写 IRP 绝不入读路径）。
+     * [FIX DATA-5 R4] 补 RbFeatAdmit 进程排除检查：worker 路径在吸收前检查
+     * [ADMIT-1]，内联快路径原先缺——被排除进程（临时文件/自有缓存软件）的
+     * 写在内联被吸收进缓存，绕过排除策略（性能策略失灵，非正确性；与
+     * [ADMIT-1] 语义对齐）。排除命中 → 落入 worker 路径直写。 */
+    if (sp->MajorFunction == IRP_MJ_WRITE &&
+        KeGetCurrentIrql() <= APC_LEVEL &&
+        RbIsWriteBack(ext) &&
+        RbFeatAdmit(ext)) {
+        PVOID tgt = RbMapIrpBuffer(irp);
+        if (tgt) {
+            rb_write_pre  pre; pre.mask = NULL; pre.dseq = NULL; pre.max_bits = 0; pre.base = 0; pre.bits = 0;
+            rb_direct_range direct[RB_MAX_RANGES]; ULONG dcnt = 0;
+            NTSTATUS ws = rb_write_ex(ext->Stream,
+                                      (rb_u64)sp->Parameters.Write.ByteOffset.QuadPart,
+                                      tgt, len, direct, &dcnt, RB_MAX_RANGES, &pre);
+            if (NT_SUCCESS(ws) && dcnt == 0) {
+                irp->IoStatus.Status = STATUS_SUCCESS;
+                irp->IoStatus.Information = len;
+                IoCompleteRequest(irp, IO_DISK_INCREMENT);
+                RbNoteIoResult(ext, STATUS_SUCCESS);
+                return STATUS_SUCCESS;
+            }
+            /* 吸收失败/有 direct 区间 → worker 路径（完整 DseqBuf 记账+失效处理）。
+             * 已吸收部分：同数据幂等重吸收 ✓ 安全。 */
+        }
+    }
+    /* [OPT F8 2026-11-01] 内联全命中快路径：IRQL≤APC 且读准入通过时，
+     * 尝试纯缓存命中——就地持共享锁拷贝并完成，省 dispatch→worker 往返
+     * （4K 随机读的主要成本）。任一 miss → 回退 worker 路径。
+     * 特征钩子/遥测与 worker 路径对齐（准入语义不绕过）。 */
+    if (sp->MajorFunction == IRP_MJ_READ &&
+        KeGetCurrentIrql() <= APC_LEVEL && len <= (1u << 20)) {
+        PVOID tgt;
+        LARGE_INTEGER lat0;
+        BOOLEAN latS, allHit;
+        RbFeatOnRead(ext, (ULONG64)sp->Parameters.Read.ByteOffset.QuadPart, len);
+        if (!RbFeatAdmit(ext)) goto workerpath;
+        tgt = RbMapIrpBuffer(irp);
+        if (!tgt) goto workerpath;
+        latS = RbLatSampleStart(&lat0);
+        allHit = rb_read_try_cache(ext->Stream,
+                                   (rb_u64)sp->Parameters.Read.ByteOffset.QuadPart,
+                                   tgt, len) != 0;
+        RbLatNote(latS, lat0, allHit ? 0 : 1);
+        if (allHit) {
+            irp->IoStatus.Status = STATUS_SUCCESS;
+            irp->IoStatus.Information = len;
+            IoCompleteRequest(irp, IO_DISK_INCREMENT);
+            RbNoteIoResult(ext, STATUS_SUCCESS);
+            return STATUS_SUCCESS;
+        }
+        /* 回退：tgt 映射无害保留（MmGetSystemAddressForMdlSafe 不需解除），
+         * worker 路径重新映射同地址 */
+    }
+workerpath:
     {
         PRB_IOCTX ctx = RbCtxAlloc();
-        if (!ctx) { return RbDispatchPassthrough(ext, dev, irp); }
+        if (!ctx) {
+            RbNoteBypass(ext, RB_BYPASS_RESOURCE);
+            return RbDispatchPassthrough(ext, dev, irp);
+        }
         ctx->Irp = irp; ctx->Ext = ext; ctx->Major = sp->MajorFunction;
         ctx->Passthru = 0;
         ctx->Offset = sp->Parameters.Read.ByteOffset; ctx->Length = len;
@@ -1157,6 +1543,7 @@ NTSTATUS RbDispatchReadWrite(PDEVICE_OBJECT dev, PIRP irp)
             RbSubmitIo(ctx);                  /* FIX[多核]: 专用 per-CPU worker 池 */
         } else {
             /* [FIX R2-M1] 入队即计数（见 RbSubmitIo 同款注释） */
+            RbNoteBypass(ext, RB_BYPASS_RESOURCE);
             InterlockedIncrement(&g_Rb.FallbackInFlight);
             ExInitializeWorkItem(&ctx->Item, RbRwWorker, ctx);   /* [FIX S-workitem] 兜底（理论不可达） */
             ExQueueWorkItem(&ctx->Item, DelayedWorkQueue);
@@ -1226,7 +1613,12 @@ static VOID RbFlushJobDone(VOID)
 static VOID RbFlusherLoop(PVOID p)
 {
     RB_FLUSHER *f = (RB_FLUSHER *)p;
-    RbPinToCpu(f->CpuIndex);
+    /* [PF-16 2026-11-06] 不再绑核。原因：① 路数可到 16，RbPinToCpu 用的是
+     * (KAFFINITY)1 << (cpu & 63)，绑到不存在的逻辑 CPU 会让 worker 永不运行
+     * ——在途 zone 作业永久滞留 = 脏数据不落盘（丢数据）；② D6-08 审计已指出
+     * flusher 固定绑 CPU0..3 与 I/O worker 争物理核。改由系统调度，正确性优先。
+     * I/O worker 的绑核策略（RbPinToCpu 另一调用点）保持不变。 */
+    /* RbPinToCpu(f->CpuIndex); */
     for (;;) {
         KeWaitForSingleObject(&f->Wake, Executive, KernelMode, FALSE, NULL);
         for (;;) {
@@ -1248,7 +1640,7 @@ static VOID RbFlusherLoop(PVOID p)
             KeAcquireSpinLock(&f->Lock, &qirql);
             empty = IsListEmpty(&f->QueueHead);
             alive = f->Alive;
-            KeReleaseSpinLock(&f->Lock, &qirql);
+            KeReleaseSpinLock(&f->Lock, qirql);
             if (!alive && empty) break;
         }
     }
@@ -1258,8 +1650,13 @@ static VOID RbFlusherLoop(PVOID p)
 
 static VOID RbFlushSubmit(rb_stream *s, int zone, int nzones, int sidx)
 {
-    /* zone+sidx 交错映射 → 多流场景 4 个 flusher 也均匀吃满 */
-    ULONG start = (ULONG)(zone + sidx) % RB_FLUSH_WORKERS;
+    /* [PF-16] zone+sidx 交错映射；取模必须用【本轮生效路数】active，且必须与
+     * RbEngineFlushZones 传给 core 的 nzones 严格一致：否则 zone_sel>=active
+     * 或作业投到未启用 worker，该 zone 的脏块本轮无人落盘（=丢数据）。 */
+    ULONG active = (ULONG)InterlockedCompareExchange(&g_Rb.FlushWorkerActive, 0, 0);
+    ULONG start;
+    if (active == 0 || active > RB_FLUSH_WORKERS) active = RB_FLUSH_WORKERS_DEF;
+    start = (ULONG)(zone + sidx) % active;
     RB_FLUSHJOB *j; KIRQL irql; ULONG k;
     /* [P2-6] 映射目标 flusher 死亡时改投任一存活者：旧代码对死 worker
      * 直接 RbFlushJobDone()——该 zone 回写被静默丢弃却计为完成，周期回写
@@ -1270,8 +1667,12 @@ static VOID RbFlushSubmit(rb_stream *s, int zone, int nzones, int sidx)
     /* [FIX D6-10] 选择+入队在同一个锁临界区内：原锁外读 Alive 与 RbStopFlushers
      * 的停机竞态——选中后、入队前 flusher 死亡即作业进死队列（该 zone 回写
      * 静默丢失，脏数据永不落盘）。 */
+    /* 先在 [0,active) 内按交错序找存活者；若前 active 全死（停机竞态/重启窗），
+     * 再扫全池任何存活 worker（含收缩后仍服役的旧 worker），绝不静默丢作业。
+     * 选择+入队仍在同一锁临界区内（FIX D6-10 纪律）。 */
     for (k = 0; k < RB_FLUSH_WORKERS; k++) {
-        RB_FLUSHER *cand = &g_Rb.Flushers[(start + k) % RB_FLUSH_WORKERS];
+        ULONG idx = (k < active) ? ((start + k) % active) : k;
+        RB_FLUSHER *cand = &g_Rb.Flushers[idx];
         KeAcquireSpinLock(&cand->Lock, &irql);
         if (cand->Alive) {
             InsertTailList(&cand->QueueHead, &j->le);
@@ -1286,31 +1687,90 @@ static VOID RbFlushSubmit(rb_stream *s, int zone, int nzones, int sidx)
     RbFlushJobDone();
 }
 
+/* [PF-16 2026-11-06] 创建单个 zone flusher 线程（PASSIVE；Start/Ensure 共用）。
+ * 结构初始化与线程创建分离：未启用的 worker 也必须初始化 Wake/QueueHead，
+ * 否则 RbStopFlushers 对全零 KEVENT 调 KeSetEvent 会蓝屏（FIX C2）。 */
+static BOOLEAN RbSpawnFlusher(RB_FLUSHER *f)
+{
+    OBJECT_ATTRIBUTES oa; HANDLE h = NULL;
+    PAGED_CODE();
+    InitializeListHead(&f->QueueHead);
+    KeInitializeSpinLock(&f->Lock);
+    KeInitializeEvent(&f->Wake, SynchronizationEvent, FALSE);
+    f->Ws = NULL; f->Alive = 1; f->Thread = NULL;
+    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (!NT_SUCCESS(PsCreateSystemThread(&h, THREAD_ALL_ACCESS, &oa, NULL, NULL,
+                                         RbFlusherLoop, f))) {
+        f->Alive = 0;
+        return FALSE;
+    }
+    /* [FIX S-ObRef] 返回值必检（同 IO worker） */
+    if (!NT_SUCCESS(ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType,
+                                              KernelMode, (PVOID *)&f->Thread, NULL)))
+        f->Thread = NULL;
+    ZwClose(h);
+    return (f->Thread != NULL);
+}
+
+/* [PF-16] 本轮期望路数：配置钳到 1..RB_FLUSH_WORKERS；1=串行。 */
+static ULONG RbFlushDesired(VOID)
+{
+    ULONG n = (ULONG)g_Rb.Config.ParallelFlush;
+    if (n < 1) n = 1;
+    if (n > RB_FLUSH_WORKERS) n = RB_FLUSH_WORKERS;
+    return n;
+}
+
+/* [PF-16] 运行期路数调整：只扩容、绝不销毁已启动线程（S7-13 停机竞态纪律）。
+ * 收缩只把 active 改小：多余 worker 仍在服役但不再收作业（RbFlushSubmit 取模
+ * 范围随之收缩），空转等 Wake，零 CPU 成本。2→16 与 16→2 都即时生效，且不
+ * 产生「选中后、入队前线程死亡」的窗口。调用上下文必须 PASSIVE。 */
+static ULONG RbEnsureFlushers(ULONG want)
+{
+    ULONG i, cur;
+    PAGED_CODE();
+    if (want < 1) want = 1;
+    if (want > RB_FLUSH_WORKERS) want = RB_FLUSH_WORKERS;
+    cur = (ULONG)InterlockedCompareExchange(&g_Rb.FlushWorkerActive, 0, 0);
+    if (cur == 0 || cur > RB_FLUSH_WORKERS) cur = 1;
+    for (i = cur; i < want; i++) {
+        RB_FLUSHER *f = &g_Rb.Flushers[i];
+        if (f->Thread) continue;   /* 曾启动过（收缩后保留）：仍在服役，直接复用 */
+        f->CpuIndex = i;
+        (void)RbSpawnFlusher(f);
+    }
+    if (want != cur) {
+        InterlockedExchange(&g_Rb.FlushWorkerActive, (LONG)want);
+        RbLog(0, __LINE__, (LONG)want, L"zone flusher active workers changed");
+    }
+    return (ULONG)InterlockedCompareExchange(&g_Rb.FlushWorkerActive, 0, 0);
+}
+
 void RbStartFlushers(VOID)
 {
-    ULONG i;
+    ULONG i, active;
+    RB_FLUSHER *f;
+    active = RbFlushDesired();
+    if (InterlockedCompareExchange(&g_Rb.FlushWorkerActive, 0, 0) != 0) {
+        /* 池已启动（重复 attach / unload 中止后重启）：只调整路数，不重建池。 */
+        (void)RbEnsureFlushers(active);
+        return;
+    }
     KeInitializeEvent(&g_Rb.FlushDone, SynchronizationEvent, FALSE);
     g_Rb.FlushJobs = 0;
     for (i = 0; i < RB_FLUSH_WORKERS; i++) {
-        RB_FLUSHER *f = &g_Rb.Flushers[i];
-        OBJECT_ATTRIBUTES oa; HANDLE h = NULL;
+        f = &g_Rb.Flushers[i];
         InitializeListHead(&f->QueueHead);
         KeInitializeSpinLock(&f->Lock);
         KeInitializeEvent(&f->Wake, SynchronizationEvent, FALSE);
-        f->CpuIndex = i; f->Ws = NULL; f->Alive = 1;
-        InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
-        if (NT_SUCCESS(PsCreateSystemThread(&h, THREAD_ALL_ACCESS, &oa, NULL, NULL, RbFlusherLoop, f))) {
-            /* [FIX S-ObRef] 返回值必检（同 IO worker） */
-            if (!NT_SUCCESS(ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
-                                      (PVOID *)&f->Thread, NULL)))
-                f->Thread = NULL;
-            ZwClose(h);
-        }
-        else {
-            f->Alive = 0; f->Thread = NULL;
-        }
+        f->CpuIndex = i; f->Ws = NULL; f->Alive = 0; f->Thread = NULL;
     }
-    RbLog(0, __LINE__, 0, L"zone flusher pool started");
+    InterlockedExchange(&g_Rb.FlushWorkerActive, (LONG)active);
+    for (i = 0; i < active; i++) {
+        f = &g_Rb.Flushers[i];
+        (void)RbSpawnFlusher(f);
+    }
+    RbLog(0, __LINE__, (LONG)active, L"zone flusher pool started (active workers)");
 }
 
 /* [FIX S7-13] 重启已终止的 zone flusher（同 RbRestartDeadIoWorkers 纪律）。 */
@@ -1355,7 +1815,7 @@ NTSTATUS RbStopFlushers(VOID)   /* FIX[UNLOAD]: 等待回写线程真正退出�
          * [FIX C2] Wake/QueueHead 仅在 RbStartFlushers（首次 attach 成功）初始化；
          * 纯旁观部署（从未 attach）时 f->Thread==NULL，对全零 KEVENT 调 KeSetEvent 即蓝屏 */
         if (f->Thread) {
-            KIRQL sirql; KeAcquireSpinLock(&f->Lock, &sirql); f->Alive = 0; KeReleaseSpinLock(&f->Lock, &sirql);
+            KIRQL sirql; KeAcquireSpinLock(&f->Lock, &sirql); f->Alive = 0; KeReleaseSpinLock(&f->Lock, sirql);
         } else {
             f->Alive = 0;
         }
@@ -1375,14 +1835,28 @@ NTSTATUS RbStopFlushers(VOID)   /* FIX[UNLOAD]: 等待回写线程真正退出�
     return st;
 }
 
-/* 周期回写：快照（io_users 引用）→ 每流拆 RB_FLUSH_WORKERS 个 zone 任务并行落盘 */
+/* [PF-16] 周期回写：快照（io_users 引用）→ 每流拆 nzones 个 zone 任务并行落盘。
+ * nzones 必须等于 g_Rb.FlushWorkerActive（RbFlushSubmit 的取模基数）；core 的
+ * flush_pass 以 zone_of % nzones == zone_sel 过滤——两者一致才保证每个脏块
+ * 恰好被一个 flusher 落盘（不漏、不重）。 */
 static VOID RbEngineFlushZones(rb_engine *eng, int nzones)
 {
     rb_stream *snap[RB_FLUSH_SNAP_MAX];
     int cnt, i, z;
+    ULONG active, k;
+    BOOLEAN any = FALSE;
     if (!eng || nzones <= 0) return;
-    /* FIX[N2]: 池未起来（线程创建全失败）→ 退化为串行，绝不能让脏数据永不落盘 */
-    if (!g_Rb.Flushers[0].Alive) { rb_engine_flush(eng, 0); return; }
+    active = (ULONG)InterlockedCompareExchange(&g_Rb.FlushWorkerActive, 0, 0);
+    if (active == 0 || active > RB_FLUSH_WORKERS) active = RB_FLUSH_WORKERS_DEF;
+    if (nzones != (int)active) {   /* 配置刚变更的收敛窗：一切以池实际路数为准 */
+        RbLog(1, __LINE__, (LONG)nzones, L"zone flush nzones aligned to active workers");
+        nzones = (int)active;
+    }
+    /* FIX[N2]/[PF-16]: 生效路数内一个存活 worker 都没有 → 退化为串行，
+     * 绝不能让脏数据永不落盘。 */
+    for (k = 0; k < active; k++)
+        if (g_Rb.Flushers[k].Alive) { any = TRUE; break; }
+    if (!any) { rb_engine_flush(eng, 0); return; }
     /* 快照“有脏数据”的流（核心持表锁并取io引用），不再直接捅引擎内部字段 */
     cnt = rb_engine_snapshot_streams(eng, snap, RB_FLUSH_SNAP_MAX, 1);
     if (cnt == 0) return;
@@ -1412,13 +1886,69 @@ VOID RbRefreshMemoryBudget(VOID)
     {
         ULONG reserve = g_Rb.Config.MemReserveMB;
         ULONG budget;
+        static ULONG s_prev_budget = 0;   /* [OPT-BUDGET] 上一轮预算（迟滞用） */
+        /* [MEM-ADAPT 2026-11-06] MemReserveMB=0 = AUTO：按【装机总物理内存】
+         * 推导保留量（总容量 5%，钳在 [512MB, 8GB]）——8GB 机不过度保留、
+         * 256GB 机留足余量；预算仍按每 tick 的【实时可用内存】闭环（下式），
+         * 即「装机容量分档 + 实际剩余动态」双轴适配。显式值 >0 行为不变。
+         * 附带效果：下方"可用内存 < 保留/保留×2"的压力安全网在 AUTO 下
+         * 不再因保留=0 而恒不触发。查询失败（total=0）→ 保持 0=旧语义。 */
+        if (reserve == 0) {
+            ULONG total = RbMemTotalMB();
+            if (total) {
+                ULONG r = total / 20;
+                if (r < 512)  r = 512;
+                if (r > 8192) r = 8192;
+                reserve = r;
+            }
+        }
         if (avail > reserve) budget = (avail - reserve) * g_Rb.Config.AutoUsePct / 100;
         else budget = 0;
+        /* [OPT-BUDGET 2026-11-05] 动态预算优化（三项）：
+         *  ① 迟滞（hysteresis）：向上调整需超过 5% 才生效，避免可用内存
+         *     小幅抖动导致预算频繁变动 → 反复 evict/create（"缓存抖动"
+         *     是高并发下最隐蔽的 CPU 与命中率杀手）；
+         *     向下调整立即生效（应用抢内存时必须马上退让，不能等）。
+         *  ② 下限保护：预算不低于 256MB（除非可用内存真的不够），避免
+         *     "预算趋零 → 缓存形同关闭 → 命中率崩塌"的悬崖。
+         *  ③ 上限收敛：不超过 CacheSizeMB（若用户配置了固定值），
+         *     防止硬件内存特别大时缓存无限膨胀。 */
+        if (budget > s_prev_budget) {
+            /* 向上：需显著增长才调（5% 迟滞） */
+            if (s_prev_budget && budget - s_prev_budget < s_prev_budget / 20) budget = s_prev_budget;
+        }
+        else if (budget < s_prev_budget) {
+            /* 向下：立即生效；但保底 256MB（除非可用内存本身不足 384MB） */
+            if (avail > 384 && budget < 256) budget = 256;
+        }
+        s_prev_budget = budget;
         g_Rb.DynamicLimitMB = budget;
         rb_engine_set_dynamic_limit(g_Rb.Engine, (rb_u64)budget * 1024 * 1024);
         rb_engine_set_available_mb(g_Rb.Engine, avail, budget);
-        rb_engine_apply_pressure(g_Rb.Engine,
-                                 avail < reserve ? 2 : (avail < reserve * 2 ? 1 : 0));
+        /* [FIX MEMBUDGET 2026-11-05] 压力分级与实际收缩阈值对齐：
+         * 原实现最高只给到 level=2（avail < reserve 时），而 reserve 默认 0
+         * → 只有可用内存真的接近 0 才收缩，等于不收缩。
+         * 新语义（预算驱动）：
+         *   · 缓存占用 > 新预算        → HIGH(2)：立即驱逐到预算内
+         *   · 缓存占用 > 新预算 90%    → MOD(1)：预警（不驱逐）
+         *   · 可用内存 < 保留*2        → HIGH(2)：额外安全网
+         *   · 可用内存 < 保留          → CRIT(3)：驱逐 + 刷脏
+         * 这样"应用吃内存 → 预算下降 → 缓存主动退让"形成闭环。 */
+        {
+            rb_u64 cur_b = rb_engine_get_stats ? 0 : 0;   /* 占位，下面用 engine 统计 */
+            ULONG lvl = 0;
+            rb_u64 budget_bytes = (rb_u64)budget * 1024ull * 1024ull;
+            if (reserve && avail < reserve) lvl = 3;
+            else if (reserve && avail < reserve * 2) lvl = 2;
+            else if (budget_bytes && g_Rb.Engine) {
+                rb_stats st;
+                rb_engine_get_stats(g_Rb.Engine, &st);
+                if (st.cur_bytes > budget_bytes) lvl = 2;
+                else if (st.cur_bytes > budget_bytes / 10 * 9) lvl = 1;
+            }
+            rb_engine_apply_pressure(g_Rb.Engine, (int)lvl);
+            (void)cur_b;
+        }
     }
 }
 
@@ -1458,10 +1988,27 @@ static VOID RbFlushThread(VOID *ctx)
             }
             now = RbInterruptMs();
             {
-                /* need_flush 优先于节律：脏数据贴高水位时立即回写（不等周期） */
-                BOOLEAN need = (periodic && g_Rb.Engine) ? rb_engine_need_flush(g_Rb.Engine) : 0;
+                /* need_flush 优先于节律：脏数据贴高水位时立即回写（不等周期）。
+                 * [FIX LINK-1 2026-11-03] 水位应急不再被 periodic 门死：原式
+                 * (periodic && ...) 在 FlushIntervalMs=0（合法配置"关闭周期回
+                 * 写"，BUG2）时恒 FALSE——回写卷脏贴 DirtyHighPct 永不落盘，
+                 * 缓存被脏占满后 can_create 拒建+clean 块逐光=全直写性能悬崖。
+                 * "关闭周期回写"关的是定时落盘，不是容量安全网；水位应急
+                 * flush 保留（显式 FLUSH/卸载/关机语义不变）。 */
+                BOOLEAN need = g_Rb.Engine ? rb_engine_need_flush(g_Rb.Engine) : 0;
                 BOOLEAN due = (now >= next_due);
-                if (!need && !due) continue;           /* 未到点：继续切片等待 */
+                if (!need && !due) {
+                    /* [FIX MEMBUDGET 2026-11-05] 内存预算刷新必须在 continue 之前：
+                     * 原实现在循环体末尾调用 RbRefreshMemoryBudget，但"无脏数据
+                     * 且未到周期"时直接 continue —— 于是**最容易发生内存压力的
+                     * 场景（纯读负载、无脏数据）恰恰永远不刷新预算**：应用持续
+                     * 吃内存把可用量压下去，缓存却抱着开机时的旧预算不收缩，
+                     * 直到下个周期（默认 60s）甚至永远不会。
+                     * 现在：每次 1s 切片都刷新（内部是单个系统信息查询，微秒级），
+                     * 应用内存增长 → 预算随之下降 → 缓存主动退让。 */
+                    if (g_Rb.Engine) RbRefreshMemoryBudget();
+                    continue;                          /* 未到点：继续切片等待 */
+                }
                 next_due = now + (periodic ? ms : 30000);
                 if (need) periodic = TRUE;             /* 水位驱动：本轮必执行回写 */
             }
@@ -1493,6 +2040,22 @@ static VOID RbFlushThread(VOID *ctx)
             for (k = 0; k < n2; k++) { rb_stream_drain_writeback(snap[k]); rb_stream_release_io(snap[k]); }
             n2 = rb_engine_snapshot_streams(g_Rb.Engine, snap, RB_FLUSH_SNAP_MAX, 1);
             for (k = 0; k < n2; k++) { rb_stream_flush(snap[k], 1); rb_stream_release_io(snap[k]); }
+            /* [FIX DATA-2 2026-11-01] discard 之前必须复核"确实没有脏数据了"。
+             * 原实现第二次 flush 后直接 discard_all：若回写因盘错失败（而 panic
+             * 最常见的触发原因正是 "device I/O failing persistently"），脏数据
+             * 会被整段丢弃，只留下一个没人看的 lost_dirty_bytes 计数。这里先留痕，
+             * 让现场能区分"自愈成功"与"以丢数换自愈"。 */
+            {
+                rb_u64 left = 0;
+                n2 = rb_engine_snapshot_streams(g_Rb.Engine, snap, RB_FLUSH_SNAP_MAX, 1);
+                for (k = 0; k < n2; k++) {
+                    left += rb_stream_dirty_bytes(snap[k]);
+                    rb_stream_release_io(snap[k]);
+                }
+                if (left)
+                    RbLog(2, __LINE__, STATUS_UNSUCCESSFUL,
+                          L"panic self-heal: writeback failed, dirty data will be discarded");
+            }
             n2 = rb_engine_snapshot_streams(g_Rb.Engine, snap, RB_FLUSH_SNAP_MAX, 0);
             for (k = 0; k < n2; k++) { rb_stream_discard_all(snap[k]); rb_stream_release_io(snap[k]); }
             rb_engine_note_flush_done(g_Rb.Engine);
@@ -1518,11 +2081,18 @@ static VOID RbFlushThread(VOID *ctx)
             rb_engine_tick(g_Rb.Engine, RbInterruptMs());
             /* [BUG2] 周期回写总闸：FlushIntervalMs=0（无限）时跳过；
              * 显式 FLUSH IRP / panic 自愈 / 卸载路径不受影响（各自独立调用） */
-            if (periodic)
-                /* [FIX S7-15] ParallelFlush 消费点：原本字段零消费（zone flusher
-                 * 恒 4 路）。语义：1=串行（全部 zone 投同一 flusher），>=2=分片并行。 */
-                RbEngineFlushZones(g_Rb.Engine,
-                    (g_Rb.Config.ParallelFlush >= 2) ? RB_FLUSH_WORKERS : 1);
+            if (periodic) {
+                /* [PF-16 2026-11-06] ParallelFlush = 运行期生效路数（1..16）。
+                 * 1=串行（全部 zone 投同一 flusher）；2/4/8/16=分片并行。
+                 * 每轮先确保 worker 齐备（只扩容不销毁，PASSIVE 上下文安全），
+                 * 再以池实际 active 作为 nzones——配置热改即时生效且不丢作业。 */
+                ULONG want = RbFlushDesired();
+                ULONG active;
+                if (InterlockedCompareExchange(&g_Rb.FlushWorkerActive, 0, 0) == 0)
+                    RbStartFlushers();      /* 纯旁观部署后首次回写：初始化池 */
+                active = RbEnsureFlushers(want);
+                RbEngineFlushZones(g_Rb.Engine, (int)active);
+            }
             /* FIX[N3]: 空闲回收此前从未被驱动调度 —— 开关形同虚设；按阈值执行 */
             if (g_Rb.Config.IdleReclaimEnabled) {
                 rb_stream *snap[RB_FLUSH_SNAP_MAX];

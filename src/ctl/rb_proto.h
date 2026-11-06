@@ -99,9 +99,11 @@
 #define RB_DEFAULT_DIRTY_LOW    40
 #define RB_DEFAULT_WRITEBACK    0       /* [BUG-003] 全局默认 write-through（上次异常退出/断电丢脏块窗口为0）；回写仅对明确知情的数据卷逐卷开启 */
 #define RB_DEFAULT_IDLE_SEC     1800
+/* [PF-16 2026-11-06] 回写并行度：1=串行（默认，安全）；2/4/8/16=zone 分片并行。
+ * 合法区间 1..16，运行期 SET_CONFIG 下一轮周期回写即时生效（只扩容不销毁线程）。 */
 #define RB_DEFAULT_PARALLEL     1
 #define RB_DEFAULT_IDLE_ENABLED 1
-#define RB_DEFAULT_RESERVE_MB   4096    /* 给系统保留的应急地板 */
+#define RB_DEFAULT_RESERVE_MB   0       /* [MEM-ADAPT 2026-11-06] 0=AUTO 按装机总内存推导保留量（5%，钳 512MB-8GB）；旧死值 4096 不再适配小/大内存机器 */
 #define RB_DEFAULT_AUTO_USEPCT  80      /* 最多使用“当前可用内存”的百分比 */
 #define RB_DEFAULT_BLOCK_SIZE   4096
 #define RB_PROTOCOL_VERSION     9       /* [V10.1] 协议 8->9：纯追加（既有偏移不动，消息号追加不复用） */
@@ -188,6 +190,18 @@ typedef struct RB_STATS_T {
      * 前端收益页二级明细消费；无样本不画假值（0=未测）。 */
     uint32_t CacheReadLatencyUs;
     uint32_t DiskReadLatencyUs;
+    /* ---- [U1 2026-11-06] 读延迟分位数（log2 桶近似；末尾纯追加）----
+     * 数据源：驱动 RbLatNote 1/64 采样入 RB_GLOB.ReadLatHist[2][32]
+     * （slot0=全命中读 / slot1=含 miss 下盘读），GET_STATS 时从累计桶计数
+     * 求分位、取桶下界（2^b us 近似）。0=尚无样本（与 EWMA 字段同语义）。
+     * 兼容纪律：结构追加不升 ProtocolVersion（B-12 先例）；驱动回拷按调用方
+     * 缓冲容量截断（RbMsgGetStats local+min 模式），老客户端不受影响。 */
+    uint32_t CacheReadLatP50Us;    /* 偏移 1256：全命中读 P50 */
+    uint32_t CacheReadLatP95Us;    /* 1260 */
+    uint32_t CacheReadLatP99Us;    /* 1264 */
+    uint32_t DiskReadLatP50Us;     /* 1268：含下盘读 P50 */
+    uint32_t DiskReadLatP95Us;     /* 1272 */
+    uint32_t DiskReadLatP99Us;     /* 1276 */
 } RB_STATS;
 
 /* ---- 卷枚举（V8 扩展，新字段追加于末尾） ---- */
@@ -307,10 +321,13 @@ typedef struct RB_MSG_T {
         RB_VOLUME_ATTACH VolumeAttach;
         RB_LOG_LIST    LogList;
         RB_VERSION     Version;
-        /* [V10.6/B-5] 追加成员（远小于 RB_LOG_LIST=7688，union 总大小不变，
-         * sizeof(RB_MSG) 仍为 7704——既有偏移零漂移） */
+        /* [V10.6/B-5] 追加成员（远小于 RB_LOG_LIST，union 总大小不变） */
         RB_INVALIDATE_RANGE InvalidateRange;
-        /* [V10.6/B-7] 追加成员（RB_EVENT_LIST < RB_LOG_LIST，总大小不变） */
+        /* [V10.6/B-7] 追加成员。[FIX 2026-10-24] 更正此前的错误论断：
+         * RB_EVENT_LIST(8208) > RB_LOG_LIST(7688)，它才是 union 最大成员，
+         * sizeof(RB_MSG) = 16 + 8208 = 8224（原注释称"总大小不变 7704"导致
+         * WPF 副本漏改——驱动 Size 校验拒绝，实测全 IOCTL Win32 87）。
+         * 用户态缓冲/常量必须与 C 编译器 sizeof 一致（check_proto_sync 动态把关）。 */
         RB_EVENT_LIST    EventList;
         RB_EVENT_QUERY   EventQuery;
     } Data;

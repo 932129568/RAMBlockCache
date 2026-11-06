@@ -52,14 +52,14 @@ public sealed class DriveItemViewModel : ObservableObject
     public bool IsBypass => Mounted && (AccelText?.Contains("旁路") ?? false);
 
     /// <summary>状态徽标短文案（原型六态白名单：未挂载 / 就绪 / 加速 · 直写 / 加速 · 回写）。</summary>
-    public string BadgeText => !Mounted ? "未挂载" : IsBypass ? "就绪" : Mode == 1 ? "加速 · 回写" : "加速 · 直写";
+    public string BadgeText => !Mounted ? "未挂载" : IsBypass ? "就绪" : Mode == 1 ? "已启用 · 回写" : "已启用 · 直写";
     /// <summary>徽标角标（回写卷提示未落盘风险；空=无角标；原型带"· "前缀）。</summary>
     public string BadgeCorner => Mounted && !IsBypass && Mode == 1 ? "· 有未落盘数据" : "";
     /// <summary>结论先行的一句话（原型 volSentence 逐条对：系统卷/未挂载/就绪/回写/直写五态）。</summary>
     public string StatusSentence => !Mounted
         ? (IsSystem ? "系统卷默认不加速（安全第一）。" : "未挂载：该卷暂未由缓存加速。")
         : IsBypass ? "已挂载，未开启加速。"
-        : Mode == 1 ? "回写模式：更快，异常退出可能丢未落盘数据。" : "直写模式：缓存正常工作（最安全）。";
+        : Mode == 1 ? "加速已启用 · 回写；异常退出可能丢未落盘数据。" : "加速已启用 · 直写；等待全局命中样本。";
     /// <summary>行内主行动文案（原型 volAction：跟着结论走）。</summary>
     public string StatusAction => !Mounted ? "去加速页" : IsBypass ? "开启加速" : Mode == 1 ? "查看未落盘量" : "查看收益";
     /// <summary>行内主行动目标页。</summary>
@@ -83,7 +83,7 @@ public sealed class DriveItemViewModel : ObservableObject
     /// <summary>加速页微状态行（原型："缓存已启用 · 直写" / "已挂栈 · 未开启加速" / "系统卷默认不加速" / "未挂载"）。</summary>
     public string AccelStateText => !Mounted
         ? (IsSystem ? "系统卷默认不加速" : "未挂载")
-        : Mode == 1 ? "缓存已启用 · 回写" : "缓存已启用 · 直写";
+        : Mode == 1 ? "加速已启用 · 回写（等待样本）" : "加速已启用 · 直写（等待样本）";
 
     /// <summary>控制区原因文案（原型 ctl-reason；系统卷未挂载时给出安全第一说明）。</summary>
     public string CtlReason => IsSystem && !Mounted ? "系统卷默认不加速（安全第一）" : "";
@@ -227,11 +227,11 @@ public sealed class DriveItemViewModel : ObservableObject
     /// <summary>写吞吐 MB/s（回写模式=脏块后台落盘速率 WbBytes 差值；直写模式恒 0，属预期）。</summary>
     public double WriteMbps { get => _writeMbps; private set => Set(ref _writeMbps, value); }
 
-    // [空值口径 S16 2026-10-23] 卷卡指标行消费：未挂载卷无采样 → 文本 "—"（设计稿空值口径，
-    // 禁 0.0 误导"在跑但为零"）；数值属性保留（Sparkline/KPI 汇总消费）
-    public string ReadText => Mounted ? $"{_readMbps:F1}" : "—";
-    public string WriteText => Mounted ? $"{_writeMbps:F1}" : "—";
-    public string HitText => Mounted ? $"{_hitPct:F1}" : "—";
+    /// <summary>当前驱动没有逐卷指标；卷卡缺数据时统一显示“—”。</summary>
+    public bool MetricsAvailable { get; private set; }
+    public string ReadText => Mounted && MetricsAvailable ? $"{_readMbps:F1}" : "—";
+    public string WriteText => Mounted && MetricsAvailable ? $"{_writeMbps:F1}" : "—";
+    public string HitText => Mounted && MetricsAvailable ? $"{_hitPct:F1}" : "—";
     private string _usedText = "—";
     /// <summary>"已用 / 总缓存 (MB)" 文本（EffectiveCacheMB 为动态上限）。</summary>
     public string UsedText { get => _usedText; private set => Set(ref _usedText, value); }
@@ -300,41 +300,66 @@ public sealed class DriveItemViewModel : ObservableObject
             else        { DriverService.Instance.Pause(DeviceKey);  Paused = true;  }
         }), can: () => false);
 
-        StatsService.Instance.Sampled += OnSample;
+        StatsService.Instance.VolumeSampled += OnSample;
     }
 
-    // [P1-11] 默认参数同步改为直写（与驱动安全默认一致）。
-    public async Task MountAsync(uint quotaBytes, uint mode = Rb.ModeWriteThrough)
+    private int _mountInFlight;
+    internal static Func<char, Services.VolumeGuard.Result>? MountPrecheckProvider { get; set; }
+    internal static Func<ulong, uint, uint, Task<ulong>>? MountOperationProvider { get; set; }
+
+    /// <summary>挂载显式结果；前置拒绝、异常、超时和重入均返回失败。</summary>
+    public async Task<OperationResult> MountAsync(uint quotaBytes, uint mode = Rb.ModeWriteThrough)
     {
-        // [契约 B-9] 挂载前盘符冲突校验（用户态前置可读化；校验不可用=放行）
-        var pre = Services.VolumeGuard.CheckMount(DriveLetter[0]);
-        if (!pre.Ok)
-        {
-            Post(() => Mounted = false);
-            LogService.Error($"{DriveLetter} 挂载被前置校验拒绝（{pre.ErrorCode}）：{pre.ErrorText}");
-            return;
-        }
+        if (Interlocked.CompareExchange(ref _mountInFlight, 1, 0) != 0)
+            return OperationResult.Fail("MountInProgress", $"{DriveLetter} 挂载正在进行，请等待当前操作完成");
+
         try
         {
-            /* [FIX R2-U1] M24 残余：MountAsync 的 IOCTL 同步段（首个 await 前）
-             * 仍在调用线程执行——单卷挂载按钮/开机自动挂载冻结 UI。移入线程池 */
-            ulong applied = await Task.Run(() =>
-                DriverService.Instance.MountAsync(DeviceKey, quotaBytes, mode)).ConfigureAwait(false);
-            void Ui()
+            var pre = MountPrecheckProvider?.Invoke(DriveLetter[0])
+                ?? Services.VolumeGuard.CheckMount(DriveLetter[0]);
+            if (!pre.Ok)
             {
-                Mounted = true; Paused = false; _mode = mode;
-                _quotaBytes = applied;
-                RaisePropertyChanged(nameof(QuotaBytes)); RaisePropertyChanged(nameof(QuotaMB));
-                RaisePropertyChanged(nameof(StatusText));
-                RaisePropertyChanged(nameof(WriteModeHint));   // [W1.5] 挂载即同步写模式提示
+                Post(() => Mounted = false);
+                string text = $"{DriveLetter} 挂载被前置校验拒绝：{pre.ErrorText}";
+                LogService.Error(text);
+                return OperationResult.Fail(pre.ErrorCode, text);
             }
-            Post(Ui);
+
+            Task<ulong> operation = MountOperationProvider?.Invoke(DeviceKey, quotaBytes, mode)
+                ?? Task.Run(() => DriverService.Instance.MountAsync(DeviceKey, quotaBytes, mode));
+            ulong applied = await operation.WaitAsync(TimeSpan.FromSeconds(35)).ConfigureAwait(false);
+            Post(() =>
+            {
+                Mounted = true;
+                Paused = false;
+                _mode = mode;
+                _quotaBytes = applied;
+                RaisePropertyChanged(nameof(QuotaBytes));
+                RaisePropertyChanged(nameof(QuotaMB));
+                RaisePropertyChanged(nameof(StatusText));
+                RaisePropertyChanged(nameof(WriteModeHint));
+            });
             LogService.Info($"{DriveLetter} 挂载成功，配额 {applied / 1048576} MB");
+            return OperationResult.Ok();
         }
-        catch (DriverException ex)
+        catch (TimeoutException ex)
         {
             Post(() => Mounted = false);
-            LogService.Error($"{DriveLetter} 挂载失败：{ex.Message}");
+            string text = $"{DriveLetter} 挂载超时：{ex.Message}";
+            LogService.Error(text);
+            return OperationResult.Fail("MountTimeout", text);
+        }
+        catch (Exception ex)
+        {
+            Post(() => Mounted = false);
+            string code = ex is DriverException ? "DriverError" : "MountError";
+            string text = $"{DriveLetter} 挂载失败：{ex.Message}";
+            LogService.Error(text);
+            return OperationResult.Fail(code, text);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _mountInFlight, 0);
         }
     }
 
@@ -375,23 +400,18 @@ public sealed class DriveItemViewModel : ObservableObject
         if (s.DeviceKey != DeviceKey) return;
         Post(() =>
         {
-            HitPct = s.HitPct; ReadMbps = s.ReadMbps; WriteMbps = s.WriteMbps;
-            // [空值口径 S16] 派生文本属性联动通知（ReadText/WriteText/HitText）
+            MetricsAvailable = s.HasMetrics;
+            HitPct = 0;
+            ReadMbps = 0;
+            WriteMbps = 0;
+            CacheUsedBytes = 0;
+            ServedBytes = 0;
+            UsedPct = 0;
+            UsedText = "—（暂无逐卷统计）";
+            ServedText = "—（无逐卷命中数据）";
             RaisePropertyChanged(nameof(ReadText));
             RaisePropertyChanged(nameof(WriteText));
             RaisePropertyChanged(nameof(HitText));
-            UsedPct = s.CacheBytesTotal == 0 ? 0 : s.CacheBytesUsed * 100.0 / s.CacheBytesTotal;
-            CacheUsedBytes = s.CacheBytesUsed;
-            /* [BUG3] 总缓存为 0（预算尚未计算/驱动刚建引擎）时不再显示"0 / 0 MB"，
-             * 那会被读成"缓存没启用"；改显示计算中。驱动侧已在建引擎时算首次预算。 */
-            UsedText = s.CacheBytesTotal == 0
-                ? $"{s.CacheBytesUsed / 1048576} MB（缓存预算计算中）"
-                : $"{s.CacheBytesUsed / 1048576} / {s.CacheBytesTotal / 1048576} MB";
-            // [W1.5 S14 2026-10-23] 文案对齐设计稿（"本次开机缓存读取 X"）；0 值用 "—"（设计稿空值口径）
-            ServedText = s.BytesFromCache == 0
-                ? "本次开机缓存读取 —"
-                : $"本次开机缓存读取 {Conv.Size(s.BytesFromCache)}";
-            ServedBytes = s.BytesFromCache;
             // [W1-3①] in-flight 保护：用户已乐观切换但 IOCTL 未完成时，
             // 采样回报的仍是旧模式——跳过回纠，等下一 tick（下放完成后）以真相为准。
             if (Volatile.Read(ref _modeInFlight) == 0 && _mode != s.Mode)
@@ -413,7 +433,7 @@ public sealed class DriveItemViewModel : ObservableObject
 
     // ================= 特性层每卷面（FR-PF-02 预读窗口 / FR-BL-06 原因码） =================
 
-    private int _raIndex;   // 0=关闭 1=8 2=16 3=32 4=64（ReadAheadMBOptions.Legal 下标）
+    private int _raIndex;   // ReadAheadMBOptions.Legal 下标：0=关 1=8 2=16 3=32 4=64（[回滚 2026-10-24] 扩档撤回）
 
     /// <summary>每卷预读窗口下拉索引（缓存页绑定；变更即写 Policies\&lt;X&gt;\ReadAheadMB 并 REFRESH）。</summary>
     public int ReadAheadIndex
@@ -479,8 +499,14 @@ public sealed class DriveItemViewModel : ObservableObject
         {
             _accelState = st; _accelReason = reason;
             RaisePropertyChanged(nameof(AccelText));
+            RaisePropertyChanged(nameof(IsBypass));
+            RaisePropertyChanged(nameof(BadgeText));
+            RaisePropertyChanged(nameof(BadgeCorner));
+            RaisePropertyChanged(nameof(StatusSentence));
+            RaisePropertyChanged(nameof(StatusAction));
+            RaisePropertyChanged(nameof(StatusActionPage));
         }
     }
 
-    public void Unsubscribe() => StatsService.Instance.Sampled -= OnSample;
+    public void Unsubscribe() => StatsService.Instance.VolumeSampled -= OnSample;
 }

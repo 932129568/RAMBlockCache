@@ -85,10 +85,10 @@ public sealed record UiStateView(
                 "上次未正常退出，已强制直写保护数据", "确认数据无误后退出", "RbcWarningFg", false);
         if (attachedCount > 0)
             return anyBackMode
-                ? new UiStateView(UiStateKind.AccelerateBack, "加速 · 回写",
-                    "回写模式：更快，异常退出可能丢未落盘数据", "查看未落盘量", "RbcSuccessFg", false)
-                : new UiStateView(UiStateKind.AccelerateThrough, "加速 · 直写",
-                    "直写模式：缓存正常工作（最安全）", "查看收益", "RbcSuccessFg", false);
+                ? new UiStateView(UiStateKind.AccelerateBack, "已启用 · 回写",
+                    "加速已启用 · 回写；异常退出可能丢未落盘数据", "查看未落盘量", "RbcSuccessFg", false)
+                : new UiStateView(UiStateKind.AccelerateThrough, "已启用 · 直写",
+                    "加速已启用 · 直写；等待全局命中样本", "查看收益", "RbcSuccessFg", false);
         if (boundCount > 0)
             return new UiStateView(UiStateKind.Ready, "就绪",
                 "已挂栈，未开启加速", "开启加速", "RbcInfoFg", false);

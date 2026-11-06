@@ -1,7 +1,78 @@
 # 已知 Bug 与遗留问题清单（KNOWN_ISSUES）
 
-> 截至 2026-10-17 · 基于 Build 19 最新签名构建 `b6fb097b…`
-> 状态图例：✅ 已修复（有验证） · 🔧 已修复（待真机复验） · 🟡 已知限制/设计行为 · ⏳ 待评审/待做
+> 截至 2026-11-06 13:30 · 63 号 ParallelFlush 批已发布（详见 deliverables/63-parallelflush-2026-11-06.md + 63-flushpar-qa + 64-verifier-harvest）
+> 状态图例：✅ 已修复（有验证） · 🔧 已修复（待真机复验） · 🟡 已知限制/设计行为 · ⏳ 待评审/待做 · ⛔ 阻断
+
+## 0-C. 2026-11-06「1/2/4/8/16 路可配」批（**已发布**，待重启加载 + Verifier 收获）
+
+| # | 项 | 状态 | 证据/说明 |
+|---|---|---|---|
+| C1 | ✅ 重启验收 9b1cdeb2：12:06:26 开机加载、服务 Running/Boot、`DeploySeq=8 / DeployAck=8 / FilterArmed=0 / LastBootHealthy=1 / BootFailCount=0` —— 看门武装→健康到桌面→自动解除武装全周期闭环 | ✅ | B6 消项；P1.5 首次真机闭环 |
+| C2 | ✅ ParallelFlush 运行期 1/2/4/8/16 可配：worker 池上限 16、只扩容不销毁线程、`nzones ≡ active` 不变式、死 worker 全池兜底、解除 flusher 绑核、Web 五档下拉；**core 数据路径零改动**；默认 1 路与旧行为逐字等价 | 🔧 源码 + 用户态验证通过，**真机待重启后复验**（Verifier 收获周期） | 63 号 §3/§5；64 号协议 |
+| C3 | ✅ `test_flushpar.c`（QA 双轨版 625 行 / `sha256 524c1a7c…`）：sentinel 抓零丢失 + concurrent 抓静默写坏 × full/sparse × 写回/直写 = 每档 8 组合；覆盖 chunk 边界/卷尾非对齐/重叠写/失效 truncate/空 zone | ✅ | **40/40 PASS**（Release + ASan 双构建）；`deliverables/63-flushpar-qa-2026-11-06.md` |
+| C4 | 🟡 两套粗测方向相反：旧单轨版（已作废）1→253.8 / 16→924.3；QA 双轨版 1→141.6 / 2→520.5 / 4→444.3 / 8→247.0 / 16→140.5 MB/s。短窗口下部分 lane `active=0` + 安静模式 + Verifier 噪声主导 | 🟡 | 63 号 §5.1：**绝对值不作峰值宣称、不据此给最优路数结论**；收网后最佳性能档复测 |
+| C5 | ✅ **已发布**：Setup `5d210f52…`（299,124,056 B，Valid）、sys `4099b7fb…`（158,944 B，Valid）、三锚点同步、System32 文件已换、双看门任务注册、`Seq=9/Ack=8/FilterArmed=1` 武装就绪；门禁五件套全 PASS | ✅ 待重启 | 63 号 §0；旧基线 `9b1cdeb2`/`d9e75a55` 停用 |
+| C6 | ✅ 过程更正：架构师 ×2 与部分 QA 调度因后端 401/503 失败，**但首轮 QA 全程运行并完成独立回归**；设计/驱动实现/发布由主理人，测试本体与正式回归由 QA 独立完成（作者≠验证者成立）。并发写冲突已去重，四脚本各 1 处注册 | ✅ | 63 号 §1；QA 288 行报告 |
+| C7 | ⏳ **存量** `test_race1106 mode3 gated=1` 时序敏感：6 次中 2 次 `churn_err>0`（QA 4662 / 主理人独立复跑 2909），m2/m4 对照 clean。与本批**无因果**（旧 exe 11:29、cache.c/h 未变、只调串行 `rb_stream_flush`）；`f_err=0` + final F sweep clean = 无应用可见 DLL 陈旧 serve。源码头注释（passthrough / `discard_all`）与实现口径错位需理清 | ⏳ | 63 号 §6；建议硬判据改为 `f_err=0 + final F sweep clean`，`churn_err` 单独跟踪 |
+| C8 | 🟡 工具瑕疵/受阻（如实）：`sync_anchors.ps1` 打印 `[warn]` 但三锚点确实已更新且门禁⑤ PASS；`qa_teeth.ps1` 变异体 `build/qa4/cache_mut.c` 缺失本轮不可用；`run_all.bat` 因沙箱禁 cmd 由 QA 等价重放覆盖 | 🟡 | 63 号 §7 |
+
+## 0-B. 2026-11-06 下午「一次破锚点」批（新驱动 9b1cdeb2，重启已由 C1 验收）
+
+| # | 项 | 状态 | 证据/说明 |
+|---|---|---|---|
+| B1 | ✅ 64K/128K 白名单四层封堵（F1）：rbctl.c / cache.c legal[] / ramboostctl.c / WPF 下拉；保留 4K/8K/16K/32K | ✅ | 22/22 Release + 22/22 ASan + test_geom 回落断言 |
+| B2 | ✅ slab 滞留 F4（字节上限 256MB）、单批 F5（自适应）、F10 引擎几何 getter、F11 死常量删除 | ✅ | 同上 + 驱动 16 源编译 |
+| B3 | ✅ U1 延迟分位数全栈（RB_STATS +6 字段；命中/下盘 P50/P95/P99）、F2 TRIM 计数、P3.15 桥接随安装 | ✅ | check_proto_sync 23 组镜像 PASS；Web tsc/vite PASS |
+| B4 | ✅ 顺带修复：GET_STATS 应答回拷容量钳位（老客户端短缓冲 + 新结构 = SystemBuffer 池溢写隐患，属历史崩溃类别） | ✅ | rbctl.c RbMsgGetStats local+min 模式 |
+| B5 | ✅ 内存双轴适配：MemReserveMB=0=AUTO 按装机总内存 5%（钳 512MB–8GB）推导保留量；预算仍按实时可用内存闭环；默认 4096→0 | ✅ | 见 62 号 §2.D |
+| B6 | 🔧 本批驱动 9b1cdeb2 已部署（System32 文件已换、FilterArmed=1 武装就绪），**真机加载验证待用户重启一次** | 🔧 | 重启后按 62 号 §6 逐项确认 |
+| B7 | ⏳ 11-04 蓝屏（U-8）+ 10-24 崩溃：dump 归因收窄但未闭环；rbpref.c 注释把两代二进制混记 +0xBCC 已纠正 | ⏳ | 61 号报告 |
+| B8 | 🟡 本机 Verifier 自 10-25 调试期至今仍生效（VerifyDrivers=RMBlockCache.sys）；新驱动重启后自动进入收获周期 | 🟡 | 收网：verifier_disable.cmd + 重启 |
+| B9 | 🟡 S2 16K 实验为用户态 core「安静模式 + Verifier」初测（16K 30GB/s ≈ 4K 的 1.75×），**绝对值不作峰值宣称** | 🟡 | 62 号 §4；待最佳性能档 + Verifier 收网后复测 |
+| B10 | 🟡 ParallelFlush「4 路」是编译期常量（RB_FLUSH_WORKERS=4），下拉只是 1/≥2 开关；无 2/4/8/16 路吞吐基准 | 🟡 | 62 号 §5 |
+
+## 0-A. 2026-11-06 夜战批（应用 DLL 入口点错报两代同根因闭环）
+
+| # | 问题 | 状态 | 验证 |
+|---|---|---|---|
+| N1 | ✅ **视图丢失效竞争**：元数据钩子（改名/删除/TRIM）的 flush+discard 窗口内，在途读回填把操作前盘面重新提交进缓存 → 应用读到更新前 DLL（"无法定位程序输入点"，11-04/11-06 两代）。修复=视图世代门控（stream.view_gen，rb_read_commit_gen 校验失配即弃） | ✅ 已真机复验（2026-11-06 09:47 重启加载 245c6681：D 自动恢复加速、当日日志零 ERROR、微信等应用正常；gated=1 矩阵 6/6 clean） | test_race1106 + 59 号 §一/§六 |
+| N2 | ✅ **TRIM 丢写窗口**：[706] 处理 flush→discard_all 之间被吸收的已确认写随整卷丢弃（F9 级）。修复=解析 DS_MANAGE_DATA_SET_RANGE 按范围失效（丢写窗口归零），解析失败回退旧路径 | ✅ 已真机复验（同上周期） | 同上套件 |
+| N3 | ✅ **变更窗缺失**：钩子窗口内读写继续走缓存（吸收/回填）。修复=view_mutating 窗口，窗口内读写透传（RB_BYPASS_VIEW_MUTATING=12） | ✅ 已真机复验（同上周期） | 同上 |
+| N4 | ✅ **CachePagingIo 配置无消费者**：声明未实现，分页 IO（加载器读 DLL）全程过缓存。已兑现（IRP_PAGING_IO 且 =0 → 直通，RB_BYPASS_PAGING=11） | ✅ | 构建+部署链 |
+| N5 | ✅ **预取回填未门控**（同类竞争，接口穿参完成：RB2_PRD.ViewGen + Rb2PortFillGen） | ✅ | 构建通过 |
+| N6 | ⏳ **绝对归因**：驱动装配层原始错服务的精确竞争点（本轮以"缓解+门控"封闭且核心级复现测试全形状干净），WinDbg/Verifier 归因待做——工具+协议已就绪（verifier_enable/disable.cmd，59 号 §七） | ⏳ 待用户排期 | 59 号 §七 |
+| N7 | ⏳ 预取回填门控后的残余审计；**64K 禁令维持（11-03）**：几何审计完成（59-64k-audit）——钳制白名单/WPF 下拉/INF/`rb build` 四层全放行 64K，禁令仅靠纪律；解禁前置=白名单封堵（F1）→slab 滞留修复（F4，64K 下 2GB 非分页滞留）→补 65536 几何测试→WinDbg 复现 | ⏳ 前置清单就绪 | 59-64k-audit §5 |
+| N8 | 🟡 重启自愈机制注记：错误页同时存在于内核缓存与 MM 映像页两层，重启清双层（MmFlushImageSection 语义） | 🟡 调研印证 | 57-research.md |
+| N9 | 📌 2026-11-06 上午补记：test_race1106 的 gated=0 阳性对照在安静机器上 7 连跑不咬（时序敏感竞争形状，夜间 16 错记录保持为机制验证证据）；回归判据 = gated=1 矩阵 | 🟡 已知限制 | 59 号 §六 |
+
+## 0. 当前恢复候选状态（2026-10-29）
+
+| 项 | 当前事实 |
+|---|---|
+| 候选包 | `deliverables/RAMBlockCache-RecoveryCandidate-2026-10-29.zip`，67,067,140B，SHA-256 `e30376f23e5b450e016e1177dee2c9008abc8df462e3f9fd66164e4ca78e0db9` |
+| 发布属性 | ❌ 非生产发布：`productionRelease=false`、`deploymentAllowed=false` |
+| 驱动签名 | ⛔ 包内仅为 `test-only/RAMBlockCache-TestMode-Unsigned.sys`，Authenticode=NotSigned，禁止替换 `dist/setup` 或直接加载 |
+| 离线验证 | ✅ C# 13/13、WPF 0错0警、状态矩阵 12/12、六页双尺寸 12/12、六件套与统一 W2 全绿；ZIP 17 成员 testzip/三方哈希全匹配 |
+| 启动健康 | ✅ 新候选 Controller 隔离启动 8 秒保持响应、主窗口存在、本次日志无未处理异常；驱动离线导致自动挂载失败，无成功挂载 |
+| 视觉覆盖 | 🟡 离线六页、长文本、降级、应急、滚底和 150% DPI 已渲染核对；真实联机、OS 原生截图、键盘焦点、读屏、高对比度、混合 DPI 仍 BLOCKED |
+| 真机验证 | ⛔ 真实挂载/性能、Verifier、热插拔、完整 dump、签名加载、长期稳定性 NOT RUN |
+| 崩溃根因 | ⛔ 周期性 0x7E/0xC0000096 未归因；`102426-21937-01.dmp` 等原始栈读取被权限阻断；另有 0xC4 新形态 dump，不能与本故障混同 |
+| 旧候选 | ⛔ `RAMBlockCache-RecoveryCandidate-2026-10-26.zip` 不含 W6 视觉修复，仅作历史，不得用于验收 |
+
+已关闭的恢复候选源码缺陷：
+
+- ✅ 离散 miss `-2/33` 溢出导致第二遍仍不预热：已加入 4K/32 子块有界读计划，Release/ASAN 回归通过。
+- ✅ 全局统计被两卷重复计入：已改成单轮单样本；标准 C# 与契约测试覆盖。
+- ✅ 挂载失败仍假报成功：已改 `OperationResult` 并在 UI 汇总真实成功数。
+- ✅ 几何查询失败仍猜 4K 失效范围：共享 `RbBenchTryGetClusterBytes` 失败前返回，invalidate 计数为 0。
+- ✅ VOLSTATUS 派生展示不刷新：状态/原因实际变化时通知全部依赖显示属性。
+- ✅ 诊断 IOCTL 点阵窄栏重叠、长卷标跨列侵入：W6 自适应点阵 + 卷标省略，独立 QA 34 复验通过。
+
+> 结论：代码与离线验证为「待真机验收候选」；在完成有效 TestMode 签名、完整 dump/Verifier 与真实性能验收前，不能宣称生产稳定或崩溃已修复。
+
+<!-- 以下为历史清单（2026-10-17），保留用于追踪，不代表当前候选真机状态。 -->
+
+状态图例：✅ 已修复（有验证） · 🔧 已修复（待真机复验） · 🟡 已知限制/设计行为 · ⏳ 待评审/待做
 
 ## A. 事故级（曾导致蓝屏/砖机）
 
@@ -49,7 +120,7 @@
 
 ## 验证声明
 
-- 静态门禁五件套全绿（check_repo / check_proto_sync --strict / refcount_model 17 断言 / check_ps_syntax 31 文件 / check_signature 签名+三锚点）
-- 真机验证：驱动签名部署 + BOOT_START 加载 + CLI 全通道（stats/vols/get-config）+ WPF 首开通过
-- **未经 Driver Verifier** —— 内核深度验证列入 W0-3（迭代计划）
-- 一切「已修复」以上表状态列为准；「🔧」项以真机复验证据闭环为准
+- 当前恢复候选离线门禁：`check_repo`、`check_proto_sync --strict`、`refcount_model`、`check_xaml_resources`、`check_ps_syntax`、`check_signature` 均通过；core Release/ASAN 21/21、标准 C# 13/13、bench policy 12/12。
+- 当前恢复候选视觉：进程内真实 WPF 渲染六页双尺寸 12/12、状态矩阵 12/12；只证明离线布局与初始/注入状态，不替代真实驱动联机和 OS 原生截图。
+- 历史「驱动签名部署 + BOOT_START 加载」记录属于旧构建，不代表 2026-10-29 未签名 TestMode 候选已真机加载。
+- **当前候选未经 Driver Verifier、热插拔、完整 dump 或真实卷性能验证**；真实稳定性与崩溃归因仍为阻断项。

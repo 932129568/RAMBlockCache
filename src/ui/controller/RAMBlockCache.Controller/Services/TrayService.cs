@@ -175,7 +175,7 @@ public sealed class TrayService : IDisposable
         {
             try
             {
-                var s = DriverService.Instance.QueryStats(0);
+                var s = snap.EngineStats;   // 复用本轮唯一全局样本，避免托盘重复 IOCTL
                 // StatusOutput 无 ReadReq 原字段：请求总数 = ReadHits + ReadMisses
                 ulong req = s.ReadHits + s.ReadMisses;
                 double hit = req > 0 ? s.ReadHits * 100.0 / req : 0;

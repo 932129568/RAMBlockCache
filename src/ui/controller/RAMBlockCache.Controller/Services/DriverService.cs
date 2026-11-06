@@ -46,6 +46,8 @@ internal struct RbStats
     public ulong AvailablePhysMB, PeakBytes, ReadaheadBytes, ReadaheadHitBytes, PressureShrinkBytes;
     public uint ReadaheadActive, PanicActive, BootFails, DirtySnapshotMB;
     public uint CacheReadLatencyUs, DiskReadLatencyUs;   // [V10.6/B-12] 读延迟 EWMA（微秒；0=无样本）
+    public uint CacheReadLatP50Us, CacheReadLatP95Us, CacheReadLatP99Us;   // [U1 2026-11-06] 命中读分位（log2 桶近似；0=无样本）
+    public uint DiskReadLatP50Us, DiskReadLatP95Us, DiskReadLatP99Us;      // [U1 2026-11-06] 含下盘读分位
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 8)]
@@ -147,6 +149,14 @@ public struct StatusOutput
     public uint CacheReadLatencyUs;
     /// <summary>[V10.6/B-12] 含下盘读延迟 EWMA（微秒；0=尚无样本）。</summary>
     public uint DiskReadLatencyUs;
+    /// <summary>[U1 2026-11-06] 命中读延迟 P50/P95/P99（微秒；log2 桶近似；0=尚无样本）。</summary>
+    public uint CacheReadLatP50Us;
+    public uint CacheReadLatP95Us;
+    public uint CacheReadLatP99Us;
+    /// <summary>[U1 2026-11-06] 含下盘读延迟 P50/P95/P99（微秒；log2 桶近似；0=尚无样本）。</summary>
+    public uint DiskReadLatP50Us;
+    public uint DiskReadLatP95Us;
+    public uint DiskReadLatP99Us;
     /// <summary>[FIX R2-U9] GET_VOLUMES 结果随行：QueryStats 内部已查询全卷列表
     /// （原只为匹配单卷后丢弃），状态条复用之，每 tick 省一次冗余 IOCTL。</summary>
     internal RbVolumeList Volumes;
@@ -173,7 +183,7 @@ public sealed class DriverService : IDisposable
 
     private const string DevicePath = @"\\.\RAMBlockCache";
     private const uint IOCTL_RB_REQUEST = 0x00222000;
-    private const int BufSize = 7704;
+    private const int BufSize = 8224;   // [FIX 2026-10-24] = sizeof(RB_MSG)：RB_EVENT_LIST(8208) 为 union 最大成员（原 7704 被驱动 Size 校验拒绝）
 
     // 消息号（ctl/rb_proto.h）
     private const uint MSG_GET_STATS = 1, MSG_SET_CONFIG = 2, MSG_FLUSH = 3,
@@ -460,57 +470,59 @@ public sealed class DriverService : IDisposable
     /// 主理人裁定最小变更；外部无调用方，仅本程序集 QueryStats/UpdateStateBar 使用）。</summary>
     internal RbVolumeList QueryVolumes() => Query<RbVolumeList>(MSG_GET_VOLUMES, null);
 
-    /// <summary>
-    /// 全局统计 + 卷列表合并为 StatusOutput（逐卷 attached/writeMode 从 GET_VOLUMES 匹配）。
-    /// 注意：Statistics 为全局值，多卷共享。
-    /// </summary>
-    public StatusOutput QueryStats(ulong deviceKey)
+    /// <summary>仅查询一次引擎全局统计；不读取卷列表，也不把全局指标归属到单卷。</summary>
+    internal StatusOutput QueryEngineStats()
     {
-        char letter = SystemService.LetterFromKey(deviceKey);
         var s = Query<RbStats>(MSG_GET_STATS, null);
-        var list = QueryVolumes();
-        uint attached = 0, wmode = 0;
-        /* [FIX S7-17] deviceKey=0 → letter='\0' 会与"盘符未解析"卷（Letter=0）
-         * 互相命中，把任意卷的挂载态/写模式安到这个 key 上。合法盘符 A-Z 之外
-         * 一律按"未挂载"处理（attached 保持 0）。 */
-        bool letterOk = letter is >= 'A' and <= 'Z' or >= 'a' and <= 'z';
-        for (int i = 0; i < list.Count && i < 8; i++)
-        {
-            if (!letterOk) break;
-            if (char.ToUpperInvariant((char)list.Items[i].Letter) == char.ToUpperInvariant(letter))
-            { attached = list.Items[i].Attached; wmode = list.Items[i].WriteMode; break; }
-        }
         ulong miss = s.ReadReq > s.ReadHit ? s.ReadReq - s.ReadHit : 0;
         ulong wmiss = s.WriteReq > s.WriteCached ? s.WriteReq - s.WriteCached : 0;
         ulong diskBytes = s.ReadBytes > s.ReadHitBytes ? s.ReadBytes - s.ReadHitBytes : 0;
         return new StatusOutput
         {
-            DeviceKey = deviceKey,
+            DeviceKey = 0,
             ReadHits = s.ReadHit, ReadMisses = miss,
             WriteHits = s.WriteCached, WriteMisses = wmiss,
             BytesFromCache = s.ReadHitBytes, BytesFromDisk = diskBytes,
             DirtyBlocks = s.DirtyBytes / BlockSize, Evictions = s.EvictBytes / BlockSize, FlushErrors = 0,
             CacheBytesUsed = s.CurBytes,
             CacheBytesTotal = (ulong)s.EffectiveCacheMB * 1048576,
-            Mounted = attached, Mode = wmode, Paused = 0,
             PanicActive = s.PanicActive, SafeMode = s.SafeMode, DirtyBytes = s.DirtyBytes,
             WbBytes = s.WbBytes,
-            // [FIX B1] 分片累计值防御性拷贝（StripeCount 可能 <64：驱动对未用分片填 0，
-            // 这里原样拷贝不补 NaN——"全 0=本周期无吞吐"由 UI 按空态处理，
-            // 与"统计数据缺失"两种语义不混染）。
-            StripeRead = CopyStripes(s.StripeRead),
-            StripeWrite = CopyStripes(s.StripeWrite),
-            // [FIX B2] 已确认丢失（异常退出未落盘量；0=正常态）
+            StripeRead = CopyStripes(s.StripeRead), StripeWrite = CopyStripes(s.StripeWrite),
             LostDirtyBytes = s.LostDirtyBytes,
-            // [FIX B4] 内存预算只读汇总三源（SET_CONFIG 的生效结果由 RbStats 呈现）
-            EffectiveCacheMB = s.EffectiveCacheMB,
-            DynamicLimitMB = s.DynamicLimitMB,
+            EffectiveCacheMB = s.EffectiveCacheMB, DynamicLimitMB = s.DynamicLimitMB,
             AvailablePhysMB = s.AvailablePhysMB,
-            // [V10.6/B-12] 读延迟 EWMA（0=尚无样本，UI 按空态处理不画假值）
-            CacheReadLatencyUs = s.CacheReadLatencyUs,
-            DiskReadLatencyUs = s.DiskReadLatencyUs,
-            Volumes = list   /* [FIX R2-U9] 随行返回，避免状态条二次 GET_VOLUMES */
+            CacheReadLatencyUs = s.CacheReadLatencyUs, DiskReadLatencyUs = s.DiskReadLatencyUs,
+            CacheReadLatP50Us = s.CacheReadLatP50Us, CacheReadLatP95Us = s.CacheReadLatP95Us, CacheReadLatP99Us = s.CacheReadLatP99Us,
+            DiskReadLatP50Us = s.DiskReadLatP50Us, DiskReadLatP95Us = s.DiskReadLatP95Us, DiskReadLatP99Us = s.DiskReadLatP99Us
         };
+    }
+
+    /// <summary>仅从已取得的卷列表生成轻量卷状态；不复制引擎指标。</summary>
+    internal StatusOutput QueryVolumeState(ulong deviceKey, RbVolumeList volumes)
+    {
+        char letter = SystemService.LetterFromKey(deviceKey);
+        uint attached = 0, wmode = 0;
+        bool letterOk = letter is >= 'A' and <= 'Z' or >= 'a' and <= 'z';
+        for (int i = 0; letterOk && i < volumes.Count && i < 8; i++)
+        {
+            if (char.ToUpperInvariant((char)volumes.Items[i].Letter) == char.ToUpperInvariant(letter))
+            { attached = volumes.Items[i].Attached; wmode = volumes.Items[i].WriteMode; break; }
+        }
+        return new StatusOutput { DeviceKey = deviceKey, Mounted = attached, Mode = wmode, Volumes = volumes };
+    }
+
+    /// <summary>兼容包装：一次全局统计 + 一次卷列表，保留原调用方的完整返回形状。</summary>
+    public StatusOutput QueryStats(ulong deviceKey)
+    {
+        var stats = QueryEngineStats();
+        var volumes = QueryVolumes();
+        var volume = QueryVolumeState(deviceKey, volumes);
+        stats.Mounted = volume.Mounted;
+        stats.Mode = volume.Mode;
+        stats.Paused = volume.Paused;
+        stats.Volumes = volumes;
+        return stats;
     }
 
     /// <summary>[FIX B1] 分片数组防御性拷贝：长度不足/为 null 时补零（封送异常不外溢），

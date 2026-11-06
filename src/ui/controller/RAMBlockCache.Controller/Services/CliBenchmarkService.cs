@@ -126,6 +126,14 @@ public sealed partial class CliBenchmarkService : IBenchmarkService
         }
 
         ct.ThrowIfCancellationRequested();
+        return ParseBenchmarkResult(outText);
+    }
+
+    /// <summary>真实结构化解析入口；兼容旧八字段与可选 driverCold 字段。</summary>
+    internal static ColdWarmResult ParseBenchmarkResult(string output)
+    {
+        var r = ResultRe().Match(output);
+        if (!r.Success) throw new ArgumentException("bench 结构化结果缺失或字段不完整", nameof(output));
         return new ColdWarmResult(
             ParseD(r.Groups[1]), ParseD(r.Groups[2]), ParseD(r.Groups[3]), ParseD(r.Groups[4]),
             ParseU(r.Groups[5]), ParseD(r.Groups[6]),
@@ -180,12 +188,12 @@ public sealed partial class CliBenchmarkService : IBenchmarkService
     }
 
     private static FlushRangeResult FlushFail(RbErrorCode code, string text)
-        => new(false, code, $"{text}——第一遍可能不是冷读，结果仅供参考。");
+        => new(false, code, $"{text}——driver-cold-unverified / os-cache-unknown，结果仅供诊断。");
 
     // —— 解析辅助 ——
 
     /// <summary>bench 结构化结果行（八字段与 ColdWarmResult 逐字对应；toolVersion 带引号）。</summary>
-    [System.Text.RegularExpressions.GeneratedRegex(@"bench\s+firstMbps=([\d.\-]+)\s+firstSec=([\d.\-]+)\s+secondMbps=([\d.\-]+)\s+secondSec=([\d.\-]+)\s+bytes=(\d+)\s+secondHitRate=([\d.\-]+)\s+ioMode=(\S+)\s+toolVersion=""([^""]*)""")]
+    [System.Text.RegularExpressions.GeneratedRegex(@"bench\s+firstMbps=([\d.\-]+)\s+firstSec=([\d.\-]+)\s+secondMbps=([\d.\-]+)\s+secondSec=([\d.\-]+)\s+bytes=(\d+)\s+secondHitRate=([\d.\-]+)(?:\s+driverCold=(?:true|false))?\s+ioMode=(\S+)\s+toolVersion=""([^""]*)""")]
     private static partial Regex ResultRe();
 
     /// <summary>进度行（stderr，250ms 节流；pass=first|second）。</summary>

@@ -51,6 +51,8 @@ CSPROJ = SRC / "ui" / "controller" / "RAMBlockCache.Controller" / "RAMBlockCache
 README = SRC.parent / "README.txt"
 INF = SRC / "driver" / "RAMBlockCache.inf"
 RB_COMMON_H = SRC / "driver" / "rb_common.h"
+RB_FEATURE_CS = SRC / "ui" / "controller" / "RAMBlockCache.Controller" / "Models" / "RbFeature.cs"
+RB_FEATCTL_C = SRC / "ctl" / "rbfeatctl.c"
 
 fails: list[str] = []
 warns: list[str] = []
@@ -301,17 +303,24 @@ def main():
     # ── C. sizeof(RB_MSG) ──
     if "RB_MSG" in cstructs:
         env_sz = c_lay.struct_size("RB_MSG")     # union 摘除后仅剩信封 16
+        # [FIX 2026-10-24] union 候选此前硬编码七成员且断言写死 7704——B-7 新增的
+        # RB_EVENT_LIST(8208) 实为新的最大成员（> RB_LOG_LIST 7688），漏检放行了
+        # 驱动(8224)/WPF(7704) 失同步（实测 WPF 全 IOCTL Win32 87）。改为：
+        # 候选=全部 union 成员，断言=动态计算值，C# 常量必须与计算值一致（见 D 段）。
         union_sz = 0
+        union_max = ""
         for cand in ("RB_LOG_LIST", "RB_STATS", "RB_CONFIG", "RB_VOLUME_LIST",
-                     "RB_VOLUME_SET", "RB_VOLUME_ATTACH", "RB_VERSION"):
+                     "RB_VOLUME_SET", "RB_VOLUME_ATTACH", "RB_VERSION",
+                     "RB_INVALIDATE_RANGE", "RB_EVENT_LIST", "RB_EVENT_QUERY"):
             if cand in cstructs:
-                union_sz = max(union_sz, c_lay.struct_size(cand))
-        total = env_sz + union_sz
-        print(f"   sizeof(RB_MSG) = 信封{env_sz} + union{union_sz} = {total}"
-              f"（最大成员 RB_LOG_LIST）")
-        if total != 7704:
-            fails.append(f"sizeof(RB_MSG) 计算值 {total} != 7704（信封/union 漂移）")
+                sz = c_lay.struct_size(cand)
+                if sz > union_sz:
+                    union_sz, union_max = sz, cand
+        RB_MSG_TOTAL = env_sz + union_sz
+        print(f"   sizeof(RB_MSG) = 信封{env_sz} + union{union_sz} = {RB_MSG_TOTAL}"
+              f"（最大成员 {union_max}）")
     else:
+        RB_MSG_TOTAL = 0
         fails.append("rb_proto.h 未解析到 RB_MSG 信封")
 
     # ── B. 三副本字段级比对 ──
@@ -386,8 +395,9 @@ def main():
         sz_m = re.search(r"(?:MsgSize|RbMsgSize)\s*=\s*(\d+)", s)
         if off_m and int(off_m.group(1)) != 16:
             fails.append(f"{label} DataOffset={off_m.group(1)} != 16")
-        if sz_m and int(sz_m.group(1)) != 7704:
-            fails.append(f"{label} MsgSize={sz_m.group(1)} != 7704")
+        # [FIX 2026-10-24] 不再写死 7704：C# MsgSize 必须等于 C 侧动态计算值
+        if sz_m and RB_MSG_TOTAL and int(sz_m.group(1)) != RB_MSG_TOTAL:
+            fails.append(f"{label} MsgSize={sz_m.group(1)} != C 侧 sizeof(RB_MSG)={RB_MSG_TOTAL}")
         if not off_m:
             warns.append(f"{label} 未见 DataOffset 常量")
         io = re.search(r"IOCTL_RB_REQUEST\s*=\s*(0x[0-9A-Fa-f]+|\d+)", s)
@@ -396,13 +406,15 @@ def main():
         have = set()
         for m in re.finditer(r"(?:RB_MSG_|MSG_)?(GET_STATS|SET_CONFIG|FLUSH|GET_CONFIG|"
                              r"EXIT_SAFE_MODE|SET_VOLUME|GET_VOLUMES|ATTACH_VOLUME|"
-                             r"GET_LOG|GET_VERSION|PANIC|PANIC_CLEAR|INVALIDATE_RANGE)\s*=\s*(\d+)", s):
+                             r"GET_LOG|GET_VERSION|PANIC|PANIC_CLEAR|INVALIDATE_RANGE|"
+                             r"GET_EVENTS)\s*=\s*(\d+)", s):
             have.add((m.group(1), int(m.group(2))))
         expect_msgs = {("GET_STATS", 1), ("SET_CONFIG", 2), ("FLUSH", 3), ("GET_CONFIG", 4),
                        ("EXIT_SAFE_MODE", 5), ("SET_VOLUME", 6), ("GET_VOLUMES", 7),
                        ("ATTACH_VOLUME", 8), ("GET_LOG", 9), ("GET_VERSION", 10),
                        ("PANIC", 11), ("PANIC_CLEAR", 12),
-                       ("INVALIDATE_RANGE", 13)}   # [V10.6/B-5] 末尾追加
+                       ("INVALIDATE_RANGE", 13),   # [V10.6/B-5] 末尾追加
+                       ("GET_EVENTS", 14)}         # [V10.6/B-7] 末尾追加（[FIX 2026-10-24] 补入检查）
         extra = {x for x in have if x not in expect_msgs}
         if extra:
             fails.append(f"{label} 消息号越界: {sorted(extra)}")
@@ -494,6 +506,24 @@ def main():
         if "V10.5.0 Build 19" in s:
             warns.append(f"{xaml.relative_to(SRC)} 仍含硬编码发布名"
                          f"（应收敛到 ProductVersion 绑定）")
+
+    # VOLSTATUS reason 6-10：数值唯一权威 rb_common.h，UI/CLI 文案同波同步；布局不改。
+    reason_defs = {
+        "RB_BYPASS_STREAM_GEOMETRY": 6,
+        "RB_BYPASS_DIRECTION": 7,
+        "RB_BYPASS_IO_TOO_LARGE": 8,
+        "RB_BYPASS_ADMIT": 9,
+        "RB_BYPASS_RESOURCE": 10,
+    }
+    feature_text = read(RB_FEATURE_CS) if RB_FEATURE_CS.exists() else ""
+    featctl_text = read(RB_FEATCTL_C) if RB_FEATCTL_C.exists() else ""
+    for name, value in reason_defs.items():
+        if not re.search(rf"#define\s+{name}\s+{value}\b", bh):
+            fails.append(f"VOLSTATUS reason 权威值缺失/漂移: {name} != {value}")
+        if not re.search(rf"\b{value}\s*=>", feature_text):
+            fails.append(f"UI VolReasonText 缺少 reason {value}")
+        if not re.search(rf"case\s+{value}\s*:", featctl_text):
+            fails.append(f"CLI VolReasonText 缺少 reason {value}")
 
     # ── 汇总 ──
     for w in warns:

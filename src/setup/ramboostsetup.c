@@ -10,6 +10,11 @@
  *   4) 向标准卷类 {71a27cdd-...} 的 UpperFilters 读-改-写【追加】RAMBlockCache
  *      （保留 volsnap；已存在则幂等跳过）
  *   5) 提示重启一次生效；之后 ATTACH/DETACH 热开关免重启
+ *   6) [P1.5] 武装 boot_guard 看门：随包 guard 脚本复制到
+ *      C:\ProgramData\RAMBoost + 注册双计划任务（AtStartup boot_guard.ps1 /
+ *      AtLogOn logon_disarm.ps1）+ 写 FilterArmed 武装基线 + 签名态盖章；
+ *      三件套全部就绪才置 FilterArmed=1（绝不"武装了没看门"），
+ *      武装失败不中止安装（降级为 签名预检 + offline_rollback.cmd 两层网）
  * [U1-2/U0-1] 命令行（纯增量；无参数时行为与历史一致）：
  *   /S                       静默安装（输出写入 %TEMP%\RAMBlockCache-Setup.log）
  *   /TestMode                测试模式：DEMAND_START + TestMode=1 + 不写 UpperFilters
@@ -26,9 +31,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <shellapi.h>
+#include <wincrypt.h>          /* [DISTRIB] 根证书导入 */
 #include <wintrust.h>          /* [FIX A2] VerifyDriverSignature: WinVerifyTrust */
 #include <softpub.h>           /* [FIX A2] WINTRUST_ACTION_GENERIC_VERIFY_V2 GUID */
 #pragma comment(lib, "wintrust.lib")   /* [FIX A2] 自包含链接（编译行亦同步追加） */
+#pragma comment(lib, "crypt32.lib")    /* [DISTRIB] 根证书自动导入（CertOpenStore/CertAddCertificateContextToStore） */
 
 /* IsUserAnAdmin 由 shell32.dll 导出（shlobj.h）；WIN32_LEAN_AND_MEAN 不拉 shlobj.h，
  * 这里显式给出原型，消除 C4013。 */
@@ -177,6 +184,56 @@ static void DeleteServiceIfExists(void)
  * 链有效性：链到本机任一信任根即通过（RAMBoostFS 测试根、未来 WHQL/EV 均
  * 可），未签名/断链被拒。注意本检查管"有有效签名"；自签测试证书场景下
  * 内核能否加载还取决于 testsigning 是否开启——那由调用方的 WARN 提示高亮。 */
+/* [DISTRIB-2026-11-04] 一键信任：把随包分发的根证书导入本机「受信任的根证书
+ * 颁发机构」。新机器没有 RAMBoostFS 根证书时，WinVerifyTrust 返回
+ * 0x800B0109（CERT_E_UNTRUSTEDROOT），安装器按 fail-closed 拒绝——用户拿到的
+ * 是"装不了"。本函数在拿到该类错误后自动导入同目录 RAMBoostFS-Root.cer，
+ * 使校验可通过。证书由官方安装包携带（与驱动同源），不降低安全性：
+ * 导入的仍是签名链的根，无法用于验证其他任何文件。 */
+static BOOL ImportBundledRootCert(void)
+{
+    WCHAR cer[MAX_PATH], tmp[MAX_PATH];
+    HCERTSTORE store;
+    PCCERT_CONTEXT ctx;
+    DWORD  size = 0;
+    PBYTE  buf  = NULL;
+    HANDLE hf   = INVALID_HANDLE_VALUE;
+    DWORD  rd   = 0;
+    BOOL   ok   = FALSE;
+
+    GetModuleFileNameW(NULL, cer, MAX_PATH);
+    { WCHAR *sl = wcsrchr(cer, L'\\'); if (sl) *sl = 0; }
+    wcscat_s(cer, MAX_PATH, L"\\RAMBoostFS-Root.cer");
+    if (GetFileAttributesW(cer) == INVALID_FILE_ATTRIBUTES) return FALSE;
+
+    hf = CreateFileW(cer, GENERIC_READ, FILE_SHARE_READ, NULL,
+                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return FALSE;
+    size = GetFileSize(hf, NULL);
+    if (size == 0 || size == INVALID_FILE_SIZE || size > 65536) { CloseHandle(hf); return FALSE; }
+    buf = (PBYTE)HeapAlloc(GetProcessHeap(), 0, size);
+    if (!buf) { CloseHandle(hf); return FALSE; }
+    if (!ReadFile(hf, buf, size, &rd, NULL) || rd != size) { CloseHandle(hf); HeapFree(GetProcessHeap(), 0, buf); return FALSE; }
+    CloseHandle(hf);
+
+    store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, NULL,
+                          CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG,
+                          L"ROOT");
+    if (!store) { HeapFree(GetProcessHeap(), 0, buf); return FALSE; }
+    ctx = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, buf, size);
+    if (ctx) {
+        ok = CertAddCertificateContextToStore(store, ctx,
+                 CERT_STORE_ADD_REPLACE_EXISTING, NULL) ? TRUE : FALSE;
+        CertFreeCertificateContext(ctx);
+    }
+    CertCloseStore(store, 0);
+    HeapFree(GetProcessHeap(), 0, buf);
+    if (ok) Ok(L"root certificate imported to LocalMachine\\Root (bundled RAMBoostFS-Root.cer)");
+    else    Fail(L"import bundled root certificate (manual: certutil -addstore Root RAMBoostFS-Root.cer)");
+    (void)tmp;
+    return ok;
+}
+
 static BOOL VerifyDriverSignature(void)
 {
     WCHAR src[MAX_PATH];
@@ -209,6 +266,25 @@ static BOOL VerifyDriverSignature(void)
     wd.dwStateAction = WTD_STATEACTION_CLOSE;   /* 释放 provider 状态 */
     WinVerifyTrust(NULL, &action, &wd);
 
+    /* [DISTRIB-2026-11-04] 根证书不在本机信任列表时，自动导入随包证书后重试：
+     * 新机器首次安装的必经路径（否则用户永远装不上，只能手工 certutil）。 */
+    if (st == (LONG)0x800B0109 /* CERT_E_UNTRUSTEDROOT */ ||
+        st == (LONG)0x800B010D /* CERT_E_UNTRUSTEDTESTROOT */) {
+        Ok(L"root not trusted on this machine - importing bundled certificate");
+        if (ImportBundledRootCert()) {
+            ZeroMemory(&wd, sizeof(wd));
+            wd.cbStruct      = sizeof(wd);
+            wd.dwUIChoice    = WTD_UI_NONE;
+            wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+            wd.dwUnionChoice = WTD_CHOICE_FILE;
+            wd.pFile         = &fi;
+            wd.dwStateAction = WTD_STATEACTION_VERIFY;
+            st = WinVerifyTrust(NULL, &action, &wd);
+            wd.dwStateAction = WTD_STATEACTION_CLOSE;
+            WinVerifyTrust(NULL, &action, &wd);
+        }
+    }
+
     if (st == ERROR_SUCCESS) { Ok(L"driver signature chain: VALID"); return TRUE; }
 
     fwprintf(stderr, L"[X] driver signature check FAILED (WinVerifyTrust=0x%08lX)\n", st);
@@ -222,13 +298,24 @@ static BOOL VerifyDriverSignature(void)
 static BOOL CopyDriverFile(void)
 {
     WCHAR src[MAX_PATH], dst[MAX_PATH];
+    int retry;
     GetModuleFileNameW(NULL, src, MAX_PATH);
     WCHAR *sl = wcsrchr(src, L'\\'); if (sl) *sl = 0;
     wcscat_s(src, MAX_PATH, L"\\RAMBlockCache.sys");
     GetSystemDirectoryW(dst, MAX_PATH);
     wcscat_s(dst, MAX_PATH, L"\\drivers\\");
     wcscat_s(dst, MAX_PATH, DRV_SYSNAME);
-    if (!CopyFileW(src, dst, FALSE)) { Fail(L"copy driver (place RAMBlockCache.sys beside me)"); return FALSE; }
+    /* [FIX err=32 2026-10-24] 刚停服的旧驱动映像段释放有延迟（卸载异步），
+     * 立刻覆盖拷贝会撞 ERROR_SHARING_VIOLATION。占用重试（上限 ~10s），
+     * 超限才报错——重装不再要求用户手动等待。 */
+    for (retry = 0; ; retry++) {
+        if (CopyFileW(src, dst, FALSE)) break;
+        if (GetLastError() != ERROR_SHARING_VIOLATION || retry >= 20) {
+            Fail(L"copy driver (place RAMBlockCache.sys beside me)");
+            return FALSE;
+        }
+        Sleep(500);
+    }
     Ok(L"driver copied");
     return TRUE;
 }
@@ -237,14 +324,298 @@ static BOOL CopyDriverFile(void)
  * /S              静默：输出重定向 %TEMP%\RAMBlockCache-Setup.log，屏幕零输出
  * /TestMode       测试模式：DEMAND_START 服务 + 写 TestMode=1 + 不写卷类 UpperFilters
  *                  （零重启 dev loop 的安装面；运行时挂栈路径由驱动 TestMode 门放行）
- * /AutoAttach=0|1         覆盖默认 AutoAttach（历史默认 1）
+ * /AutoAttach=0|1         覆盖默认 AutoAttach（[FIX 2026-11-06] 默认 1→0：
+ *                          与驱动默认（USER-REQ ②"开机不自动加速任何卷"）对齐；
+ *                          原安装器显式写 1 覆盖驱动默认 0，新装机违反开机策略）
  * /DefaultMode=WriteThrough|WriteBack  覆盖默认写模式（历史默认 WriteThrough=直写） */
 typedef struct _RB_INSTALL_OPTS {
     BOOL   Silent;
     BOOL   TestMode;
     DWORD  AutoAttach;
     DWORD  WriteBack;
+    BOOL   NoTestSigning;   /* [DISTRIB] /NoTestSigning 保险丝：跳过自动 bcdedit */
+    BOOL   BootStart;       /* [FIX 0x7B-DISTRIB] /BootStart 显式升级 BOOT_START（默认 DEMAND_START） */
 } RB_INSTALL_OPTS;
+
+/* [DISTRIB 2026-11-04] 一键测试签名模式：分发包的驱动为测试签名（RAMBoostFS
+ * Root 测试链），目标机器必须 testsigning on 才能加载——否则 BOOT_START 加载
+ * 失败（BootLoopGuard 兜底可进系统，但驱动不可用）。安装器以管理员运行
+ * （app.manifest requireAdministrator），直接调 bcdedit 幂等开启；重启后生效
+ * （桌面右下角"测试模式"水印为正常现象）。/NoTestSigning 保险丝供正式签名
+ * 分发包关闭本行为。 */
+static BOOL EnableTestSigning(BOOL silent)
+{
+    /* [DISTRIB-FIX 2026-11-05] 三改进（实测对方机器 bcdedit exit=1 无法归因）：
+     * ① 输出重定向到临时文件并读出——360 等安全软件拦截 bcdedit 时能看到
+     *    具体拒绝文本，而不是只有 exit=1；
+     * ② 失败重试 3 次（偶发拦截/文件锁）；
+     * ③ 每次重试间 Ok/Warn 可见。 */
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+    WCHAR cmd[] = L"bcdedit /set testsigning on";
+    WCHAR outf[MAX_PATH];
+    DWORD rc = (DWORD)-1;
+    int attempt;
+    HANDLE hf;
+    GetTempPathW(MAX_PATH, outf);
+    wcscat_s(outf, MAX_PATH, L"rb-bcdedit-out.txt");
+    for (attempt = 1; attempt <= 3; attempt++) {
+        hf = CreateFileW(outf, GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+        si.wShowWindow = SW_HIDE;
+        si.hStdOutput = hf;
+        si.hStdError  = hf;
+        if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            Fail(L"launch bcdedit (testsigning) - run manually: bcdedit /set testsigning on");
+            if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+            return FALSE;
+        }
+        WaitForSingleObject(pi.hProcess, 15000);
+        GetExitCodeProcess(pi.hProcess, &rc);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+        if (rc == 0) {
+            Ok(L"testsigning ON (reboot required; desktop watermark is normal)");
+            return TRUE;
+        }
+        {
+            WCHAR b[96];
+            wsprintfW(b, L"bcdedit attempt %d/%d failed exit=%lu - retrying/see detail below",
+                      attempt, 3, rc);
+            Fail(b);
+            /* 显示 bcdedit 的输出（拦截软件的拒绝原因会出现在这里） */
+            hf = CreateFileW(outf, GENERIC_READ, FILE_SHARE_READ, NULL,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hf != INVALID_HANDLE_VALUE) {
+                char abuf[1024]; DWORD rd = 0;
+                if (ReadFile(hf, abuf, sizeof(abuf) - 1, &rd, NULL) && rd) {
+                    abuf[rd] = 0;
+                    { WCHAR wbuf[1024]; int wi = 0;
+                      for (DWORD bi = 0; bi < rd && wi < 1023; bi++)
+                          wbuf[wi++] = (wchar_t)(unsigned char)abuf[bi];
+                      wbuf[wi] = 0;
+                      Fail(wbuf); }
+                }
+                CloseHandle(hf);
+            }
+            Sleep(1000);
+        }
+    }
+    Fail(L"bcdedit failed 3 times - likely blocked by security software (360 etc).");
+    Fail(L"Manual: exit 360, then admin cmd: bcdedit /set testsigning on, reboot.");
+    return FALSE;
+}
+
+/* ---- [P1.5 2026-11-06] boot_guard 看门协议（安装引擎侧移植，消 U-5）----
+ * 开发机链路 src\scripts\deploy.ps1 的步骤 3/3a/4/5（武装基线 + 签名态盖章 +
+ * guard 脚本 + 双计划任务）移植进分发安装链：GUI 分发包的静默引擎在完成
+ * UpperFilters 追加与 testsigning 后同样武装三件套——此前分发机只有随包
+ * offline_rollback.cmd，看门完全缺位。语义（严格）：
+ *   ① 三件套（guard 脚本 + 两计划任务）全部就绪才写 FilterArmed=1；
+ *   ② 任一失败不 return 1、不中止安装（360 等安全软件拦 schtasks 时硬拒
+ *      = 分发机装不上），打 Fail 后降级为两层网继续走完安装；
+ *   ③ 仅生产模式路径调用（TestMode 路径零改动）。 */
+
+/* [P1.5-A1] 签名态盖章（deploy.ps1 步骤 3a 同口径）：从引擎同目录
+ * RAMBlockCache.sys 提取签名者信息写入 PARM_KEY：
+ *   TestSigned (REG_DWORD)：签名者证书自签（Subject 字符串 == Issuer 字符串）
+ *                            → 1，CA 链签发 → 0；任何失败 → 保守 1
+ *                            （与驱动侧 RbRegGetDW(L"TestSigned",1) 缺省一致）。
+ *   Signer    (REG_SZ)：签名者 Subject，非空才写。
+ * 驱动 DriverEntry 读取这两个值填 GET_VERSION（前端 DriverSignatureState 契约）；
+ * 取不到 = 1/空 = 保守，反作弊警示照弹，不降低安全性。 */
+static void StampSignerState(void)
+{
+    WCHAR sysPath[MAX_PATH];
+    HCERTSTORE store = NULL;
+    HCRYPTMSG  msg   = NULL;
+    PCMSG_SIGNER_INFO info = NULL;
+    PCCERT_CONTEXT signer = NULL;
+    HKEY hk = NULL;
+    DWORD cbInfo = 0, testSigned = 1;
+    WCHAR subject[256] = L"", issuer[256] = L"";
+
+    /* 源文件 = 安装器 exe 同目录的 RAMBlockCache.sys（与 CopyDriverFile 同源） */
+    GetModuleFileNameW(NULL, sysPath, MAX_PATH);
+    { WCHAR *sl = wcsrchr(sysPath, L'\\'); if (sl) *sl = 0; }
+    wcscat_s(sysPath, MAX_PATH, L"\\" DRV_SYSNAME);
+
+    /* 提取内嵌 Authenticode 签名的签名者：文件 -> (cert store + crypt msg) ->
+     * CMSG_SIGNER_INFO（含 Issuer + SerialNumber）-> 按二者定位签名者证书。 */
+    if (CryptQueryObject(CERT_QUERY_OBJECT_FILE, sysPath,
+                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                         CERT_QUERY_FORMAT_FLAG_BINARY,
+                         0, NULL, NULL, NULL,
+                         &store, &msg, NULL)) {
+        if (CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0, NULL, &cbInfo) && cbInfo) {
+            info = (PCMSG_SIGNER_INFO)HeapAlloc(GetProcessHeap(), 0, cbInfo);
+            if (info && CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0,
+                                         (PVOID)info, &cbInfo)) {
+                CERT_INFO ci;
+                ZeroMemory(&ci, sizeof(ci));
+                ci.Issuer       = info->Issuer;
+                ci.SerialNumber = info->SerialNumber;
+                signer = CertFindCertificateInStore(store,
+                             X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                             0, CERT_FIND_SUBJECT_CERT, &ci, NULL);
+            }
+        }
+    }
+    if (signer) {
+        /* 判定口径与 deploy.ps1 3a 一致：证书字符串 Subject == Issuer = 自签
+         * 测试证书 -> 1；CA 链签发（两者不同）-> 0。任一取名失败保持 1。 */
+        if (CertNameToStrW(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                           &signer->pCertInfo->Subject,
+                           CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                           subject, ARRAYSIZE(subject)) &&
+            CertNameToStrW(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                           &signer->pCertInfo->Issuer,
+                           CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                           issuer, ARRAYSIZE(issuer))) {
+            testSigned = (wcscmp(subject, issuer) == 0) ? 1 : 0;
+        }
+    }
+
+    /* 盖章：TestSigned 恒写（失败路径保守 1）；Signer 非空才写。
+     * 注册表失败不中止安装：驱动侧缺省同保守 1，最多 UI 多弹一次警示。 */
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, PARM_KEY, 0, NULL, 0,
+                        KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &hk, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hk, L"TestSigned", 0, REG_DWORD,
+                       (const BYTE *)&testSigned, sizeof(testSigned));
+        if (subject[0]) {
+            RegSetValueExW(hk, L"Signer", 0, REG_SZ, (const BYTE *)subject,
+                           (DWORD)((wcslen(subject) + 1) * sizeof(WCHAR)));
+        }
+        RegCloseKey(hk);
+        {
+            WCHAR b[512];
+            wsprintfW(b, L"signature state stamped: TestSigned=%lu, Signer=%s",
+                      testSigned, subject[0] ? subject : L"(none)");
+            Ok(b);
+        }
+    } else {
+        Fail(L"stamp signature state (Parameters key) - driver defaults apply");
+    }
+
+    if (signer) CertFreeCertificateContext(signer);
+    if (info)   HeapFree(GetProcessHeap(), 0, info);
+    if (msg)    CryptMsgClose(msg);
+    if (store)  CertCloseStore(store, 0);
+}
+
+/* [P1.5-A2] guard 脚本随包落地：把引擎同目录（GUI 安装器的 staging，由
+ * Payload.cs KernelFiles 提取）的 boot_guard.ps1 / logon_disarm.ps1 复制到
+ * C:\ProgramData\RAMBoost\（目录不存在则创建；覆盖写）。
+ * 任一源缺失 -> FALSE（按无看门降级，由调用方决定不中止安装）。 */
+static BOOL InstallGuardScripts(void)
+{
+    WCHAR srcDir[MAX_PATH], dstDir[MAX_PATH];
+    static const LPCWSTR names[2] = { L"boot_guard.ps1", L"logon_disarm.ps1" };
+    DWORD i;
+
+    GetModuleFileNameW(NULL, srcDir, MAX_PATH);
+    { WCHAR *sl = wcsrchr(srcDir, L'\\'); if (sl) *sl = 0; }
+
+    wcscpy_s(dstDir, MAX_PATH, L"C:\\ProgramData\\RAMBoost");
+    if (GetFileAttributesW(dstDir) == INVALID_FILE_ATTRIBUTES) {
+        if (!CreateDirectoryW(dstDir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+            Fail(L"create C:\\ProgramData\\RAMBoost (guard scripts target)");
+            return FALSE;
+        }
+    }
+    for (i = 0; i < ARRAYSIZE(names); i++) {
+        WCHAR srcFile[MAX_PATH], dstFile[MAX_PATH];
+        wcscpy_s(srcFile, MAX_PATH, srcDir);
+        wcscat_s(srcFile, MAX_PATH, L"\\");
+        wcscat_s(srcFile, MAX_PATH, names[i]);
+        wcscpy_s(dstFile, MAX_PATH, dstDir);
+        wcscat_s(dstFile, MAX_PATH, L"\\");
+        wcscat_s(dstFile, MAX_PATH, names[i]);
+        if (!CopyFileW(srcFile, dstFile, FALSE)) {
+            WCHAR b[MAX_PATH + 64];
+            wsprintfW(b, L"copy guard script %s (must ship beside the engine)", names[i]);
+            Fail(b);
+            return FALSE;
+        }
+    }
+    Ok(L"guard scripts installed to C:\\ProgramData\\RAMBoost");
+    return TRUE;
+}
+
+/* [P1.5-A3] 注册单个看门计划任务（与 deploy.ps1 第 5 步 Register-ScheduledTask
+ * 等价：SYSTEM / RunLevel Highest / AtStartup|AtLogOn，动作 = powershell
+ * -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File）。
+ * 进程启动模式完全参照 EnableTestSigning：输出重定向临时文件、SW_HIDE、
+ * WaitForSingleObject 15s；退出码 0 -> TRUE，非 0 把临时文件内容打出来
+ * （360 拦截 schtasks 的归因面）再 FALSE。/TR 值整体双引号、内部路径用 \"
+ * 转义（标准 Windows 命令行转义，schtasks 解析正确）。 */
+static BOOL RegisterGuardTask(LPCWSTR taskName, LPCWSTR schedule, LPCWSTR scriptPath)
+{
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+    WCHAR cmd[1024];
+    WCHAR outf[MAX_PATH];
+    WCHAR b[160];
+    DWORD rc = (DWORD)-1;
+    HANDLE hf;
+
+    wsprintfW(cmd,
+        L"schtasks.exe /Create /F /TN %s /SC %s /RU SYSTEM /RL HIGHEST /TR "
+        L"\"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden "
+        L"-File \\\"%s\\\"\"",
+        taskName, schedule, scriptPath);
+
+    GetTempPathW(MAX_PATH, outf);
+    wcscat_s(outf, MAX_PATH, L"rb-schtasks-out.txt");
+    hf = CreateFileW(outf, GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hf;
+    si.hStdError  = hf;
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        Fail(L"launch schtasks (guard task) - security software may block it");
+        if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+        return FALSE;
+    }
+    WaitForSingleObject(pi.hProcess, 15000);
+    GetExitCodeProcess(pi.hProcess, &rc);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+
+    if (rc == 0) {
+        wsprintfW(b, L"scheduled task %s registered (SYSTEM, %s)", taskName, schedule);
+        Ok(b);
+        return TRUE;
+    }
+    wsprintfW(b, L"schtasks for %s failed exit=%lu - detail follows", taskName, rc);
+    Fail(b);
+    /* 打出 schtasks 的输出（安全软件拦截的拒绝原因会出现在这里） */
+    hf = CreateFileW(outf, GENERIC_READ, FILE_SHARE_READ, NULL,
+                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf != INVALID_HANDLE_VALUE) {
+        char abuf[1024]; DWORD rd = 0;
+        if (ReadFile(hf, abuf, sizeof(abuf) - 1, &rd, NULL) && rd) {
+            abuf[rd] = 0;
+            { WCHAR wbuf[1024]; int wi = 0;
+              for (DWORD bi = 0; bi < rd && wi < 1023; bi++)
+                  wbuf[wi++] = (wchar_t)(unsigned char)abuf[bi];
+              wbuf[wi] = 0;
+              Fail(wbuf); }
+        }
+        CloseHandle(hf);
+    }
+    return FALSE;
+}
 
 /* 参数解析：未知参数/非法值一律拒绝（fail-closed：不静默忽略拼写错误，
  * 批量静默安装时一个拼错的开关必须失败可见，而不是装出一个非预期默认态）。
@@ -262,6 +633,10 @@ static BOOL RbParseArgs(int argc, LPWSTR *argv, RB_INSTALL_OPTS *o)
             o->Silent = TRUE;
         } else if (_wcsicmp(a, L"/TestMode") == 0) {
             o->TestMode = TRUE;
+        } else if (_wcsicmp(a, L"/NoTestSigning") == 0) {
+            o->NoTestSigning = TRUE;   /* [DISTRIB] 正式签名分发包的保险丝 */
+        } else if (_wcsicmp(a, L"/BootStart") == 0) {
+            o->BootStart = TRUE;   /* [FIX 0x7B-DISTRIB] 显式升级引导启动 */
         } else if (_wcsnicmp(a, L"/AutoAttach=", 12) == 0) {
             LPCWSTR v = a + 12;
             if (wcscmp(v, L"0") == 0) o->AutoAttach = 0;
@@ -319,17 +694,26 @@ static void SetDefaults(DWORD autoAttach, DWORD writeBack)
 int wmain(int argc, LPWSTR *argv)
 {
     SC_HANDLE m, s;
-    RB_INSTALL_OPTS opt = { FALSE, FALSE, 1, 0 };
-    DWORD startType = SERVICE_BOOT_START;
-    LPCWSTR svcGroup = L"System Bus Extender";
+    RB_INSTALL_OPTS opt = { FALSE, FALSE, 0, 0 };   /* [FIX 2026-11-06] AutoAttach 1→0：安装器默认对齐驱动默认/用户开机策略 ② */
+    /* [FIX 0x7B-DISTRIB 2026-11-04] 首装一律 DEMAND_START（物理上不可能 0x7B）。
+     * 原 BOOT_START + System Bus Extender 组让驱动参与引导最早期——陌生硬件/
+     * 驱动初始化任何失败 = INACCESSIBLE_BOOT_DEVICE（实测新机器 0x7B 死机）。
+     * 新流程：首装 DEMAND_START → 用户手动 sc start 验证能加载 → 确认稳定后
+     * 重跑本引擎加 /BootStart 开关升级 BOOT_START。正确性 > 开机即加速。
+     * [U-7 2026-11-06] 原文"用 ramboostctl enable-boot 升级"为过时口径：
+     * ramboostctl 无 enable-boot 子命令，实际升级路径是本引擎 /BootStart。 */
+    DWORD startType = SERVICE_DEMAND_START;
+    LPCWSTR svcGroup = NULL;
     WCHAR logPath[MAX_PATH];
 
     /* [U1-2] 参数解析先行于一切（含管理员检查）：拼错开关在提权前就失败可见 */
     if (!RbParseArgs(argc, argv, &opt)) {
         fwprintf(stderr, L"[X] bad argument. Usage:\n");
-        fwprintf(stderr, L"    ramboostsetup.exe [/S] [/TestMode] [/AutoAttach=0|1] [/DefaultMode=WriteThrough|WriteBack]\n");
+        fwprintf(stderr, L"    ramboostsetup.exe [/S] [/TestMode] [/AutoAttach=0|1] [/DefaultMode=WriteThrough|WriteBack] [/BootStart]\n");
         return 1;
     }
+    /* [/BootStart] 显式升级开关：仅当用户确认驱动可加载后使用（高级选项） */
+    if (opt.BootStart) { startType = SERVICE_BOOT_START; svcGroup = L"System Bus Extender"; }
 
     /* [U1-2] 静默模式：stdout/stderr 追加重定向到 %TEMP%\RAMBlockCache-Setup.log
      * （无人值守批次安装的归因面；既有全部打印语句零改动流入日志）。 */
@@ -376,6 +760,7 @@ int wmain(int argc, LPWSTR *argv)
     if (!m) { Fail(L"open SCM"); return 1; }
     {
         WCHAR bin[MAX_PATH];
+        int retry;
         GetSystemDirectoryW(bin, MAX_PATH);
         wcscat_s(bin, MAX_PATH, L"\\drivers\\");
         wcscat_s(bin, MAX_PATH, DRV_SYSNAME);
@@ -383,6 +768,18 @@ int wmain(int argc, LPWSTR *argv)
                            SERVICE_KERNEL_DRIVER, startType,
                            SERVICE_ERROR_NORMAL, bin, svcGroup,
                            NULL, NULL, NULL, NULL);
+        /* [FIX 1072 2026-10-24] 删旧->立刻建新撞 ERROR_SERVICE_MARKED_FOR_DELETE：
+         * 墓碑摘除需 SCM 异步落库（本进程句柄已关仍可能慢一拍）。等待重试
+         * （上限 10s）；其间被真建成则走 EXISTS 分支打开。 */
+        for (retry = 0; !s && GetLastError() == ERROR_SERVICE_MARKED_FOR_DELETE
+                        && retry < 20; retry++) {
+            Sleep(500);
+            s = CreateServiceW(m, SVC_NAME, SVC_NAME, SERVICE_ALL_ACCESS,
+                               SERVICE_KERNEL_DRIVER, startType,
+                               SERVICE_ERROR_NORMAL, bin, svcGroup,
+                               NULL, NULL, NULL, NULL);
+            if (!s && GetLastError() == ERROR_SERVICE_EXISTS) break;
+        }
         if (!s && GetLastError() == ERROR_SERVICE_EXISTS)
             s = OpenServiceW(m, SVC_NAME, SERVICE_ALL_ACCESS);
         if (s) {
@@ -426,7 +823,16 @@ int wmain(int argc, LPWSTR *argv)
             RegCloseKey(h);
         }
         Ok(L"TestMode=1 (runtime attach armed; UpperFilters untouched)");
-        wprintf(L"\n>>> DONE (TestMode). NO REBOOT NEEDED.\n");
+        /* [USER-REQ 2026-11-05] testsigning 是硬前提：测试签名驱动未开
+         * testsigning 会在开机被 Code Integrity 拒载 → 0x7B 蓝屏循环。
+         * 失败即中止安装（此前只警告继续，是 0x7B 的真实成因之一）。 */
+        if (!opt.NoTestSigning && !EnableTestSigning(opt.Silent)) {
+            Fail(L"ABORT: testsigning could not be enabled - driver would fail to load at boot (0x7B).");
+            Fail(L"Close 360/security software and re-run the installer, or run:");
+            Fail(L"    bcdedit /set testsigning on   (as admin)   then reboot and install again.");
+            return 1;
+        }
+        wprintf(L"\n>>> DONE (TestMode). NO REBOOT NEEDED for install; testsigning needs ONE reboot.\n");
         wprintf(L">>> Then:  sc start RAMBlockCache   /   ramboostctl attach <X:>\n");
         wprintf(L">>> Uninstall = sc stop (clean unload, dirty flushed). Production mode:\n");
         wprintf(L">>> re-run this installer WITHOUT /TestMode (one reboot then).\n");
@@ -449,6 +855,56 @@ int wmain(int argc, LPWSTR *argv)
     if (RegMultiSzAppend(CLS_VOLUME, L"UpperFilters", L"RAMBlockCache"))
         { Fail(L"append Volume UpperFilters"); return 1; }
     Ok(L"Volume UpperFilters appended (volsnap kept)");
+    /* [USER-REQ 2026-11-05] 同上：testsigning 失败必须中止，绝不留下
+     * "驱动已装但开机加载不了"的半成品（那正是对方机器 0x7B 的现场）。 */
+    if (!opt.NoTestSigning && !EnableTestSigning(opt.Silent)) {
+        Fail(L"ABORT: testsigning could not be enabled - driver would fail to load at boot (0x7B).");
+        Fail(L"Disable security software blocking bcdedit, then re-run the installer.");
+        return 1;
+    }
+
+    /* [P1.5 2026-11-06] 武装 boot_guard 看门（deploy.ps1 步骤 3/4/5 的分发链移植）。
+     * 语义（严格）：① 三件套（guard 脚本 + RAMBoostBootGuard/RAMBoostLogonDisarm
+     * 两计划任务）全部就绪才写 FilterArmed=1——绝不"武装了没看门"；
+     * ② 任一失败不 return 1、不中止安装（分发机可能被 360 等拦 schtasks，
+     * 硬拒 = 装不上），打 Fail 后继续，回滚网降级为
+     * 签名预检 + offline_rollback.cmd 两层。 */
+    if (InstallGuardScripts() &&
+        RegisterGuardTask(L"RAMBoostBootGuard",   L"ONSTART",
+                          L"C:\\ProgramData\\RAMBoost\\boot_guard.ps1") &&
+        RegisterGuardTask(L"RAMBoostLogonDisarm", L"ONLOGON",
+                          L"C:\\ProgramData\\RAMBoost\\logon_disarm.ps1")) {
+        HKEY h;
+        DWORD seq = 0, cbSeq = sizeof(seq), type = 0, zero = 0, one = 1;
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, PARM_KEY, 0, NULL, 0,
+                            KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
+                            NULL, &h, NULL) == ERROR_SUCCESS) {
+            /* 武装基线（deploy.ps1 第 3 步同款）：DeploySeq=旧值+1（不存在按 0）、
+             * BootFailCount=0、LastBootHealthy=0、FilterArmed=1。 */
+            if (RegQueryValueExW(h, L"DeploySeq", NULL, &type, (LPBYTE)&seq, &cbSeq)
+                    != ERROR_SUCCESS || type != REG_DWORD) {
+                seq = 0;
+            }
+            seq += 1;
+            RegSetValueExW(h, L"DeploySeq",      0, REG_DWORD, (const BYTE *)&seq,  sizeof(seq));
+            RegSetValueExW(h, L"BootFailCount",  0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
+            RegSetValueExW(h, L"LastBootHealthy", 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
+            RegSetValueExW(h, L"FilterArmed",    0, REG_DWORD, (const BYTE *)&one,  sizeof(one));
+            RegCloseKey(h);
+            {
+                WCHAR b[128];
+                wsprintfW(b, L"boot guard armed: DeploySeq=%lu BootFailCount=0 LastBootHealthy=0 FilterArmed=1", seq);
+                Ok(b);
+            }
+        } else {
+            /* 基线写不进去（Parameters 刚被 SetDefaults 建过，理论上几乎不可能）
+             * ——FilterArmed 未置 1 = 未武装，方向安全：看门任务空转即退出。 */
+            Fail(L"write armed baseline (Parameters key) - FilterArmed NOT set");
+        }
+        StampSignerState();
+    } else {
+        Fail(L"boot guard not armed (guard scripts/schtasks unavailable) - install continues; rollback net = signature gate + offline_rollback.cmd");
+    }
 
     wprintf(L"\n>>> DONE. Reboot ONCE to bring the filter into every volume stack\n");
     wprintf(L">>> (first mount needs one reboot; after that attach/detach is hot,\n");

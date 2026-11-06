@@ -17,7 +17,9 @@
         <!-- 原型 .statusbar{align-items:center}：24px 药丸在 40px 条内垂直居中 -->
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
             <Border x:Name="SegDriver" CornerRadius="{StaticResource RbcRadiusMd}" Padding="12,0" MinHeight="30" Margin="0,0,12,0"
-                    Background="Transparent" Cursor="Hand"
+                    Background="Transparent" Cursor="Hand" Focusable="True"
+                    AutomationProperties.Name="驱动连接状态，Enter 打开诊断"
+                    FocusVisualStyle="{StaticResource RbcFocusRingStyle}"
                     MouseLeftButtonUp="SegDriver_Click">
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Ellipse Width="8" Height="8" Margin="0,0,8,0" x:Name="DotDriver"/>
@@ -27,7 +29,9 @@
             </Border>
 
             <Border x:Name="SegStack" CornerRadius="{StaticResource RbcRadiusMd}" Padding="12,0" MinHeight="30" Margin="0,0,12,0"
-                    Background="Transparent" Cursor="Hand"
+                    Background="Transparent" Cursor="Hand" Focusable="True"
+                    AutomationProperties.Name="挂栈卷状态，Enter 打开加速"
+                    FocusVisualStyle="{StaticResource RbcFocusRingStyle}"
                     MouseLeftButtonUp="SegStack_Click">
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Ellipse Width="8" Height="8" Margin="0,0,8,0" x:Name="DotStack"/>
@@ -37,7 +41,9 @@
             </Border>
 
             <Border x:Name="SegAccel" CornerRadius="{StaticResource RbcRadiusMd}" Padding="12,0" MinHeight="30" Margin="0,0,12,0"
-                    Background="Transparent" Cursor="Hand"
+                    Background="Transparent" Cursor="Hand" Focusable="True"
+                    AutomationProperties.Name="加速启用状态，Enter 打开状态"
+                    FocusVisualStyle="{StaticResource RbcFocusRingStyle}"
                     MouseLeftButtonUp="SegAccel_Click">
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Ellipse Width="8" Height="8" Margin="0,0,8,0" x:Name="DotAccel"/>
@@ -47,7 +53,9 @@
             </Border>
 
             <Border x:Name="SegRisk" CornerRadius="{StaticResource RbcRadiusMd}" Padding="12,0" MinHeight="30"
-                    Background="Transparent" Cursor="Hand"
+                    Background="Transparent" Cursor="Hand" Focusable="True"
+                    AutomationProperties.Name="风险状态，Enter 打开应急"
+                    FocusVisualStyle="{StaticResource RbcFocusRingStyle}"
                     MouseLeftButtonUp="SegRisk_Click">
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Ellipse Width="8" Height="8" Margin="0,0,8,0" x:Name="DotRisk"/>

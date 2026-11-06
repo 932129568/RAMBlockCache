@@ -7,34 +7,25 @@ using RAMBlockCache.Controller.Models;
 
 namespace RAMBlockCache.Controller.Services;
 
-/// <summary>
-/// 每卷统计采样快照（StatsService 秒级采样后经 Sampled 事件分发）。
-/// 字段与 DriverService.QueryStats 返回的 StatusOutput 对应。
-/// </summary>
+public enum StatsScope { EngineGlobal, VolumeState }
+
+/// <summary>应用层快照：引擎指标与卷状态分离；卷状态没有伪逐卷指标。</summary>
 public sealed class StatsSnapshot
 {
-    /// <summary>卷设备键（盘符编码，见 SystemService.DeviceKeyFromVolumeGuid）。</summary>
+    public StatsScope Scope { get; init; }
+    public bool HasMetrics { get; init; }
     public ulong DeviceKey { get; init; }
-    /// <summary>读吞吐 MB/s（按 BytesFromDisk 差值计算）。</summary>
+    public StatusOutput EngineStats { get; init; }
     public double ReadMbps, WriteMbps, HitPct;
-    /// <summary>已用 / 总缓存字节。</summary>
     public ulong CacheBytesUsed, CacheBytesTotal;
-    /// <summary>[BUG3] 本次开机累计：缓存读取字节（ReadHitBytes）/ 回写落盘字节（WbBytes）。
-    /// 二者让"缓存在工作"可见——旧 UI 只有瞬时速率，冷缓存首屏全为 0，用户误判无加速。</summary>
     public ulong BytesFromCache, WbBytes;
-    /// <summary>驱动侧上报的挂载/暂停态。</summary>
     public bool Mounted, Paused;
-    /// <summary>写模式（0=WriteThrough 1=WriteBack）。</summary>
     public uint Mode;
 }
 
-/// <summary>
-/// 1 秒周期轮询驱动统计并向订阅者分发快照。
-/// Start 传入设备键集合；Stop/Dispose 取消轮询。
-/// </summary>
+/// <summary>每轮一次全局统计和一次卷列表，再分发一个全局样本与 N 个卷状态样本。</summary>
 public sealed class StatsService : IDisposable
 {
-    /// <summary>进程内单例。</summary>
     public static StatsService Instance { get; } = new();
     private StatsService() { }
 
@@ -43,57 +34,40 @@ public sealed class StatsService : IDisposable
     private Task? _loop;
     private CancellationTokenSource? _cts;
     private readonly object _gate = new();
-    /* [FIX S7-01] 速率基线改单调 TickCount64：原用 DateTime.UtcNow——NTP 回拨/
-     * 休眠跨钟点后 now>prev.at 为假 → 读写吞吐静默显示 0 且无降级提示
-     * （违反 RD.5"禁把过期值当正常数据"）。TickCount64 单调、免时钟跳变，
-     * 与 FeedSeries 的口径统一。 */
-    private readonly Dictionary<ulong, (ulong hits, ulong disk, ulong wb, long at)> _last = new();
+    private (ulong disk, ulong wb, long at) _last;
     private ulong[] _keys = Array.Empty<ulong>();
 
-    /// <summary>每次成功采样后触发（DriveItemViewModel.OnSample 订阅）。</summary>
+    // 内部测试接缝；生产默认仍走真实 DriverService，不改变公开驱动协议。
+    internal Func<StatusOutput>? EngineStatsProvider { get; set; }
+    internal Func<object>? VolumeListProvider { get; set; }
+
+    /// <summary>兼容托盘/主窗口：每轮只触发一次，且只携带全局指标。</summary>
     public event Action<StatsSnapshot>? Sampled;
-    /// <summary>设备键在驱动侧消失（Win32Error=2）时触发。</summary>
+    public event Action<StatsSnapshot>? GlobalSampled;
+    public event Action<StatsSnapshot>? VolumeSampled;
     public event Action<ulong>? DriverReportedUnmounted;
-    /// <summary>[B7] 连续多轮全部卷采样失败后触发一次（轮询死亡可观测；参数=最后失败原因）。</summary>
     public event Action<string>? StatsDegraded;
-    /// <summary>[B7] 降级后首次出现成功采样时触发一次（恢复通知）。</summary>
     public event Action? StatsRecovered;
 
-    /// <summary>[B7] 连续全失败轮数达到该值即判定"轮询死亡"，向 UI 发降级事件。
-    /// 采样周期 1s × 3 轮 ≈ 3s，满足架构文档 B7"注入失败 10s 内 UI 可见降级"。</summary>
     private const int DegradeAfterFailRounds = 3;
     private int _failStreak;
     private bool _degraded;
 
-    /// <summary>[FIX R6-UI1] 增量更新轮询键集合（热插拔）：RefreshDrives 发现新卷时调用。
-    /// 原 _keys 一次性物化后永不更新——握手后插入的新卷其 DeviceKey 不在集合中，
-    /// OnSample 的 key 过滤永远不命中 → 该卷统计恒"—"；拔除的卷留在集合中每秒
-    /// 失败（Win32Error=2）→ DriverReportedUnmounted 刷 WARN。持 _gate 与轮询循环互斥。</summary>
     public void SetKeys(IEnumerable<ulong> deviceKeys)
     {
-        lock (_gate)
-        {
-            _keys = deviceKeys.Distinct().ToArray();
-        }
+        lock (_gate) _keys = deviceKeys.Distinct().ToArray();
     }
 
-    /// <summary>[FIX S7-02] 遗忘指定卷的速率基线（热插拔移除时调用）：
-    /// 原 _last 字典只增不减——反复插拔的卷基线无限累积（长跑内存缓慢增长）。</summary>
     public void ForgetKey(ulong deviceKey)
     {
-        lock (_gate) { _last.Remove(deviceKey); }
+        // 全局引擎基线不因单卷插拔而清零；保留该方法以兼容既有调用方。
     }
 
-    /// <summary>启动轮询（重复调用先停后开，幂等）。</summary>
     public void Start(IEnumerable<ulong> deviceKeys)
     {
         lock (_gate)
         {
             StopCore();
-            // [P1-13] 立即物化为数组：调用方传入的常为 Drives.Select(...) 这类
-            // 延迟查询；旧代码每秒 foreach 该 IEnumerable，与 UI 线程 Drives.Add
-            // 并发 → InvalidOperationException 冒泡出 foreach → 任务 Faulted 无人
-            // 观察 → PeriodicTimer 空转，统计静默停更。物化后集合不可变，根治。
             _keys = deviceKeys.Distinct().ToArray();
             _cts = new CancellationTokenSource();
             _timer = new PeriodicTimer(_period);
@@ -101,53 +75,42 @@ public sealed class StatsService : IDisposable
         }
     }
 
+    private StatusOutput QueryEngineStats()
+        => EngineStatsProvider?.Invoke() ?? DriverService.Instance.QueryEngineStats();
+
+    private RbVolumeList QueryVolumes()
+    {
+        if (VolumeListProvider is null) return DriverService.Instance.QueryVolumes();
+        object value = VolumeListProvider();
+        if (value is RbVolumeList list) return list;
+        throw new InvalidOperationException("卷列表测试接缝必须返回 RbVolumeList");
+    }
+
     private async Task LoopAsync(PeriodicTimer timer, CancellationToken ct)
     {
         while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
         {
-            // [P1-13] 整轮 try/catch：订阅者异常、IL/意外错误只记日志，
-            // 绝不让 Faulted 任务默默杀死轮询（旧代码仅 BuildSnapshot 有 try，
-            // Sampled 分发裸调，一个订阅者抛异常即全线停摆）。
             int ok = 0;
             string? failReason = null;
-            try
+            try { PollOnce(); ok = 1; }
+            catch (DriverException ex) when (ex.Win32Error == 2)
             {
-                foreach (var key in _keys)
-                {
-                    StatsSnapshot? snap = null;
-                    try { snap = BuildSnapshot(key); }
-                    catch (DriverException ex) when (ex.Win32Error == 2)
-                    {
-                        DriverReportedUnmounted?.Invoke(key);
-                        failReason ??= $"卷 0x{key:X} 已从驱动侧消失";
-                    }
-                    catch (Exception ex)
-                    {
-                        LogService.Warn($"统计采样失败（卷 0x{key:X}）：{ex.Message}");
-                        failReason ??= ex.Message;
-                    }
-                    if (snap == null) continue;
-                    ok++;
-                    try { Sampled?.Invoke(snap); }
-                    catch (Exception ex) { LogService.Warn($"统计事件分发失败：{ex.Message}"); }
-                }
+                foreach (var key in _keys) DriverReportedUnmounted?.Invoke(key);
+                failReason = ex.Message;
             }
             catch (Exception ex)
             {
                 LogService.Warn($"统计轮询本轮异常（已继续）：{ex.Message}");
-                failReason ??= ex.Message;
+                failReason = ex.Message;
             }
 
-            // [B7] 轮询死亡可观测：仅当"有卷在采且整轮零成功"才计失败轮（部分成功
-            // 不算死亡，避免单卷噪声误报全局降级）；连续 DegradeAfterFailRounds 轮
-            // 边沿触发一次 StatsDegraded，恢复后再次死亡可重新触发（不刷屏）。
             if (_keys.Length > 0 && ok == 0)
             {
                 _failStreak++;
                 if (!_degraded && _failStreak >= DegradeAfterFailRounds)
                 {
                     _degraded = true;
-                    LogService.Warn($"统计连续 {_failStreak} 轮不可用（最后原因：{failReason ?? "未知"}）");
+                    LogService.Warn($"统计连续 {_failStreak} 轮不可用（最后原因：{failReason ?? "未知原因"}）");
                     try { StatsDegraded?.Invoke(failReason ?? "未知原因"); }
                     catch (Exception ex) { LogService.Warn($"统计降级事件处理失败：{ex.Message}"); }
                 }
@@ -166,50 +129,87 @@ public sealed class StatsService : IDisposable
         }
     }
 
-    private StatsSnapshot BuildSnapshot(ulong key)
+    private StatsSnapshot BuildGlobalSnapshot(StatusOutput s)
     {
-        var s = DriverService.Instance.QueryStats(key);
         var now = Environment.TickCount64;
-        double rMbps = 0, wMbps = 0;
+        double readMbps = 0, writeMbps = 0;
         lock (_gate)
         {
-            if (_last.TryGetValue(key, out var prev) && now > prev.at)
+            if (_last.at > 0 && now > _last.at)
             {
-                var dt = (now - prev.at) / 1000.0;
-                ulong dDisk = s.BytesFromDisk >= prev.disk ? s.BytesFromDisk - prev.disk : 0;
-                rMbps = Math.Max(0, dDisk / dt / 1048576.0);
-                /* [BUG3] 回写吞吐：脏块后台落盘速率（WbBytes 差值）——回写模式下
-                 * 这是"写吸收→异步落盘"链路工作的直接证据（旧恒 0 不可见） */
-                ulong dWb = s.WbBytes >= prev.wb ? s.WbBytes - prev.wb : 0;
-                wMbps = Math.Max(0, dWb / dt / 1048576.0);
+                double dt = (now - _last.at) / 1000.0;
+                ulong disk = s.BytesFromDisk >= _last.disk ? s.BytesFromDisk - _last.disk : 0;
+                ulong wb = s.WbBytes >= _last.wb ? s.WbBytes - _last.wb : 0;
+                readMbps = Math.Max(0, disk / dt / 1048576.0);
+                writeMbps = Math.Max(0, wb / dt / 1048576.0);
             }
-            _last[key] = (s.ReadHits, s.BytesFromDisk, s.WbBytes, now);
+            _last = (s.BytesFromDisk, s.WbBytes, now);
         }
-        ulong totalReads = s.ReadHits + s.ReadMisses;
+        ulong totalBytes = s.BytesFromCache + s.BytesFromDisk;
         return new StatsSnapshot
         {
-            DeviceKey = key,
-            ReadMbps = rMbps, WriteMbps = wMbps,
-            HitPct = totalReads == 0 ? 0 : s.ReadHits * 100.0 / totalReads,
-            CacheBytesUsed = s.CacheBytesUsed, CacheBytesTotal = s.CacheBytesTotal,
-            BytesFromCache = s.BytesFromCache, WbBytes = s.WbBytes,
-            Mounted = s.Mounted != 0, Paused = s.Paused != 0, Mode = s.Mode
+            Scope = StatsScope.EngineGlobal,
+            HasMetrics = true,
+            DeviceKey = 0,
+            EngineStats = s,
+            ReadMbps = readMbps,
+            WriteMbps = writeMbps,
+            HitPct = totalBytes == 0 ? 0 : s.BytesFromCache * 100.0 / totalBytes,
+            CacheBytesUsed = s.CacheBytesUsed,
+            CacheBytesTotal = s.CacheBytesTotal,
+            BytesFromCache = s.BytesFromCache,
+            WbBytes = s.WbBytes
         };
     }
 
-    /// <summary>停止轮询（同步等待最多 500ms）。</summary>
+    /// <summary>单轮真实入口；测试可通过内部提供器验证查询次数，无需 IOCTL。</summary>
+    internal void PollOnce()
+    {
+        StatusOutput engine = QueryEngineStats();
+        RbVolumeList volumes = QueryVolumes();
+        engine.Volumes = volumes;
+        StatsSnapshot global = BuildGlobalSnapshot(engine);
+        InvokeSafely(GlobalSampled, global, "全局统计");
+        InvokeSafely(Sampled, global, "兼容统计");
+
+        foreach (ulong key in _keys)
+        {
+            StatusOutput state = DriverService.Instance.QueryVolumeState(key, volumes);
+            var snapshot = new StatsSnapshot
+            {
+                Scope = StatsScope.VolumeState,
+                HasMetrics = false,
+                DeviceKey = key,
+                Mounted = state.Mounted != 0,
+                Paused = state.Paused != 0,
+                Mode = state.Mode
+            };
+            InvokeSafely(VolumeSampled, snapshot, $"卷 0x{key:X}");
+        }
+    }
+
+    private static void InvokeSafely(Action<StatsSnapshot>? handlers, StatsSnapshot snapshot, string name)
+    {
+        try { handlers?.Invoke(snapshot); }
+        catch (Exception ex) { LogService.Warn($"{name}事件分发失败：{ex.Message}"); }
+    }
+
     public void Stop() { lock (_gate) StopCore(); }
+
     private void StopCore()
     {
         _cts?.Cancel();
-        _timer?.Dispose(); _timer = null;
-        // [FIX U-07] 停止等待失败可见（行为不变：仍继续停止流程）
-        try { _loop?.Wait(500); } catch (Exception ex) { LogService.Warn($"轮询线程停止等待异常（继续停止流程）：{ex.Message}"); }
-        _loop = null; _cts?.Dispose(); _cts = null;
-        _last.Clear();
-        // [B7] 重置 watchdog 状态：Stop 后再 Start 不应沿用旧的降级标记
+        _timer?.Dispose();
+        _timer = null;
+        try { _loop?.Wait(500); }
+        catch (Exception ex) { LogService.Warn($"轮询线程停止等待异常（继续停止流程）：{ex.Message}"); }
+        _loop = null;
+        _cts?.Dispose();
+        _cts = null;
+        _last = default;
         _failStreak = 0;
         _degraded = false;
     }
+
     public void Dispose() => Stop();
 }

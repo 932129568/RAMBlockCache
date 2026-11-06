@@ -19,6 +19,24 @@
 /* RbRegSetDW 定义于 rbdriver.c（非 static）；panic-clear 需持久化清计数。 */
 extern VOID RbRegSetDW(PCWSTR name, ULONG v);
 
+/* [U1 2026-11-06] 从累计 log2 桶计数求分位数（下界近似）。
+ * 桶 b 覆盖 [2^b, 2^(b+1)) us；分位落在桶 b → 报 2^b（log 近似下界）。
+ * pct100 = 百分比×100（P50=5000 / P95=9500 / P99=9900）；
+ * total==0 → 0（尚无样本，与 EWMA 字段同语义）。计数求和用 64 位防溢出。 */
+static ULONG RbLatPercentile(const volatile LONG hist[32], ULONG pct100)
+{
+    UINT64 total = 0, cum = 0, target;
+    ULONG b;
+    for (b = 0; b < 32; b++) total += (UINT64)(ULONG)hist[b];
+    if (total == 0) return 0;
+    target = (total * pct100 + 9999) / 10000;   /* ceil(total*pct) */
+    for (b = 0; b < 32; b++) {
+        cum += (UINT64)(ULONG)hist[b];
+        if (cum >= target) return (ULONG)(1ull << b);
+    }
+    return (ULONG)(1ull << 31);                 /* 不可达防御 */
+}
+
 /* rb_stats(core) -> RB_STATS（冻结协议） */
 static void RbFillStats(RB_STATS *out)
 {
@@ -32,6 +50,14 @@ static void RbFillStats(RB_STATS *out)
     /* [V10.6/B-12] 读延迟 EWMA（微秒）：与引擎无关（驱动侧测量），同样前置 */
     out->CacheReadLatencyUs = (uint32_t)g_Rb.ReadLatEwmaUs[0];
     out->DiskReadLatencyUs  = (uint32_t)g_Rb.ReadLatEwmaUs[1];
+    /* [U1 2026-11-06] 读延迟分位数（log2 桶近似下界；0=尚无样本）：
+     * 同为驱动侧测量，与引擎无关，前置。 */
+    out->CacheReadLatP50Us = RbLatPercentile(g_Rb.ReadLatHist[0], 5000);
+    out->CacheReadLatP95Us = RbLatPercentile(g_Rb.ReadLatHist[0], 9500);
+    out->CacheReadLatP99Us = RbLatPercentile(g_Rb.ReadLatHist[0], 9900);
+    out->DiskReadLatP50Us  = RbLatPercentile(g_Rb.ReadLatHist[1], 5000);
+    out->DiskReadLatP95Us  = RbLatPercentile(g_Rb.ReadLatHist[1], 9500);
+    out->DiskReadLatP99Us  = RbLatPercentile(g_Rb.ReadLatHist[1], 9900);
     if (!g_Rb.Engine) return;
     rb_engine_get_stripe_stats(g_Rb.Engine, out->StripeRead, out->StripeWrite, RB_STRIPES);
 
@@ -53,8 +79,16 @@ static void RbFillStats(RB_STATS *out)
     out->ChunkCount      = st.chunk_count;
     out->InstanceCount   = (uint32_t)g_Rb.DevCount;
     out->CacheSizeMB     = g_Rb.Config.CacheSizeMB;
-    out->EffectiveCacheMB= g_Rb.Config.CacheSizeMB ? g_Rb.Config.CacheSizeMB
-                                                   : g_Rb.DynamicLimitMB;
+    /* [FIX CACHE-LIMIT 2026-11-05] 生效上限的优先级修正：
+     * 原逻辑 `CacheSizeMB ? CacheSizeMB : DynamicLimitMB` 只认"0=动态"，
+     * 但设置页的自动模式是 AutoMemory=1（CacheSizeMB 仍留着上次的 4096）——
+     * 于是 UI 开"自动内存预算"后，生效上限仍显示死值 4096MB，
+     * 占用环百分比按 4GB 分母算，与实际动态预算完全脱节。
+     * 正确语义：AutoMemory=1 → 以动态预算为准（预算未算出时回退配置值）；
+     *           AutoMemory=0 → 以配置值 CacheSizeMB 为准。 */
+    out->EffectiveCacheMB = g_Rb.Config.AutoMemory
+                          ? (g_Rb.DynamicLimitMB ? g_Rb.DynamicLimitMB : g_Rb.Config.CacheSizeMB)
+                          : g_Rb.Config.CacheSizeMB;
     out->WriteBackMode   = g_Rb.Config.WriteBack;
     out->Enabled         = g_Rb.Config.Enabled;
     out->SafeMode        = (g_Rb.SafeMode ? 1u : 0u);          /* FIX[P2-2] */
@@ -78,9 +112,13 @@ VOID RbClampConfig(RB_CONFIG *c)
 {
     if (c->DirtyHighPct < 10 || c->DirtyHighPct > 99) c->DirtyHighPct = 60;
     /* [FIX R6-05a] DirtyLowPct 补下界并与 High 联动：原 Low=0 合法下发 →
-     * High=10 & Low=0 时水位策略退化（10%/0%）。 */
-    if (c->DirtyLowPct < 5) c->DirtyLowPct = 5;
+     * High=10 & Low=0 时水位策略退化（10%/0%）。
+     * [FIX D4 2026-11-03] 联动收敛序：原顺序（抬下界→Low>High 减 10）在
+     * High∈[10,14] 时产出 Low∈[0,4]——击穿自身 5% 下界且经 GET_CONFIG 回读
+     * 粘滞。改为：先压 High 下限到 ≥15（保证 High-10≥5），再联动。 */
+    if (c->DirtyHighPct < 15) c->DirtyHighPct = 15;
     if (c->DirtyLowPct > c->DirtyHighPct) c->DirtyLowPct = c->DirtyHighPct - 10;
+    if (c->DirtyLowPct < 5) c->DirtyLowPct = 5;
     if (c->AutoUsePct < 10 || c->AutoUsePct > 95) c->AutoUsePct = 80;
     if (c->MemReserveMB > 65536) c->MemReserveMB = 4096;
     /* [BUG2] FlushIntervalMs=0 = "无限"（关闭周期回写；显式 FLUSH/卸载/关机仍落盘）。
@@ -98,8 +136,28 @@ VOID RbClampConfig(RB_CONFIG *c)
      * （如 0xFFFFFFFF → 约 4TB 窗口）可致预读策略退化/IO 放大。 */
     if (c->ReadaheadWindowKB > 1024 * 1024) c->ReadaheadWindowKB = 1024 * 1024;   /* ≤1GB 窗口 */
     if (c->IdleReclaimSec > 86400) c->IdleReclaimSec = 86400;                    /* ≤24h */
-    if (c->ParallelFlush > 64) c->ParallelFlush = 64;
-    /* BlockSize 由 core 在 create 时校验（非法回落 4096） */
+    /* [PF-16 2026-11-06] ParallelFlush = 运行期 zone 回写路数，合法 1..16。
+     * 1=串行；2/4/8/16=分片并行。0 归一为 1（旧默认语义），>16 钳到上限。
+     * 旧代码 >64→64 只防脏值：配 8/16/64 都仍走编译期固定 4 路。 */
+    if (c->ParallelFlush == 0) c->ParallelFlush = 1;
+    if (c->ParallelFlush > RB_FLUSH_WORKERS) c->ParallelFlush = RB_FLUSH_WORKERS;
+    /* [FIX F6→DECOUPLE 2026-11-02] BlockSize 解钳位：白名单 {4K,8K,16K,32K,64K,128K}
+     * 与 core rb_engine_create 的 legal[] 完全同款（几何全派生：chunk=block*16、
+     * sub_shift、chunk_mask——cache.c 无 4096 硬依赖；掩码 uint16 恰 16 子块）。
+     * F6 实证损坏的真正根因是【引擎存活期热改】（DEVEXT 几何与运行引擎脱节），
+     * 该面仍由 RbApplyConfig 的"推迟到引擎重建"纪律（下方 :137）拒绝——本钳位
+     * 只挡【创建期】非法值。L2 记录粒度门（rbl2.c 自检 block*16==64KB）对非
+     * 4096 自动保持 OFF（自守，无需在此联动）。
+     * [F1 2026-11-06] 65536/131072 自白名单摘除：11-03 64K 系统级事故未归因
+     * （U-4/U-8，见 59-64k-audit §5 前置清单），128K 同族且滞留更甚；归因+
+     * Verifier+WinDbg 复现通过后按审计 §5 恢复。 */
+    {
+        static const ULONG rb_legal_bs[] = {4096, 8192, 16384, 32768};
+        int rb_ok = 0, rb_z;
+        for (rb_z = 0; rb_z < (int)(sizeof(rb_legal_bs) / sizeof(rb_legal_bs[0])); rb_z++)
+            if (c->BlockSize == rb_legal_bs[rb_z]) { rb_ok = 1; break; }
+        if (!rb_ok) c->BlockSize = 4096;
+    }
 }
 
 /* 把 RB_CONFIG 应用到引擎（不落盘）—— DriverEntry 与 SET_CONFIG 共用 */
@@ -119,12 +177,51 @@ VOID RbApplyEngineConfig(const RB_CONFIG *cfg)
     rb_engine_set_write_release(g_Rb.Engine, cfg->WriteRelease ? 1 : 0);
 }
 
+/* [FIX DATA-13 2026-11-04] 丢弃全部缓存视图（只丢干净块；调用前必须已刷脏）。
+ *
+ * 为什么必须丢：透传期（Enabled=0 / 卷热停用 / panic 透传）里所有写都直落盘，
+ * 磁盘内容可能被任意改写，而缓存里的**干净块**仍是旧内容。一旦恢复加速，
+ * 这些陈旧干净块会被读命中直接返回——应用读到旧 DLL/旧配置 → 打不开、
+ * 0xC0000142、入口点丢失（实测症状，重装应用即恢复）。这是与"脏块以旧盖新"
+ * 并列的第二条陈旧数据通道，必须对称封死：离开加速态时刷脏+丢视图，
+ * 回来时缓存从零重建（冷启动一轮，正确性优先）。 */
+static void RbDiscardAllCachedData(void)
+{
+    rb_stream *snap[RB_FLUSH_SNAP_MAX];
+    int n2, k;
+    if (!g_Rb.Engine) return;
+    n2 = rb_engine_snapshot_streams(g_Rb.Engine, snap, RB_FLUSH_SNAP_MAX, 0);
+    for (k = 0; k < n2; k++) {
+        rb_stream_discard_all(snap[k]);
+        rb_stream_release_io(snap[k]);
+    }
+}
+
 static void RbApplyConfig(const RB_CONFIG *cfg)
 {
     RB_CONFIG c = *cfg;
     RB_CONFIG saved;
     RbClampConfig(&c);                 /* M10: 逐字段 clamp，防异常值导致内存/策略失控 */
     saved = c;                         /* [S-建议] 含新 BlockSize：持久化之 */
+    /* [FIX DATA-11 2026-11-04] 吸收面收窄前必须先同步刷脏（三条纪律同一根因：
+     * 缓存里既有的脏块仍会被周期 flusher 落盘，而新的同 LBA 写已直写盘 =
+     * 旧盖新，应用文件被写坏；实测症状：DLL 入口点丢失 / 0xC0000142，
+     * 重装应用即恢复）。触发面：
+     *   ① Enabled 1→0（关总开关，此后全部透传直写）
+     *   ② WriteBack 1→0（回写→直写，此后写直接落盘）
+     * 与 detach(S7-03)/Admit/panic 的 flush-first 范式同款。 */
+    if (g_Rb.Engine &&
+        ((g_Rb.Config.Enabled && !c.Enabled) ||
+         (g_Rb.Config.WriteBack && !c.WriteBack))) {
+        rb_engine_flush(g_Rb.Engine, 1);
+        /* [FIX DATA-13] 刷脏之后必须丢缓存视图：透传期磁盘可被任意改写，
+         * 留下的干净块全是潜在陈旧数据（恢复加速后读命中即返回旧内容）。 */
+        RbDiscardAllCachedData();
+        RbLog(0, __LINE__, 0,
+              (g_Rb.Config.Enabled && !c.Enabled)
+                  ? L"cfg: Enabled 1->0, dirty flushed + cache view dropped before passthrough"
+                  : L"cfg: WriteBack 1->0, dirty flushed + cache view dropped before write-through");
+    }
     /* [FIX W12] 引擎存活期禁止改 BlockSize：引擎几何在 create 时冻结，
      * 运行期改它会与运行引擎分片/L2 块粒度门（block*16==64KB）脱节。
      * [S-建议] 运行时保持旧值，但新值照常持久化——引擎销毁重建后真正生效
@@ -179,11 +276,22 @@ static ULONG RbCtlMinBuffer(const RB_MSG *msg)
  * STATUS_SUCCESS，仅失败分支改写）；pinfo=Information 出参（仅写本消息回包长度）。
  * 旧版 switch 中对应 case 体的每条语句原样搬运于此（s→*pst、info→*pinfo）。 */
 
-static VOID RbMsgGetStats(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+static VOID RbMsgGetStats(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo, ULONG outLen)
 {
+    RB_STATS local;
+    ULONG avail;
     UNREFERENCED_PARAMETER(pst);
-    RbFillStats(&msg->Data.Stats);
-    *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_STATS);
+    RbFillStats(&local);
+    /* [U1/兼容 2026-11-06] 容量钳位回拷：老客户端（旧 RB_STATS 尺寸）遇新驱动
+     * 不得溢写 SystemBuffer——先填局部结构，再按调用方容量截断拷贝；回包长度=
+     * 实际拷贝字节数。原实现直接 fill 调用方缓冲（尺寸不符即池溢写——结构性
+     * 隐患，正是历史崩溃类别），本批修复；未来任何协议结构追加都必须沿用本
+     * local+min 模式。信息长度截断（出口 info>outLen 钳位）保持不变。 */
+    avail = (outLen > (ULONG)offsetof(RB_MSG, Data))
+          ? (outLen - (ULONG)offsetof(RB_MSG, Data)) : 0;
+    if (avail > sizeof(RB_STATS)) avail = (ULONG)sizeof(RB_STATS);
+    RtlCopyMemory(&msg->Data.Stats, &local, avail);
+    *pinfo = (ULONG)offsetof(RB_MSG, Data) + avail;
 }
 
 static VOID RbMsgGetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
@@ -294,6 +402,18 @@ static VOID RbMsgSetVolume(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
         ext->ReadEnabled  = msg->Data.VolumeSet.ReadEnabled;
         ext->WriteEnabled = msg->Data.VolumeSet.WriteEnabled;
         ext->WriteMode    = (LONG)wm;
+        /* [FIX DATA-3 2026-11-01] 切到 write-through 时立即把存量脏数据落盘。
+         * 用户把卷改回直写，语义预期是"从这一刻起数据都在盘上"；若不 flush，
+         * 切换前吸收的脏数据仍只在内存，直到下个周期回写（默认 30s 级）才落盘，
+         * 期间掉电/蓝屏即丢——与用户刚做出的"更安全"选择直接矛盾。
+         * 控制面恒 PASSIVE，可安全做盘 I/O；失败由 core 记账，下一次周期回写重试。
+         * [FIX DATA-13 2026-11-04] 写完直写之后还要丢缓存视图：直写期磁盘可被
+         * 任意改写，残留干净块=陈旧数据（读命中返回旧内容 → 应用读到自己更新前
+         * 的文件 → 打不开）。数据已落盘，丢视图零风险。 */
+        if (wm == RB_WRITEMODE_THROUGH && ext->Stream) {
+            rb_stream_flush(ext->Stream, 1);
+            rb_stream_discard_all(ext->Stream);
+        }
         RbDerefExt(ext);
     } else *pst = STATUS_NOT_FOUND;
 }
@@ -328,6 +448,14 @@ static VOID RbMsgAttachVolume(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
                 if (wm != RB_WRITEMODE_GLOBAL) ext->WriteMode = (LONG)wm;
                 ext->ReadEnabled  = msg->Data.VolumeAttach.ReadEnabled;
                 ext->WriteEnabled = msg->Data.VolumeAttach.WriteEnabled;
+                /* [FIX DATA-13] 热开启时再丢一次缓存视图（幂等保险）：停用期
+                 * 磁盘可被任意改写，若因任何原因残留了旧干净块（例如软分离
+                 * 丢视图失败、或流来自更早的挂载周期），开启瞬间就会读到陈旧
+                 * 内容。空缓存时零开销。 */
+                if (ext->Stream) {
+                    if (rb_stream_dirty_bytes(ext->Stream)) rb_stream_flush(ext->Stream, 1);
+                    rb_stream_discard_all(ext->Stream);
+                }
                 RbDerefExt(ext);
             }
             /* [FIX R6-09] 二次查找失败必须可见：原实现静默跳过——attach 成功后
@@ -377,16 +505,18 @@ static VOID RbMsgGetEvents(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 
     maxSeq = g_Rb.EvSeq;                    /* 快照：>=此值的发布可能进行中，不取 */
     RtlZeroMemory(out, sizeof(*out));
-    for (i = 0; i < (LONG)RB_EVENT_MAX && n < q.MaxCount; i++) {
+    { uint64_t maxDelivered = cursor;       /* [FIX D3] 游标取"已交付最大 Seq" */
+      for (i = 0; i < (LONG)RB_EVENT_MAX && n < q.MaxCount; i++) {
         /* 环内第 i 条的 Seq 由发布方写入；只取 (cursor, maxSeq] 区间 */
         RB_EVENT_REC *e = &g_Rb.EvRing[i];
         uint64_t seq = (uint64_t)InterlockedCompareExchange64((volatile LONG64 *)&e->Seq, 0, 0);
         if (seq == 0 || seq <= cursor || seq > (uint64_t)maxSeq) continue;
         out->Items[n++] = *e;
-        out->Cursor = seq;                  /* 推进游标（单调不回退） */
+        if (seq > maxDelivered) maxDelivered = seq;
+      }
+      out->Cursor = maxDelivered;           /* 环回绕交付乱序（[64,1..63]）时取最大，保证单调不回退 */
     }
     out->Count = n;
-    if (n == 0) out->Cursor = cursor;       /* 无事件：游标原样回（调用方不重复取） */
     *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_EVENT_LIST);
 }
 
@@ -428,7 +558,36 @@ static VOID RbMsgInvalidateRange(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
         return;
     }
 
-    rb_stream_invalidate_range(ext->Stream, r->Offset, r->Length);
+    /* [FIX D2 2026-11-03] 范围钳到卷容量：桥接（无特权 POST）可下发
+     * Length=2^53——lock_stripes 条纹收集+失效扫描按块步进【全程】且持全部
+     * 64 条纹 WLOCK，天文范围=控制面线程永久滞留内核（IRP 无 cancel 例程，
+     * 桥接 3s CancelIoEx 无法回收）+全卷 IO 停摆。与 LINK-3 同款"用户输入
+     * 范围必钳卷容量"纪律。超出卷首=空操作；尾部截断到 DiskSize。 */
+    if ((rb_u64)r->Offset >= (rb_u64)ext->DiskSize) {
+        RbDerefExt(ext);
+        RbDerefExt(ext);
+        RbLog(1, __LINE__, 0, L"invalidate range beyond EOD: ignored");
+        *pst = STATUS_SUCCESS;
+        *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_INVALIDATE_RANGE);
+        return;
+    }
+    if ((rb_u64)r->Length > (rb_u64)ext->DiskSize - (rb_u64)r->Offset)
+        r->Length = (rb_u32)((rb_u64)ext->DiskSize - (rb_u64)r->Offset);
+
+    /* [FIX F9 2026-11-01] 回写卷的 invalidate 必须先同步刷脏：superseded=1 语义
+     * （盘面为最终语）只对直写成立——回写模式下范围内脏块可能是数据唯一副本，
+     * 直接丢弃 = 用户数据丢失（bench/冷热二遍读在回写卷上即触发；write-through
+     * 时脏块不存在，调用为无害空转）。force=1 串行 flush 在本 PASSIVE 上下文
+     * 同步执行，返回即全部脏块落盘；随后 invalidate 丢弃的只是干净块（盘上有
+     * 同内容），wb_drain 亦立即通过。
+     * [FIX DATA-2 R1] 门槛从全局 g_Rb.Config.WriteBack 改为无条件：每卷
+     * WriteMode=Back + 全局 WriteBack=0 的组合下 RbIsWriteBack 判该卷回写、
+     * 缓存有脏，原门槛不触发 flush → flushfile 直接丢脏且零记账。
+     * 无条件 flush 在无脏/直写态是无害空转（rb_engine_flush 内部快速跳过）。 */
+    if (g_Rb.Engine)
+        rb_engine_flush(g_Rb.Engine, 1);
+
+    RbInvalidateAfterFlush(ext->Stream, r->Offset, r->Length);
 
     RbDerefExt(ext);                              /* IO 引用 */
     RbDerefExt(ext);                              /* find 引用 */
@@ -457,6 +616,192 @@ static VOID RbMsgGetVersion(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_VERSION);
 }
 
+/* ---- [OPT-EXCL 2026-11-01] LBA 排除集（临时文件/软件缓存不占缓存内存） ----
+ * 输入：RB_EXCL_REQ（见 ctl/rb_excl.h），Size = 32 + Count*16（METHOD_BUFFERED）。
+ * 语义：core 侧先发布新集合（后续写立即直写），再 force flush 本流，最后失效
+ * 区间内已缓存块——已 ack 的脏数据必须先落盘，绝不允许"改成不缓存"变丢数。
+ * 该路径会做盘 I/O，必须 PASSIVE；控制面请求本就来自用户态 DeviceIoControl。
+ * 引用：RbFindExtByLetter 返回带引用，所有出口都要 RbDerefExt。 */
+typedef char RbExclLayoutCheck[(sizeof(RB_EXCL_ENT)==16 && sizeof(rb_extent)==16
+                                && RB_EXCL_HDR_SIZE==32
+                                && offsetof(RB_EXCL_REQ, Ents)==32) ? 1 : -1];   /* [FIX D1] offsetof 断言补齐（原只断言宏自等） */
+static NTSTATUS RbCtlSetExclude(PIRP irp, ULONG inLen)
+{
+    RB_EXCL_REQ *req = (RB_EXCL_REQ *)irp->AssociatedIrp.SystemBuffer;
+    PRB_DEV_EXT ext;
+    WCHAR letter;
+    int n;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_REQUEST;
+    if (!req || inLen < RB_EXCL_HDR_SIZE) return STATUS_BUFFER_TOO_SMALL;
+    if (req->Flags != 0 || req->Count > RB_EXCL_MAX) return STATUS_INVALID_PARAMETER;
+    /* 严格长度校验：既拒短包（防越界读调用方缓冲），也拒长包与实际不符 */
+    if (req->Count > (0xFFFFFFFFu - RB_EXCL_HDR_SIZE) / RB_EXCL_ENT_SIZE)
+        return STATUS_INVALID_PARAMETER;
+    if (inLen < RB_EXCL_REQ_SIZE(req->Count)) return STATUS_BUFFER_TOO_SMALL;
+    if (req->Letter < L'A' || req->Letter > L'Z') return STATUS_INVALID_PARAMETER;
+    letter = (WCHAR)req->Letter;
+
+    ext = RbFindExtByLetter(letter);          /* 带引用 */
+    if (!ext) return STATUS_NOT_FOUND;
+    if (!ext->IsAttached || !ext->Stream || InterlockedCompareExchange(&ext->Removed, 0, 0)) {
+        RbDerefExt(ext);
+        return STATUS_DEVICE_NOT_READY;
+    }
+    /* [FIX D2] 逐条钳到卷容量：Len 可为 2^62 级（回绕校验不拦），失效/合并
+     * 走 lock_stripes 全程扫描。超卷尾条目置 len=0（core 跳过空条目）。 */
+    { int ez; for (ez = 0; ez < (int)req->Count; ez++) {
+          if ((rb_u64)req->Ents[ez].Start >= (rb_u64)ext->DiskSize)
+              req->Ents[ez].Len = 0;
+          else if ((rb_u64)req->Ents[ez].Len > (rb_u64)ext->DiskSize - (rb_u64)req->Ents[ez].Start)
+              req->Ents[ez].Len = (rb_u64)ext->DiskSize - (rb_u64)req->Ents[ez].Start;
+      } }
+    n = rb_stream_set_exclude(ext->Stream, (const rb_extent *)(const void *)req->Ents,
+                              (int)req->Count);
+    RbDerefExt(ext);
+    if (n < 0) return STATUS_INVALID_PARAMETER;
+    return STATUS_SUCCESS;
+}
+
+/* [FIX DATA-14 2026-11-04] 卷级"簇重排/失效"操作前刷脏（回写模式第二道闸门）。
+ *
+ * 与 DATA-12（SET_INFORMATION：删除/改名/截断）同源：块层看不到文件，但
+ * 下列卷级操作会让磁盘内容绕过缓存被整体改写或重排——缓存里的陈旧脏块
+ * 若在其后落盘，会写坏新结构（实测症状：应用文件损坏、卷元数据错乱）。
+ *
+ * 覆盖：卷级 FSCTL（置零/稀疏/卸载/收缩/移动/克隆/文件级 TRIM）与存储级
+ * IOCTL（TRIM-UNMAP/分区布局改写）。全部"先刷脏再下传"——脏块落盘一定
+ * 发生在结构变更之前。无脏时零开销（dirty_bytes 原子读）。 */
+static BOOLEAN RbIsClusterAffectingCode(ULONG code, BOOLEAN fsc)
+{
+    if (fsc) {
+        switch (code) {
+        case 0x00090020UL: /* FSCTL_DISMOUNT_VOLUME */
+        case 0x000900A4UL: /* FSCTL_SET_REPARSE_POINT */
+        case 0x000900ACUL: /* FSCTL_DELETE_REPARSE_POINT */
+        case 0x000900C4UL: /* FSCTL_SET_SPARSE */
+        case 0x000900FCUL: /* FSCTL_MARK_HANDLE */
+        case 0x00090274UL: /* FSCTL_SHRINK_VOLUME */
+        case 0x00094280UL: /* FSCTL_OFFLOAD_WRITE */
+        case 0x000980C8UL: /* FSCTL_SET_ZERO_DATA */
+        case 0x000980D0UL: /* FSCTL_MOVE_FILE (defrag) */
+        case 0x00098208UL: /* FSCTL_FILE_LEVEL_TRIM */
+        case 0x00098344UL: /* FSCTL_DUPLICATE_EXTENTS_TO_FILE */
+            return TRUE;
+        default:
+            return FALSE;
+        }
+    }
+    switch (code) {
+    case 0x002D1400UL: /* IOCTL_STORAGE_MANAGE_DATA_ATTRIBUTES (TRIM/UNMAP) */
+    case 0x0007C100UL: /* IOCTL_DISK_DELETE_DRIVE_LAYOUT */
+    case 0x0007C054UL: /* IOCTL_DISK_SET_DRIVE_LAYOUT_EX */
+    case 0x0007C0D4UL: /* IOCTL_DISK_SET_PARTITION_INFO_EX */
+    case 0x0007C10CUL: /* IOCTL_DISK_SET_DRIVE_LAYOUT */
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+/* 卷设备上遇到簇重排类请求：先刷该卷脏数据再下传。 */
+static void RbFlushDirtyForVolumeExt(PRB_DEV_EXT ext)
+{
+    if (ext->Magic == RB_EXT_MAGIC && ext->Stream && !ext->Removed &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL)
+        rb_stream_flush(ext->Stream, 1);
+}
+
+/* [FIX 2026-11-06 TRIM 范围化失效] 旧路径对 TRIM 一律 flush + discard_all：
+ * ① flush 结束到 discard 之间被吸收的**已确认写入**会被整卷丢弃（F9 级丢写
+ * 窗口）；② 全卷丢视图放大无谓冷启动。现解析 TRIM 载荷（DEVICE_MANAGE_
+ * DATA_SET_ATTRIBUTES + DS_MANAGE_DATA_SET_RANGE 数组），仅失效被裁剪范围：
+ * 已裁剪范围的缓存内容按定义失效（设备清零/未定义），未裁剪范围的缓存
+ * （含 flush 窗口内新吸收的写）全部保留 = 丢写窗口归零。
+ * 返回 TRUE=范围化处理完成（调用方直接 forward）；FALSE=回退旧全卷路径。
+ * 裁剪头/范围结构本地定义（裁剪版 NuGet WDK 头缺 ntddscsi.h，同
+ * SYSTEM_INFORMATION_CLASS 先例）；字段布局以 Microsoft 文档为准。 */
+typedef struct _RB_DMSA_ATTRS {         /* DEVICE_MANAGE_DATA_SET_ATTRIBUTES */
+    ULONG   Size;
+    ULONG   Action;
+    ULONG   Flags;
+    ULONG   Reserved;
+    ULONG64 ParameterBlockOffset;
+    ULONG64 ParameterBlockLength;
+} RB_DMSA_ATTRS;
+typedef struct _RB_DMSA_RANGE {         /* DS_MANAGE_DATA_SET_RANGE */
+    ULONG64 Offset;
+    ULONG64 Length;
+    ULONG64 FileOffset;
+    ULONG64 Reserved[2];
+} RB_DMSA_RANGE;
+#define RB_DMSA_ACTION_TRIM   6         /* DeviceDsmAction_Trim */
+#define RB_DMSA_RANGE_MAX     4096      /* 超过则回退全卷路径（防御异常载荷） */
+
+static BOOLEAN RbTrimRangeInvalidate(PRB_DEV_EXT vext, PVOID sysBuf, ULONG inLen)
+{
+    RB_DMSA_ATTRS *h;
+    RB_DMSA_RANGE *rg;
+    ULONG count, i;
+    rb_stream *st;
+
+    if (!vext || vext->Magic != RB_EXT_MAGIC || !(st = vext->Stream) ||
+        vext->Removed || KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return FALSE;
+    if (!sysBuf || inLen < sizeof(RB_DMSA_ATTRS)) return FALSE;
+    h = (RB_DMSA_ATTRS *)sysBuf;
+    if (h->Action != RB_DMSA_ACTION_TRIM) return FALSE;
+    if (h->ParameterBlockOffset > inLen) return FALSE;
+    if (h->ParameterBlockLength > inLen - h->ParameterBlockOffset) return FALSE;
+    if (h->ParameterBlockLength == 0) return FALSE;
+    count = (ULONG)(h->ParameterBlockLength / sizeof(RB_DMSA_RANGE));
+    if (count == 0 || count > RB_DMSA_RANGE_MAX) return FALSE;
+    rg = (RB_DMSA_RANGE *)((PUCHAR)sysBuf + h->ParameterBlockOffset);
+
+    /* 顺序与旧路径同源：先刷脏（保数据），再按范围失效（升视图代），后由调用方 forward。
+     * 范围失效内部升 view_gen —— 在途回填自动失格（视图世代门控）。 */
+    rb_stream_flush(st, 1);
+    for (i = 0; i < (ULONG)count; i++) {
+        ULONG64 off = rg[i].Offset, len = rg[i].Length;
+        ULONG64 dsz = (ULONG64)vext->DiskSize;
+        if (len == 0) continue;
+        if (off >= dsz) continue;
+        if (len > dsz - off) len = dsz - off;
+        rb_stream_invalidate_range(st, off, (size_t)len);
+    }
+    RbLog(0, __LINE__, (LONG)count, L"trim: range-targeted invalidate");
+    return TRUE;
+}
+
+NTSTATUS RbDispatchFileSystemControl(PDEVICE_OBJECT dev, PIRP irp)
+{
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
+    if (dev != g_Rb.ControlDevice) {
+        PRB_DEV_EXT ext = (PRB_DEV_EXT)dev->DeviceExtension;
+        NTSTATUS fs;
+        BOOLEAN windowOpen = FALSE;
+        /* [FIX 2026-11-06 变更窗] 簇重排 FSCTL：窗口内读写透传（零丢写/零撕裂回填） */
+        if (ext->Magic == RB_EXT_MAGIC && ext->Stream && !ext->Removed &&
+            !g_Rb.Unloading && !g_Rb.PanicPassthrough &&
+            KeGetCurrentIrql() == PASSIVE_LEVEL &&
+            RbIsClusterAffectingCode(sp->Parameters.FileSystemControl.FsControlCode, TRUE)) {
+            rb_stream_set_view_mutating(ext->Stream, 1);
+            windowOpen = TRUE;
+            if (rb_stream_dirty_bytes(ext->Stream) != 0) {
+                RbFlushDirtyForVolumeExt(ext);
+                rb_stream_discard_all(ext->Stream);   /* [FIX DATA-15] 陈旧干净块不可留 */
+                RbLog(0, __LINE__, (LONG)sp->Parameters.FileSystemControl.FsControlCode,
+                      L"fsctl: dirty flushed + cache view dropped");
+            }
+        }
+        fs = RbForward(dev, irp);
+        if (windowOpen && ext->Magic == RB_EXT_MAGIC && ext->Stream)
+            rb_stream_set_view_mutating(ext->Stream, 0);
+        return fs;
+    }
+    return RbForward(dev, irp);
+}
+
 NTSTATUS RbDispatchDeviceControl(PDEVICE_OBJECT dev, PIRP irp)
 {
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
@@ -468,7 +813,106 @@ NTSTATUS RbDispatchDeviceControl(PDEVICE_OBJECT dev, PIRP irp)
 
     /* 仅控制设备处理本 IOCTL；卷设备上的同类请求透传 */
     if (dev != g_Rb.ControlDevice) {
-        return RbForward(dev, irp);
+    /* [FIX DATA-14] 卷/存储级 IOCTL：簇重排类（TRIM/分区布局）先刷脏。
+     * [FIX 2026-11-06] TRIM 走范围化失效（丢写窗口归零+不放大冷启动）；
+     * 解析失败/其余簇重排码维持旧全卷路径。全部开变更窗（窗口内读写透传）。 */
+    PRB_DEV_EXT vext = (PRB_DEV_EXT)dev->DeviceExtension;
+    if (vext->Magic == RB_EXT_MAGIC && vext->Stream && !vext->Removed &&
+        !g_Rb.Unloading && !g_Rb.PanicPassthrough &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        ULONG ioCode = sp->Parameters.DeviceIoControl.IoControlCode;
+        if (RbIsClusterAffectingCode(ioCode, FALSE)) {
+            NTSTATUS ds;
+            BOOLEAN windowOpen = TRUE;
+            rb_stream_set_view_mutating(vext->Stream, 1);
+            if (ioCode == 0x002D1400UL &&
+                RbTrimRangeInvalidate(vext, irp->AssociatedIrp.SystemBuffer, inLen)) {
+                /* 范围化失效已完成（含刷脏）；直接 forward */
+            } else if (rb_stream_dirty_bytes(vext->Stream) != 0) {
+                RbFlushDirtyForVolumeExt(vext);
+                rb_stream_discard_all(vext->Stream);   /* [FIX DATA-15] 同 fsctl */
+                RbLog(0, __LINE__, (LONG)ioCode,
+                      L"ioctl: dirty flushed + cache view dropped");
+            }
+            ds = RbForward(dev, irp);
+            rb_stream_set_view_mutating(vext->Stream, 0);
+            return ds;
+        }
+    }
+    return RbForward(dev, irp);
+    }
+
+    /* [OPT-EXCL] 独立功能码：不进 RB_MSG 信封，也不受 sizeof(RB_MSG) 约束
+     * （1024 条区间 = 16KB > 8224B 的信封上限）。自行完成 IRP 后立即返回，
+     * 严禁再落到下面的统一完成路径（双重完成 = 0x8E/0xC2）。 */
+    /* [USER-REQ 2026-11-05] 开机行为配置（独立功能码 0x80A）：
+     * 读/写 Parameters\AutoAttach 与 ResumeOnBoot（默认 0/1：
+     * 不自动挂载任何卷，但恢复上次加速过的盘）。 */
+    if (sp->Parameters.DeviceIoControl.IoControlCode == IOCTL_RB_BOOTCFG) {
+        RB_BOOTCFG *b = (RB_BOOTCFG *)irp->AssociatedIrp.SystemBuffer;
+        UNICODE_STRING key = RTL_CONSTANT_STRING(RB_REG_PARAMS);   /* [FIX 2026-11-05] 原手写转义坏 */
+        NTSTATUS bs = STATUS_SUCCESS;
+        if (!b || inLen < sizeof(RB_BOOTCFG) || outLen < sizeof(RB_BOOTCFG) ||
+            KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            bs = STATUS_INVALID_PARAMETER;
+        } else if (b->Get) {
+            /* 只读：回填当前值与跟踪列表 */
+            b->AutoAttach = (uint32_t)g_Rb.AutoAttach;
+            b->ResumeOnBoot = (uint32_t)g_Rb.ResumeOnBoot;
+            RtlStringCchCopyW(b->ResumeLetters, 32, RbGetResumeLetters());
+        } else {
+            ULONG v;
+            if (b->AutoAttach != RB_BOOTCFG_UNCHANGED) {
+                v = b->AutoAttach ? 1 : 0;
+                if (NT_SUCCESS(RbRegSetValue(&key, L"AutoAttach", REG_DWORD, &v, sizeof(v)))) {
+                    g_Rb.AutoAttach = (LONG)v;
+                } else bs = STATUS_UNSUCCESSFUL;
+            }
+            if (b->ResumeOnBoot != RB_BOOTCFG_UNCHANGED) {
+                v = b->ResumeOnBoot ? 1 : 0;
+                if (NT_SUCCESS(RbRegSetValue(&key, L"ResumeOnBoot", REG_DWORD, &v, sizeof(v)))) {
+                    g_Rb.ResumeOnBoot = (LONG)v;
+                } else bs = STATUS_UNSUCCESSFUL;
+            }
+            RbLog(0, __LINE__, (LONG)g_Rb.ResumeOnBoot,
+                  L"boot policy updated (AutoAttach/ResumeOnBoot)");
+            b->AutoAttach = (uint32_t)g_Rb.AutoAttach;
+            b->ResumeOnBoot = (uint32_t)g_Rb.ResumeOnBoot;
+            RtlStringCchCopyW(b->ResumeLetters, 32, RbGetResumeLetters());
+        }
+        irp->IoStatus.Status = bs;
+        irp->IoStatus.Information = NT_SUCCESS(bs) ? sizeof(RB_BOOTCFG) : 0;
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        return bs;
+    }
+
+    /* [FEAT-LOGQ 2026-11-05] 日志分页查询（独立功能码 0x809，不进 RB_MSG 信封）：
+     * 旧 GET_LOG 受 8224B 限制只能 64 条×48 字符，故障复盘历史早被覆盖。 */
+    if (sp->Parameters.DeviceIoControl.IoControlCode == IOCTL_RB_LOGQ) {
+        RB_LOGQ_REQ  *q = (RB_LOGQ_REQ *)irp->AssociatedIrp.SystemBuffer;
+        RB_LOGQ_RESP *r = (RB_LOGQ_RESP *)irp->AssociatedIrp.SystemBuffer;
+        NTSTATUS ls;
+        if (!q || inLen < sizeof(RB_LOGQ_REQ) || outLen < RB_LOGQ_RESP_SIZE(RB_LOGQ_BATCH)) {
+            ls = STATUS_BUFFER_TOO_SMALL;
+        } else {
+            ULONG64 from = q->FromSeq;
+            ULONG mc = q->MaxCount;
+            RbLogQueryPair(r, from, mc);
+            ls = STATUS_SUCCESS;
+            irp->IoStatus.Information = RB_LOGQ_RESP_SIZE(r->Count);
+        }
+        irp->IoStatus.Status = ls;
+        if (!NT_SUCCESS(ls)) irp->IoStatus.Information = 0;
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        return ls;
+    }
+
+    if (sp->Parameters.DeviceIoControl.IoControlCode == IOCTL_RB_EXCLUDE) {
+        NTSTATUS xs = RbCtlSetExclude(irp, inLen);
+        irp->IoStatus.Status = xs;
+        irp->IoStatus.Information = 0;
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        return xs;
     }
 
     /* [V10.3.1] V3-06: 四判定均带 code== 前缀；RbFeatDispatch 内部已完成 IRP，
@@ -501,7 +945,7 @@ NTSTATUS RbDispatchDeviceControl(PDEVICE_OBJECT dev, PIRP irp)
     msg->Status = 0;
 
     switch (msg->Type) {
-    case RB_MSG_GET_STATS:      RbMsgGetStats(msg, &st, &info);      break;
+    case RB_MSG_GET_STATS:      RbMsgGetStats(msg, &st, &info, outLen);  break;
     case RB_MSG_GET_CONFIG:     RbMsgGetConfig(msg, &st, &info);     break;
     case RB_MSG_SET_CONFIG:     RbMsgSetConfig(msg, &st, &info);     break;
     case RB_MSG_FLUSH:          RbMsgFlush(msg, &st, &info);         break;

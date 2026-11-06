@@ -50,7 +50,16 @@ public static class DriverSignatureProbe
         if (sys is null) return null;
         try
         {
+            // [P0-3 SYSLIB0057 定点压制·书面理由] .NET 10 弃用 X509Certificate2(string)，
+            // 官方替代 X509CertificateLoader 仅支持 PEM/DER/PFX，**不承接 PE 内嵌
+            // Authenticode 提取**（CreateFromSignedFile 一同弃用，BCL 无替代）。
+            // 本探测即依赖"从 .sys 内嵌签名提取证书"；替代方案需引入 crypt32
+            // CryptQueryObject P/Invoke——本文件 [安全 2026-10-24] 已因 AV 风险
+            // 否决 Wintrust P/Invoke 路线，且本类是 B-6 协议字段铺开前的过渡实现。
+            // 故保留旧 API + 定点压制；移除条件 = B-6 正解全量落地或 .NET 移除该 API。
+            #pragma warning disable SYSLIB0057
             using var cert = new X509Certificate2(sys);   // 无内嵌签名时抛 CryptographicException
+            #pragma warning restore SYSLIB0057
             using var chain = new X509Chain();
             chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;   // 离线机器不吊销检查
             chain.ChainPolicy.RevocationFlag = X509RevocationFlag.EntireChain;

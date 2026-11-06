@@ -65,32 +65,40 @@ static void *bench_writer(void *p)
 
 int main(int argc, char **argv){
     rb_config cfg; memset(&cfg,0,sizeof(cfg));
-    cfg.max_bytes=256ull*1024*1024; cfg.writeback=wb; cfg.readback=rb; cfg.block_size=4096;
+    /* [S2 16K 实验 2026-11-06] 第 2 个参数 = 块大小（4096/8192/16384/32768，
+     * 与 F1 后白名单一致）；省略时行为与历史完全一致（4096），保证回归零漂移。 */
+    unsigned bs = (argc>=3) ? (unsigned)strtol(argv[2],NULL,0) : 4096;
+    if(bs!=4096 && bs!=8192 && bs!=16384 && bs!=32768){
+        printf("bs must be one of 4096/8192/16384/32768\n"); return 2;
+    }
+    cfg.max_bytes=256ull*1024*1024; cfg.writeback=wb; cfg.readback=rb; cfg.block_size=bs;
     rb_engine *e=rb_engine_create(&cfg);
+    if(!e){ printf("engine create fail (bs=%u)\n",bs); return 1; }
     rb_stream *s=rb_stream_create(e,1);
-    unsigned char wr[65536]; memset(wr,0x5a,sizeof(wr));
-    rb_direct_range dr[8]; int dc=0;
-    if(rb_write(s,0,wr,sizeof(wr),dr,&dc,8)!=0){ printf("write fail\n"); return 1; }
-    rb_engine_flush(e,1);   /* 落盘干净，chunk 变干净缓存块 */
-
-    unsigned char rd[4096];
-    /* warmup */
+    unsigned char *wr=(unsigned char*)malloc(bs); memset(wr,0x5a,bs);
+    unsigned char *rd=(unsigned char*)malloc(bs);
     int i;
+    for(i=0;i<16;i++){ rb_direct_range dr[8]; int dc=0;
+        if(rb_write(s,(rb_u64)i*bs,wr,bs,dr,&dc,8)!=0){ printf("write fail\n"); return 1; } }
+    rb_engine_flush(e,1);   /* 落盘干净，chunk 变干净缓存块 */
+    /* warmup */
     for(i=0;i<100000;i++){ rb_direct_range m[8]; int mm=0;
-        rb_read(s,(rb_u64)(i%16)*4096,rd,4096,m,&mm,8); }
+        rb_read(s,(rb_u64)(i%16)*bs,rd,bs,m,&mm,8); }
 
     long N = (argc>=2)? strtol(argv[1],NULL,0) : 20000000;
     double t0=now_ns();
     long h=0;
     for(i=0;i<N;i++){
         rb_direct_range m[8]; int mm=0;
-        int r=rb_read(s,(rb_u64)(i%16)*4096,rd,4096,m,&mm,8);
+        int r=rb_read(s,(rb_u64)(i%16)*bs,rd,bs,m,&mm,8);
         if(r==1 && mm==0) h++;
     }
     double t1=now_ns();
     double rh_nsop=(t1-t0)/(double)N;
-    printf("read-hit 4K: ops=%ld  hits=%ld  total_ms=%.1f  ns/op=%.2f\n",
-           N, h, (t1-t0)/1e6, rh_nsop);
+    /* 1 byte/ns = 1 GB/s（十进制 GB）；故 N*bs/耗时(ns) 即 GB/s */
+    double gbps=(double)N*(double)bs/(t1-t0);
+    printf("read-hit %uK: ops=%ld  hits=%ld  total_ms=%.1f  ns/op=%.2f  GB/s=%.2f\n",
+           bs/1024, N, h, (t1-t0)/1e6, rh_nsop, gbps);
 
     /* ============ 并发段（D2/D4 验收） ============ */
     {

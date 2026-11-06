@@ -16,7 +16,7 @@
 #include "rb_common.h"
 #include "rb_common2.h"
 
-static VOID Rb2_PortFill(PVOID Extp, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa)
+static VOID Rb2_PortFill(PVOID Extp, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa, rb_u64 ViewGen)
 {
     /* [FIX W6] 裸读 ext->Stream 与 destroy 无同步：改走 RbGetExt 持引用，
      * 拆除方（RbVolumeRemove 排空/Reaper）必须等本回调离开才销毁流 */
@@ -24,7 +24,8 @@ static VOID Rb2_PortFill(PVOID Extp, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa)
     rb_stream *st;
     if (!ext || !SrcVa || Len == 0) return;
     st = ext->Stream;
-    if (st) rb_read_commit(st, (rb_u64)LbaBytes, SrcVa, (size_t)Len);
+    /* [FIX 2026-11-06 视图世代门控] 预取回填按读前捕获世代校验 */
+    if (st) rb_read_commit_gen(st, (rb_u64)LbaBytes, SrcVa, (size_t)Len, ViewGen);
     RbDerefExt(ext);
 }
 

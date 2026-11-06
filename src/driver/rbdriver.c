@@ -57,8 +57,13 @@ static WCHAR RbReadSystemDriveLetter(VOID)
 }
 
 /* ---------------- 日志环 ---------------- */
-#define RB_LOG_CAP  RB_LOG_MAX
-static RB_LOG_REC g_Log[RB_LOG_CAP];
+#include "../ctl/rb_logq.h"   /* [FEAT-LOGQ] 分页日志 ABI（扩容量+长文本） */
+/* [FEAT-LOGQ 2026-11-05] 环容量/文本长度取自 rb_logq.h（512/96）：
+ * 原 RB_LOG_MAX=64 / RB_LOG_TEXT_MAX=48 在故障复盘时严重不足——
+ * 历史 8 秒内被覆盖、61 处日志文案被截断（0x7B 复盘只能猜）。 */
+#define RB_LOG_CAP  RB_LOGQ_MAX
+static RB_LOGQ_REC g_Log[RB_LOG_CAP];
+static ULONG64 g_LogSeq = 0;   /* [FEAT-LOGQ] 单调序号（重启归零，前端回退自愈） */
 static ULONG g_LogHead = 0;
 static KSPIN_LOCK g_LogLock;
 static LONG g_LogInit = 0;
@@ -74,19 +79,53 @@ void RbLog(unsigned Level, unsigned Src, long Status, const WCHAR *Text)
 {
     /* [FIX W7] 契约明示：Text 必须指向驻留内存（常量/栈上稳定缓冲），
      * 本函数在自旋锁内同步拷贝，返回后绝不回读 Text。任意 IRQL 可调。 */
-    KIRQL irql; RB_LOG_REC *s; LARGE_INTEGER now;
+    KIRQL irql; RB_LOGQ_REC *s; LARGE_INTEGER now;   /* [FEAT-LOGQ] 环内为 96 字符记录 */
+    WCHAR local[RB_LOGQ_TEXT_MAX];   /* [OPT-LOGLOCK] 锁外拷贝暂存 */
     if (!g_LogInit) return;
+    /* [OPT-LOGLOCK 2026-11-05] 文本拷贝移到自旋锁外：原实现在
+     * KeAcquireSpinLock 内做 RtlStringCchCopyW（最长 96 wchar 的变长循环拷贝）
+     * ——高并发下（多核同时打日志，故障风暴时最明显）每个 CPU 都要排队等
+     * 这把锁，锁持有时间被拷贝拉长数倍，表现为"日志一多整个 I/O 路径变慢"。
+     * 现在先在锁外把文本拷进栈缓冲，锁内只做固定长度的内存搬运。 */
+    if (Text) RtlStringCchCopyW(local, RB_LOGQ_TEXT_MAX, Text);
+    else local[0] = 0;
     KeQuerySystemTimePrecise(&now);
     /* 持 g_LogLock 防任意 IRQL 并发写环缓冲：反例是无锁时两核同时取同一
      * g_LogHead 槽位，一条记录被另一条覆盖/文本撕裂（Ticks 与 Text 不同源）。 */
     KeAcquireSpinLock(&g_LogLock, &irql);
     s = &g_Log[g_LogHead % RB_LOG_CAP];
+    g_LogSeq++;
+    s->Seq = g_LogSeq;
     s->Ticks = (ULONG64)now.QuadPart;
-    s->Level = Level; s->Src = Src; s->Status = Status;
-    if (Text) RtlStringCchCopyW(s->Text, RB_LOG_TEXT_MAX, Text);
-    else s->Text[0] = 0;
+    s->Level = Level; s->Src = Src; s->Status = Status; s->Reserved = 0;
+    RtlStringCchCopyW(s->Text, RB_LOGQ_TEXT_MAX, local);   /* [OPT-LOGLOCK] 锁内定长搬运 */
     g_LogHead++;
     KeReleaseSpinLock(&g_LogLock, irql);
+}
+
+/* [FEAT-LOGQ 2026-11-05] 分页查询：按 Seq 升序返回 (FromSeq, LastSeq]。
+ * 与 RbLog 同锁；容量 512×224B，单批 <=RB_LOGQ_BATCH。 */
+ULONG RbLogQueryPair(RB_LOGQ_RESP *out, ULONG64 fromSeq, ULONG maxCount)
+{
+    KIRQL irql; ULONG i, n = 0, valid, want;
+    if (!out) return 0;
+    if (maxCount == 0 || maxCount > RB_LOGQ_BATCH) maxCount = RB_LOGQ_BATCH;
+    KeAcquireSpinLock(&g_LogLock, &irql);
+    valid = (g_LogHead < RB_LOG_CAP) ? g_LogHead : RB_LOG_CAP;
+    out->LastSeq = fromSeq;
+    /* 从最旧到最新遍历，收集 Seq > fromSeq 的记录 */
+    for (i = 0; i < valid && n < maxCount; i++) {
+        ULONG idx = (ULONG)((g_LogHead - valid + i) % RB_LOG_CAP);
+        RB_LOGQ_REC *e = &g_Log[idx];
+        if (e->Seq == 0 || e->Seq <= fromSeq) continue;
+        out->Items[n] = *e;
+        n++;
+        out->LastSeq = e->Seq;
+    }
+    out->Count = n;
+    (void)want;
+    KeReleaseSpinLock(&g_LogLock, irql);
+    return n;
 }
 
 ULONG RbLogSnapshot(RB_LOG_LIST *out)
@@ -98,8 +137,17 @@ ULONG RbLogSnapshot(RB_LOG_LIST *out)
     valid = (g_LogHead < RB_LOG_CAP) ? g_LogHead : RB_LOG_CAP;
     for (i = 0; i < valid; i++) {
         ULONG idx = (ULONG)((g_LogHead - 1 - i) % RB_LOG_CAP);
+        RB_LOGQ_REC *src;
+        RB_LOG_REC  *dst;
         if (g_Log[idx].Text[0] == 0 && g_Log[idx].Ticks == 0) continue;
-        out->Items[n] = g_Log[idx]; n++;
+        /* [FEAT-LOGQ] 环内为 96 字符的 RB_LOGQ_REC，旧 GET_LOG 信封只有 48 字符：
+         * 逐字段转译并截断——对外行为（字段/顺序/截断语义）保持不变，
+         * 完整文本由 IOCTL_RB_LOGQ 分页读取。 */
+        src = &g_Log[idx]; dst = &out->Items[n];
+        dst->Ticks = src->Ticks; dst->Level = src->Level;
+        dst->Src = src->Src; dst->Status = src->Status;
+        RtlStringCchCopyW(dst->Text, RB_LOG_TEXT_MAX, src->Text);
+        n++;
     }
     out->Count = n;
     out->Cursor = g_LogHead;
@@ -108,7 +156,8 @@ ULONG RbLogSnapshot(RB_LOG_LIST *out)
 }
 
 /* ========== 注册表：配置持久化（P2-1）/ 安全模式（P2-2） ========== */
-#define RB_REG_PARAMS L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\RAMBlockCache\\Parameters"
+/* RB_REG_PARAMS 已上移 rb_common.h（[FIX 2026-11-05] 共享给 rbattach/rbctl，
+ * 根除三处手写 L"\Registry\... 单反斜杠转义坏 → 注册表写静默失败） */
 
 static VOID RbInitUS(UNICODE_STRING *u, PCWSTR s)   /* 不依赖 RtlInitUnicodeString */
 {
@@ -263,13 +312,20 @@ VOID RbRegSetClean(ULONG v)   /* FIX[P2-2]: LastCleanShutdown 标记 */
 
 /* [V10.3] 上次引导是否健康到桌面（RbBootFailLoad 置，RbSafeModeLoad 复用） */
 static BOOLEAN s_lastBootHealthy = FALSE;
+/* [FIX GRACE-1 2026-11-01] 本次是否"部署后首启宽限"。
+ * 真机实测：deploy 写 LastBootHealthy=0，首启 BootFailLoad 走 grace 分支不计失败，
+ * 但 s_lastBootHealthy 仍为 FALSE、LastCleanShutdown 因旧驱动未参与关机而为 0
+ * → RbSafeModeLoad 两票皆"未知"被判成"异常"→ SafeMode=1 → 引擎全程直写、
+ * 缓存零命中（verify-now 实测 ReadReq=0/1.00×）。宽限首启必须豁免 SafeMode：
+ * 此时没有任何一次已证实失败，靠 BootFailCount 与 boot_guard 兜底。 */
+static BOOLEAN s_graceBoot = FALSE;
 
 LONG RbSafeModeLoad(VOID)
 {
     /* [V10.3.1] V3-04: 两票皆异常才保守 write-through；只置位、绝不清位
        —— 不得覆盖 RbBootFailLoad 中 BootLoopGuard(fails>=2) 刚置位的 SafeMode=1
        （DriverEntry 顺序: RbBootFailLoad 先行，三目无条件赋值会把保护清掉） */
-    if (!s_lastBootHealthy && RbRegGetDW(L"LastCleanShutdown", 0) == 0) {
+    if (!s_lastBootHealthy && !s_graceBoot && RbRegGetDW(L"LastCleanShutdown", 0) == 0) {
         g_Rb.SafeMode = 1;
         RbLog(1, __LINE__, 0, L"safe mode ON (last boot unhealthy & shutdown unclean)");
     }
@@ -310,6 +366,7 @@ VOID RbBootFailLoad(VOID)
         fails = 0;
     } else if (depSeq != 0 && depSeq != depAck) {
         grace = TRUE;
+        s_graceBoot = TRUE;                              /* [FIX GRACE-1] 供 RbSafeModeLoad 豁免 */
         RbRegSetDW(L"DeployAck", depSeq);                /* 一次性消费宽限 */
     } else {
         /* [FIX S7-08] 回绕钳位：注册表损坏值 0xFFFFFFFF +1 回绕为 0 →
@@ -451,6 +508,53 @@ VOID RbZombieReap(VOID)     /* PASSIVE 调用（flush 线程 / RbUnload） */
     }
 }
 
+/* ---------- W4 固定诊断环：非分页静态存储，写者仅原子占位，读者不取锁。 ---------- */
+static RB_DIAG_EVENT s_DiagRing[RB_DIAG_RING_COUNT];
+static volatile LONGLONG s_DiagSeq;
+
+VOID RbDiagRecord(ULONG Kind, ULONG Phase, NTSTATUS Status, ULONG Flags,
+                  PVOID Object, PVOID Aux, PVOID Ext, PVOID Stream,
+                  PVOID LowerDevice, PVOID Fn)
+{
+    LONGLONG seq;
+    if (!g_Rb.TestMode) return;       /* 仅隔离 TestMode 记录敏感地址 */
+    seq = InterlockedIncrement64(&s_DiagSeq);
+    RB_DIAG_EVENT *e = &s_DiagRing[(ULONGLONG)(seq - 1) % RB_DIAG_RING_COUNT];
+    e->Sequence = 0;                 /* 覆盖期间让读者跳过本槽 */
+    e->Kind = Kind;
+    e->Phase = Phase;
+    e->Status = Status;
+    e->Flags = Flags;
+    e->Reserved = 0;
+    e->Object = Object;
+    e->Aux = Aux;
+    e->Ext = Ext;
+    e->Stream = Stream;
+    e->LowerDevice = LowerDevice;
+    e->Fn = Fn;
+    MemoryBarrier();
+    e->Sequence = (ULONGLONG)seq;    /* 最后发布完整记录 */
+}
+
+ULONG RbDiagSnapshot(RB_DIAG_EVENT *Out, ULONG Capacity)
+{
+    ULONGLONG seq = (ULONGLONG)s_DiagSeq;
+    ULONGLONG available = seq < RB_DIAG_RING_COUNT ? seq : RB_DIAG_RING_COUNT;
+    ULONGLONG i;
+    ULONG count = 0;
+    if (!g_Rb.TestMode || !Out || Capacity == 0) return 0;
+    for (i = 0; i < available && count < Capacity; i++) {
+        RB_DIAG_EVENT *src = &s_DiagRing[(seq - 1 - i) % RB_DIAG_RING_COUNT];
+        ULONGLONG before = src->Sequence;
+        RB_DIAG_EVENT copy;
+        MemoryBarrier();
+        copy = *src;
+        MemoryBarrier();
+        if (before != 0 && before == src->Sequence) Out[count++] = copy;
+    }
+    return count;
+}
+
 /* ---------- 蓝屏取证 ----------
  * bugcheck 时 IRQL=HIGH_LEVEL：只读非分页原子量，绝不做磁盘 IO。
  * 头部被 capture 进 dump，事后即可回答"崩溃瞬间还有多少数据未落盘"。 */
@@ -481,14 +585,25 @@ static VOID NTAPI RbBugCheckCb(
 {
     KBUGCHECK_SECONDARY_DUMP_DATA *dd;
     RB_CRASH_HDR *h;
+    RB_DIAG_CRASH_BLOB *blob;
     UNREFERENCED_PARAMETER(Rec);
     UNREFERENCED_PARAMETER(ReasonSpecificDataLength);
     if (Reason != KbCallbackSecondaryDumpData) return;
     dd = (KBUGCHECK_SECONDARY_DUMP_DATA *)ReasonSpecificData;
     if (dd->MaximumAllowed < sizeof(RB_CRASH_HDR)) return;
-    h = (RB_CRASH_HDR *)dd->OutBuffer;
-    RbCrashFill(h);
-    dd->OutBufferLength = sizeof(RB_CRASH_HDR);
+    if (dd->MaximumAllowed >= sizeof(RB_DIAG_CRASH_BLOB)) {
+        blob = (RB_DIAG_CRASH_BLOB *)dd->OutBuffer;
+        RtlZeroMemory(blob, sizeof(*blob));
+        RbCrashFill(&blob->Header);
+        blob->EventSize = sizeof(RB_DIAG_EVENT);
+        blob->Sequence = (ULONGLONG)s_DiagSeq;
+        blob->EventCount = RbDiagSnapshot(blob->Events, RB_DIAG_EXPORT_COUNT);
+        dd->OutBufferLength = sizeof(RB_DIAG_CRASH_BLOB);
+    } else {
+        h = (RB_CRASH_HDR *)dd->OutBuffer;
+        RbCrashFill(h);
+        dd->OutBufferLength = sizeof(RB_CRASH_HDR);
+    }
 }
 
 VOID RbRegisterCrashHooks(PDRIVER_OBJECT drv)
@@ -536,6 +651,28 @@ VOID RbFreeAligned(PVOID p)
  *   - force=FALSE（GET_VOLUMES 轮询路径）：距上次成功解析 <10s 沿用缓存；
  *   - force=TRUE （ATTACH 路径）：必重新问 PnP；解析失败则清除缓存字母
  *     （找不到好过挂错；卷真没字母时本就不该被字母挂载）。 */
+/* [FIX LETTER-1 2026-11-01] 从 IoVolumeDeviceToDosName 的返回值里取盘符。
+ * 原实现直接取 dos.Buffer[0]：对 "C:" 型返回正确，但对无盘符卷
+ * （"\??\Volume{...}\"，恢复/EFI 分区）取到 '\'（0x5C）——被当成合法盘符
+ * 去 attach，每次 STATUS_INVALID_PARAMETER，且 30s 巡检反复重试刷日志
+ * （真机实测：卷表出现 "\:" 行 + 13 条 sweep + 2 条 FAILED 0xC000000D）。
+ * 现按 ':' 定位并校验 A-Z，取不到即视为"该卷无盘符"（返回 0）。 */
+static WCHAR RbParseDosLetter(PCWSTR s, USHORT bytes)
+{
+    ULONG n, i;
+    if (!s || bytes < 2 * sizeof(WCHAR)) return 0;
+    n = (ULONG)(bytes / sizeof(WCHAR));
+    for (i = 1; i < n; i++) {
+        if (s[i] == L':') {
+            WCHAR c = s[i - 1];
+            if (c >= L'A' && c <= L'Z') return c;
+            if (c >= L'a' && c <= L'z') return (WCHAR)(c - L'a' + L'A');
+            return 0;
+        }
+    }
+    return 0;
+}
+
 static VOID RbTryResolveLetter(PRB_DEV_EXT e, BOOLEAN force)
 {
     UNICODE_STRING dos;
@@ -549,10 +686,21 @@ static VOID RbTryResolveLetter(PRB_DEV_EXT e, BOOLEAN force)
     RtlZeroMemory(&dos, sizeof(dos));
     if (NT_SUCCESS(IoVolumeDeviceToDosName(e->Pdo, &dos)) &&
         dos.Length >= sizeof(WCHAR)) {
-        WCHAR nl = dos.Buffer[0];
+        WCHAR nl = RbParseDosLetter(dos.Buffer, dos.Length);
+        if (nl == 0) {
+            /* 查询成功但卷无盘符（恢复/EFI 分区）：不得把垃圾字符写成 Letter */
+            RtlFreeUnicodeString(&dos);
+            if (force && e->Letter) {
+                ExAcquireFastMutex(&g_Rb.DevListLock);
+                e->Letter   = 0;
+                e->IsSystem = 0;
+                ExReleaseFastMutex(&g_Rb.DevListLock);
+            }
+            return;
+        }
         /* [FIX A-10] Letter/IsSystem 写入纳入 DevListLock：轮询(FALSE)与 attach
          * 强制刷新(TRUE)可对同一 ext 并发无锁写（成功/失败分支组合出
-         * "Letter=X 但 IsSystem=1"的错配态）。PnP 查询仍在锁外（可阻塞）。 */
+         * "Letter=X 但 IsSystem=1" 的错配态）。PnP 查询仍在锁外（可阻塞）。 */
         ExAcquireFastMutex(&g_Rb.DevListLock);
         e->Letter    = nl;
         e->IsSystem  = (nl == g_Rb.SystemDriveLetter) ? 1 : 0;   /* 每次重算，不只变更时 */
@@ -607,7 +755,7 @@ PRB_DEV_EXT RbFindExtByLetter(WCHAR letter)
 {
     PRB_DEV_EXT stack_snap[RB_MAX_VOLUMES];
     PRB_DEV_EXT *snap = stack_snap;    /* 指向指针数组（栈或堆） */
-    PRB_DEV_EXT heap_snap = NULL;
+    PRB_DEV_EXT *heap_snap = NULL;
     PLIST_ENTRY link;
     ULONG n = 0, k, cap = RB_MAX_VOLUMES;
     PRB_DEV_EXT found = NULL;
@@ -620,7 +768,7 @@ PRB_DEV_EXT RbFindExtByLetter(WCHAR letter)
     for (link = g_Rb.DevList.Flink; link != &g_Rb.DevList; link = link->Flink) n++;
     ExReleaseFastMutex(&g_Rb.DevListLock);
     if (n > cap) {
-        heap_snap = (PRB_DEV_EXT)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+        heap_snap = (PRB_DEV_EXT *)ExAllocatePool2(POOL_FLAG_NON_PAGED,
                                                  (SIZE_T)n * sizeof(PRB_DEV_EXT), RB_POOL_TAG);
         if (heap_snap) { snap = heap_snap; cap = n; }
         else n = cap;
@@ -1181,6 +1329,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     drv->MajorFunction[IRP_MJ_PNP]            = RbDispatchPnp;
     drv->MajorFunction[IRP_MJ_POWER]          = RbDispatchPower;
     drv->MajorFunction[IRP_MJ_DEVICE_CONTROL] = RbDispatchDeviceControl;
+    drv->MajorFunction[IRP_MJ_SET_INFORMATION] = RbDispatchSetInformation;   /* [FIX DATA-12] */
+    drv->MajorFunction[IRP_MJ_FILE_SYSTEM_CONTROL] = RbDispatchFileSystemControl;   /* [FIX DATA-14] */
     drv->MajorFunction[IRP_MJ_SHUTDOWN]       = RbPassThrough;
 
     /* 全局配置：仅加载，不建引擎 */
@@ -1210,7 +1360,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
      * → 每次开机冷缓存、必须手动挂载，用户实测"挂载后与裸盘跑分一致"。
      * 自动路径只覆盖数据卷：系统卷/引导关键卷由 RbGeoWorkRoutine 显式排除，
      * 手动 GUI attach 仍允许任何卷（用户显式知情，三重回滚兜底）。 */
-    g_Rb.AutoAttach = RbRegGetDW(L"AutoAttach", 1);
+    /* [USER-REQ 2026-11-05] 默认改为 0（不自动挂载任何卷，全部手动开启）。
+     * 用户明确要求："现在全部开机都原始设置不默认打开，只能手动打开"。
+     * 需要"开机恢复上次加速卷"时，由控制面在 attach 成功后写回
+     * ResumeOnBoot=1 + 卷列表，驱动在本函数之后按该列表恢复（见 rbattach.c）。 */
+    g_Rb.AutoAttach = RbRegGetDW(L"AutoAttach", 0);
+    /* [USER-REQ] 开机恢复上次加速盘（默认开）：只在 AutoAttach==0 时生效，
+     * 列表由控制面写入 Parameters\ResumeLetters（如 "DE"）。 */
+    g_Rb.ResumeOnBoot = RbRegGetDW(L"ResumeOnBoot", 1);
+    /* [FIX AUTOATTACH-8] 自动挂载是否放行"引导关键卷"（页面文件/转储卷，
+     * 本机实测 D:）。默认 0=沿用 0x7B 防线的排除口径；用户要求缓存 D: 这类
+     * 数据盘时置 1（手动 attach 一直允许，本开关只影响开机自动路径）。 */
+    g_Rb.AutoAttachAll = RbRegGetDW(L"AutoAttachAll", 0);
     /* [U0-1 2026-10-19] 测试模式总门（默认关=0）：仅安装器 /TestMode（DEMAND_START
      * 安装）置 1。开启后 ATTACH 对无 ext 的既有卷走"运行时开卷→Safe 挂栈→建流"
      * 路径（零重启 dev loop）；生产安装不写该项 → 路径不可达，行为零变化。 */
@@ -1295,6 +1456,19 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         ExDeleteNPagedLookasideList(&g_Rb.IoCtxLa);
         RbSyncCtxPoolDelete();   /* [W1.5] 与 IoCtxLa 对称：DriverEntry 内失败即删 */
         return st;
+    }
+
+    /* [FIX 2026-11-06 ResumeOnBoot 冷启动失效] 特性层必须随 DriverEntry 启动：
+     * RbAutoAttachSweep（ResumeOnBoot 的唯一执行体）挂在 Rb2Tick（30s 周期），
+     * 而 Rb2Tick 随特性层惰性启动（rbio.c 池启动尾部 RbFeatInit）——冷启动 +
+     * AutoAttach=0 时无人创建引擎 → 池永不启动 → 扫描永不跑 → ResumeOnBoot
+     * 形同虚设（真机实测：08:26 启动日志仅 DriverEntry+AddDevice，无 [561]）。
+     * 此处提前启动（CAS 幂等，池启动尾部二次调用无害）；tick 各职责均旗标
+     * 门控且不依赖引擎，DriverEntry（PASSIVE）上下文安全。 */
+    {
+        NTSTATUS fst = RbFeatInit();
+        if (!NT_SUCCESS(fst))
+            RbLog(2, __LINE__, fst, L"feat init at DriverEntry failed (pool start will retry)");
     }
 
     RbLog(0, __LINE__, 0, L"DriverEntry ok v" RB_VERSION_WSTRING L" (engine lazy, no UpperFilter)");

@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- [U0-2] 交付名 RAMBlockCache-Setup.exe（与交付包/README 口径一致） -->
+    <AssemblyName>RAMBlockCache-Setup</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 机器版本串 10.4.1.19（common/version.h 单一事实源；与 Controller 同值） -->
+    <Version>10.4.1.19</Version>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <!-- [PACK-FIX 2026-11-04] self-contained：原先 false 导致安装器本体要求目标机
+         预装 .NET 8 Desktop Runtime（实测新机器报 "You must install or update .NET"，
+         用户根本无法开始安装）。改 true 后运行时随 exe 自带，双击即装。
+         注：csproj 的 SelfContained 会覆盖命令行同名参数，两处必须同步。 -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+  <ItemGroup>
+    <Resource Include="app.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- 嵌入式载荷（LogicalName=payload.<文件名>，见 Services/Payload.cs）。
+         目录为空时（开发期直跑）不嵌入任何资源，EnginePresent 回合同目录引擎。 -->
+    <EmbeddedResource Include="Assets/payload/**/*">
+      <LogicalName>payload.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+</Project>

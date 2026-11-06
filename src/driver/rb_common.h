@@ -26,10 +26,19 @@
 #include <wdmsec.h>
 
 #include "../ctl/rb_proto.h"
+#include "../ctl/rb_excl.h"
+#include "../ctl/rb_logq.h"
+#include "../ctl/rb_bootcfg.h"   /* [USER-REQ] 开机行为配置 */      /* [FEAT-LOGQ] 分页日志 ABI */        /* [OPT-EXCL] LBA 排除集控制面 ABI（独立功能码，不动协议） */
 #include "../core/cache.h"
 #include "../common/version.h"      /* [Commit5] 唯一版本事实来源 */
 
 #define RB_POOL_TAG        'bRBC'
+/* [FIX 2026-11-05] 注册表参数键绝对路径（共享宏）。原 rbdriver.c 文件局部宏被
+ * rbattach.c/rbctl.c 手写复刻时写成 L"\Registry\..."——单反斜杠的 \R/\M/\S/\C
+ * 均为 MSVC 未定义转义（C4129 丢反斜杠），运行时路径分隔符全失，
+ * ZwCreateKey 静默失败 → ResumeLetters 记录/恢复与 BOOTCFG 写持久化全坏。
+ * 各处一律引用本宏，禁止手写路径字面量。 */
+#define RB_REG_PARAMS L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\RAMBlockCache\\Parameters"
 #define RB_BUF_ALIGN       4096
 #define RB_MAX_RANGES      32      /* 单次读 miss / 写 direct 区间上限 */
 
@@ -43,8 +52,15 @@
 #define RB_MAX_CACHE_IO_KB_MAX   131072
 
 /* ---- V8.1 多核（第二/三轮合并） ---- */
+/* [PF-16 2026-11-06] zone 回写 worker 池硬上限：ParallelFlush 运行期可配
+ * 1/2/4/8/16 路（合法区间 1..16）。数组维度、启动初始化、停机 join 一律按
+ * 上限遍历；每轮实际路数 = g_Rb.FlushWorkerActive，且必须与
+ * RbEngineFlushZones 传给 core 的 nzones 严格一致——core 的
+ * rb_stream_flush_zoned(s, zone_sel, nzones, ws) 按 zone_of % nzones 动态
+ * 分片，因此本改造【零改动 core 数据路径】。旧固定 4 路保留为 DEF 常量。 */
 #define RB_IO_WORKERS_MAX  32      /* I/O worker 池上限（按逻辑 CPU 数截断，含超线程） */
-#define RB_FLUSH_WORKERS   4       /* zone 并行回写线程数 */
+#define RB_FLUSH_WORKERS   16      /* zone 回写 worker 池硬上限 */
+#define RB_FLUSH_WORKERS_DEF 4     /* 历史固定路数（ParallelFlush>=2 的旧行为） */
 #define RB_FLUSH_SNAP_MAX  64      /* 单轮快照流上限 */
 
 /* ---- FIX[R6]: 版本与源码联动（GET_VERSION 不再硬编码 v1.0.0） ---- */
@@ -55,6 +71,16 @@
 /* ---- [V10.1] failsafe 常量 ---- */
 #define RB_EXT_MAGIC       0x52424348UL   /* 'RBCH' 内存踩踏哨兵 / 崩溃头 Tag */
 #define RB_IO_FAIL_PANIC   32             /* 盘 I/O 连续失败 >=32 → 全局熔断 */
+
+/* VOLSTATUS 内部最近旁路原因（线协议 Reason 6-10；0..5 语义冻结）。
+ * [FIX 2026-11-06] 新增 11=分页 IO（CachePagingIo=0 兑现）、12=元数据变更窗。 */
+#define RB_BYPASS_STREAM_GEOMETRY  6
+#define RB_BYPASS_DIRECTION        7
+#define RB_BYPASS_IO_TOO_LARGE     8
+#define RB_BYPASS_ADMIT            9
+#define RB_BYPASS_RESOURCE        10
+#define RB_BYPASS_PAGING           11
+#define RB_BYPASS_VIEW_MUTATING   12
 
 /* ---- V9 运行时附加 / 硬排除 ---- */
 #define RB_MAX_CRITICAL    16
@@ -106,7 +132,13 @@ typedef struct _RB_DEV_EXT {
     ULONG64          VolId;            /* 存储设备序列号哈希（不可得时回落 几何组合哈希）。
                                         * L2 记录/索引/容器身份均带此值——跨卷/换盘的
                                         * 数据一律 MISS（索引键仅 LBA 无卷标识的根治）。 */
+    volatile LONG    LastBypassReason; /* 最近请求级旁路；仅原子读写，不进入 RB_MSG/V106。 */
 } RB_DEV_EXT, *PRB_DEV_EXT;
+
+static __inline VOID RbNoteBypass(PRB_DEV_EXT ext, LONG reason)
+{
+    if (ext) InterlockedExchange(&ext->LastBypassReason, reason);
+}
 
 /* 一条被拦截、转投 worker 的 IRP 上下文 */
 typedef struct _RB_IOCTX {
@@ -184,11 +216,17 @@ typedef struct _RB_GLOB {
     volatile LONG    IoRR;            /* 轮询游标 */
     volatile LONG    FallbackInFlight;/* [FIX M11] ExQueueWorkItem 兜底路径在途 ctx 数（卸载删池前排空） */
     RB_FLUSHER       Flushers[RB_FLUSH_WORKERS];
+    volatile LONG    FlushWorkerActive;  /* [PF-16] 本轮生效路数 1..RB_FLUSH_WORKERS；0=池未启动 */
     KEVENT           FlushDone;       /* SynchronizationEvent：本轮 zone 任务全部完成 */
     volatile LONG    FlushJobs;       /* 未完成 zone 任务数 */
     /* ---- V8.1 安全模式 / 持久化 / 自动附加 ---- */
     volatile LONG    SafeMode;        /* 1=上次异常退出（蓝屏/断电/强杀）→ 强制直写 */
     LONG             AutoAttach;      /* 注册表 AutoAttach：卷挂栈即自动入缓存（系统卷除外） */
+    /* [FIX AUTOATTACH-8 2026-11-01] 注册表 AutoAttachAll（默认 0）：=1 时自动挂载
+     * 不再跳过"引导关键卷"（页面文件/转储所在卷，如实测本机 D:）。默认仍排除——
+     * 该闸门是 0x7B 防线的一部分；用户显式知情后才放开（手动 attach 一直允许）。 */
+    LONG             AutoAttachAll;
+    LONG             ResumeOnBoot;     /* [USER-REQ] 开机恢复上次加速卷（默认 1；AutoAttach=0 时生效） */
     /* ---- V9 硬排除 / 惰性引擎 ---- */
     FAST_MUTEX       EngineMutex;
     FAST_MUTEX       InfoMutex;
@@ -251,9 +289,19 @@ typedef struct _RB_GLOB {
      * （~40ns/64 笔，可忽略）；EWMA 1/8 权重非锁更新（读多写少，最坏一次
      * 撕裂读无害）。QpcFreq 由 RbLatCalibrate 在 RbStartIoWorkers 内一次性
      * 校准（KeStall 50ms 实测）；校准失败=0 → 采样整体跳过（不产假数据）。 */
-    volatile LONG   ReadLatSeq;         /* 读采样序号（&63==0 命中采样） */
+    volatile LONG   ReadLatSeq;         /* 读采样序号（&63==0 命中采样）——[OPT-STATS R26] 已被 per-CPU 版取代，保留字段防 ABI 依赖 */
+    volatile LONG   ReadLatSeqCpu[64];  /* [OPT-STATS R26] per-CPU 采样序号：全局原子 seq 是 64 路读热的乒乓点；每核独立 &63==0 命中，采样率不变，热路径零原子 */
     volatile LONG   ReadLatEwmaUs[2];   /* [0]=全命中读 [1]=含 miss 下盘读 */
     LONG            QpcFreq;            /* QPC 频率（次/秒；0=未校准=不采样） */
+    /* ---- [U1 2026-11-06] 读延迟分位直方图（末尾纯追加；RB_STATS
+     * CacheReadLatP50/P95/P99Us、DiskReadLatP50/P95/P99Us 数据源）----
+     * [slot][b]：slot 0=全命中读 / 1=含 miss 下盘读（与 ReadLatEwmaUs 同分法）；
+     * 桶 b 覆盖 [2^b, 2^(b+1)) 微秒（b=0 含 us==0），u32 计数，32 桶覆盖
+     * 1us..~4295s。写入：RbLatNote 采样点 InterlockedIncrement（每 64 笔读
+     * 一次原子自增，与 EWMA 的 InterlockedExchange 同成本级）；读取：
+     * rbctl.c RbLatPercentile 求分位。累计分布不清零（重启即复位）——
+     * 与 EWMA 的「运行期观测」语义一致。非协议面（不进 RB_CONFIG）。 */
+    volatile LONG   ReadLatHist[2][32];
     /* ---- [V10.6/B-7] 操作进度事件环（末尾纯追加；RB_MSG_GET_EVENTS 数据源）----
      * 非分页内存固定环（RB_EVENT_MAX 条）+ 单调 Seq；发布方任意 IRQL 可调
      * RbEvPublish（Interlocked 占位 + 拷贝；无锁无分配）。轮询方经 GET_EVENTS
@@ -265,6 +313,41 @@ typedef struct _RB_GLOB {
 } RB_GLOB;
 
 extern RB_GLOB g_Rb;
+
+/* ---- W4 固定大小诊断环：非分页、无分配、无锁、单调序号；地址仅进受控 dump。 ---- */
+#define RB_DIAG_RING_COUNT    64
+#define RB_DIAG_EXPORT_COUNT  16
+#define RB_DIAG_KIND_SYNC_IO  1
+#define RB_DIAG_KIND_RB2_JOB  2
+#define RB_DIAG_KIND_ATTACH   3
+#define RB_DIAG_KIND_PNP      4
+#define RB_DIAG_PHASE_ENTER   1
+#define RB_DIAG_PHASE_COMPLETE 2
+#define RB_DIAG_PHASE_ENQUEUE 3
+#define RB_DIAG_PHASE_EXECUTE 4
+#define RB_DIAG_PHASE_FN_CHECK 5
+#define RB_DIAG_PHASE_START   6
+#define RB_DIAG_PHASE_DRAIN   7
+#define RB_DIAG_PHASE_END     8
+#define RB_DIAG_PHASE_REMOVE  9
+#define RB_DIAG_FLAG_UNKNOWN  0
+#define RB_DIAG_FLAG_ALLOWED  1
+#define RB_DIAG_FLAG_REJECTED 2
+
+typedef struct _RB_DIAG_EVENT {
+    ULONGLONG Sequence;
+    ULONG Kind;
+    ULONG Phase;
+    NTSTATUS Status;
+    ULONG Flags;            /* Fn 白名单结果：0 未知 / 1 合法 / 2 非白名单 */
+    ULONG Reserved;
+    PVOID Object;           /* IRP 或 RB2 job */
+    PVOID Aux;              /* RbSyncComplete 或 Remove work item */
+    PVOID Ext;
+    PVOID Stream;
+    PVOID LowerDevice;
+    PVOID Fn;
+} RB_DIAG_EVENT;
 
 /* ---- [V10.1] 崩溃取证头：bugcheck 时写入 secondary dump，事后回答
  * "崩溃瞬间还有多少未落盘数据"（=数据丢失窗口上界）。全字段为非分页可安全读取量。 ---- */
@@ -280,18 +363,41 @@ typedef struct _RB_CRASH_HDR {
     WCHAR   LastNote[24];
 } RB_CRASH_HDR;
 
+typedef struct _RB_DIAG_CRASH_BLOB {
+    RB_CRASH_HDR Header;
+    ULONG EventCount;
+    ULONG EventSize;
+    ULONGLONG Sequence;
+    RB_DIAG_EVENT Events[RB_DIAG_EXPORT_COUNT];
+} RB_DIAG_CRASH_BLOB;
+
+C_ASSERT(sizeof(RB_DIAG_EVENT) == 80);
+C_ASSERT(sizeof(RB_DIAG_CRASH_BLOB) == 1384);
+
+VOID RbDiagRecord(ULONG Kind, ULONG Phase, NTSTATUS Status, ULONG Flags,
+                  PVOID Object, PVOID Aux, PVOID Ext, PVOID Stream,
+                  PVOID LowerDevice, PVOID Fn);
+ULONG RbDiagSnapshot(RB_DIAG_EVENT *Out, ULONG Capacity);
+
 /* ---- 日志环（DISPATCH/APC 安全，spinlock） ---- */
 void  RbLogInit(VOID);
 void  RbLog(unsigned Level, unsigned Src, long Status, const WCHAR *Text);
 ULONG RbLogSnapshot(RB_LOG_LIST *out);
+ULONG RbLogQueryPair(RB_LOGQ_RESP *out, ULONG64 fromSeq, ULONG maxCount);   /* [FEAT-LOGQ] */
 
 /* ---- rbio.c ---- */
 NTSTATUS RbForward(PDEVICE_OBJECT dev, PIRP irp);
 NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
                   PVOID buf, ULONG len, PULONG_PTR pInfo);
+/* [FIX DATA-7 R7] flush 后失效的结果复核：范围内残留脏（flush 未收敛，坏盘）
+ * → 保守失效（superseded=0，脏按 lost_dirty_bytes 记账+readback 恢复）+留痕；
+ * 干净 → 常规 superseded=1 失效。 */
+VOID     RbInvalidateAfterFlush(struct rb_stream *st, rb_u64 off, rb_u64 len);
 DRIVER_DISPATCH RbDispatchReadWrite;
 DRIVER_DISPATCH RbDispatchFlush;
 DRIVER_DISPATCH RbDispatchCreateClose;
+DRIVER_DISPATCH RbDispatchSetInformation;
+DRIVER_DISPATCH RbDispatchFileSystemControl;   /* [FIX DATA-14] FSCTL 簇重排前刷脏 */   /* [FIX DATA-12] 簇客户操作前刷脏（回写正确性闸门） */
 void     RbFlushAllDirty(VOID);
 NTSTATUS RbStartFlushThread(VOID);
 /* [P1-2] Stop 系列改为返回 NTSTATUS：join 超时时 RbUnload 必须中止卸载
@@ -330,6 +436,7 @@ VOID        RbDerefExt(PRB_DEV_EXT ext);
 PVOID  RbAllocAlignedNonPaged(SIZE_T sz);
 VOID   RbFreeAligned(PVOID p);
 ULONG  RbMemAvailableMB(VOID);
+ULONG  RbMemTotalMB(VOID);      /* [MEM-ADAPT 2026-11-06] 装机总物理内存 MB；0=查询失败 */
 /* FIX[P2-1]/FIX[P2-2]: 配置持久化 + 安全模式（注册表） */
 VOID   RbSaveConfig(const RB_CONFIG *cfg);
 VOID   RbLoadConfig(RB_CONFIG *cfg);   /* cfg 须先填默认值；注册表有值则覆盖 */
@@ -350,6 +457,10 @@ NTSTATUS RbAttachVolumeByLetter(WCHAR letter);
 /* [FIX B-U0-8] TestMode 运行时挂栈卷孤儿巡检（Rb2Tick 周期调）：卷意外消失
  * （USB 拔出/盘符易主，无 REMOVE IRP 到达）→ 强制重解析失败超 30s 即完整拆除。 */
 VOID     RbJanitorSweepRuntimeAttached(VOID);
+/* [FIX AUTOATTACH-2 2026-11-01] 开机迟到盘符的自动挂载补偿（Rb2Tick 每 30s 调） */
+VOID     RbAutoAttachSweep(VOID);
+VOID     RbLoadResumeLetters(VOID);   /* [USER-REQ] 读上次加速卷列表 */
+PCWSTR   RbGetResumeLetters(VOID);  /* [USER-REQ] 当前跟踪的上次加速卷 */
 /* [FIX B-U0-8] 强制重解析单卷盘符（巡检/诊断用；PASSIVE，内部自持 DevListLock）。 */
 VOID     RbForceResolveLetter(PRB_DEV_EXT ext);
 NTSTATUS RbDetachVolumeByLetter(WCHAR letter);

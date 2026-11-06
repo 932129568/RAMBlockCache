@@ -33,8 +33,27 @@ public sealed class MainViewModel : ObservableObject
     public bool VolumesEmpty => Drives.Count == 0;
     /// <summary>[FIX B21] 诊断页日志空态（原空白区）。</summary>
     public bool LogEmpty => LogLines.Count == 0;
-    /// <summary>日志页绑定的行集合（最新在前，200 行封顶；LogService.Appended 驱动）。</summary>
-    public ObservableCollection<string> LogLines { get; } = new();
+
+    /// <summary>[P0-3 net10 2026-10-31] LogLines 唯一写入口：顶部插入 atTop、200 行封顶，
+    /// 以**整体替换**（Reset 语义）回填——见 LogLines 属性注释的生成器一致性说明。
+    /// 替换后显式广播 LogLines / LogEmpty（自动属性不自动通知）。</summary>
+    private void ReplaceLogLines(IEnumerable<string> atTop)
+    {
+        var next = new List<string>(atTop);
+        next.AddRange(LogLines);
+        if (next.Count > 200) next.RemoveRange(200, next.Count - 200);
+        LogLines = new ObservableCollection<string>(next);
+        RaisePropertyChanged(nameof(LogLines));
+        RaisePropertyChanged(nameof(LogEmpty));
+    }
+    /// <summary>日志页绑定的行集合（最新在前，200 行封顶；LogService.Appended 驱动）。
+    /// [P0-3 net10 2026-10-31] 改为"快照整体替换"语义：.NET 10 的
+    /// VirtualizingStackPanel.MeasureChild→Verify() 对增量 CollectionChanged 计数
+    /// 做一致性校验，而本列表有多个异步写入方（LogService.Appended 事件链 /
+    /// PullDriverLog 回填 / 握手失败记录），任何一条增量事件在生成器重置窗口内
+    /// 丢账即抛 InvalidOperationException（离屏渲染 1920x1080 实测复现，.NET 8 不查）。
+    /// Reset 语义下生成器全量重枚举快照，计数不可能漂移；≤200 行重建开销可忽略。</summary>
+    public ObservableCollection<string> LogLines { get; private set; } = new();
 
     /// <summary>[状态条] 状态条控件引用（MainWindow 构造后注入；采样 tick 驱动 Update，
     /// VM 不直接依赖可视树其余部分）。</summary>
@@ -103,7 +122,7 @@ public sealed class MainViewModel : ObservableObject
     /// 必须 Mode=OneWay。
     /// </summary>
     public string StatusSubtitle => _mountedCount > 0
-        ? $"缓存正在保护 {_mountedCount} 个卷，数据每秒自动刷新"
+        ? $"{_mountedCount} 个卷已启用加速，等待全局命中样本"
         : "尚未加速任何卷——到「加速」页挂载数据卷";
     private double _avgHit;
     /// <summary>已挂载卷平均命中率（DriveItemViewModel.HitPct 的均值；无挂载时为 0）。</summary>
@@ -201,7 +220,7 @@ public sealed class MainViewModel : ObservableObject
          * CheckReentrancy → 渲染回调里抛异常 → 白屏"未响应"。现档位刷新收敛到
          * RefreshDrives 收尾一次（见该方法 finally），此处只做廉价的空态通知。 */
         Drives.CollectionChanged += (_, _) => { RaisePropertyChanged(nameof(VolumesEmpty)); };
-        LogLines.CollectionChanged += (_, _) => { RaisePropertyChanged(nameof(LogEmpty)); };
+        // [P0-3 net10] LogLines 改为整体替换（ReplaceLogLines），空态随属性通知刷新，无需订阅集合变更
 
         if (!SystemService.IsElevated)
         {
@@ -225,8 +244,13 @@ public sealed class MainViewModel : ObservableObject
             if (snap.Length == 0) { LogService.Info("MountAll：当前无可挂载卷"); return Task.CompletedTask; }
             return Task.Run(async () =>
             {
-                await Task.WhenAll(snap.Select(d => d.MountAsync((uint)Math.Min(d.QuotaBytes, uint.MaxValue)))).ConfigureAwait(false);
-                ToastService.Instance.Show($"已挂载 {snap.Length} 个卷", ToastLevel.Success);   // [D5] 命令完成反馈
+                OperationResult[] results = await Task.WhenAll(
+                    snap.Select(d => d.MountAsync((uint)Math.Min(d.QuotaBytes, uint.MaxValue)))).ConfigureAwait(false);
+                MountBatchSummary summary = OperationResult.Summarize(results);
+                LogService.Info($"MountAll：总数 {summary.Total} / 成功 {summary.Success} / 失败 {summary.Failure}");
+                ToastService.Instance.Show(
+                    summary.Failure == 0 ? $"已挂载 {summary.Success}/{summary.Total} 个卷" : $"挂载完成：成功 {summary.Success} / 失败 {summary.Failure} / 总数 {summary.Total}",
+                    summary.Failure == 0 ? ToastLevel.Success : ToastLevel.Warning);
             });
         });
         UnmountAllCommand = new AsyncRelayCommand(() =>
@@ -417,7 +441,7 @@ public sealed class MainViewModel : ObservableObject
             Services.FirstRunExperience.RequestWizard();   // 主窗口订阅同一入口（幂等）
         });
 
-        LogService.Appended += line => Post(() => { LogLines.Insert(0, line); while (LogLines.Count > 200) LogLines.RemoveAt(LogLines.Count - 1); });
+        LogService.Appended += line => Post(() => ReplaceLogLines(new[] { line }));
 
         StatsService.Instance.DriverReportedUnmounted += key =>
         {
@@ -437,8 +461,9 @@ public sealed class MainViewModel : ObservableObject
          * 线程占住，_failStreak 永不递增 → StatsDegraded 永不触发 → 界面继续呈现
          * 过期值（RD.5 失效）。现改为轮询线程只发信号，IOCTL 在独立线程池任务上跑，
          * 轮询线程立即返回继续采样（挂死即降级的路径由此打通）。 */
-        StatsService.Instance.Sampled += snap =>
+        StatsService.Instance.GlobalSampled += snap =>
         {
+            Post(() => OnGlobalSample(snap));
             Post(UpdateStateBar);
             var now = Environment.TickCount64;
             if (now - Interlocked.Read(ref _lastFeatRefreshTick) < 1000) return;
@@ -473,6 +498,30 @@ public sealed class MainViewModel : ObservableObject
         _ = InitializeAsync();
     }
 
+    private StatusOutput _globalStatus = new();
+    private double _globalHitPct;
+    private double _globalReadMbps;
+    private double _globalWriteMbps;
+    private ulong _globalCacheBytesUsed;
+    private ulong _globalCacheBytesTotal;
+    private ulong _globalBytesFromCache;
+    private bool _globalHasMetrics;
+
+    /// <summary>唯一引擎样本进入总览、KPI 和图表；不按卷复制或求和。</summary>
+    private void OnGlobalSample(StatsSnapshot sample)
+    {
+        if (sample.Scope != StatsScope.EngineGlobal) return;
+        _globalStatus = sample.EngineStats;
+        _globalHasMetrics = sample.HasMetrics;
+        _globalHitPct = sample.HitPct;
+        _globalReadMbps = sample.ReadMbps;
+        _globalWriteMbps = sample.WriteMbps;
+        _globalCacheBytesUsed = sample.CacheBytesUsed;
+        _globalCacheBytesTotal = sample.CacheBytesTotal;
+        _globalBytesFromCache = sample.BytesFromCache;
+        RefreshOverview();
+    }
+
     /// <summary>[状态条] 采样驱动的快照喂给 StateBar（未连接时给降级呈现）。</summary>
     private void UpdateStateBar()
     {
@@ -485,7 +534,7 @@ public sealed class MainViewModel : ObservableObject
         {
             try
             {
-                var stats = DriverService.Instance.QueryStats(0);   // 全局统计（deviceKey 仅供卷匹配）
+                var stats = _globalStatus;   // 复用 StatsService 本轮唯一全局样本，不重复 IOCTL
                 uint bound = 0, attached = 0, back = 0;
                 var list = stats.Volumes;   /* [FIX R2-U9] 复用 QueryStats 内部已查的卷列表，省一次 GET_VOLUMES */
                 for (int i = 0; list.Items != null && i < list.Count && i < 8; i++)
@@ -509,6 +558,8 @@ public sealed class MainViewModel : ObservableObject
                     _effectiveCacheMB = stats.EffectiveCacheMB; _dynamicLimitMB = stats.DynamicLimitMB;
                     _availablePhysMB = stats.AvailablePhysMB;   // [FIX B4] 内存预算只读汇总三源
                     _cacheLatencyUs = stats.CacheReadLatencyUs; _diskLatencyUs = stats.DiskReadLatencyUs;   // [V10.6/B-12]
+                    _cacheLatP50 = stats.CacheReadLatP50Us; _cacheLatP95 = stats.CacheReadLatP95Us; _cacheLatP99 = stats.CacheReadLatP99Us;   // [U1 2026-11-06]
+                    _diskLatP50 = stats.DiskReadLatP50Us; _diskLatP95 = stats.DiskReadLatP95Us; _diskLatP99 = stats.DiskReadLatP99Us;          // [U1 2026-11-06]
                     // 写模式构成（A4：加速卷 = 直写 + 回写；回写数取自挂载表 WriteMode）
                     _throughCount = (int)(a2 - w2); _backCount = (int)w2;
                     RaiseStateChanged();
@@ -540,6 +591,8 @@ public sealed class MainViewModel : ObservableObject
                     _lostDirtyBytes = 0;   // [FIX B2] 离线不呈现过期丢失量
                     _effectiveCacheMB = 0; _dynamicLimitMB = 0; _availablePhysMB = 0;   // [FIX B4]
                     _cacheLatencyUs = 0; _diskLatencyUs = 0;   // [V10.6/B-12] 离线不呈现过期延迟
+                    _cacheLatP50 = 0; _cacheLatP95 = 0; _cacheLatP99 = 0;   // [U1 2026-11-06]
+                    _diskLatP50 = 0; _diskLatP95 = 0; _diskLatP99 = 0;      // [U1 2026-11-06]
                     RaiseStateChanged();
                     StateBarCtl?.Update(
                         connected: false, accessDenied: denied, protocolMismatch: protoMismatch,   // [FIX R6-UI6]
@@ -561,6 +614,8 @@ public sealed class MainViewModel : ObservableObject
                     _lostDirtyBytes = 0;
                     _effectiveCacheMB = 0; _dynamicLimitMB = 0; _availablePhysMB = 0;
                     _cacheLatencyUs = 0; _diskLatencyUs = 0;   // [V10.6/B-12] 离线不呈现过期延迟
+                    _cacheLatP50 = 0; _cacheLatP95 = 0; _cacheLatP99 = 0;   // [U1 2026-11-06]
+                    _diskLatP50 = 0; _diskLatP95 = 0; _diskLatP99 = 0;      // [U1 2026-11-06]
                     RaiseStateChanged();
                     StateBarCtl?.Update(
                         connected: false, accessDenied: false, protocolMismatch: false,
@@ -745,20 +800,13 @@ public sealed class MainViewModel : ObservableObject
                 int ok = 0;
                 foreach (var vm in autoMount)
                 {
-                    try
-                    {
-                        await vm.MountAsync((uint)Math.Min(vm.QuotaBytes, uint.MaxValue))
-                            .ConfigureAwait(false);   /* 默认直写（MountAsync 默认参数） */
-                        ok++;
-                    }
-                    catch (Exception ex)
-                    {
-                        /* [FIX D#9] 结果可见性：原外层 Task 无人观察、完成无汇总——
-                         * 自动挂载成败静默（违反"命令执行后至少一条日志"纪律）。 */
-                        LogService.Warn($"开机自动挂载 {vm.DriveLetter} 失败：{ex.Message}");
-                    }
+                    OperationResult result = await vm.MountAsync((uint)Math.Min(vm.QuotaBytes, uint.MaxValue))
+                        .ConfigureAwait(false);
+                    if (result.Success) ok++;
+                    else LogService.Warn($"开机自动挂载 {vm.DriveLetter} 失败（{result.ErrorCode}）：{result.ErrorMessage}");
                 }
-                LogService.Info($"开机自动挂载完成：{ok}/{autoMount.Count} 成功");
+                int fail = autoMount.Count - ok;
+                LogService.Info($"开机自动挂载完成：成功 {ok} / 失败 {fail} / 总数 {autoMount.Count}");
             });
     }
 
@@ -781,12 +829,12 @@ public sealed class MainViewModel : ObservableObject
         // [T4] 状态页副标题随挂载数切换（保护中 N 个卷 / 空态指引）；
         // MountedCount 变化是唯一真相源，此处统一通知，避免多处重复刷新。
         RaisePropertyChanged(nameof(StatusSubtitle));
-        AvgHit = mounted.Count == 0 ? 0 : mounted.Average(d => d.HitPct);
-        ulong used = (ulong)mounted.Sum(d => (double)d.CacheUsedBytes);
-        ulong cap = (ulong)mounted.Sum(d => (double)d.QuotaBytes);
-        // [空值口径 v2] 无挂载卷 = 无数据（「—」），有挂载才呈现 0 KB/MB 起步的真实计量
-        CacheText = mounted.Count == 0 ? "—" : used < 1048576 ? $"{used / 1024.0:F0} KB" : $"{used / 1048576.0:F0} MB";
-        // [A3/A6] 状态页 KPI 结构化面：占用环数值源 + "省下磁盘读"全员合计
+        AvgHit = mounted.Count == 0 || !_globalHasMetrics ? 0 : _globalHitPct;
+        ulong used = _globalHasMetrics ? _globalCacheBytesUsed : 0;
+        ulong cap = _globalHasMetrics ? _globalCacheBytesTotal : 0;
+        CacheText = mounted.Count == 0 || !_globalHasMetrics
+            ? "—"
+            : used < 1048576 ? $"{used / 1024.0:F0} KB" : $"{used / 1048576.0:F0} MB";
         CacheUsedTotal = used;
         CacheCapTotal = cap;
         RaisePropertyChanged(nameof(CacheUsedRatio));
@@ -794,7 +842,7 @@ public sealed class MainViewModel : ObservableObject
         RaisePropertyChanged(nameof(CacheUsedText));
         RaisePropertyChanged(nameof(CacheUsedPct));
         RaisePropertyChanged(nameof(CacheCapText));
-        ulong served = (ulong)mounted.Sum(d => (double)d.ServedBytes);
+        ulong served = _globalHasMetrics ? _globalBytesFromCache : 0;
         _servedTotalBytes = served;
         RaisePropertyChanged(nameof(ServedTotalGB));
         ServedTotalText = served == 0
@@ -818,15 +866,11 @@ public sealed class MainViewModel : ObservableObject
             try { lines = DriverService.Instance.GetLog().Select(e => $"[驱动 {(e.Level switch { 1 => "WARN", 2 => "ERR ", _ => "INFO" })}] {e.Text}").ToList(); }
             catch (Exception ex)
             {
-                Post(() => LogLines.Insert(0, $"[驱动日志] 读取失败：{ex.Message}"));
+                Post(() => ReplaceLogLines(new[] { $"[驱动日志] 读取失败：{ex.Message}" }));
                 Interlocked.Exchange(ref _logInFlight, 0);   /* [FIX R6-UI13] */
                 return;
             }
-            Post(() =>
-            {
-                foreach (var l in lines) LogLines.Insert(0, l);
-                while (LogLines.Count > 200) LogLines.RemoveAt(LogLines.Count - 1);
-            });
+            Post(() => ReplaceLogLines(lines));
             Interlocked.Exchange(ref _logInFlight, 0);   /* [FIX R6-UI13] */
         });
     }
@@ -872,9 +916,10 @@ public sealed class MainViewModel : ObservableObject
         _lastSeriesTick = now;
         var mounted = Drives.Where(d => d.Mounted).ToList();
         // 无挂载 = 该点无数据（NaN），图表断线——不补零（禁归零误导）
-        _hitSeries.Add(mounted.Count == 0 ? double.NaN : mounted.Average(d => d.HitPct));
-        _readSeries.Add(mounted.Count == 0 ? double.NaN : mounted.Sum(d => d.ReadMbps));
-        _writeSeries.Add(mounted.Count == 0 ? double.NaN : mounted.Sum(d => d.WriteMbps));
+        bool hasData = mounted.Count > 0 && _globalHasMetrics;
+        _hitSeries.Add(hasData ? _globalHitPct : double.NaN);
+        _readSeries.Add(hasData ? _globalReadMbps : double.NaN);
+        _writeSeries.Add(hasData ? _globalWriteMbps : double.NaN);
         while (_hitSeries.Count > SeriesLen) { _hitSeries.RemoveAt(0); _readSeries.RemoveAt(0); _writeSeries.RemoveAt(0); }
         SampleStripeHeat();   // [FIX B1] 分片吞吐热力与序列同 tick（周期增量 → 峰值归一）
         RaisePropertyChanged(nameof(HitSeries));
@@ -1036,6 +1081,8 @@ public sealed class MainViewModel : ObservableObject
     private ulong _dirtyBytes;
     private ulong _lostDirtyBytes;   // [FIX B2] 已确认丢失（异常退出未落盘量；0=正常态）
     private uint _cacheLatencyUs, _diskLatencyUs;   // [V10.6/B-12] 读延迟 EWMA（0=尚无样本）
+    private uint _cacheLatP50, _cacheLatP95, _cacheLatP99;   // [U1 2026-11-06] 命中读分位（0=尚无样本）
+    private uint _diskLatP50, _diskLatP95, _diskLatP99;      // [U1 2026-11-06] 含下盘读分位
 
     /// <summary>
     /// [契约 B-12] 收益页二级明细「平均延迟」行（缓存命中 vs 含下盘读 EWMA，微秒）。
@@ -1045,7 +1092,9 @@ public sealed class MainViewModel : ObservableObject
     /// </summary>
     public string LatencyDetailText => !_connOk
         ? "—（驱动未连接）"
-        : RbStatsLatency.FormatDetail(_cacheLatencyUs, _diskLatencyUs);
+        : RbStatsLatency.FormatDetail(_cacheLatencyUs, _diskLatencyUs,
+                                      _cacheLatP50, _cacheLatP95, _cacheLatP99,
+                                      _diskLatP50, _diskLatP95, _diskLatP99);
 
     /// <summary>应急导航徽标计数（异常项：熔断/安全模式/未落盘超阈值/已确认丢失/驱动离线）。</summary>
     public int IssueCount { get; private set; }
@@ -1384,8 +1433,8 @@ public sealed class MainViewModel : ObservableObject
     public const double MemReserveMaxMB = 65536;
     /// <summary>保留量步进（256MB 粒度，与设置页 Slider TickFrequency 对齐）。</summary>
     public const double MemReserveStepMB = 256;
-    /// <summary>驱动默认（rb_proto.h：RB_DEFAULT_AUTO_USEPCT=80 / RB_DEFAULT_RESERVE_MB=4096）。</summary>
-    private const double DefaultAutoUsePct = 80, DefaultMemReserveMB = 4096;
+    /// <summary>驱动默认（rb_proto.h：RB_DEFAULT_AUTO_USEPCT=80 / RB_DEFAULT_RESERVE_MB=0=AUTO 按装机内存容量推导）。</summary>
+    private const double DefaultAutoUsePct = 80, DefaultMemReserveMB = 0;
 
     private double _autoUsePct = DefaultAutoUsePct;
     /// <summary>自动占用百分比（10–95，步进 5；设置页 Slider 绑定。
@@ -1424,8 +1473,10 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
-    /// <summary>保留量当前值人话（MB 人话，大数千分位分排）。</summary>
-    public string MemReserveText => $"{_memReserveMB:N0} MB";
+    /// <summary>保留量当前值人话（0=AUTO：驱动按装机总内存的 5% 推导，钳 512MB-8GB）。</summary>
+    public string MemReserveText => _memReserveMB == 0
+        ? "自动（按物理内存容量适配）"
+        : $"{_memReserveMB:N0} MB";
 
     private uint _effectiveCacheMB, _dynamicLimitMB;
     private ulong _availablePhysMB;

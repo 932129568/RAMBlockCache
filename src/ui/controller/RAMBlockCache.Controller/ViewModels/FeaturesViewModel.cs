@@ -653,8 +653,8 @@ public sealed class FeaturesViewModel : ObservableObject
 
     private string _benchHitRateText = "";
     /// <summary>
-    /// [C-3 解锁 2026-10-24] 第二遍缓存命中率文本（结果表列）。
-    /// 真数据 = secondHitRate×100%；驱动不可测（-1）=「—」；演示态恒「—」不造假（红线 8）。
+    /// [C-3] 第二遍缓存字节命中率文本（结果表列）。
+    /// 真数据 = ΔReadHitBytes/ΔReadBytes×100%；不可测（-1）=「—」；演示态恒「—」不造假。
     /// </summary>
     public string BenchHitRateText { get => _benchHitRateText; private set => Set(ref _benchHitRateText, value); }
 
@@ -693,7 +693,7 @@ public sealed class FeaturesViewModel : ObservableObject
             Application.Current?.Dispatcher.Invoke(() =>
             {
                 BenchBytesText = Conv.Size((ulong)Math.Max(0, size));
-                BenchFileInfo = $"{Conv.Size((ulong)Math.Max(0, size))} · 所在卷已加速";
+                BenchFileInfo = $"{Conv.Size((ulong)Math.Max(0, size))} · 所在卷已启用加速";
                 BenchState = "fileready";
             });
         });
@@ -777,6 +777,11 @@ public sealed class FeaturesViewModel : ObservableObject
     /// [契约 B-4/B-5] 真路径：FlushFileRange 前置（第一遍冷读前提）→ 执行体测量 →
     /// 进度经 B-7 总线投影（OnOpProgress 过滤 _benchOpId）。取消经总线登记应答（stats 口径不变）。
     /// </summary>
+    internal static bool IsDiagnosticBenchmark(string ioMode)
+        => ioMode.Contains("driver-offline", StringComparison.OrdinalIgnoreCase)
+            || ioMode.Contains("driver-cold-unverified", StringComparison.OrdinalIgnoreCase)
+            || ioMode.Contains("os-cache-unknown", StringComparison.OrdinalIgnoreCase);
+
     private async Task RunRealBenchmarkAsync(System.Threading.CancellationToken ct)
     {
         // B-5：缓存范围刷新；不可用=降级横幅（不中断对比，口径声明"第一遍可能不是冷读"）
@@ -785,7 +790,7 @@ public sealed class FeaturesViewModel : ObservableObject
         {
             BenchDegraded = true;
             RaisePropertyChanged(nameof(BenchDegraded));
-            LogService.Warn($"FlushFileRange 不可用：{flush.ErrorText}——第一遍可能不是冷读，结果仅供参考");
+            LogService.Warn($"FlushFileRange 不可用：{flush.ErrorText}");
         }
         // B-7：登记可取消 + 进度经总线发布（4Hz 节流由执行体负责）
         _progress.RegisterCancelable(_benchOpId, () => _benchCts?.Cancel());
@@ -800,12 +805,18 @@ public sealed class FeaturesViewModel : ObservableObject
         BenchSecondMbps = r.SecondMbps;
         BenchSecondSec = r.SecondSec;
         BenchBytesText = Conv.Size(r.Bytes);
-        BenchHitRateText = r.SecondHitRate >= 0 ? $"{r.SecondHitRate * 100:F1}%" : "—";   // [C-3]
+        BenchHitRateText = r.SecondHitRate >= 0 ? $"{r.SecondHitRate * 100:F1}%（字节）" : "—";
         BenchYMax = Math.Ceiling(Math.Max(r.FirstMbps, r.SecondMbps) / 400.0) * 400.0;
         BenchSpeedupText = r.FirstMbps > 0 ? $"{r.SecondMbps / r.FirstMbps:F1}×" : "—";
         RaisePropertyChanged(nameof(BenchTimeSavedPct));
         BenchState = "result";
-        Toast($"对比完成：第二遍快 {BenchSpeedupText}", "success");
+        bool degraded = IsDiagnosticBenchmark(r.IoMode);
+        BenchDegraded = degraded;
+        RaisePropertyChanged(nameof(BenchDegraded));
+        if (degraded)
+            Toast($"诊断测量完成（冷态未验证）：第二遍 {BenchSpeedupText}；{r.IoMode}", "warning");
+        else
+            Toast($"对比完成：第二遍快 {BenchSpeedupText}", "success");
     }
 
     /// <summary>取消对比（取消后 stats 口径不变——真路径经总线登记，演示路径直接 CTS）。</summary>

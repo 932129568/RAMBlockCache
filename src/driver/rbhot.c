@@ -50,7 +50,7 @@ VOID RbHotSnapshot(VOID)
     RtlInitUnicodeString(&u, base);
     RbRegSetValue(&u, L"HotZones", REG_BINARY, top, (ULONG)(n * sizeof(RB2_HZ)));
 }
-static VOID RbHotPrewarmJob(PVOID Ctx)
+VOID RbHotPrewarmJob(PVOID Ctx)
 {
     PRB_DEV_EXT ext = (PRB_DEV_EXT)Ctx;
     static const WCHAR base[] = L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\RAMBlockCache";

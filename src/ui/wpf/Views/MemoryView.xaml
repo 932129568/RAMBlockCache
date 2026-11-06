@@ -140,12 +140,11 @@
                     </StackPanel>
                     <ComboBox x:Name="blockSizeBox" Grid.Column="1" VerticalAlignment="Center" SelectedIndex="0"
                               SelectionChanged="BlockSize_SelectionChanged">
+                        <!-- [F1 2026-11-06] 64K/128K 摘除（11-03 事故未归因，59-64k-audit F1）；须与 MemoryView.xaml.cs _blockSizes 保持 4 项对齐 -->
                         <ComboBoxItem Content="4K  (4096 B)"/>
                         <ComboBoxItem Content="8K  (8192 B)"/>
                         <ComboBoxItem Content="16K (16384 B)"/>
                         <ComboBoxItem Content="32K (32768 B)"/>
-                        <ComboBoxItem Content="64K (65536 B)"/>
-                        <ComboBoxItem Content="128K (131072 B)"/>
                     </ComboBox>
                 </Grid>
 

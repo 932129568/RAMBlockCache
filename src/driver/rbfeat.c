@@ -112,6 +112,9 @@ VOID  Rb2Free(PVOID p)   { if (p) ExFreePoolWithTag(p, RB_POOL_TAG); }
  *   显式 0            -> 该卷关闭预取（RbPrefStream 入口直接 return）
  *   合法非零档        -> {8,16,32,64} 原样采用
  *   其余非零值        -> 回退 16 并 RbLog（可观测）
+ *   [回滚 2026-10-24] 扩档(128/256/512)撤回：随扩档部署出现三次整机崩溃
+ *   （0x7B/0x7E；minidump：页对齐基址+0xBCC 特权指令异常=控制流破坏形态），
+ *   二分归因先回退，稳定后另议扩档。
  * MaxWriteIops 行为不变：0 或非法回退 2000，不记日志。 */
 VOID RbPolGetFor(WCHAR Letter, RB2_POL *Pol)
 {
@@ -250,9 +253,9 @@ BOOLEAN RbFeatAdmit(PVOID Ext)
 
 /* ---- 端口 / 生命周期 ---- */
 VOID RbPortRegister(RB2_PORT_FILL Fill, RB2_PORT_SHRINK Shrink) { s_Fill = Fill; s_Shrink = Shrink; }
-VOID Rb2PortFill(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa)
+VOID Rb2PortFillGen(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa, rb_u64 ViewGen)
 {
-    if (s_Fill) s_Fill(Ext, LbaBytes, Len, SrcVa);
+    if (s_Fill) s_Fill(Ext, LbaBytes, Len, SrcVa, ViewGen);
 }
 VOID Rb2IoEnter(VOID) { InterlockedIncrement(&s_InFeat); }
 VOID Rb2IoLeave(VOID) { InterlockedDecrement(&s_InFeat); }
@@ -268,6 +271,12 @@ VOID Rb2ReloadFlags(VOID)
     if (v & RB2F_WBCOAL) {
         v &= ~RB2F_WBCOAL;
         RbLog(1, __LINE__, 0, L"flags: WBCOAL forced off (not wired)");
+    }
+    /* [FIX F2] MEMGUARD（bit4）零消费：全驱动无任何 RB2F_MEMGUARD 判定，
+     * 置位=纯假成功。与 WBCOAL 同款强制剥离（实现接线前不可启用）。 */
+    if (v & RB2F_MEMGUARD) {
+        v &= ~RB2F_MEMGUARD;
+        RbLog(1, __LINE__, 0, L"flags: MEMGUARD forced off (not wired)");
     }
     g_Rb2Flags = v;
     Rb2LoadExcl();
@@ -297,6 +306,10 @@ static VOID Rb2Tick(PVOID Ctx)
         /* [FIX B-U0-8] 运行时挂栈卷孤儿巡检（30s）：TestMode 卷不在 PnP 链上，
          * 底层卷意外移除时无 REMOVE IRP——此处兜底完整拆除。生产零行为。 */
         if (n % 30 == 0) RbJanitorSweepRuntimeAttached();
+        /* [FIX AUTOATTACH-2 2026-11-01] 开机迟到盘符补偿：AutoAttach 只依赖
+         * 各卷 PnP START 的一次性工作项，而盘符由 mount manager 后分配 →
+         * 开机必然错过（实测 attached=0/ReadReq=0/1.00×）。30s 巡检补齐。 */
+        if (n % 30 == 0) RbAutoAttachSweep();
     }
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -477,13 +490,27 @@ NTSTATUS RbFeatDispatch(PIRP Irp)
                     state = 0; reason = 3;               /* panic/安全模式 */
                 } else if (e->IsSystem) {
                     state = 0; reason = 1;               /* 系统卷默认排除 */
+                } else if (!e->IsAttached) {
+                    state = 0; reason = 2;               /* 用户关闭 */
+                } else if (!e->Stream || !e->GeometryValid) {
+                    state = 0; reason = RB_BYPASS_STREAM_GEOMETRY;
+                } else if (!g_Rb.Config.Enabled ||
+                           !g_Rb.Config.ReadCacheEnabled || !e->ReadEnabled ||
+                           !g_Rb.Config.WriteCacheEnabled || !e->WriteEnabled) {
+                    state = 0; reason = RB_BYPASS_DIRECTION;
                 } else {
-                    BOOLEAN bootcrit = FALSE;
-                    for (i = 0; i < critN; i++)
-                        if (crit[i] == e->Letter) { bootcrit = TRUE; break; }
-                    if (bootcrit)          { state = 0; reason = 4; }  /* 引导保护 */
-                    else if (!e->IsAttached){ state = 0; reason = 2; }  /* 用户关闭 */
-                    else                    { state = 1; reason = 0; }  /* 加速 */
+                    LONG recent = InterlockedCompareExchange(&e->LastBypassReason, 0, 0);
+                    if (recent >= RB_BYPASS_IO_TOO_LARGE && recent <= RB_BYPASS_RESOURCE) {
+                        state = 0; reason = (ULONG)recent;   /* 最近 IO 超门/准入/资源降级 */
+                    } else {
+                        state = 1; reason = 0;               /* eligible；不代表已有收益 */
+                        for (i = 0; i < critN; i++)
+                            if (crit[i] == e->Letter) {
+                                RbLog(0, __LINE__, 0,
+                                      L"volstatus: pagefile/dump volume eligible (mount gate decided)");
+                                break;
+                            }
+                    }
                 }
                 if (vl->Count < RB2_VOLSTATUS_MAX) {
                     vl->Items[vl->Count].Letter = e->Letter;
@@ -536,7 +563,7 @@ typedef struct _RB2_EVICT_JOB {
     ULONG64 Hits;
     PVOID   Buf;
 } RB2_EVICT_JOB;
-static VOID RbEvictJob(PVOID Ctx)
+VOID RbEvictJob(PVOID Ctx)
 {
     RB2_EVICT_JOB *j = (RB2_EVICT_JOB *)Ctx;
     if (j) {
@@ -554,8 +581,14 @@ static VOID RbEvictJob(PVOID Ctx)
  * chunk 数据，故 Src 在本次调用内始终可读。冷块过滤 Hits<2 保持（热数据才配持久化）。 */
 VOID RbFeatOnEvict(PVOID Ext, ULONG64 Lba, ULONG Len, PVOID Src, ULONG64 Hits)
 {
-    /* [V10.3.1] V3-07: 淘汰可能发生在持锁路径，严禁 >PASSIVE 触发 Zw 文件 IO */
+    /* [V10.3.1] V3-07: 淘汰可能发生在持锁路径，严禁 >PASSIVE 触发 Zw 文件 IO
+     * [FIX P2-2 R2 2026-11-03] L2 状态预检：RB2F_L2 位置位但 L2 容器未开
+     * （RbL2State()!=1，含几何门拒绝 state=3——64K 块下 chunk=1MB 必被拒）
+     * 时，本回调会在每次淘汰做 1MB 非分页分配+拷贝+池作业后原样丢弃
+     * （rbL2.c RbL2Store 入口 len!=RB2_L2BLK return）。预检拦截，消除
+     * 64K 几何下每块淘汰 1MB 白拷。 */
     if ((g_Rb2Flags & RB2F_L2) == 0)        return;
+    if (RbL2State() != 1)                   return;
     if (RbPanicActive())                    return;
     if (Ext == NULL || Src == NULL || Len == 0) return;
     if (Hits < 2)                           return;   /* 冷块不进 L2 */
@@ -611,8 +644,11 @@ NTSTATUS Rb2VolRead(PVOID Extp, ULONG64 Off, ULONG Len)
     buf = RbAllocAlignedNonPaged((SIZE_T)Len);
     if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
     o.QuadPart = (LONGLONG)Off;
-    s = RbSyncIo(ext, FALSE, &o, buf, (ULONG)Len, NULL);   /* PASSIVE：预取作业线程内 */
-    if (NT_SUCCESS(s)) rb_read_commit(ext->Stream, (rb_u64)Off, buf, (ULONG)Len);
+    {   /* [FIX 2026-11-06] 预热回填门控：世代在下盘读之前捕获 */
+        rb_u64 vgen = rb_stream_view_gen(ext->Stream);
+        s = RbSyncIo(ext, FALSE, &o, buf, (ULONG)Len, NULL);   /* PASSIVE：预取作业线程内 */
+        if (NT_SUCCESS(s)) rb_read_commit_gen(ext->Stream, (rb_u64)Off, buf, (ULONG)Len, vgen);
+    }
     RbFreeAligned(buf);
     return s;
 }

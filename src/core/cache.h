@@ -18,6 +18,10 @@ extern "C" {
   #define RB_AADD32(p,v)  (rb_u32)InterlockedExchangeAdd((volatile LONG *)(p), (LONG)(v))
   #define RB_ASTORE32(p,v) (void)InterlockedExchange((volatile LONG *)(p), (LONG)(v))
   #define RB_ALOAD32(p)   (rb_u32)InterlockedCompareExchange((volatile LONG *)(p), 0, 0)
+  /* [OPT-SPIN 2026-11-02] chunk 引用计数协议所需：位 Or / CAS（见 cache.c
+   * RB_REF_DYING 注释——free 单主 via CAS claim，Or(DYING) 只置位不抢主） */
+  #define RB_AOR32(p,v)   (rb_u32)InterlockedOr((volatile LONG *)(p), (LONG)(v))
+  #define RB_ACAS32(p,x,c) (rb_u32)InterlockedCompareExchange((volatile LONG *)(p), (LONG)(x), (LONG)(c))
 #elif defined(_MSC_VER)
   #include <windows.h>
   static __inline unsigned int rb_port_rand_r(unsigned int *seedp)
@@ -29,13 +33,17 @@ extern "C" {
   #define RB_AADD32(p,v)  (rb_u32)InterlockedExchangeAdd((volatile LONG *)(p), (LONG)(v))
   #define RB_ASTORE32(p,v) (void)InterlockedExchange((volatile LONG *)(p), (LONG)(v))
   #define RB_ALOAD32(p)   (rb_u32)InterlockedCompareExchange((volatile LONG *)(p), 0, 0)
+  #define RB_AOR32(p,v)   (rb_u32)InterlockedOr((volatile LONG *)(p), (LONG)(v))
+  #define RB_ACAS32(p,x,c) (rb_u32)InterlockedCompareExchange((volatile LONG *)(p), (LONG)(x), (LONG)(c))
 #else
   #define RB_AADD64(p,v)  (rb_u64)__atomic_fetch_add((p), (v), __ATOMIC_SEQ_CST)
   #define RB_ASTORE64(p,v) __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
   #define RB_ALOAD64(p)   (rb_u64)__atomic_load_n((p), __ATOMIC_SEQ_CST)
   #define RB_AADD32(p,v)  (rb_u32)__atomic_fetch_add((p), (v), __ATOMIC_SEQ_CST)
   #define RB_ASTORE32(p,v) __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
-  #define RB_ALOAD32(p)   (rb_u32)__atomic_load_n((p), __ATOMIC_SEQ_CST)
+  #define RB_ALOAD32(p)   (rb_u32)__atomic_load_n((p), __ATOMIC_SEQ_CST)  /* FIX: 原 InterlockedCompareExchange 为 Windows 专属，gcc 下不可用 */
+  #define RB_AOR32(p,v)   (rb_u32)__atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
+  #define RB_ACAS32(p,x,c) __atomic_compare_exchange_n((p), &(rb_u32){(c)}, (x), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
 #endif
 #ifndef CORE_MALLOC
 #include <stdlib.h>
@@ -43,11 +51,11 @@ extern "C" {
 #define CORE_REALLOC(p, sz)  realloc((p), (sz))
 #define CORE_FREE(p)         free(p)
 #endif
-#define RB_CHUNK_SIZE       (64u * 1024u)   /* legacy default geometry */
-#define RB_SUB_SIZE         (4u  * 1024u)
-#define RB_SUBS_PER_CHUNK   (RB_CHUNK_SIZE / RB_SUB_SIZE)
-#define RB_CHUNK_MASK       (RB_CHUNK_SIZE - 1)
-#define RB_CHUNK_ALIGN(x)   ((x) & ~(rb_u64)RB_CHUNK_MASK)
+/* [F11 2026-11-06] 删除 legacy 死常量（59-64k-audit F11；grep 全库复核零消费，
+ * 仅本定义处与文档引用）：RB_CHUNK_SIZE/RB_SUB_SIZE/RB_SUBS_PER_CHUNK/
+ * RB_CHUNK_MASK/RB_CHUNK_ALIGN——一律使用 eng->chunk_size / eng->chunk_mask
+ * （引擎 create 期派生，见 rb_engine_create；64K 语义下"chunk=64KB"旧注释
+ * 误导维护者，实际 chunk=block_size×16）。 */
 typedef uint64_t rb_u64;
 typedef int64_t  rb_i64;
 typedef uint32_t rb_u32;
@@ -93,12 +101,46 @@ typedef struct rb_direct_range {
     rb_u64 offset;
     size_t len;
 } rb_direct_range;
+/* ---- [OPT-EXCL 2026-11-01] LBA exclusion set ----
+ * 块层看不到文件名，所以"临时文件/软件缓存"这类不该占缓存的写入只能由上层
+ * （用户态按 FSCTL_GET_RETRIEVAL_POINTERS 解析出物理簇范围）下推为 LBA 区间。
+ * 语义：命中区间的子块一律走直写（不进缓存、不产生回写、不占内存），读路径
+ * 也不再回填。列表是"性能策略"而非正确性闸门：并发设置期间读取者可能看到
+ * 新版/旧版/半新半旧的一份，最坏结果是多缓存或少缓存几个块，永不导致数据
+ * 错误或丢失——因此热路径可以零锁查询。 */
+#ifndef RB_EXCL_MAX
+#define RB_EXCL_MAX 1024   /* 与 ctl/rb_excl.h 同值：驱动侧两处都包含，必须防重定义 */
+#endif
+typedef struct rb_extent {
+    rb_u64 start;      /* 卷内字节偏移（簇对齐） */
+    rb_u64 len;        /* 字节长度 */
+} rb_extent;
+/* 设置/替换排除集（n<=0 清空）。内部顺序：发布新集 → force flush 本流 →
+ * 失效区间内已缓存块（flush 未收敛时按"可能丢脏"保守记账）。
+ * 返回实际生效的区间数（合并后），<0 = 参数错误。PASSIVE 上下文。 */
+int  rb_stream_set_exclude(rb_stream *s, const rb_extent *ents, int n);
+int  rb_stream_get_exclude(rb_stream *s, rb_extent *out, int cap);
+/* 因排除集而绕过的写字节数 / 次数（引擎级累计，仅供诊断） */
+void rb_engine_get_excl_bypass(rb_engine *eng, rb_u64 *bytes, rb_u64 *ops);
 /* ---- engine ---- */
 rb_engine *rb_engine_create(const rb_config *cfg);
 void rb_engine_destroy(rb_engine *eng);
 void rb_engine_mark_teardown(rb_engine *eng);
 void rb_engine_get_stats(rb_engine *eng, rb_stats *out);
 int rb_engine_get_stripe_stats(rb_engine *eng, rb_u64 *rb, rb_u64 *wb, int cap);
+/* [F10 2026-11-06] 引擎几何 getter：返回引擎 create 期冻结的 block_size
+ * （eng==NULL → 0）。W12 推迟窗内驱动切块应以此为准，config 副本仅持久化面
+ * （见 rbio.c 切块点 / rbctl.c RbApplyConfig 推迟纪律）。 */
+rb_u32 rb_engine_block_size(const rb_engine *eng);
+#if defined(RB_SLAB_TEST_HOOK) && RB_SLAB_TEST_HOOK
+/* [F4/F5 测试钩子 2026-11-06] 仅在 /DRB_SLAB_TEST_HOOK=1 编译时存在
+ * （与 cache.c 内定义同步；test_geom.c 断言 slab 留池上限/单批块数用）：
+ *   nfree  = free-stack 当前块数；grows = 批分配次数；
+ *   cap    = 当前几何的 free-stack 块数上限 min(2048, 256MB/chunk_size)。 */
+rb_u32 rb_slab_test_nfree(const rb_engine *eng);
+rb_u32 rb_slab_test_grows(const rb_engine *eng);
+rb_u32 rb_slab_test_cap(const rb_engine *eng);
+#endif
 /* ---- stream ---- */
 rb_stream *rb_stream_create(rb_engine *eng, rb_u64 file_id);
 void rb_stream_destroy(rb_stream *s);
@@ -107,7 +149,24 @@ void rb_stream_destroy(rb_stream *s);
  * 违例返回 -2，不触碰任何输出。 */
 int rb_read(rb_stream *s, rb_u64 offset, void *buf, size_t len,
             rb_direct_range *miss, int *miss_count, int max_miss);
+/* [OPT F8 2026-11-01] 纯缓存命中内联尝试：范围内全部子块已加载时持共享锁
+ * 拷贝并返回 1（调用方就地完成 IRP，省 dispatch→worker 往返）；任一 miss
+ * 返回 0 且【未拷贝未计数】（调用方回退 rb_read miss 路径）。
+ * 统计口径与 rb_read 一致（本函数成功时计入 req/bytes/hit）。
+ * 调用契约：IRQL≤APC（共享 ERESOURCE）；命中路径无阻塞。 */
+int rb_read_try_cache(rb_stream *s, rb_u64 offset, void *buf, size_t len);
 void rb_read_commit(rb_stream *s, rb_u64 offset, const void *buf, size_t len);
+/* [FIX 2026-11-06 视图世代门控] 读回填必须携带 rb_read 计划时的视图世代
+ * （rb_stream_view_gen 快照）。期间发生过任何丢视图操作（discard_all /
+ * invalidate / truncate）→ 世代失配 → 放弃回填（防"改名/删除落地前的盘读
+ * 回填重新污染缓存"——11-04/11-06 应用 DLL 入口点错报两代事故同族根因）。 */
+void rb_read_commit_gen(rb_stream *s, rb_u64 offset, const void *buf, size_t len,
+                        rb_u64 view_gen);
+rb_u64 rb_stream_view_gen(rb_stream *s);
+/* [FIX 2026-11-06 变更窗] 元数据钩子窗口：窗口内驱动分发将读写透传
+ * （不吸收不回填）——flush 收敛、discard 零丢写、盘面过渡期读不进缓存。 */
+LONG rb_stream_view_mutating(rb_stream *s);
+void rb_stream_set_view_mutating(rb_stream *s, LONG v);
 void rb_read_copy_dirty(rb_stream *s, rb_u64 offset, void *buf, size_t len);
 /* ---- write ---- */
 /* [FIX W19] 契约：buf/direct/direct_count 必须非 NULL。违例返回 -2。 */
@@ -205,6 +264,8 @@ void rb_engine_set_dynamic_limit(rb_engine *eng, rb_u64 dynamic_limit_bytes);
 rb_u64 rb_engine_apply_pressure(rb_engine *eng, int level);
 void rb_engine_set_available_mb(rb_engine *eng, rb_u32 avail_mb, rb_u32 dyn_limit_mb);
 void rb_readahead_note_hit(rb_engine *eng, rb_u64 bytes);
+/* [FIX F1/F5] 预读填充接线：置 active 位并累计 readahead_bytes（rbpref 填充点调用） */
+void rb_readahead_note_fill(rb_engine *eng, rb_u64 bytes);
 rb_u64 rb_engine_get_dynamic_limit_bytes(rb_engine *eng);
 #ifdef __cplusplus
 }

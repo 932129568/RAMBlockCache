@@ -1,7 +1,9 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <!-- [P0-3 2026-10-31] .NET 8 EOL 2026-11-10，升级至 net10.0-windows（SDK ≥10.0.14）；
+         版本资源保持 10.4.1.19（机器版本串，check_repo 版本五联动口径）不变。 -->
+    <TargetFramework>net10.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -15,5 +17,10 @@
   </PropertyGroup>
   <ItemGroup>
     <Resource Include="app.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- [UI-HOST 2026-11-05] WebView2 壳：控制器内嵌 Web 控制台（UI 与 Web 端永远一致）。
+         Win11 自带 Evergreen Runtime；Win10 由 Evergreen 引导自动安装。 -->
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2792.45" />
   </ItemGroup>
 </Project>

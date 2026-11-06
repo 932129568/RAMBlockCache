@@ -1,0 +1,129 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                   xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                   xmlns:sys="clr-namespace:System;assembly=mscorlib"
+                   xmlns:ctl="clr-namespace:RAMBlockCache.Setup.Controls">
+    <!-- =====================================================================
+         RAMBlockCache 安装器设计令牌（与 Controller Theme/Dark.xaml 同源：
+         deliverables/design/02-design-system.md；[FIX U-05] 后动效时长/缓动
+         单一事实源在 Controls/Motion.cs，XAML 一律 {x:Static ctl:Motion.DurN}）
+         ===================================================================== -->
+
+    <!-- ===== 背景 ===== -->
+    <SolidColorBrush x:Key="RbcBgApp"          Color="#FF0E0E11"/>
+    <SolidColorBrush x:Key="RbcBgSurface"      Color="#FF17171C"/>
+    <SolidColorBrush x:Key="RbcBgSurfaceHover" Color="#FF1E1E24"/>
+    <SolidColorBrush x:Key="RbcBorder"         Color="#FF26262E"/>
+    <SolidColorBrush x:Key="RbcBorderStrong"   Color="#FF3A3A45"/>
+
+    <!-- ===== 文本 ===== -->
+    <SolidColorBrush x:Key="RbcTextPrimary"    Color="#FFEDEDF2"/>
+    <SolidColorBrush x:Key="RbcTextSecondary"  Color="#FF9A9AA5"/>
+    <SolidColorBrush x:Key="RbcTextTertiary"   Color="#FF6F6F7A"/>
+
+    <!-- ===== 强调 / 语义五色 ===== -->
+    <SolidColorBrush x:Key="RbcAccent"         Color="#FF4CC2FF"/>
+    <SolidColorBrush x:Key="RbcSuccessFg"      Color="#FF63D6A0"/>
+    <SolidColorBrush x:Key="RbcWarningFg"      Color="#FFF2B84B"/>
+    <SolidColorBrush x:Key="RbcDangerFg"       Color="#FFF27A72"/>
+    <SolidColorBrush x:Key="RbcInfoFg"         Color="#FF6FB4F5"/>
+    <SolidColorBrush x:Key="RbcNeutralFg"      Color="#FFA6A6B0"/>
+
+    <!-- ===== 语义色底 ===== -->
+    <SolidColorBrush x:Key="RbcSuccessBg"      Color="#FF04342C"/>
+    <SolidColorBrush x:Key="RbcWarningBg"      Color="#FF412402"/>
+    <SolidColorBrush x:Key="RbcDangerBg"       Color="#FF501313"/>
+    <SolidColorBrush x:Key="RbcInfoBg"         Color="#FF042C53"/>
+    <SolidColorBrush x:Key="RbcNeutralBg"      Color="#FF2C2C2A"/>
+
+    <!-- ===== 按钮 ===== -->
+    <SolidColorBrush x:Key="RbcDangerBtn"      Color="#FF7A2020"/>
+    <SolidColorBrush x:Key="RbcDangerBtnHover" Color="#FFA32D2D"/>
+    <SolidColorBrush x:Key="RbcPrimaryBtn"     Color="#FF185FA5"/>
+    <SolidColorBrush x:Key="RbcPrimaryBtnHover" Color="#FF0C447C"/>
+
+    <!-- ===== 进度轨道 / 焦点环 ===== -->
+    <SolidColorBrush x:Key="RbcTrackBg"   Color="#FF23232B"/>
+    <SolidColorBrush x:Key="RbcFocusRing" Color="#FF4CC2FF"/>
+
+    <!-- ===== 焦点环（02b §B.3-11）===== -->
+    <Style x:Key="RbcFocusRingStyle" TargetType="Control">
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate>
+                    <Rectangle Stroke="{StaticResource RbcFocusRing}" StrokeThickness="2"
+                               RadiusX="4" RadiusY="4" SnapsToDevicePixels="True" Margin="-2"/>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ===== 按钮：主 / 次 / 危险（与 Controller BtnBase 同款） ===== -->
+    <Style x:Key="BtnBase" TargetType="Button">
+        <Setter Property="Foreground" Value="{StaticResource RbcTextPrimary}"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Padding" Value="13,7"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="FocusVisualStyle" Value="{StaticResource RbcFocusRingStyle}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="bd" Background="{TemplateBinding Background}"
+                            CornerRadius="6" Padding="{TemplateBinding Padding}"
+                            RenderTransformOrigin="0.5,0.5">
+                        <Border.RenderTransform>
+                            <TranslateTransform x:Name="press" Y="0"/>
+                        </Border.RenderTransform>
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="bd" Property="Opacity" Value="0.88"/>
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <Trigger.EnterActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <DoubleAnimation Storyboard.TargetName="press" Storyboard.TargetProperty="Y"
+                                                         To="1" Duration="{x:Static ctl:Motion.Dur90}"/>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </Trigger.EnterActions>
+                            <Trigger.ExitActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <DoubleAnimation Storyboard.TargetName="press" Storyboard.TargetProperty="Y"
+                                                         To="0" Duration="{x:Static ctl:Motion.Dur90}"/>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </Trigger.ExitActions>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="bd" Property="Opacity" Value="0.45"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+    <Style x:Key="BtnPrimary" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+        <Setter Property="Background" Value="{StaticResource RbcPrimaryBtn}"/>
+        <Style.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter Property="Background" Value="{StaticResource RbcPrimaryBtnHover}"/>
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+    <Style x:Key="BtnSecondary" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+        <Setter Property="Background" Value="{StaticResource RbcBgSurfaceHover}"/>
+    </Style>
+    <Style x:Key="BtnDanger" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+        <Setter Property="Background" Value="{StaticResource RbcDangerBtn}"/>
+        <Setter Property="Focusable" Value="False"/>
+        <Style.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter Property="Background" Value="{StaticResource RbcDangerBtnHover}"/>
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+</ResourceDictionary>

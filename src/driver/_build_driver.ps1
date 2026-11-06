@@ -27,7 +27,7 @@ foreach ($f in $files) {
     $src = Join-Path $drv ($f + ".c")
     $fo  = Join-Path $obj ($name + ".obj")
     & cl /nologo /c /O2 /Oi /Gy /utf-8 /W3 /std:c11 /Zi /MT `
-         /D_AMD64_ /D_WIN64 /DRB_KERNEL_BUILD `
+         /D_AMD64_ /D_WIN64 /D_KERNEL_MODE /DRB_KERNEL_BUILD `
          $src "/Fo$fo"
     if ($LASTEXITCODE -ne 0) { Write-Output "[FAIL-cl] $name"; $fail++ }
 }

@@ -96,7 +96,7 @@ public static class FeatureText
         _ => "未知状态"
     };
 
-    public static string VolStateText(uint s) => s == 1 ? "已加速" : "旁路";
+    public static string VolStateText(uint s) => s == 1 ? "加速已启用" : "旁路";
 
     public static string VolReasonText(uint r) => r switch
     {
@@ -106,7 +106,12 @@ public static class FeatureText
         3 => "熔断/安全模式",
         4 => "引导保护",
         5 => "卷已移除",
-        _ => "未知原因"
+        6 => "流/几何不可用",
+        7 => "缓存方向已禁用",
+        8 => "最近 IO 超过缓存门",
+        9 => "最近进程/准入排除",
+        10 => "最近分配/队列资源降级",
+        _ => $"未知原因({r})"
     };
 
     /// <summary>特性位 → 中文名（设置页/日志展示用）。</summary>
@@ -123,7 +128,8 @@ public static class FeatureText
     };
 }
 
-/// <summary>每卷预读窗口合法档位（FR-PF-02：0=关；缺省 16；其余值驱动回退 16）。</summary>
+/// <summary>每卷预读窗口合法档位（FR-PF-02：0=关；缺省 16；其余值驱动回退 16）。
+/// [回滚 2026-10-24] 128/256/512 扩档撤回（随扩档部署出现整机崩溃，驱动侧同步回退）。</summary>
 public static class ReadAheadMBOptions
 {
     public static readonly uint[] Legal = { 0, 8, 16, 32, 64 };

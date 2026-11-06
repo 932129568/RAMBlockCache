@@ -148,6 +148,93 @@ typedef struct _RB_FLUSH_COUNTERS {
   #define RB_RW_DESTROY(r) pthread_rwlock_destroy((r))
   #define RB_RW_WTRYLOCK(r) (pthread_rwlock_trywrlock((r))==0)
 #endif
+/* ---- [OPT-SPIN 2026-11-02] bucket 自旋锁（快路径专用；语义=共享/排他）----
+ * 动因：rb_read_try_cache 每 IO 一次 ERESOURCE 共享获取/释放（ExAcquire
+ * ResourceSharedLite：线程 OwnerEntry 记账 + APC 抑制）≈0.3-0.7µs，是 4K
+ * 随机读每-IO 成本的最大单项。快路径改用 EX_SPIN_LOCK（内核）/SRWLOCK
+ * （测试）保护【哈希桶】：
+ *   - 快读者：bucket 共享锁内完成 查找+ref++，随即放锁，持 ref 拷贝；
+ *   - 变异者（chunk_create 插入 / chunk_unlink_account 摘除）：bucket 排他锁；
+ * 锁序不变式（只紧不松）：stripe WLOCK → chain（ERESOURCE）→ bucket（自旋）。
+ * bucket 自旋临界区内【零阻塞调用】（仅指针走链+Interlocked），快读者在
+ * 共享侧同样零阻塞 → 无自旋饿死面。stripes/chain 全部原样保留，慢路径
+ * （rb_read/rb_write_ex/invalidate/flush）逐字不变。 */
+#ifdef RB_KERNEL_BUILD
+  typedef EX_SPIN_LOCK rb_bspin;
+  /* 内核 EX_SPIN_LOCK 获取返回旧 IRQL、释放需传回（wdm.h 原型）。宏在调用点
+   * 声明 _rb_bq 局部变量——所有使用点均为"同一作用域内获取/释放"配对
+   * （rb_read_try_cache 循环体、chunk_create/unlink 的既有块作用域），无嵌套。 */
+  #define RB_B_INIT(b)     do{ *(b)=0; }while(0)
+  #define RB_B_RLOCK(b)    KIRQL _rb_bq = ExAcquireSpinLockShared((b))
+  #define RB_B_WLOCK(b)    KIRQL _rb_bq = ExAcquireSpinLockExclusive((b))
+  #define RB_B_RUNLOCK(b)  ExReleaseSpinLockShared((b), _rb_bq)
+  #define RB_B_WUNLOCK(b)  ExReleaseSpinLockExclusive((b), _rb_bq)
+  #define RB_B_DESTROY(b)  do{ *(b)=0; }while(0)
+#elif defined(_MSC_VER)
+  typedef SRWLOCK rb_bspin;
+  #define RB_B_INIT(b)     do{ InitializeSRWLock((b)); }while(0)
+  #define RB_B_RLOCK(b)    (void)AcquireSRWLockShared((b))
+  #define RB_B_WLOCK(b)    (void)AcquireSRWLockExclusive((b))
+  #define RB_B_RUNLOCK(b)  (void)ReleaseSRWLockShared((b))
+  #define RB_B_WUNLOCK(b)  (void)ReleaseSRWLockExclusive((b))
+  #define RB_B_DESTROY(b)  do{ }while(0)
+#else
+  #include <pthread.h>
+  typedef pthread_rwlock_t rb_bspin;
+  #define RB_B_INIT(b)     pthread_rwlock_init((b), NULL)
+  #define RB_B_RLOCK(b)    pthread_rwlock_rdlock((b))
+  #define RB_B_WLOCK(b)    pthread_rwlock_wrlock((b))
+  #define RB_B_RUNLOCK(b)  pthread_rwlock_unlock((b))
+  #define RB_B_WUNLOCK(b)  pthread_rwlock_unlock((b))
+  #define RB_B_DESTROY(b)  pthread_rwlock_destroy((b))
+#endif
+/* [OPT-SPIN] 快读者撕裂检测（写者持 stripe WLOCK 改 c->data，快读者无
+ * stripe 锁）：每子块 seq 奇偶校验。写者：seq++ → memcpy → seq++（同为
+ * stripe WLOCK 内，写写互斥）。读者：读 seq（奇=写中→退慢路径）→ 拷贝 →
+ * 复核 seq 不变。x64 硬件 load-load 不重排，只需编译器屏障；MSVC 驱动
+ * 构建 /volatile:ms（volatile 读=acquire 写=release）已足；gcc 用
+ * __atomic_thread_fence。 */
+#ifdef RB_KERNEL_BUILD
+  #define RB_SEQ_FENCE()   KeMemoryBarrier()
+#elif defined(_MSC_VER)
+  #define RB_SEQ_FENCE()   MemoryBarrier()
+#else
+  #define RB_SEQ_FENCE()   __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#endif
+/* [OPT-SPIN] 写者桩（调用方必须持该 chunk 所在 stripe WLOCK——写写互斥由此
+ * 保证）：子块数据变更前后各一次代进阶（偶→奇→偶）。快读者见奇代即退慢
+ * 路径，拷后复核代不变。仅"会写 c->data 的桩点"需要；只清位/记账的路径
+ * （invalidate/flush 清理）不写数据，无需桩。 */
+#define RB_SEQ_BUMP(c,i)      do{ (c)->seq[i] = (uint32_t)((c)->seq[i] + 1u); }while(0)
+#define RB_SEQ_BUMP_ALL(c)    do{ unsigned _i; for(_i=0;_i<RB_SUBS_FIXED;_i++) RB_SEQ_BUMP(c,_i); }while(0)
+/* ---- [OPT-BACKOFF 2026-11-05] 自适应退避：锁争抢的 CPU 效率核心 ----
+ * 问题：原先所有等待都走 RB_YIELD，内核态=固定 1ms 睡眠。高并发场景（多 worker
+ * 争同一 stream 的 flush_active、多 flusher 争 dirty 链）下，每次争抢付 1ms
+ * 是**延迟放大 1000 倍**的根因：本该在微秒级完成的临界区等待被拖成毫秒，
+ * 并发越高越慢。
+ * 方案（标准锁退避）：前 RB_BACKOFF_SPIN 次只让出时间片（yield，微秒级，
+ * 适合"锁马上就会释放"的常见情况）；之后按 2× 指数退避直到上限，避免
+ * 长时间争抢时空转烧 CPU。两个目标同时满足：低延迟 + 不空转。 */
+static __inline void RB_BACKOFF(unsigned spin)
+{
+    if (spin < 64u) {
+#ifdef RB_KERNEL_BUILD
+        /* 内核：YieldProcessor 是编译器内建（PAUSE 指令），不给调度器让核但
+         * 大幅降低自旋功耗与超线程争用——短临界区的最优选择 */
+        YieldProcessor();
+#elif defined(_MSC_VER)
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
+    } else {
+        /* 长等待：指数退避到 1ms 上限 */
+        unsigned sh = (spin < 512u) ? 0u : ((spin < 1024u) ? 1u : 2u);
+        (void)sh;
+        RB_YIELD();
+    }
+}
+
 /* ---- in-flight markers: YIELD while waiting, never burn a core ---- */
 #ifdef RB_KERNEL_BUILD
   #define RB_FL_TRY(s)   (InterlockedCompareExchange((volatile LONG*)&(s)->flush_active,1,0)==0)
@@ -155,18 +242,25 @@ typedef struct _RB_FLUSH_COUNTERS {
   #define RB_FL_REL(s)   (void)InterlockedExchange((volatile LONG*)&(s)->flush_active,0)
   #define RC_TRY(s)      (InterlockedCompareExchange((volatile LONG*)&(s)->reclaim_active,1,0)==0)
   #define RC_REL(s)      (void)InterlockedExchange((volatile LONG*)&(s)->reclaim_active,0)
+  /* [OPT-EXCL] exclude-set update serialization (see rb_stream_set_exclude) */
+  #define EXCL_TRY(s)    (InterlockedCompareExchange((volatile LONG*)&(s)->excl_busy,1,0)==0)
+  #define EXCL_REL(s)    (void)InterlockedExchange((volatile LONG*)&(s)->excl_busy,0)
 #elif defined(_MSC_VER)
   #define RB_FL_TRY(s)   (InterlockedCompareExchange((volatile LONG*)&(s)->flush_active,1,0)==0)
   #define RB_FL_FORCE(s) do{ while(InterlockedCompareExchange((volatile LONG*)&(s)->flush_active,1,0)!=0) RB_YIELD(); }while(0)
   #define RB_FL_REL(s)   (void)InterlockedExchange((volatile LONG*)&(s)->flush_active,0)
   #define RC_TRY(s)      (InterlockedCompareExchange((volatile LONG*)&(s)->reclaim_active,1,0)==0)
   #define RC_REL(s)      (void)InterlockedExchange((volatile LONG*)&(s)->reclaim_active,0)
+  #define EXCL_TRY(s)    (InterlockedCompareExchange((volatile LONG*)&(s)->excl_busy,1,0)==0)
+  #define EXCL_REL(s)    (void)InterlockedExchange((volatile LONG*)&(s)->excl_busy,0)
 #else
   #define RB_FL_TRY(s)   (__sync_val_compare_and_swap(&(s)->flush_active,0,1)==0)
   #define RB_FL_FORCE(s) do{ while(__sync_val_compare_and_swap(&(s)->flush_active,0,1)!=0) RB_YIELD(); }while(0)
   #define RB_FL_REL(s)   __sync_lock_release(&(s)->flush_active)
   #define RC_TRY(s)      (__sync_val_compare_and_swap(&(s)->reclaim_active,0,1)==0)
   #define RC_REL(s)      __sync_lock_release(&(s)->reclaim_active)
+  #define EXCL_TRY(s)    (__sync_val_compare_and_swap(&(s)->excl_busy,0,1)==0)
+  #define EXCL_REL(s)    __sync_lock_release(&(s)->excl_busy)
 #endif
 #define RB_NBUCKETS 16384
 #define RB_NSTRIPES 64
@@ -213,6 +307,15 @@ struct rb_chunk {
     /* [FIX W18] evicting 死字段已删除：全库无人置 1，纯误导维护者 */
     rb_u64 epoch;                    /* birth id: defeats chunk-address reuse on validate */
     uint32_t dseq[RB_SUBS_FIXED];    /* per-sub dirty generation (bumped on every write) */
+    /* [OPT-SPIN 2026-11-02] 快路径（rb_read_try_cache 无 stripe 锁拷贝）两件套：
+     * ref  : bit0-30 = 在用读者数；bit31(RB_REF_DYING)=已从哈希摘除待释放；
+     *        bit30(RB_REF_FREED)=内存已归还（CAS claim 单主，防 double free）。
+     *        读者协议：bucket 共享锁内 ref++（unlink 需要 bucket 排他锁 →
+     *        读者找到的 chunk 必然尚未摘除），拷完 ref--；释放单主判定见
+     *        chunk_free/chunk_unref。非快路径持 stripe 锁的读者不经 ref。
+     * seq[] : 每子块撕裂检测代（写者 seq++/memcpy/seq++，见 RB_SEQ_FENCE 注）。 */
+    volatile LONG ref;
+    volatile uint32_t seq[RB_SUBS_FIXED];
     struct rb_chunk *hash_next;
     struct rb_chunk *lru_prev, *lru_next;
     struct rb_chunk *d_prev, *d_next;
@@ -229,6 +332,9 @@ struct rb_stream {
     volatile rb_u32 chunk_count;
     rb_rwlock *stripes;
     rb_mutex chain[RB_CHAIN_SHARDS];
+    /* [OPT-SPIN 2026-11-02] 快路径哈希桶自旋锁（16384×4B=64KB/流，内核
+     * 非分页；只护 buckets 哈希链的并发走链/摘除，LRU/dirty 链仍归 chain 锁） */
+    rb_bspin bspin[RB_NBUCKETS];
     /* [FIX WS-RACE-2] 在途回写计数：flush_pass 的"stage→锁外 writeback"区间
      * 内 >0。失效路径（rb_stream_invalidate_range_ex）入口先排空——
      * 直写+失效假设"直写是盘面最终语"，若在途回写其后落盘即以旧数据覆盖
@@ -241,7 +347,135 @@ struct rb_stream {
     rb_u64 last_read_off;
     struct rb_stream *next, *prev;
     struct rb_flushws *ws;           /* serial-path workspace (lazy, freed at destroy) */
+    /* [OPT-EXCL 2026-11-01] LBA exclusion set（见 cache.h 契约）。excl_n==0 时
+     * 热路径只多一次 volatile 读，零代价；发布顺序 store(0)→填充→store(n)
+     * 保证读者看到的 n 与数组内容至多"新旧混搭"，不会越界（excl_n 单调收敛）。 */
+    volatile rb_u32 excl_n;
+    volatile long  excl_busy;        /* set_exclude 串行化：并发 IOCTL 会撕裂数组 */
+    rb_extent excl[RB_EXCL_MAX];     /* sorted by start, non-overlapping */
+    volatile rb_u64 excl_bytes;      /* 因排除绕过的写字节（本流） */
+    volatile rb_u64 excl_ops;        /* 因排除绕过的写次数（本流） */
+    /* [FIX 2026-11-06 视图世代门控] 丢视图类操作（discard_all / invalidate_*
+     * / truncate）入口原子 ++。读回填（rb_read_commit_gen）必须校验"miss
+     * 计划时捕获的世代"——不匹配即放弃回填。封堵丢失效竞争：元数据操作
+     * （改名/删除/截断）的"刷脏+丢视图"窗口内，并发读的【改名前】盘读
+     * 完成后回填，会把操作前盘面重新提交进缓存 = 视图被重新污染（应用
+     * 读到自己更新前的 DLL = 入口点错报，11-04/11-06 两代事故同族）。 */
+    volatile rb_u64 view_gen;
+    /* [FIX 2026-11-06 变更窗] 元数据钩子的"flush→discard→forward"窗口置 1：
+     * 窗口内读写一律直通（驱动分发检查）——flush 无新脏可收敛（discard 零
+     * 丢写）、盘面过渡期读不进缓存（无撕裂回填）、窗口关闭后冷启动。
+     * 0=正常，1=窗口开启。Interlocked 读写保证与驱动的跨线程可见性。 */
+    volatile LONG view_mutating;
 };
+/* ---- [OPT-SLAB 2026-11-01] chunk data block pool ----
+ * Profiling (src/core/bench_write_absorb.c): cold sequential write runs at
+ * 2473 MiB/s vs 22497 MiB/s steady-state overwrite. Of the ~22.5us spent in
+ * every cold chunk_create, 19-25us is CORE_MALLOC(chunk_size): on Win64 a
+ * 64KiB request falls in the heap's worst band (above LFH's 16KiB, below the
+ * VirtualAlloc threshold). Measured: malloc(64KiB) = 24.0us/block, while
+ * malloc(1MiB) sliced into 16 blocks costs 0.19us/block -- 126x cheaper.
+ * Pooling one batch per 16 blocks therefore removes the dominant cold-write
+ * cost. Blocks are interchangeable data buffers (position-independent), the
+ * pool never hands one block to two live chunks, and the lock is held only
+ * for a push/pop (no I/O, no memset). Alignment: the batch base is rounded up
+ * to 64KiB, so every block is >=4KiB aligned -- strictly better than the
+ * previous per-block 4KiB guarantee. */
+#define RB_SLAB_BATCH     16u     /* 单批块数上限: 16 x chunk_size（[F5] 起按几何自适应收缩，见 slab_get） */
+/* [F4 2026-11-06] free-stack 块数上限 = min(RB_SLAB_FREE_MAX, RB_SLAB_RETAIN_BYTES/chunk_size)：
+ * 原纯块数上限 2048 在大几何档把非分页滞留按 chunk 倍数放大（32K 档 chunk=512KB
+ * → 2048×512KB=1GB；64K 档 2GB、128K 档 4GB——59-64k-audit F4：chunk_destroy→
+ * slab_put 后 total_bytes 已减、不受动态预算/reclaim 约束，是唯一随块大小放大的
+ * 资源面缺陷）。改按 256MB 字节预算封顶后各档结果（chunk = block_size×16）：
+ *   4K 档 chunk= 64KB → 256MB/ 64KB=4096 → min(2048,4096)=2048（不变）
+ *   8K 档 chunk=128KB → 2048 → 2048（不变）
+ *  16K 档 chunk=256KB → 1024
+ *  32K 档 chunk=512KB →  512
+ * free_stack 数组物理维度保持 RB_SLAB_FREE_MAX=2048（只改接纳判据，不动内存
+ * 布局）；满栈=直接丢弃该块（batch 链在引擎销毁时统一释放，不泄漏，仅损失复用）。 */
+#define RB_SLAB_RETAIN_BYTES (256u*1024u*1024u)   /* free-stack 字节预算（0x10000000） */
+#define RB_SLAB_FREE_MAX  2048u   /* free-stack 物理维度; overflow just loses reuse */
+/* [F4] 块数上限接纳判据（slab_get/slab_put 共用，保证两端一致）。
+ * chunk_size 一律取引擎 create 期派生的实际值（调用方传入），绝不按
+ * block_size×16 重算。除零防御：chunk_size==0（几何未派生，不可达）→ 物理
+ * 维度；商为 0（chunk>256MB，白名单下不可达）→ 至少 1。 */
+static rb_u32 slab_free_cap(rb_u32 chunk_size)
+{
+    rb_u64 n;
+    if(chunk_size==0) return RB_SLAB_FREE_MAX;
+    n=RB_SLAB_RETAIN_BYTES/chunk_size;      /* 整除向下取整 */
+    if(n>(rb_u64)RB_SLAB_FREE_MAX) n=RB_SLAB_FREE_MAX;
+    if(n<1u) n=1u;
+    return (rb_u32)n;
+}
+struct rb_slab_batch { struct rb_slab_batch *next; rb_u32 nblocks; };
+struct rb_slab {
+    rb_mutex lock;
+    struct rb_slab_batch *batches;
+    void   *free_stack[RB_SLAB_FREE_MAX];
+    rb_u32  nfree;
+    rb_u32  grows;                /* diagnostics: batch allocations */
+};
+/* one contiguous grow, sliced into n blocks (n = F5 自适应批); returns one block.
+ * NULL => caller degrades to direct I/O (same as any chunk_create failure). */
+static void *slab_get(struct rb_slab *sl, rb_u32 block_size)
+{
+    void *p=NULL;
+    rb_u32 cap=slab_free_cap(block_size);   /* [F4] 接纳判据（与 slab_put 同式） */
+    if(!block_size) return NULL;            /* 防御：几何未派生（不可达） */
+    RB_M_LOCK(&sl->lock);
+    if(sl->nfree) p=sl->free_stack[--sl->nfree];
+    RB_M_UNLOCK(&sl->lock);
+    if(p)return p;
+    {
+        /* [F5 2026-11-06] 单批块数自适应：batch = min(16, max(1, (4MB-64KB)/chunk_size))
+         * （0x400000-0x10000 为"4MB 批预算 - 64KiB 对齐 slack"，整除向下取整）。
+         * 原固定 16 在大几何档把单次非分页分配大额化（4K 档 ≈1.06MB → 32K 档
+         * ≈8.4MB、64K 档 ≈16.07MB），失败→NULL→chunk_create NULL→direct 兜底
+         * （安全）但反复失败 = 静默性能悬崖（59-64k-audit F5）。各档结果：
+         *   4K 档 chunk= 64KB → (4MB-64KB)/ 64KB=63 → 16（不变）
+         *  16K 档 chunk=256KB → 15
+         *  32K 档 chunk=512KB → 7
+         *   8K 档 chunk=128KB → 31 → 16（不变）
+         * 失败路径零改动：CORE_MALLOC_NP 失败 → NULL → 既有 direct 兜底。 */
+        rb_u32 fit=(rb_u32)((0x400000u-0x10000u)/block_size);
+        rb_u32 n=RB_SLAB_BATCH;
+        if(fit<1u) fit=1u;                  /* 极小 chunk 防御（不可达，白名单下 fit≥63） */
+        if(fit<n) n=fit;
+        size_t head=(sizeof(struct rb_slab_batch)+63u)&~(size_t)63u;
+        size_t need=head+(size_t)n*block_size+65536u;   /* slack for 64KiB align */
+        unsigned char *raw=(unsigned char *)CORE_MALLOC_NP(need);
+        unsigned char *base; rb_u32 i;
+        struct rb_slab_batch *b;
+        if(!raw)return NULL;
+        base=(unsigned char *)(((uintptr_t)(raw+head)+65535u)&~(uintptr_t)65535u);
+        b=(struct rb_slab_batch *)raw; b->nblocks=n;
+        RB_M_LOCK(&sl->lock);
+        b->next=sl->batches; sl->batches=b; sl->grows++;
+        for(i=n;i>1;i--)
+            if(sl->nfree<cap) sl->free_stack[sl->nfree++]=base+(size_t)(i-1)*block_size;
+        RB_M_UNLOCK(&sl->lock);
+        return base;
+    }
+}
+/* return a block; a full stack simply drops it (batch is freed with the engine).
+ * [F4 2026-11-06] 满栈判据从物理维度改为 slab_free_cap(chunk_size)（字节预算）；
+ * chunk_size 由调用方传引擎几何（chunk_free/chunk_unref 两处调用点均持有 eng）。 */
+static void slab_put(struct rb_slab *sl, void *p, rb_u32 chunk_size)
+{
+    rb_u32 cap;
+    if(!sl||!p)return;
+    cap=slab_free_cap(chunk_size);
+    RB_M_LOCK(&sl->lock);
+    if(sl->nfree<cap) sl->free_stack[sl->nfree++]=p;
+    RB_M_UNLOCK(&sl->lock);
+}
+static void slab_release_all(struct rb_slab *sl)
+{
+    struct rb_slab_batch *b=sl->batches;
+    while(b){ struct rb_slab_batch *n=b->next; CORE_FREE(b); b=n; }
+    sl->batches=NULL; sl->nfree=0;
+}
 struct rb_engine {
     rb_config cfg;
     rb_u32 block_size;
@@ -276,7 +510,26 @@ struct rb_engine {
     rb_stream *streams;
     struct { volatile rb_i64 v; char pad[56]; } stripe_rb[RB_NSTRIPES];
     struct { volatile rb_i64 v; char pad[56]; } stripe_wb[RB_NSTRIPES];
+    /* [OPT-STATS R25 2026-11-03] 读热四计数 64 路 stripe 分片：4K 随机读每 IO
+     * 4 次全局原子 = 单缓存行跨核 RFO 乒乓；分片后争用面 /64。汇总在
+     * rb_engine_get_stats。写侧计数低频保持全局。 */
+    struct { volatile rb_i64 v; char pad[56]; } stat_rd_req[RB_NSTRIPES];
+    struct { volatile rb_i64 v; char pad[56]; } stat_rd_bytes[RB_NSTRIPES];
+    struct { volatile rb_i64 v; char pad[56]; } stat_rd_hit[RB_NSTRIPES];
+    struct { volatile rb_i64 v; char pad[56]; } stat_rd_hitb[RB_NSTRIPES];
+    struct rb_slab slab;          /* [OPT-SLAB] chunk data block pool */
 };
+#if defined(RB_SLAB_TEST_HOOK) && RB_SLAB_TEST_HOOK
+/* [F4/F5 测试钩子 2026-11-06] 仅在显式 /DRB_SLAB_TEST_HOOK=1 编译时存在
+ * （RB_EVICT_HOOK_EXTERNAL 同款纪律：测试专用观测面，生产/内核构建零符号）。
+ * test_geom.c 用它断言 free-stack 块数上限（F4）与单批块数（F5）。 */
+rb_u32 rb_slab_test_nfree(const rb_engine *eng)
+{ return eng ? eng->slab.nfree : 0u; }
+rb_u32 rb_slab_test_grows(const rb_engine *eng)
+{ return eng ? eng->slab.grows : 0u; }
+rb_u32 rb_slab_test_cap(const rb_engine *eng)
+{ return eng ? slab_free_cap(eng->chunk_size) : 0u; }
+#endif
 /* ---- flush workspace ---- */
 typedef struct rb_fent  { rb_u64 start; uint16_t dm; } rb_fent;
 typedef struct rb_frun  { rb_u64 off;  rb_u32 sub; rb_u32 nsubs; } rb_frun;
@@ -319,6 +572,24 @@ static rb_u32 stripe_of(rb_u64 start) { return bucket_of(start) % RB_NSTRIPES; }
  * ——无锁序倒置。d_head/d_tail 脏链表自 W1.5-R2 起无任何消费者（flush 快照
  * 改走哈希桶扫描，见 flush_pass 快照段注释），随 LRU 一并分片，零行为影响。 */
 static rb_u32 chain_of(rb_u64 start) { return stripe_of(start) & (RB_CHAIN_SHARDS-1); }
+/* [OPT-EXCL] does [off, off+len) touch an excluded extent?
+ * Lock-free: excl_n is published after the array is filled (see rb_stream),
+ * so a racing reader can at worst see a stale count -> decides on an older
+ * (or slightly empty) set. Both directions are benign: this is a cache
+ * placement hint, never a correctness gate. Binary search over <=1024
+ * sorted, merged extents = ~10 loads, and only when excl_n != 0. */
+static int excl_hit(const rb_stream *s, rb_u64 off)
+{
+    rb_u32 n, lo=0, hi;
+    if(!s) return 0;
+    n=(rb_u32)RB_ALOAD32(&s->excl_n);
+    if(!n) return 0;
+    if(n>RB_EXCL_MAX) n=RB_EXCL_MAX;          /* defensive: torn publish */
+    hi=n;
+    while(lo<hi){ rb_u32 mid=(lo+hi)>>1; if(s->excl[mid].start<=off) lo=mid+1; else hi=mid; }
+    if(!lo) return 0;
+    return off < s->excl[lo-1].start + s->excl[lo-1].len;
+}
 static struct rb_chunk *chunk_lookup(rb_stream *s, rb_u64 start)
 {
     rb_u32 b=bucket_of(start); struct rb_chunk *c=s->buckets[b];
@@ -330,9 +601,20 @@ static int lock_stripes(rb_stream *s, rb_u64 off, rb_u64 end, rb_u32 *held, int 
     rb_u32 set[RB_NSTRIPES]; int n=0,i,j;
     rb_u64 csz=s->eng->chunk_size, cmask=s->eng->chunk_mask;
     rb_u64 cs=off&~cmask, ce=(end-1)&~cmask;
+    /* [OPT-LOCK 2026-11-05] 单 chunk 快路径：4K/64K 单块 IO 是最常见形态
+     * （4K 随机读写的 100% 场景）。原实现无论如何都要跑一遍 O(n²) 去重循环
+     * + 插入排序 + 数组遍历——对 n==1 是纯浪费。高并发下这些指令争的是同一
+     * 个执行端口，属于"看不见的 CPU 税"。快路径直接取锁返回。 */
+    if(cs==ce){
+        rb_u32 k=stripe_of(cs);
+        if(shared) RB_RW_RLOCK(&s->stripes[k]); else RB_RW_WLOCK(&s->stripes[k]);
+        held[0]=k;
+        return 1;
+    }
     for(;cs<=ce;cs+=csz){ rb_u32 k=stripe_of(cs);
         for(i=0;i<n;i++)if(set[i]==k)break;
-        if(i==n&&n<RB_NSTRIPES)set[n++]=k; }
+        if(i==n&&n<RB_NSTRIPES)set[n++]=k;
+        if(n>=RB_NSTRIPES) break; }   /* [FIX D2] 64 条纹收满即止：条纹集已完备（全库仅 64 把锁），主扫描照常 */
     for(i=1;i<n;i++){ rb_u32 key=set[i]; for(j=i;j>0&&set[j-1]>key;j--)set[j]=set[j-1]; set[j]=key; }
     for(i=0;i<n;i++){ if(shared) RB_RW_RLOCK(&s->stripes[set[i]]); else RB_RW_WLOCK(&s->stripes[set[i]]); held[i]=set[i]; }
     return n;
@@ -441,19 +723,47 @@ static struct rb_chunk *chunk_create(rb_stream *s, rb_u64 start)
 {
     rb_engine *eng=s->eng;
     struct rb_chunk *c=(struct rb_chunk *)CORE_MALLOC(sizeof(*c));
-    rb_u32 b;
     if(!c)return NULL;
     memset(c,0,sizeof(*c));
-    c->data=(unsigned char *)CORE_MALLOC(eng->chunk_size);
+    /* [OPT-SLAB] pooled block instead of a per-chunk 64KiB heap request.
+     * [OPT-ZEROFREE 2026-11-01] eager zeroing removed. Rationale (measured:
+     * memset(64KiB) = 3.34us vs slab pop = 0.19us -- the zeroing had become
+     * the single largest cost inside chunk_create, ~22% of kernel cold-write
+     * time). Safety: c->data bytes are only ever *consumed* through a
+     * corresponding c->loaded bit, and every site that sets a loaded bit does
+     * so in the same critical section where it wrote those bytes:
+     *   - rb_write_pass1 full sub  : memcpy(sub)          -> mark_dirty -> loaded|=bit
+     *   - rb_write_pass2 RMW fill  : memcpy(block)+memcpy -> loaded|=bit
+     *   - rb_read_commit           : memcpy(block)        -> loaded|=bit
+     *   - rb_stream_truncate       : explicit memset of the tail it keeps
+     * and the writeback path only stages sub-blocks whose DIRTY bit is set,
+     * with dirty == loaded always maintained by chunk_mark_dirty. Therefore no
+     * uninitialized byte can reach a disk write or a read result. Verified by
+     * test_cache/test_wsconc/test_wsrace + ASan, plus an opt-in poison build
+     * (RB_POISON_NEW_CHUNKS=1 fills 0xA5) that turns any such leak into a
+     * deterministic, reproducible failure instead of silent garbage. */
+    c->data=(unsigned char *)slab_get(&eng->slab, eng->chunk_size);
     if(!c->data){ CORE_FREE(c); return NULL; }
-    memset(c->data,0,eng->chunk_size);
+#if defined(RB_POISON_NEW_CHUNKS) && RB_POISON_NEW_CHUNKS
+    memset(c->data,0xA5,(size_t)eng->chunk_size);   /* debug: expose uninit reads */
+#endif
     c->start=start;
     c->last_access=RB_ALOAD64(&eng->now_ms);
     c->epoch=RB_AADD64(&eng->chunk_epoch,1)+1;
-    b=bucket_of(start);
-    c->hash_next=s->buckets[b]; s->buckets[b]=c;
+    /* [FIX 2026-11-02] 原"锁外先发布一次"残留与下方锁内发布叠加会产生
+     * 自环哈希链（c->hash_next==c）→ chunk_lookup 死循环。发布只允许出现在
+     * 下方 bucket 排他锁内（快读者的走链安全依赖它）。 */
     { rb_u32 ck=chain_of(start);   /* [D2] 片锁（持调用方条纹 WLOCK 内取） */
-      RB_M_LOCK(&s->chain[ck]); lru_push_front(s,c); RB_M_UNLOCK(&s->chain[ck]); }
+      /* [OPT-SPIN] 哈希发布移入 chain 临界区 + bucket 排他锁：快读者在
+       * bucket 共享锁内走链/取 ref，必须保证"看到即已发布"。锁序 chain→bucket
+       * 与 chunk_unlink_account 一致（防倒置）。 */
+      RB_M_LOCK(&s->chain[ck]);
+      { rb_u32 bb=bucket_of(start);
+        RB_B_WLOCK(&s->bspin[bb]);
+        c->hash_next=s->buckets[bb]; s->buckets[bb]=c;
+        RB_B_WUNLOCK(&s->bspin[bb]); }
+      lru_push_front(s,c);
+      RB_M_UNLOCK(&s->chain[ck]); }
     ev("CR",start,0);
     RB_AADD64(&eng->total_bytes,eng->chunk_size);
     RB_AADD64(&s->cur_bytes,eng->chunk_size);
@@ -482,7 +792,12 @@ static rb_u64 chunk_unlink_account(rb_stream *s, struct rb_chunk *c, int count_l
     { rb_u32 ck=chain_of(c->start);   /* [D2] 片锁 */
       RB_M_LOCK(&s->chain[ck]);
       { rb_u32 b=bucket_of(c->start); struct rb_chunk **pp=&s->buckets[b];
+        /* [OPT-SPIN] bucket 排他锁：快读者可能正持共享锁走链/取 ref——摘除
+         * 必须等它们退出（ref++ 已完成），此后不再有新读者可达本块。锁序
+         * chain→bucket 与 chunk_create 一致。 */
+        RB_B_WLOCK(&s->bspin[b]);
         while(*pp){ if(*pp==c){*pp=c->hash_next;break;} pp=&(*pp)->hash_next; }
+        RB_B_WUNLOCK(&s->bspin[b]);
         if(c->dirty)dirty_remove(s,c); else lru_remove(s,c);
       }
       RB_M_UNLOCK(&s->chain[ck]); }
@@ -494,17 +809,40 @@ static rb_u64 chunk_unlink_account(rb_stream *s, struct rb_chunk *c, int count_l
     return lost;
 }
 /* [D3] 释放 chunk 内存。evict_victim 接线路径下，必须等锁外淘汰回调
- * （RbFeatOnEvict 读取 Src=c->data）返回后才可调用本函数。 */
-static void chunk_free(struct rb_chunk *c)
+ * （RbFeatOnEvict 读取 Src=c->data）返回后才可调用本函数。
+ * [OPT-SPIN 2026-11-02] 引用计数协议：所有调用点均已摘出哈希（bucket 排他
+ * 锁已放）→ 不可能再产生新读者；ref==0 直接 CAS claim 后释放；ref>0（快读者
+ * 仍持）→ 释放责任移交给最后一个 chunk_unref（CAS 单主，双路径仅一方成功）。 */
+#define RB_REF_DYING 0x80000000L     /* bit31: 已摘除，等待/正在释放 */
+#define RB_REF_FREED 0xC0000000L     /* bit31|bit30: 内存已归还（终态） */
+static void chunk_free(rb_engine *eng, struct rb_chunk *c)
 {
+    LONG r;
     if(!c)return;
-    CORE_FREE(c->data); CORE_FREE(c);
+    r=(LONG)RB_AOR32(&c->ref,RB_REF_DYING);
+    if((r & ~RB_REF_DYING)==0 &&
+       (LONG)RB_ACAS32(&c->ref,RB_REF_FREED,RB_REF_DYING)==(LONG)RB_REF_DYING){
+        slab_put(eng?&eng->slab:NULL, c->data, eng?eng->chunk_size:0u);   /* [OPT-SLAB][F4] block returns to the pool */
+        CORE_FREE(c);
+    }
+}
+/* [OPT-SPIN] 快读者出口：ref-- 归零且已置 DYING → 本读者是最后一个，
+ * 由本函数释放（与 chunk_free 的 CAS claim 互斥，恰一方成功）。eng 必须传
+ * 【获取 ref 时捕获的指针】（本函数不触碰 stream）。 */
+static void chunk_unref(rb_engine *eng, struct rb_chunk *c)
+{
+    LONG r=(LONG)RB_AADD32(&c->ref,(LONG)-1);
+    if(r==(LONG)RB_REF_DYING &&
+       (LONG)RB_ACAS32(&c->ref,RB_REF_FREED,RB_REF_DYING)==(LONG)RB_REF_DYING){
+        slab_put(eng?&eng->slab:NULL, c->data, eng?eng->chunk_size:0u);   /* [OPT-SLAB][F4] */
+        CORE_FREE(c);
+    }
 }
 /* 组合：摘链记账 + 释放。行为与原实现逐字一致（其余调用点不变）。 */
 static rb_u64 chunk_destroy(rb_stream *s, struct rb_chunk *c, int count_lost)
 {
     rb_u64 lost=chunk_unlink_account(s,c,count_lost);
-    chunk_free(c);
+    chunk_free(s->eng,c);
     return lost;
 }
 static void lru_touch(rb_stream *s, struct rb_chunk *c)
@@ -520,9 +858,12 @@ static void chunk_mark_dirty(rb_stream *s, struct rb_chunk *c, uint16_t added)
 {
     rb_engine *eng=s->eng;
     uint16_t newly=(uint16_t)(added & ~c->dirty);
-    int i; size_t n=0;
-    for(i=0;i<(int)RB_SUBS_FIXED;i++)
-        if(added&(1u<<i)){ c->dseq[i]++; RB_FLUSH_STAT_INC(dseq); if(newly&(1u<<i)) n++; }
+    size_t n=0;
+    /* [OPT-BIGWR] iterate set bits only: a 4KiB write touches one sub, the old
+     * fixed 16-iteration scan burned 15 useless comparisons on the hot path. */
+    { rb_u32 i=0; uint16_t m=added;
+      while(m){ if(m&1u){ c->dseq[i]++; RB_FLUSH_STAT_INC(dseq); } i++; m=(uint16_t)(m>>1); } }
+    n=sub_bits_count(newly);
     { rb_u32 ck=chain_of(c->start);   /* [D2] 片锁：0→1 脏转换时换链 */
       RB_M_LOCK(&s->chain[ck]);
       if(c->dirty==0){ lru_remove(s,c); dirty_insert(s,c); }
@@ -598,7 +939,11 @@ rb_engine *rb_engine_create(const rb_config *cfg)
     if(eng->cfg.readahead_window==0)eng->cfg.readahead_window=2ull*1024*1024;
     {
         rb_u32 bs = eng->cfg.block_size;
-        static const rb_u32 legal[] = {4096,8192,16384,32768,65536,131072};
+        /* [F1 2026-11-06] 65536/131072 自白名单摘除，与驱动 rbctl.c rb_legal_bs
+         * 完全同款（注释互相引用）：11-03 64K 系统级事故未归因（U-4/U-8，
+         * 59-64k-audit §5 前置清单），128K 同族且 slab 滞留更甚；归因+Verifier+
+         * WinDbg 复现通过后按审计 §5 恢复。非法值回落 4096（下方，行为不变）。 */
+        static const rb_u32 legal[] = {4096,8192,16384,32768};
         int ok=0; size_t z;
         for(z=0;z<sizeof(legal)/sizeof(legal[0]);z++) if(legal[z]==bs){ok=1;break;}
         if(!ok) bs=4096;
@@ -608,6 +953,7 @@ rb_engine *rb_engine_create(const rb_config *cfg)
         eng->chunk_mask = (rb_u64)(eng->chunk_size - 1);
     }
     RB_M_INIT(&eng->streams_lock);
+    RB_M_INIT(&eng->slab.lock);          /* [OPT-SLAB] memset above already zeroed the pool */
 #ifndef RB_KERNEL_BUILD
     RB_M_INIT(&eng->wb_collect_lock);
 #endif
@@ -617,6 +963,12 @@ rb_engine *rb_engine_create(const rb_config *cfg)
     eng->peak_bytes=0;
     return eng;
 }
+/* [F10 2026-11-06] 引擎几何 getter：返回引擎 create 期冻结的 block_size
+ * （eng==NULL → 0）。W12 推迟窗内（改 BlockSize 仅持久化、引擎重建才生效，
+ * rbctl.c RbApplyConfig 纪律）驱动写切块应以【引擎几何】为准；config 副本
+ * 仅持久化面，两者在推迟窗内可以不同（见 rbio.c 切块点注释）。 */
+rb_u32 rb_engine_block_size(const rb_engine *eng)
+{ return eng ? eng->block_size : 0u; }
 void rb_engine_get_stats(rb_engine *eng, rb_stats *out)
 {
     if(eng&&out){
@@ -631,10 +983,19 @@ void rb_engine_get_stats(rb_engine *eng, rb_stats *out)
         /* [P2-7] 逐字段原子读，替代 `*out=eng->stats` 整体拷贝：
          * 后者对 64 位字段在 32 位内核下非原子（撕裂读），且拷贝窗口内
          * 可能混入半新半旧字段。逐字段 ALOAD 保证每个字段自身完整。 */
-        out->read_req            =(rb_u64)RB_ALOAD64(&eng->stats.read_req);
-        out->read_hit            =(rb_u64)RB_ALOAD64(&eng->stats.read_hit);
-        out->read_bytes          =(rb_u64)RB_ALOAD64(&eng->stats.read_bytes);
-        out->read_hit_bytes      =(rb_u64)RB_ALOAD64(&eng->stats.read_hit_bytes);
+        { /* [OPT-STATS R25] 64 路分片汇总 */
+          int sk_; rb_i64 rq_=0, rb_=0, rh_=0, rhb_=0;
+          for(sk_=0;sk_<RB_NSTRIPES;sk_++){
+              rq_ += RB_ALOAD64(&eng->stat_rd_req[sk_].v);
+              rb_ += RB_ALOAD64(&eng->stat_rd_bytes[sk_].v);
+              rh_ += RB_ALOAD64(&eng->stat_rd_hit[sk_].v);
+              rhb_+= RB_ALOAD64(&eng->stat_rd_hitb[sk_].v);
+          }
+          out->read_req       =(rb_u64)rq_;
+          out->read_bytes     =(rb_u64)rb_;
+          out->read_hit       =(rb_u64)rh_;
+          out->read_hit_bytes =(rb_u64)rhb_;
+        }
         out->write_req           =(rb_u64)RB_ALOAD64(&eng->stats.write_req);
         out->write_bytes         =(rb_u64)RB_ALOAD64(&eng->stats.write_bytes);
         out->write_cached        =(rb_u64)RB_ALOAD64(&eng->stats.write_cached);
@@ -705,6 +1066,16 @@ rb_u64 rb_engine_get_dynamic_limit_bytes(rb_engine *eng)
 void rb_engine_set_available_mb(rb_engine *eng, rb_u32 avail_mb, rb_u32 dyn_limit_mb)
 { (void)dyn_limit_mb;
   if(eng)RB_ASTORE32(&eng->avail_mb,avail_mb); }
+/* [FIX F1/F5 2026-11-04] 预读填充接线：readahead_active 此前只有清零无置位
+ * （prefetch check 永远假阴性）；readahead_bytes 恒 0。由 rbpref 填充点调用：
+ * 置 active（pressure/teardown 路径既有清零保留）并累计填充字节。 */
+void rb_readahead_note_fill(rb_engine *eng, rb_u64 bytes)
+{
+    if(!eng)return;
+    RB_ASTORE32(&eng->readahead_active,1);
+    if(bytes)RB_AADD64(&eng->readahead_bytes,(rb_i64)bytes);
+}
+
 void rb_readahead_note_hit(rb_engine *eng, rb_u64 bytes)
 { if(eng&&bytes)RB_AADD64(&eng->readahead_hit_bytes,bytes); }
 /* ---- stream ---- */
@@ -723,6 +1094,7 @@ rb_stream *rb_stream_create(rb_engine *eng, rb_u64 file_id)
     memset(s->stripes,0,sizeof(rb_rwlock)*RB_NSTRIPES);
     for(i=0;i<RB_NSTRIPES;i++)RB_RW_INIT(&s->stripes[i]);
     for(i=0;i<RB_CHAIN_SHARDS;i++)RB_M_INIT(&s->chain[i]);   /* [D2] 16 片锁 */
+    for(i=0;i<RB_NBUCKETS;i++)RB_B_INIT(&s->bspin[i]);       /* [OPT-SPIN] 快路径桶锁 */
     s->flush_active=0; s->zflush_cnt=0;
     s->last_read_off=(rb_u64)-1;
     RB_M_LOCK(&eng->streams_lock);
@@ -777,6 +1149,7 @@ void rb_stream_destroy(rb_stream *s)
     RB_AADD32(&eng->nstreams,(rb_u32)-1);
     for(k=0;k<RB_NSTRIPES;k++) RB_RW_DESTROY(&s->stripes[k]);
     for(k=0;k<RB_CHAIN_SHARDS;k++) RB_M_DELETE(&s->chain[k]);   /* [D2] 16 片锁 */
+    for(k=0;k<RB_NBUCKETS;k++) RB_B_DESTROY(&s->bspin[k]);      /* [OPT-SPIN] */
     if(s->ws) ws_free(s->ws);
     CORE_FREE(s->buckets); CORE_FREE_LOCK(s->stripes); CORE_FREE_LOCK(s);
 }
@@ -799,6 +1172,8 @@ void rb_engine_destroy(rb_engine *eng)
     RB_M_DELETE(&eng->wb_collect_lock);
 #endif
     if(eng->wb_snap)CORE_FREE(eng->wb_snap);
+    slab_release_all(&eng->slab);        /* [OPT-SLAB] all streams are gone: blocks unreferenced */
+    RB_M_DELETE(&eng->slab.lock);
     CORE_FREE_LOCK(eng);
 }
 /* ---- file semantics ---- */
@@ -807,6 +1182,7 @@ void rb_stream_truncate(rb_stream *s, rb_u64 new_size)
     rb_engine *eng; rb_u32 k;
     if(!s)return;
     eng=s->eng;
+    RB_AADD64(&s->view_gen,1);   /* [FIX 2026-11-06] 视图世代门控：封堵在途回填重污染 */
     for(k=0;k<RB_NSTRIPES;k++){
         rb_u32 b;
         RB_RW_WLOCK(&s->stripes[k]);
@@ -832,7 +1208,9 @@ void rb_stream_truncate(rb_stream *s, rb_u64 new_size)
                     if(new_size&(eng->block_size-1)){
                         rb_u32 idx=sub_index(eng,new_size);
                         size_t off=(size_t)(new_size&(eng->block_size-1));
+                        RB_SEQ_BUMP(c,idx);    /* [OPT-SPIN] 撕裂检测桩（尾部清零也是数据写） */
                         memset(c->data+((size_t)idx<<eng->sub_shift)+off,0,eng->block_size-off);
+                        RB_SEQ_BUMP(c,idx);
                     }
                     if(was_dirty&&c->dirty==0){
                         rb_u32 ck=chain_of(c->start);   /* [D2] 片锁 */
@@ -852,6 +1230,9 @@ void rb_stream_discard_all(rb_stream *s)
 {
     rb_u32 k;
     if(!s)return;
+    RB_AADD64(&s->view_gen,1);   /* [FIX 2026-11-06] 视图世代门控（先于逐条纹销毁：
+                                 * 在途读回填校验世代不匹配即放弃提交，封堵
+                                 * "丢弃后回填操作前盘面"的重污染竞争） */
     for(k=0;k<RB_NSTRIPES;k++){
         rb_u32 b;
         RB_RW_WLOCK(&s->stripes[k]);
@@ -904,8 +1285,9 @@ int rb_read(rb_stream *s, rb_u64 offset, void *buf, size_t len,
     if(miss_count)*miss_count=0;
     if(max_miss<1)max_miss=1;
     if(len>0 && end<offset) return -2;
-    RB_AADD64(&eng->stats.read_req,1);
-    RB_AADD64(&eng->stats.read_bytes,len);
+    { rb_u32 sk=stripe_of(offset);   /* [OPT-STATS R25] */
+      RB_AADD64(&eng->stat_rd_req[sk].v,1);
+      RB_AADD64(&eng->stat_rd_bytes[sk].v,(rb_i64)len); }
     nh=lock_stripes(s,offset,end,held,1);
     pos=offset;
     while(pos<end){
@@ -960,9 +1342,88 @@ int rb_read(rb_stream *s, rb_u64 offset, void *buf, size_t len,
     s->last_read_off=offset;
     if(overflow){ if(miss_count)*miss_count=mcount; return -2; }
     if(miss_count)*miss_count=mcount;
-    if(hit_bytes>0)RB_AADD64(&eng->stats.read_hit,1);   /* FIX[R8]: 部分命中也计一次命中请求 */
-    RB_AADD64(&eng->stats.read_hit_bytes,hit_bytes);
+    if(hit_bytes>0){ rb_u32 sk=stripe_of(offset);
+      RB_AADD64(&eng->stat_rd_hit[sk].v,1);   /* FIX[R8]: 部分命中也计一次命中请求 */
+      RB_AADD64(&eng->stat_rd_hitb[sk].v,(rb_i64)hit_bytes); }
     return hit_bytes>0?1:0;
+}
+/* [OPT F8 2026-11-01] 纯缓存命中内联尝试（供驱动 dispatch 直调，省 worker 往返）。
+ * [OPT-SPIN 2026-11-02 重写] 原 ERESOURCE 共享条纹锁实现替换为无 ERESOURCE 快路径：
+ *   ① bucket 共享自旋锁内 查找+ref++（unlink 需 bucket 排他锁 → 找到的块必然
+ *      未摘除、ref++ 必然先于释放被观察到），放锁后仅持 ref 拷贝——UAF 防护；
+ *   ② 每-IO 成本从「ERESOURCE 共享获取+释放 ≈0.3-0.7µs」降为「EX_SPIN_LOCK
+ *      共享 30-60ns + ref++/-- ≈20ns」——4K 随机读主收益；
+ *   ③ 拷贝期间写者（持 stripe WLOCK）可并发改同子块 → 每-子块 seq 奇偶撕裂
+ *      检测：拷前快照/拷后复核，奇代或代变 → 返回 0 退 worker（其整段重拷，
+ *      部分拷贝无害）；
+ *   ④ loaded 位经 volatile 读（写者持 WLOCK 并发置位不撕裂字节语义：位面
+ *      单调置位，读旧值=按写前视图线性化，与旧持锁读者一致）；
+ *   ⑤ lru_touch 改条件写（>1s 才回写 last_access）——消除热块每读一次
+ *      last_access 缓存行 RFO（16 线程随机读同一热块的乒乓大头）。
+ * 契约不变：全命中返回 1；任一 miss/撕裂 返回 0 且不计数（调用方回退
+ * worker 路径整段重拷）。统计口径与 rb_read 一致（req/bytes/hit/stripe）。
+ * 调用契约：IRQL≤APC；命中路径零阻塞（自旋仅指针级临界区）。 */
+int rb_read_try_cache(rb_stream *s, rb_u64 offset, void *buf, size_t len)
+{
+    rb_engine *eng;
+    rb_u64 end, pos;
+    unsigned char *out=(unsigned char *)buf;
+    if(!s||!buf||len==0)return 0;
+    eng=s->eng;
+    end=offset+len;
+    if(end<offset)return 0;
+    pos=offset;
+    while(pos<end){
+        rb_u64 cs=(pos & ~eng->chunk_mask);
+        rb_u32 b=bucket_of(cs);
+        struct rb_chunk *c;
+        rb_u64 cend=cs+eng->chunk_size;
+        rb_u32 si,ei,k; uint16_t mask;
+        uint32_t s1[RB_SUBS_FIXED];
+        volatile uint32_t *sq;
+        if(cend>end)cend=end;
+        /* --- ① bucket 共享锁：查找 + ref++（不接触任何可能阻塞的原语） --- */
+        RB_B_RLOCK(&s->bspin[b]);
+        c=chunk_lookup(s,cs);
+        if(!c){ RB_B_RUNLOCK(&s->bspin[b]); return 0; }
+        RB_AADD32(&c->ref,1);
+        RB_B_RUNLOCK(&s->bspin[b]);
+        /* --- ② 已安全持 ref：unlink/释放均不再可能（见 chunk_free 协议） --- */
+        si=sub_index(eng,pos);
+        ei=sub_index(eng,cend);                    /* exclusive */
+        if(ei<=si){ chunk_unref(eng,c); return 0; }/* 防御分支（cend>pos 恒真） */
+        mask=(uint16_t)(((1u<<(ei-si))-1u)<<si);
+        if((*(volatile uint16_t *)&c->loaded & mask)!=mask){ chunk_unref(eng,c); return 0; }
+        /* --- ③ 拷前快照各子块 seq（奇代=写中 → 退） --- */
+        sq=c->seq;
+        for(k=si;k<ei;k++){ s1[k]=sq[k]; if(s1[k]&1u){ chunk_unref(eng,c); return 0; } }
+        RB_SEQ_FENCE();
+        memcpy(out+(size_t)(pos-offset),
+               c->data+(size_t)(pos-cs), (size_t)(cend-pos));
+        RB_SEQ_FENCE();
+        /* --- ④ 复核：任一子块代变 → 撕裂/并发写 → 退 worker 整段重拷 --- */
+        for(k=si;k<ei;k++) if(sq[k]!=s1[k]){ chunk_unref(eng,c); return 0; }
+        /* [OPT-HITS 2026-11-05] 保留精确命中计数（每 IO 一次原子）。
+         * 曾试过 1/64 采样以消除热块缓存行 ping-pong，但 test_evict_wire 的
+         * 契约断言（chunk fill+1命中 → Hits==1）失败：hits 是 L2 淘汰过滤的
+         * 判定依据（Hits<2 视为冷块），采样会把"刚热起来"的块误判为冷块并
+         * 送入 L2，语义被破坏。**正确性优先于这点 CPU**——保留精确计数。 */
+        InterlockedIncrement((volatile LONG *)&c->hits);
+        /* [OPT-SPIN] 条件 lru_touch：last_access 每秒至多回写一次，热块读
+         * 不再打 last_access 缓存行（旧实现每命中一次 volatile 写）。 */
+        { rb_u64 now=RB_ALOAD64(&eng->now_ms);
+          if((rb_u64)(now - c->last_access) > 1000)
+              *(volatile rb_u64 *)&c->last_access = now; }
+        RB_AADD64((volatile rb_i64 *)&eng->stripe_rb[stripe_of(cs)].v,(rb_i64)(cend-pos));
+        chunk_unref(eng,c);
+        pos=cend;
+    }
+    { rb_u32 sk=stripe_of(offset);   /* [OPT-STATS R25] 64 路分片写 */
+      RB_AADD64(&eng->stat_rd_req[sk].v,1);
+      RB_AADD64(&eng->stat_rd_bytes[sk].v,(rb_i64)len);
+      RB_AADD64(&eng->stat_rd_hit[sk].v,1);
+      RB_AADD64(&eng->stat_rd_hitb[sk].v,(rb_i64)len); }
+    return 1;
 }
 void rb_read_copy_dirty(rb_stream *s, rb_u64 offset, void *buf, size_t len)
 {
@@ -989,12 +1450,17 @@ void rb_read_copy_dirty(rb_stream *s, rb_u64 offset, void *buf, size_t len)
 }
 /* [FIX M17] 前向声明：rb_read_commit 位于 can_create 定义之前 */
 static int can_create(const rb_engine *eng);
-void rb_read_commit(rb_stream *s, rb_u64 offset, const void *buf, size_t len)
+/* [FIX 2026-11-06 视图世代门控] 读回填必须携带 rb_read 计划时的视图世代：
+ * 不匹配（期间发生过任何丢视图操作）→ 放弃回填。读调用方仍可把已读数据
+ * 交付给用户（IO 先于元数据操作=合法快照），只是不再污染缓存。 */
+void rb_read_commit_gen(rb_stream *s, rb_u64 offset, const void *buf, size_t len,
+                        rb_u64 view_gen)
 {
     rb_engine *eng; rb_u32 held[RB_NSTRIPES]; int nh;
     /* [FIX QA5-3] 判空前置：s==NULL/len==0 时不触碰任何解引用 */
     if(!s||!buf)return;
     if(len==0)return;
+    if(RB_ALOAD64(&s->view_gen) != view_gen) return;   /* 世代失配：放弃回填 */
     eng=s->eng;
     rb_u64 end=offset+len, pos=offset; const unsigned char *in=(const unsigned char *)buf;
     ev("C0",offset,len);
@@ -1003,6 +1469,9 @@ void rb_read_commit(rb_stream *s, rb_u64 offset, const void *buf, size_t len)
         rb_u64 cs=(pos & ~eng->chunk_mask); rb_u32 idx=sub_index(eng,pos);
         rb_u64 sub_start=cs+((rb_u64)idx<<eng->sub_shift), sub_end=sub_start+eng->block_size;
         int full_cover=(pos<=sub_start)&&(end>=sub_end);
+        /* [OPT-EXCL] 排除区间不回填：否则临时文件读一遍就永久占住内存，
+         * 与"这些写入不该占内存"的初衷相违。 */
+        if(!full_cover || excl_hit(s,sub_start)){ pos=cs+((rb_u64)(idx+1)<<eng->sub_shift); continue; }
         if(full_cover){
             struct rb_chunk *c=chunk_lookup(s,cs);
             /* [FIX M17] 读回填同样受容量上限约束（写路径两处创建均走 can_create，
@@ -1011,8 +1480,10 @@ void rb_read_commit(rb_stream *s, rb_u64 offset, const void *buf, size_t len)
             if(!c && can_create(eng))c=chunk_create(s,cs);
             if(c){
                 if(!(c->dirty&(uint16_t)(1u<<idx))){
+                    RB_SEQ_BUMP(c,idx);    /* [OPT-SPIN] 撕裂检测桩 */
                     memcpy(c->data+((size_t)idx<<eng->sub_shift),
                            in+(size_t)(sub_start-offset),(size_t)eng->block_size);
+                    RB_SEQ_BUMP(c,idx);
                     c->loaded|=(uint16_t)(1u<<idx);
                     lru_touch(s,c);
                 }
@@ -1024,6 +1495,18 @@ void rb_read_commit(rb_stream *s, rb_u64 offset, const void *buf, size_t len)
     { rb_u64 ch_,hi_,lo_; rb_effective_caps(eng,&ch_,&hi_,&lo_);
       if(RB_ALOAD64(&eng->total_bytes) > hi_) stream_reclaim(s); }
 }
+/* 旧签名兼容包装：捕获当前世代（等价于无门控，仅测试/遗留调用方使用） */
+void rb_read_commit(rb_stream *s, rb_u64 offset, const void *buf, size_t len)
+{ rb_read_commit_gen(s, offset, buf, len, s ? RB_ALOAD64(&s->view_gen) : 0); }
+/* 世代快照（驱动在 rb_read 计划前捕获，随各段回填传回） */
+rb_u64 rb_stream_view_gen(rb_stream *s)
+{ return s ? RB_ALOAD64(&s->view_gen) : 0; }
+/* [FIX 2026-11-06 变更窗] 驱动元数据钩子窗口的置位/清除（见 cache.c
+ * rb_stream 结构注释）。查询侧零锁 volatile 读（分发热路径每 IO 一次）。 */
+LONG rb_stream_view_mutating(rb_stream *s)
+{ return s ? InterlockedCompareExchange((volatile LONG *)&s->view_mutating, 0, 0) : 0; }
+void rb_stream_set_view_mutating(rb_stream *s, LONG v)
+{ if (s) InterlockedExchange((volatile LONG *)&s->view_mutating, v ? 1 : 0); }
 /* ==== FIX[R2]: 锁外补读待办（每洞一项） ====
  * 数学事实：一次 [offset,end) 写请求只有首/尾两个子块可能部分覆盖，
  * 中间子块必然整块覆盖 → RMW 洞上限恒为 2。容量 8 纯属防御；
@@ -1077,12 +1560,61 @@ static void rb_write_pass1(rb_stream *s, rb_u64 offset, rb_u64 end,
     rb_u64 sub_i = 0;   /* 已遍历子块序号（bit i = pre_base+i*block_size） */
     nh=lock_stripes(s,offset,end,held,0);
     while(pos<end){
-        rb_u64 cs=(pos & ~eng->chunk_mask); rb_u32 idx=sub_index(eng,pos);
-        rb_u64 sub_start=cs+((rb_u64)idx<<eng->sub_shift), sub_end=sub_start+eng->block_size;
-        int full=(pos<=sub_start&&end>=sub_end);
-        rb_u64 remain=end-pos, sr=sub_end-pos;
-        size_t n=(size_t)(remain<sr?remain:sr);
-        struct rb_chunk *c=chunk_lookup(s,cs);
+        rb_u64 cs, sub_start, sub_end, remain, sr; rb_u32 idx; int full;
+        size_t n; struct rb_chunk *c;
+        /* [OPT-BIGWR 2026-11-01] chunk-granular fast path for whole-chunk writes.
+         * The per-sub loop below costs (per 64KiB chunk) 16 hash lookups, 16
+         * chunk_mark_dirty calls -- each taking a chain mutex -- and 16 64-bit
+         * atomic adds: 256 lock acquisitions + 256 atomics per 1MiB sequential
+         * write. When the incoming range covers a whole chunk we can do one
+         * memcpy, one mark_dirty(0xFFFF) and one atomic instead. Semantics are
+         * bit-for-bit identical to 16 iterations of the `full` branch: same
+         * dirty set, same loaded set, same cached/stripe_wb accounting, same
+         * pre[] snapshot taken before the first byte is written. */
+        if(!(pos & eng->chunk_mask) && (end-pos)>=(rb_u64)eng->chunk_size &&
+           !excl_hit(s,pos) && !excl_hit(s,pos+(rb_u64)eng->chunk_size-1)){
+            struct rb_chunk *cf=chunk_lookup(s,pos);
+            if(!cf && can_create(eng)) cf=chunk_create(s,pos);
+            if(cf){
+                if(pre_ok){
+                    rb_u32 k;
+                    if(pre->dseq)
+                        for(k=0;k<RB_SUBS_FIXED;k++) pre->dseq[sub_i+k]=cf->dseq[k];
+                    for(k=0;k<RB_SUBS_FIXED;k++){
+                        rb_u64 bi=sub_i+k;
+                        if(cf->dirty&(uint16_t)(1u<<k))
+                            pre->mask[bi>>3]|=(uint8_t)(1u<<(bi&7));
+                    }
+                }
+                RB_SEQ_BUMP_ALL(cf);   /* [OPT-SPIN] 快读者撕裂检测桩：写前全部进阶（偶→奇） */
+                memcpy(cf->data,in+(size_t)(pos-offset),eng->chunk_size);
+                RB_SEQ_BUMP_ALL(cf);   /* 写后回落（奇→偶）；随后 mark_dirty 发布 loaded（TSO 序保证拷贝先可见） */
+                chunk_mark_dirty(s,cf,(uint16_t)0xFFFFu);
+                *cached+=(rb_u64)eng->chunk_size;
+                RB_AADD64((volatile rb_i64*)&eng->stripe_wb[stripe_of(pos)].v,
+                          (rb_i64)eng->chunk_size);
+                pos+=(rb_u64)eng->chunk_size; sub_i+=RB_SUBS_FIXED;
+                continue;
+            }
+        }
+        cs=(pos & ~eng->chunk_mask); idx=sub_index(eng,pos);
+        sub_start=cs+((rb_u64)idx<<eng->sub_shift); sub_end=sub_start+eng->block_size;
+        full=(pos<=sub_start&&end>=sub_end);
+        remain=end-pos; sr=sub_end-pos;
+        n=(size_t)(remain<sr?remain:sr);
+        /* [OPT-EXCL] excluded sub-block: never absorbed, never dirtied, never
+         * written back later - it goes straight to the lower device as a
+         * "direct" range, exactly like a capacity-limit bypass. Checked before
+         * chunk_lookup/chunk_create so an excluded range cannot even allocate
+         * a chunk (the whole point: temp-file traffic must not take memory). */
+        if(excl_hit(s,sub_start)){
+            direct_append(direct,dcount,max_direct,pos,n);
+            RB_AADD64(&s->excl_bytes,(rb_i64)n);
+            RB_AADD64(&s->excl_ops,1);          /* 子块级计数 */
+            pos+=n; sub_i++;
+            continue;
+        }
+        c=chunk_lookup(s,cs);
         if(pre_ok){
             /* 写前真值（持排他锁瞬间）；发生在任何 mutation 之前 */
             if(pre->dseq) pre->dseq[sub_i] = c ? c->dseq[idx] : 0;
@@ -1093,13 +1625,17 @@ static void rb_write_pass1(rb_stream *s, rb_u64 offset, rb_u64 end,
             if(!c && can_create(eng))c=chunk_create(s,cs);
             if(!c){ direct_append(direct,dcount,max_direct,pos,n); }
             else{
+                RB_SEQ_BUMP(c,idx);    /* [OPT-SPIN] 撕裂检测桩 */
                 memcpy(c->data+((size_t)idx<<eng->sub_shift),in+(size_t)(pos-offset),n);
+                RB_SEQ_BUMP(c,idx);
                 chunk_mark_dirty(s,c,(uint16_t)(1u<<idx));
                 *cached+=n; RB_AADD64((volatile rb_i64*)&eng->stripe_wb[stripe_of(cs)].v,(rb_i64)n);
             }
         } else if(c&&(c->loaded&(uint16_t)(1u<<idx))){
+            RB_SEQ_BUMP(c,idx);    /* [OPT-SPIN] 撕裂检测桩 */
             memcpy(c->data+((size_t)idx<<eng->sub_shift)+(size_t)(pos-sub_start),
                    in+(size_t)(pos-offset),n);
+            RB_SEQ_BUMP(c,idx);
             chunk_mark_dirty(s,c,(uint16_t)(1u<<idx));
             *cached+=n; RB_AADD64((volatile rb_i64*)&eng->stripe_wb[stripe_of(cs)].v,(rb_i64)n);
         } else if(eng->cfg.readback && (*rmw_n)<8){
@@ -1138,15 +1674,19 @@ static void rb_write_pass2(rb_stream *s, RB_RMW *rmw, int rmw_n,
             if(c2 && (c2->loaded&(uint16_t)(1u<<it->idx))){
                 /* 洞期间该子块已被并发加载（他人写/读回填）：缓存内容即权威，
                  * 只叠加本次写入字节，绝不用可能过期的盘上数据覆盖它 */
+                RB_SEQ_BUMP(c2,it->idx);   /* [OPT-SPIN] 撕裂检测桩 */
                 memcpy(c2->data+((size_t)it->idx<<eng->sub_shift)+(size_t)(it->pos-it->sub_start),
                        in+it->buf_off,it->n);
+                RB_SEQ_BUMP(c2,it->idx);
                 chunk_mark_dirty(s,c2,(uint16_t)(1u<<it->idx));
                 *cached+=it->n;
                 RB_AADD64((volatile rb_i64*)&eng->stripe_wb[k].v,(rb_i64)it->n);
             } else if(c2 && it->c && c2==it->c && c2->epoch==it->epoch){
                 unsigned char *dst=c2->data+((size_t)it->idx<<eng->sub_shift);
+                RB_SEQ_BUMP(c2,it->idx);   /* [OPT-SPIN] 撕裂检测桩 */
                 memcpy(dst,tmp,eng->block_size);
                 memcpy(dst+(size_t)(it->pos-it->sub_start),in+it->buf_off,it->n);
+                RB_SEQ_BUMP(c2,it->idx);
                 c2->loaded|=(uint16_t)(1u<<it->idx);
                 chunk_mark_dirty(s,c2,(uint16_t)(1u<<it->idx));
                 *cached+=it->n;
@@ -1154,8 +1694,10 @@ static void rb_write_pass2(rb_stream *s, RB_RMW *rmw, int rmw_n,
             } else if(!c2 && can_create(eng) &&
                       (c2=chunk_create(s,it->sub_start & ~eng->chunk_mask))!=NULL){
                 unsigned char *dst=c2->data+((size_t)it->idx<<eng->sub_shift);
+                RB_SEQ_BUMP(c2,it->idx);   /* [OPT-SPIN] 撕裂检测桩 */
                 memcpy(dst,tmp,eng->block_size);
                 memcpy(dst+(size_t)(it->pos-it->sub_start),in+it->buf_off,it->n);
+                RB_SEQ_BUMP(c2,it->idx);
                 c2->loaded|=(uint16_t)(1u<<it->idx);
                 chunk_mark_dirty(s,c2,(uint16_t)(1u<<it->idx));
                 *cached+=it->n;
@@ -1170,8 +1712,10 @@ static void rb_write_pass2(rb_stream *s, RB_RMW *rmw, int rmw_n,
                  * 盘面已新、缓存仍旧、复读仍不符）。改为吸收：块已存在
                  * （无新分配），不受容量门限制；与分支2逐行同构。 */
                 unsigned char *dst=c2->data+((size_t)it->idx<<eng->sub_shift);
+                RB_SEQ_BUMP(c2,it->idx);   /* [OPT-SPIN] 撕裂检测桩 */
                 memcpy(dst,tmp,eng->block_size);
                 memcpy(dst+(size_t)(it->pos-it->sub_start),in+it->buf_off,it->n);
+                RB_SEQ_BUMP(c2,it->idx);
                 c2->loaded|=(uint16_t)(1u<<it->idx);
                 chunk_mark_dirty(s,c2,(uint16_t)(1u<<it->idx));
                 *cached+=it->n;
@@ -1333,6 +1877,8 @@ void rb_stream_invalidate_range_ex(rb_stream *s, rb_u64 offset, rb_u64 len,
     if(!s||len==0)return;
     end=offset+len; if(end<offset)return;
     eng=s->eng;
+    RB_AADD64(&s->view_gen,1);   /* [FIX 2026-11-06] 视图世代门控（入口即升代，
+                                 * 先于 wb_drain：在途回填一律失格） */
     /* [FIX WS-RACE-2] 先排空在途回写：本函数的 superseded=1 语义（直写数据为
      * 盘面最终语）要求"清脏位"时没有握着旧 stage 数据的回写在飞——否则回写
      * 落盘会以旧数据覆盖已镜像的新值，且脏位已清 → 污染永久（QA BLOCKER-1）。
@@ -1357,6 +1903,10 @@ void rb_stream_invalidate_range_ex(rb_stream *s, rb_u64 offset, rb_u64 len,
                     rst[nrst].seg_off=(offset>sub_start)?offset:sub_start;
                     rst[nrst].seg_len=((end<sub_end)?end:sub_end)-rst[nrst].seg_off;
                     rst[nrst].idx=idx; rst[nrst].epoch=c->epoch;
+                    /* [FIX DATA-3 R4] keep 也升脏代：置位前在途 stage run 凭
+                     * dseq 在 stage_revalidate 处弃写（与 stage_run 复核双保险）；
+                     * rst.dseq 记升代后值，恢复完成同代配对。 */
+                    c->dseq[idx]++;
                     rst[nrst].dseq=c->dseq[idx]; nrst++;
                     c->restoring=(uint16_t)(c->restoring|m);
                     keep=1;
@@ -1419,7 +1969,13 @@ void rb_stream_invalidate_range_ex(rb_stream *s, rb_u64 offset, rb_u64 len,
                 /* [FIX R2-M5] epoch+dseq 双校验通过：窗口内无人重写该子块，
                  * 盘上内容即恢复源，原子换入被覆盖段；dirty 保留待回写
                  * （组合数据 = 未覆盖段早期 ack + 覆盖段盘面内容） */
+                /* [FIX LINK-2 2026-11-03] 恢复换入也属 c->data 数据写：补快路
+                 * 径撕裂检测桩（seq 与 dseq 是两套代——R4 的 dseq 升代只封闭
+                 * 回写复检，快读者只认 seq；缺桩=恢复换入期间并发快读可拷到
+                 * 半换入内容且 seq 不变=撕裂漏检）。 */
+                RB_SEQ_BUMP(c,rst[i].idx);
                 memcpy(c->data+(size_t)(rst[i].seg_off-rst[i].cs),tmp,(size_t)rst[i].seg_len);
+                RB_SEQ_BUMP(c,rst[i].idx);
                 /* [FIX WS-RACE-2] 数据已改：升脏代使在途回写落盘前复检弃写 */
                 c->dseq[rst[i].idx]++;
             }else if(tmp && rr==0){
@@ -1458,6 +2014,89 @@ void rb_stream_invalidate_range_ex(rb_stream *s, rb_u64 offset, rb_u64 len,
 }
 void rb_stream_invalidate_range(rb_stream *s, rb_u64 offset, rb_u64 len)
 { rb_stream_invalidate_range_ex(s,offset,len,1,NULL,0,0,NULL); }   /* 兼容包装：旧调用方=直写取代语义 */
+/* ---- [OPT-EXCL 2026-11-01] exclude-set management (see cache.h) ----
+ * Publishing order matters: drop the count to 0 first so no reader can pair a
+ * new count with a half-written array, then fill/sort/merge, then store the
+ * count. Readers never take a lock; a stale window only mis-places an IO. */
+int rb_stream_set_exclude(rb_stream *s, const rb_extent *ents, int n)
+{
+    int i,j,m=0;
+    int dirty_left;
+    if(!s) return -2;
+    if(n<0) return -2;
+    if(n>RB_EXCL_MAX) return -1;
+    /* [AUDIT 2026-11-01] 串行化：两个进程同时下发（或 UI 与脚本并发）会在
+     * 同一块 16KB 数组上交错写 + 交错排序 → 数组既非新集也非旧集，二分查找
+     * 可能命中错误的区间（后果是过度/不足排除，不会丢数据，但策略会失灵）。
+     * 拒绝并发比等待更安全：控制面本来就是低频人工操作。 */
+    if(!EXCL_TRY(s)) return -3;
+    RB_ASTORE32(&s->excl_n,0);
+    for(i=0;i<n;i++){
+        if(!ents[i].len) continue;
+        s->excl[m].start=ents[i].start;
+        s->excl[m].len=ents[i].len;
+        m++;
+    }
+    /* insertion sort by start (n<=1024, called on policy changes only) */
+    for(i=1;i<m;i++){
+        rb_extent k=s->excl[i];
+        for(j=i-1;j>=0 && s->excl[j].start>k.start;j--) s->excl[j+1]=s->excl[j];
+        s->excl[j+1]=k;
+    }
+    /* merge overlapping/adjacent -> sorted, non-overlapping */
+    {
+        int w=0;
+        for(i=0;i<m;i++){
+            if(w>0){
+                rb_u64 pe=s->excl[w-1].start+s->excl[w-1].len;
+                if(s->excl[i].start<=pe){
+                    rb_u64 ne=s->excl[i].start+s->excl[i].len;
+                    if(ne>pe) s->excl[w-1].len=ne-s->excl[w-1].start;
+                    continue;
+                }
+            }
+            s->excl[w++]=s->excl[i];
+        }
+        m=w;
+    }
+    RB_ASTORE32(&s->excl_n,(rb_u32)m);
+    if(!m){ EXCL_REL(s); return 0; }
+    /* New writes into the excluded ranges now bypass the cache. Anything still
+     * resident there must go: flush first so no acknowledged dirty byte is
+     * dropped. If the flush cannot converge (disk error) we still evict, but
+     * with superseded=0 so the bytes are counted in lost_dirty_bytes instead
+     * of vanishing silently - the caller can surface that number. */
+    rb_stream_flush(s,1);
+    dirty_left=(rb_stream_dirty_bytes(s)>0);
+    for(i=0;i<m;i++)
+        rb_stream_invalidate_range_ex(s,s->excl[i].start,s->excl[i].len,
+                                     dirty_left?0:1,NULL,0,0,NULL);
+    EXCL_REL(s);
+    return m;
+}
+int rb_stream_get_exclude(rb_stream *s, rb_extent *out, int cap)
+{
+    rb_u32 n; int i;
+    if(!s||!out||cap<=0) return 0;
+    n=(rb_u32)RB_ALOAD32(&s->excl_n);
+    if(n>RB_EXCL_MAX) n=RB_EXCL_MAX;
+    if((rb_u32)cap<n) n=(rb_u32)cap;
+    for(i=0;i<(int)n;i++) out[i]=s->excl[i];
+    return (int)n;
+}
+void rb_engine_get_excl_bypass(rb_engine *eng, rb_u64 *bytes, rb_u64 *ops)
+{
+    rb_u64 b=0,o=0; rb_stream *st;
+    if(!eng) return;
+    RB_M_LOCK(&eng->streams_lock);
+    for(st=eng->streams;st;st=st->next){
+        b+=(rb_u64)RB_ALOAD64(&st->excl_bytes);
+        o+=(rb_u64)RB_ALOAD64(&st->excl_ops);
+    }
+    RB_M_UNLOCK(&eng->streams_lock);
+    if(bytes)*bytes=b;
+    if(ops)*ops=o;
+}
 /* ================= zone-parallel flush machinery ================= */
 static void runs_sort(rb_frun *a, rb_frun *tmp, size_t n)
 {
@@ -1522,7 +2161,11 @@ static int stage_run(rb_stream *s, const rb_frun *run, rb_flushws *ws,
     {
         uint16_t want=0; rb_u32 q;
         for(q=0;q<run->nsubs;q++) want|=(uint16_t)(1u<<(run->sub+q));
-        if((c->dirty & want)!=want){ RB_RW_UNLOCK(&s->stripes[k]); return 0; }
+        /* [FIX DATA-3 R4 2026-11-03] restoring 复核前移到暂存期：快照与 stage
+         * 之间 invalidate keep 路径可对 run 内子块置 restoring（保留 dirty
+         * 等待锁外恢复）——此刻暂存会把含失败写字节的混合子块落盘并清脏。
+         * 发现恢复中则本 run 本轮跳过：脏位保留，恢复后由下帧快照重收。 */
+        if((c->dirty & want)!=want || (c->restoring & want)){ RB_RW_UNLOCK(&s->stripes[k]); return 0; }
     }
     memcpy(ws->stage+dst_off, c->data+((size_t)run->sub<<eng->sub_shift), bytes);
     if(*nsl>=ws->slots_cap){ RB_RW_UNLOCK(&s->stripes[k]); return 0; }
@@ -1780,6 +2423,37 @@ static void wb_drain(rb_stream *s)
 #endif
     }
 }
+/* [FIX DEADLOCK-1 2026-11-04] 有界获取串行 flush 所有权。
+ *
+ * 原实现 `while(CAS(flush_active)) RB_YIELD();` 是**无限自旋**：只要别的线程
+ * 正持 flush_active 做盘 I/O（慢盘可达数秒），本线程就一直抢 CPU；更糟的是
+ * 该自旋也压着 zflush_cnt 等待，两侧互相拖慢 → 实测 detach 卡到 40s 不返回、
+ * 桥接线程被内核 IRP 钉死（整个控制台"无响应"）。
+ *
+ * 语义：flush_active 只用于"同一流不并发跑 flush_pass"的互斥，不是正确性
+ * 闸门（丢弃/清脏各有自己的 stripe 锁与 dseq 校验）。因此**拿不到就不等**：
+ * 超时返回 0 = 本次 flush 跳过（脏数据仍在缓存，下一次周期/显式 flush 再来）。
+ * 调用方（detach/配置切换/SET_INFORMATION 闸门）都是"尽力刷净"语义，跳过
+ * 绝不会丢数据——只可能让脏多留一个周期。 */
+#define RB_FLUSH_ACQUIRE_SPINS  2000u    /* ≈2s（内核 1ms/次 / 用户态 1ms） */
+static BOOLEAN flush_acquire(rb_stream *s)
+{
+    unsigned long spin = 0;
+    while (InterlockedCompareExchange((volatile LONG *)&s->flush_active, 1, 0) != 0) {
+        if (++spin > RB_FLUSH_ACQUIRE_SPINS) return FALSE;   /* 别的 flusher 在跑：本次跳过 */
+        RB_BACKOFF(spin);   /* [OPT-BACKOFF] 先让出时间片，长等待才睡 */
+    }
+    /* 已持所有权；再等 zoned flusher 退出（同样有界） */
+    spin = 0;
+    while ((volatile long)s->zflush_cnt != 0) {
+        if (++spin > RB_FLUSH_ACQUIRE_SPINS) {
+            InterlockedExchange((volatile LONG *)&s->flush_active, 0);
+            return FALSE;    /* zoned flusher 迟迟不退：归还所有权并跳过 */
+        }
+        RB_BACKOFF(spin);   /* [OPT-BACKOFF] */
+    }
+    return TRUE;
+}
 /* serial flush: mutual exclusion vs zoned flushers (sflush/zflush protocol) */
 static size_t flush_stream(rb_stream *s, int force)
 {
@@ -1790,8 +2464,8 @@ static size_t flush_stream(rb_stream *s, int force)
     eng=s->eng;
     per_low=RB_ALOAD64(&eng->cfg.low_water)/((rb_u64)RB_ALOAD32(&eng->nstreams)?RB_ALOAD32(&eng->nstreams):1);
     if(force){
-        while(InterlockedCompareExchange((volatile LONG*)&s->flush_active,1,0)!=0) RB_YIELD();
-        while((volatile long)s->zflush_cnt!=0) RB_YIELD();
+        /* [FIX DEADLOCK-1] 有界获取：拿不到/等不到就跳过（脏留待下轮） */
+        if(!flush_acquire(s)) return 0;
     }else{
         if(InterlockedCompareExchange((volatile LONG*)&s->flush_active,1,0)!=0)return 0;
         if((rb_u64)RB_ALOAD64(&s->dirty_bytes)<per_low){
@@ -1806,8 +2480,17 @@ static size_t flush_stream(rb_stream *s, int force)
          * dseq guard prevents a double list move (see chunk_clean_run was_dirty),
          * the running dirty counter still drifts transiently (observed as dirty
          * underflow in test_counter). Holding flush_active and draining zflush_cnt
-         * makes serial/zoned flush mutually exclusive per stream as documented. */
-        while((volatile long)s->zflush_cnt!=0) RB_YIELD();
+         * makes serial/zoned flush mutually exclusive per stream as documented.
+         * [FIX DEADLOCK-1] 同样有界：zoned flusher 长时间不退（慢盘盘 I/O）
+         * 时归还所有权并跳过本轮，绝不无限自旋拖死调用线程。 */
+        { unsigned long zs = 0;
+          while ((volatile long)s->zflush_cnt != 0) {
+              if (++zs > RB_FLUSH_ACQUIRE_SPINS) {
+                  InterlockedExchange((volatile LONG *)&s->flush_active, 0);
+                  return 0;    /* 让位：脏留待下一轮 */
+              }
+              RB_BACKOFF(zs);   /* [OPT-BACKOFF] */
+          } }
     }
     RB_FLUSH_STAT_INC(sflush);
     if(!s->ws) s->ws=ws_alloc();
@@ -2004,7 +2687,7 @@ static int evict_victim(rb_stream *s, rb_u64 start, rb_u64 epoch)
      * 时序：捕获 -> 回调 -> 释放（chunk_free）；脏块不进此路径（dirty==0 门）。 */
     if(have_evict){
         RbFeatOnEvict(evict_ext, evict_lba, evict_len, evict_src, evict_hits);
-        chunk_free(c);
+        chunk_free(s->eng,c);
     }
 #endif
     return r;

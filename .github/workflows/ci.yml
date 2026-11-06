@@ -1,0 +1,63 @@
+# RAMBlockCache 最小 CI —— 六门禁 + .NET 10 编译检查（P1-1 起步，2026-10-31）
+#
+# 范围纪律：
+#  - 六门禁在本工作流原样执行；任何一道 FAIL 即红灯（验收：故意注入协议字段漂移必须红）。
+#  - C# 13/13 测试与 WPF 离屏渲染取证（--capture-wpf）需要 STA 渲染环境，
+#    runner 上不稳定，暂留在本地 QA（qa_recovery_20261024.ps1）；CI 只做编译级检查。
+#  - web/（Node 侧）暂不纳入（41 号 §11.5：阶段 2 再接入，避免门禁频繁误报）。
+#  - check_signature 依赖仓库内 dist/RAMBlockCache.sys（ca7a9c1f…）与三锚点，
+#    均在库内，无需凭据。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  gates:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # —— 门禁① 版本单一事实源 + 接线表 + mtime ——
+      - name: Gate1 check_repo
+        run: python src/scripts/check_repo.py
+
+      # —— 门禁② 协议三副本字段级同步（注入漂移即红灯的验收载体）——
+      - name: Gate2 check_proto_sync
+        run: python src/scripts/check_proto_sync.py --strict
+
+      # —— 门禁③ 引用计数模型（17 断言）——
+      - name: Gate3 refcount_model
+        run: python deliverables/gstack/model/refcount_model.py
+
+      # —— 门禁④ XAML StaticResource 全有定义 ——
+      - name: Gate4 check_xaml_resources
+        run: python src/scripts/check_xaml_resources.py
+
+      # —— 门禁⑤ PowerShell 语法/BOM/惯用法（46 文件）——
+      - name: Gate5 check_ps_syntax
+        shell: pwsh
+        run: ./src/scripts/check_ps_syntax.ps1
+
+      # —— 门禁⑥ 签名有效性 + 三锚点一致 ——
+      - name: Gate6 check_signature
+        shell: pwsh
+        run: ./src/scripts/check_signature.ps1
+
+      # —— .NET 10 编译检查（0 警告基线）——
+      - name: Build WPF (net10.0-windows)
+        run: dotnet build src/ui/controller/RAMBlockCache.Controller/RAMBlockCache.Controller.csproj -c Release --no-incremental -warnaserror

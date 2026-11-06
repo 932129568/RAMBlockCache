@@ -43,8 +43,10 @@ typedef struct _RB_STATS2 {
 } RB_STATS2, *PRB_STATS2;
 
 /* [D10] 每卷加速/旁路状态（RB2_IOCTL_VOLSTATUS 输出，METHOD_BUFFERED）。
- * State: 0=旁路 1=加速；Reason: 0=无 1=系统卷默认排除 2=用户关闭
- *        3=panic/安全模式 4=引导保护 5=已移除。Count 封顶 RB2_VOLSTATUS_MAX。
+ * State: 0=旁路 1=eligible（配置可服务，非收益证明）；Reason: 0=无 1=系统卷默认排除 2=用户关闭
+ *        3=panic/安全模式 4=引导保护 5=已移除 6=流/几何不可用 7=方向关闭
+ *        8=最近 IO 超缓存门 9=最近准入排除 10=最近分配/队列资源降级。
+ *        0..5 语义与 Count/Item/IOCTL 布局冻结；6-10 仅追加。
  * 布局：WCHAR+ULONG+ULONG=12B/项（自然对齐），数组 8 项 + Count = 100B；
  * ctl/rbfeatctl.c 按同序定义读取，两侧默认对齐一致，无需 pack。 */
 #define RB2_VOLSTATUS_MAX 8
@@ -58,11 +60,11 @@ typedef struct _RB2_VOLSTATUS_LIST {
 } RB2_VOLSTATUS_LIST, *PRB2_VOLSTATUS_LIST;
 
 /* ===== 端口：由 rbio.c 实现并注册（见 rbio_ports.c） ===== */
-typedef VOID     (*RB2_PORT_FILL)(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa);
+typedef VOID     (*RB2_PORT_FILL)(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa, rb_u64 ViewGen); /* [FIX 2026-11-06] +视图世代 */
 typedef NTSTATUS (*RB2_PORT_SHRINK)(ULONG Percent);
 VOID     RbPortRegister(RB2_PORT_FILL Fill, RB2_PORT_SHRINK Shrink);
 VOID     Rb2PortsSetup(VOID);          /* rbio_ports.c */
-VOID     Rb2PortFill(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa); /* rbfeat.c 包装 s_Fill */
+VOID     Rb2PortFillGen(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa, rb_u64 ViewGen); /* rbfeat.c 包装 s_Fill */
 
 /* ===== 生命周期 ===== */
 NTSTATUS RbFeatInit(VOID);       /* DriverEntry/rbio 初始化尾部一次（幂等 CAS） */
@@ -107,6 +109,10 @@ NTSTATUS Rb2PoolInit(VOID);
 NTSTATUS Rb2PoolShutdown(VOID);  /* [FIX C5] join 超时返回 STATUS_TIMEOUT（leak-by-design 保留），调用方中止卸载 */
 ULONG   Rb2PoolWorkerCount(VOID); /* [FIX S-telelemetry] 实际 worker 数（STATS2.Workers） */
 NTSTATUS Rb2PoolSubmit(VOID (*Fn)(PVOID), PVOID Ctx);
+/* W4 真实 Fn 白名单：仅改变链接可见性，函数体/调用方/导出表不变。 */
+VOID RbHotPrewarmJob(PVOID Ctx);
+VOID RbPrefIssueJob(PVOID Ctx);
+VOID RbEvictJob(PVOID Ctx);
 
 /* 预取（rbpref.c） */
 VOID     RbPrefStream(PVOID Ext, ULONG64 Lba, ULONG Len);

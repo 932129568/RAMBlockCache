@@ -139,6 +139,11 @@ static const char *VolReasonText(ULONG r)
     case 3:  return "panic-safemode";
     case 4:  return "boot-protection";
     case 5:  return "removed";
+    case 6:  return "stream-geometry-unavailable";
+    case 7:  return "cache-direction-disabled";
+    case 8:  return "recent-io-over-limit";
+    case 9:  return "recent-admit-excluded";
+    case 10: return "recent-resource-degraded";
     default: return "unknown";
     }
 }
@@ -173,7 +178,8 @@ int main(int argc, char **argv)
                     !strcmp(argv[3], "L2")       ? 4 :
                     !strcmp(argv[3], "WBCOAL")   ? 8 :
                     !strcmp(argv[3], "MEMGUARD")  ? 16 :
-                    !strcmp(argv[3], "ETW")      ? 32 : 0;
+                    !strcmp(argv[3], "ETW")      ? 32 :
+                    !strcmp(argv[3], "THERMAL")  ? 64 : 0;   /* [FIX F8] 温度护栏 0x40 驱动实现完整，补映射 */
         if (!bit) { fprintf(stderr, "unknown feature\n"); return 2; }
         /* V10.3.1 -> 2026-10-15: L2 已接线（core evict_victim -> RbFeatOnEvict，
          * RB_WIRED_L2_ON_EVICT=1），可启用；WBCOAL（bit 8）仍为 M2 预留未接线，保持拦截。 */
@@ -204,6 +210,15 @@ int main(int argc, char **argv)
         if (!Xfer(d, RB2_IOCTL_REFRESH, NULL, 0, NULL, 0, NULL)) { fprintf(stderr, "refresh failed\n"); rc = 1; }
     } else if (!strcmp(argv[1], "snapshot")) {
         if (!Xfer(d, RB2_IOCTL_SNAPSHOT, NULL, 0, NULL, 0, NULL)) { fprintf(stderr, "snapshot failed\n"); rc = 1; }
+        else {
+            /* [FIX F11] 静默 no-op 收口：HOT 关闭/无热区时驱动成功但什么都没做。
+             * 读 HotZones 计数回显（>0=已持久化；0=提示原因），消除假成功。 */
+            DWORD hot = FeatDW("HotZones", 0);
+            DWORD flags = FeatDW("Flags", 0);
+            if (!(flags & 2)) { fprintf(stderr, "snapshot: HOT 特性未开启（flags on HOT 先）\n"); rc = 1; }
+            else if (!hot)    { fprintf(stderr, "snapshot: 无热区可持久化（热区统计为空）\n"); }
+            else              { printf("snapshot ok: %lu 热区已持久化\n", (unsigned long)hot); }
+        }
     } else if (!strcmp(argv[1], "shrink") && argc > 2) {
         ULONG p = (ULONG)atoi(argv[2]);
         if (!Xfer(d, RB2_IOCTL_SHRINK, &p, sizeof(p), NULL, 0, NULL)) { fprintf(stderr, "shrink failed\n"); rc = 1; }
@@ -228,6 +243,7 @@ int main(int argc, char **argv)
         /* l2 enable <X:> <GB>：配置容器 + 置 Flags L2 位 + REFRESH（含创建前警告） */
         HKEY k; DWORD gb = (DWORD)atoi(argv[4]);
         WCHAR L = (WCHAR)toupper((unsigned char)argv[3][0]);
+        if (L < L'A' || L > L'Z') { fprintf(stderr, "[x] 盘符须为 A-Z\n"); return 2; }
         const char fk[] = "SYSTEM\\CurrentControlSet\\Services\\RAMBlockCache\\Features";
         if (gb < 1) gb = 1;
         if (gb > 128) gb = 128;
@@ -250,6 +266,7 @@ int main(int argc, char **argv)
         /* 兼容旧形式：l2 <X:> <GB>（= enable，含 Flags 置位；argv[2] 须形如盘符） */
         HKEY k; DWORD gb = (DWORD)atoi(argv[3]);
         WCHAR L = (WCHAR)toupper((unsigned char)argv[2][0]);
+        if (L < L'A' || L > L'Z') { fprintf(stderr, "[x] 盘符须为 A-Z\n"); return 2; }
         const char fk[] = "SYSTEM\\CurrentControlSet\\Services\\RAMBlockCache\\Features";
         if (gb < 1) gb = 1;
         if (gb > 128) gb = 128;

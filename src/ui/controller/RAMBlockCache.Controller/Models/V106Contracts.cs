@@ -184,7 +184,23 @@ public static class RbStatsLatency
 {
     /// <summary>延迟明细文本（真值换算；cacheUs/diskUs=0 表示尚无样本）。</summary>
     public static string FormatDetail(uint cacheUs, uint diskUs)
-        => cacheUs == 0 && diskUs == 0
-            ? "—（样本不足，多读一些后再看；驱动按 1/64 采样）"
-            : $"缓存命中 {cacheUs} μs · 含下盘读 {diskUs} μs（EWMA · 采样 1/64）";
+        => FormatDetail(cacheUs, diskUs, 0, 0, 0, 0, 0, 0);
+
+    /// <summary>[U1 2026-11-06] 延迟明细文本（EWMA + 分位数）。
+    /// 分位全 0（老驱动/尚无样本）时只显示 EWMA 行——契约向后兼容；
+    /// 有样本时以 log2 桶近似下界呈现 P50/P95/P99，与 EWMA 并列。</summary>
+    public static string FormatDetail(uint cacheUs, uint diskUs,
+                                      uint cacheP50, uint cacheP95, uint cacheP99,
+                                      uint diskP50, uint diskP95, uint diskP99)
+    {
+        if (cacheUs == 0 && diskUs == 0)
+            return "—（样本不足，多读一些后再看；驱动按 1/64 采样）";
+        string ewma = $"缓存命中 {cacheUs} μs · 含下盘读 {diskUs} μs（EWMA · 采样 1/64）";
+        if (cacheP50 == 0 && diskP50 == 0)
+            return ewma;   // 老驱动（无分位字段）或尚无分位样本：不画假值
+        string part(uint p50, uint p95, uint p99) => p50 == 0
+            ? "—"
+            : $"P50 {p50} · P95 {p95} · P99 {p99} μs";
+        return ewma + $" ｜ 命中分位 {part(cacheP50, cacheP95, cacheP99)} ｜ 下盘分位 {part(diskP50, diskP95, diskP99)}（log2 桶近似）";
+    }
 }

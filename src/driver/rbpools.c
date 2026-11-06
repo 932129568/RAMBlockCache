@@ -16,6 +16,11 @@ static KSPIN_LOCK s_Lock; static LIST_ENTRY s_Q; static KSEMAPHORE s_Sem;
 static LONG s_Stop; static ULONG s_N;
 static PVOID    s_Obj[64]; static HANDLE s_Hnd[64];
 
+static BOOLEAN Rb2FnAllowed(VOID (*Fn)(PVOID))
+{
+    return Fn == RbHotPrewarmJob || Fn == RbPrefIssueJob || Fn == RbEvictJob;
+}
+
 static VOID Rb2Worker(PVOID Ctx)
 {
     PPROCESSOR_NUMBER pn = Ctx; GROUP_AFFINITY ga, old; KIRQL irql; LARGE_INTEGER t1;
@@ -30,7 +35,22 @@ static VOID Rb2Worker(PVOID Ctx)
         if (!IsListEmpty(&s_Q)) { le = RemoveHeadList(&s_Q); j = CONTAINING_RECORD(le, RB2_JOB, Le); }
         KeReleaseSpinLock(&s_Lock, irql);
         if (!j) { if (InterlockedCompareExchange(&s_Stop, 0, 0)) break; continue; }
-        j->Fn(j->Ctx); Rb2Free(j);
+        {
+            BOOLEAN allowed = Rb2FnAllowed(j->Fn);
+            RbDiagRecord(RB_DIAG_KIND_RB2_JOB, RB_DIAG_PHASE_FN_CHECK,
+                         allowed ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER,
+                         allowed ? RB_DIAG_FLAG_ALLOWED : RB_DIAG_FLAG_REJECTED,
+                         j, NULL, NULL, NULL, NULL, j->Fn);
+            if (allowed) {
+                RbDiagRecord(RB_DIAG_KIND_RB2_JOB, RB_DIAG_PHASE_EXECUTE, STATUS_SUCCESS,
+                             RB_DIAG_FLAG_ALLOWED, j, NULL, NULL, NULL, NULL, j->Fn);
+                j->Fn(j->Ctx);
+            } else {
+                /* 非法间接目标不执行；常量文本进既有安全熔断，地址仅留诊断环。 */
+                RbSetPanic(L"RB2 job Fn rejected by whitelist");
+            }
+            Rb2Free(j);
+        }
         if (InterlockedCompareExchange(&s_Stop, 0, 0)) {
             /* [FIX W5] 空表判定与摘取同锁：无锁读链表头在并发入队时可读到撕裂指针 */
             BOOLEAN empty;
@@ -62,6 +82,9 @@ NTSTATUS Rb2PoolSubmit(VOID (*Fn)(PVOID), PVOID Ctx)
     InsertTailList(&s_Q, &j->Le);
     KeReleaseSpinLock(&s_Lock, irql);
     KeReleaseSemaphore(&s_Sem, IO_NO_INCREMENT, 1, FALSE);
+    RbDiagRecord(RB_DIAG_KIND_RB2_JOB, RB_DIAG_PHASE_ENQUEUE, STATUS_SUCCESS,
+                 Rb2FnAllowed(Fn) ? RB_DIAG_FLAG_ALLOWED : RB_DIAG_FLAG_REJECTED,
+                 j, NULL, NULL, NULL, NULL, Fn);
     return STATUS_SUCCESS;
 }
 /* [FIX S-telelemetry] 导出实际 worker 数（STATS2.Workers 原恒 0，误导性遥测） */

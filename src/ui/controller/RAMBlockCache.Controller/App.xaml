@@ -161,6 +161,7 @@
                 </Setter>
             </Style>
             <Style TargetType="CheckBox">
+                <Setter Property="AutomationProperties.Name" Value="{Binding Content, RelativeSource={RelativeSource Self}}"/>
                 <Setter Property="Foreground" Value="{StaticResource RbcTextPrimary}"/>
                 <Setter Property="FontSize" Value="13"/>
                 <Setter Property="Cursor" Value="Hand"/>

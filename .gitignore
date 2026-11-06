@@ -29,12 +29,43 @@ build/
 # Chinese-named docs whose paths git-on-Windows rejects (invalid path)
 src/docs/
 
+# Web frontend build artifacts (P3.13 2026-11-06)
+web/node_modules/
+web/dist/
+web/coverage/
+web/.vite/
+
 # OS junk
 Thumbs.db
 Desktop.ini
 
-# Installer 工程（全新增 26 文件）：Mimosa L3 对进程启动形态零容忍拦截 6 处，
-# 其中 ramboostsetup.exe 引擎子进程为结构性必需无法托管化——待专项安全波次
-# 处置（ServiceController/COM 化）后入库。远端基线本不含此目录。
-src/ui/installer/
-/src/ui/installer/
+# Installer 工程源码入库（2026-11-06 重估：已是分发核心，撤销历史「整目录排除」）。
+# 只排除构建产物；46 个 .cs/.xaml/.csproj/.sln 留在版本控制内。
+src/ui/installer/**/bin/
+src/ui/installer/**/obj/
+src/ui/installer/**/*.user
+# 运行时载荷由 build_setup.ps1 从 src/scripts 生成（zip 合计 130MB+，不入库）
+src/ui/installer/**/Assets/payload/
+
+# Rust/napi native 编译产物
+web/bridge/native/target/
+
+# 已完成的历史交付文档 / 恢复快照 / 本地备份（用户确认：远端不需要保留）
+deliverables/archive/
+deliverables/recovery-candidate-*/
+deliverables/ui-recovery-*/
+deliverables/*.zip
+deliverables/*.tar.gz
+docs/legacy-wpf-ui/
+outputs/render-*/
+
+# IDE 本地配置
+.zcode/
+
+# 一次性 QA / 历史构建产物（远端已有 tracked exe 基线不受影响）
+src/ctl/*_w*.exe
+src/ctl/*_qa*.exe
+src/ctl/test_*.exe
+
+# 误创建的 0 字节中文名临时文件（git-on-Windows 路径转义不可靠）
+调试库

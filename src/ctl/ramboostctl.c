@@ -36,6 +36,7 @@
 #include <bcrypt.h>       /* BCrypt SHA-256（B-14 license HMAC 占位） */
 
 #include "rb_proto.h"
+#include "bench_policy.h"
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -43,8 +44,9 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "bcrypt.lib")
 
-/* set flush=infinite：驱动侧约定 FlushIntervalMs = 0xFFFFFFFF 表示无限延时 */
-#define RB_FLUSH_INFINITE_MS 0xFFFFFFFFu
+/* set flush=infinite：驱动真实哨兵是 0=关闭周期回写（BUG2 契约；[FIX D6] 原发
+ * 0xFFFFFFFF 被驱动钳成 600000ms，用户显式"关闭"被静默改写） */
+#define RB_FLUSH_INFINITE_MS 0u
 
 /* g_dev = 驱动控制设备句柄（CreateFileW 打开 \\.\RAMBlockCache）。 */
 static HANDLE g_dev = INVALID_HANDLE_VALUE;
@@ -303,7 +305,7 @@ static int rb_invalidate_range(wchar_t letter, uint64_t offset, uint64_t length)
  *   ① FILE_FLAG_NO_BUFFERED + 按卷 LogicalSectorBytes 对齐读（不过 Windows 文件缓存，
  *      否则第一遍不是冷读=对比造假）；文件尾部非对齐部分降级为缓冲读并在 ioMode 标注；
  *   ② QueryPerformanceCounter 计时（与 ramboostctl stats 同源时钟口径）；
- *   ③ secondHitRate 用 RB_STATS 增量（第二遍窗口的 ReadReq/ReadHit 差——与 status
+ *   ③ secondHitRate 用 RB_STATS 字节增量（第二遍窗口 ReadHitBytes/ReadBytes 差——与 status
  *      同一计数器同一路径，不另造测量）；
  *   ④ 进度 250ms 节流（≤4Hz）；Ctrl+C 取消后 stats 口径不变（本命令只读 stats，
  *      零写入，无污染）；
@@ -394,7 +396,6 @@ static int RbBenchReadPass(HANDLE hAligned, HANDLE hTail,
  *   RETRIEVAL_POINTERS_BUFFER { DWORD ExtentCount; LARGE_INTEGER StartingVcn;
  *                               struct { LARGE_INTEGER NextVcn; LARGE_INTEGER Lcn; } Extents[1]; }
  * 区间长度（簇）= Extents[i].NextVcn - (i==0 ? StartingVcn : Extents[i-1].NextVcn)。 */
-#define RB_FLUSH_EXTENT_MAX 64   /* 超过则回退整文件（碎片化大文件的区间数无上界） */
 
 static int CliFlushFileRange(wchar_t letter, const char *path, uint64_t size,
                              int *pUsedFallback, int *pExtentCount)
@@ -411,10 +412,9 @@ static int CliFlushFileRange(wchar_t letter, const char *path, uint64_t size,
 
     *pUsedFallback = 0;
     *pExtentCount = 0;
-    if (!GetDiskFreeSpaceA(root, &spc, &bps, NULL, NULL) || spc == 0 || bps == 0) {
-        spc = 8; bps = 512;   /* 取不到按 4K 簇兜底（仅影响区间切分，不影响语义） */
-    }
-    cluster = (uint64_t)spc * (uint64_t)bps;
+    if (!RbBenchTryGetClusterBytes(GetDiskFreeSpaceA(root, &spc, &bps, NULL, NULL),
+                                   (uint64_t)spc, (uint64_t)bps, &cluster))
+        return RB_BENCH_EXTENTS_UNAVAILABLE;  /* 查询失败/0/溢出：禁止猜测簇并失效错误 LCN */
 
     h = CreateFileA(path, FILE_READ_ATTRIBUTES | FILE_READ_DATA,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -427,19 +427,18 @@ static int CliFlushFileRange(wchar_t letter, const char *path, uint64_t size,
         return -1;
 
     in.StartingVcn.QuadPart = 0;
-    need = (DWORD)(sizeof(RETRIEVAL_POINTERS_BUFFER) + sizeof(LARGE_INTEGER) * 2 * RB_FLUSH_EXTENT_MAX);
+    need = (DWORD)(sizeof(RETRIEVAL_POINTERS_BUFFER) + sizeof(LARGE_INTEGER) * 2 * RB_BENCH_EXTENT_MAX);
     out = (RETRIEVAL_POINTERS_BUFFER *)malloc(need);
     if (!out) { CloseHandle(h); return -1; }
     ok = DeviceIoControl(h, FSCTL_GET_RETRIEVAL_POINTERS, &in, sizeof(in),
                          out, need, &got, NULL);
-    /* 区间数超上限 / 缓冲不足 / FSCTL 不被支持：回退整文件一次失效 */
-    if (!ok || got < sizeof(RETRIEVAL_POINTERS_BUFFER) ||
-        out->ExtentCount == 0 || out->ExtentCount > RB_FLUSH_EXTENT_MAX) {
+    /* 物理区间不可用时直接失败；[0,size) 是逻辑文件偏移，不是卷 LCN，禁止伪失效。 */
+    if (!RbBenchExtentsUsable(ok, got, sizeof(RETRIEVAL_POINTERS_BUFFER), out ? out->ExtentCount : 0)) {
         free(out);
         CloseHandle(h);
-        *pUsedFallback = 1;
-        *pExtentCount = 1;
-        return rb_invalidate_range(letter, 0, size);
+        *pUsedFallback = 0;
+        *pExtentCount = 0;
+        return RB_BENCH_EXTENTS_UNAVAILABLE;
     }
     {
         uint64_t prevVcn = (uint64_t)out->StartingVcn.QuadPart;
@@ -452,7 +451,7 @@ static int CliFlushFileRange(wchar_t letter, const char *path, uint64_t size,
             uint64_t clusters = (nextVcn > prevVcn) ? (nextVcn - prevVcn) : 0;
             int sr;
             prevVcn = nextVcn;
-            if (out->Extents[i].Lcn.QuadPart < 0) { sparse++; continue; }   /* 稀疏段无盘上区间可失效 */
+            if (out->Extents[i].Lcn.QuadPart < 0) { sparse++; break; }   /* 稀疏段无法可靠映射，整体判不可用 */
             if (clusters == 0) continue;
             sr = rb_invalidate_range(letter,
                                      (uint64_t)out->Extents[i].Lcn.QuadPart * cluster,
@@ -461,8 +460,8 @@ static int CliFlushFileRange(wchar_t letter, const char *path, uint64_t size,
         }
         free(out);
         CloseHandle(h);
+        if (sparse) return RB_BENCH_EXTENTS_UNAVAILABLE;
         if (failedStatus != 0) return failedStatus;
-        if (sparse) fprintf(stderr, "[提示] 文件含 %d 个稀疏段（无盘上区间，跳过）\n", sparse);
         return 0;
     }
 }
@@ -516,14 +515,17 @@ static int cli_flushfile(int argc, char **argv)
         } else if (r == NT_STA_INVALID_PARAMETER) {
             code = 8;
             text = "invalid range parameters";
+        } else if (r == RB_BENCH_EXTENTS_UNAVAILABLE) {
+            code = 10;
+            text = "physical extents unavailable; cache not invalidated";
         }
         fprintf(stderr, "[错误] 缓存范围刷新失败（%s）：旧驱动不支持消息 13？"
                         "或该卷未挂载缓存？\n", text);
         printf("flushfile ok=0 errorCode=%d errorText=\"%s\"\n", code, text);
         return 1;
     }
-    printf("已刷新 %s 的缓存范围（%d 个区间%s），第一遍读将真正落到磁盘。\n",
-           path, extents, usedFallback ? "，extents 查询失败已回退整文件" : "");
+    printf("已刷新 %s 的驱动缓存范围（%d 个区间%s）；OS 缓存冷态未知。\n",
+           path, extents, usedFallback ? "，使用兼容回退" : "");
     printf("flushfile ok=1 errorCode=0 extents=%d fallback=%d\n",
            extents, usedFallback);
     return 0;
@@ -542,6 +544,7 @@ static int cli_bench(int argc, char **argv)
     uint32_t chunk;
     BOOL driverOnline = FALSE;
     BOOL tailBuffered = FALSE;
+    BOOL driverCold = FALSE;
     RB_VOLUME_LIST list;
     char ioMode[128];
     double firstSec = 0, secondSec = 0, firstMbps = 0, secondMbps = 0;
@@ -639,17 +642,19 @@ static int cli_bench(int argc, char **argv)
            path, (double)size / 1048576.0, (unsigned)sector,
            driverOnline ? "驱动在线（将先刷新缓存范围）" : "驱动不在线（第一遍可能不是冷读）");
 
-    /* 第一遍前：B-5 缓存范围刷新（冷读前提）；失败/无驱动 → 降级提示，不冒充 */
+    /* 仅真实物理范围失效成功才记 driverCold；OS 缓存状态始终单独标注。 */
     if (driverOnline) {
         int usedFallback = 0, extents = 0;
         if (CliFlushFileRange((wchar_t)toupper((unsigned char)path[0]), path, size,
-                              &usedFallback, &extents) == 0)
-            printf("  已刷新缓存范围（%d 区间），第一遍为冷读。\n", extents);
-        else
-            printf("  [警告] 缓存范围刷新失败（旧驱动/卷未挂载）：第一遍可能不是冷读。\n");
+                              &usedFallback, &extents) == 0) {
+            driverCold = TRUE;
+            printf("  驱动缓存范围已失效（%d 区间），driverCold=true；OS-cache-unknown。\n", extents);
+        } else {
+            printf("  [警告] 驱动冷态未验证：物理范围失效失败；OS-cache-unknown。\n");
+        }
     }
 
-    /* 第一遍（冷读） */
+    /* 第一遍（driverCold 仅表示驱动侧冷态；OS 缓存不在此保证范围内） */
     {
         uint64_t got = 0;
         int r = RbBenchReadPass(hAligned, hTail, size, sector, buf, chunk, 0, &firstSec, &got);
@@ -657,7 +662,8 @@ static int cli_bench(int argc, char **argv)
         if (r != 0) { rc = 1; goto done; }
         bytes = got;
         firstMbps = firstSec > 0 ? ((double)got / 1048576.0) / firstSec : 0.0;
-        printf("  第一遍（冷）: %.1f MB/s，%.2f s\n", firstMbps, firstSec);
+        printf("  第一遍（%s）: %.1f MB/s，%.2f s\n",
+               driverCold ? "驱动冷态" : "冷态未验证", firstMbps, firstSec);
     }
 
     /* 第二遍起（缓存读）：stats 增量窗口包住整个热读段（B-4 ③） */
@@ -674,26 +680,28 @@ static int cli_bench(int argc, char **argv)
         secondMbps = mbps;   /* 最后一遍热读计入 second* */
     }
     if (driverOnline && rb_get_stats(&s1) == 0) {
-        uint64_t dReq = s1.ReadReq - s0.ReadReq;
-        uint64_t dHit = s1.ReadHit - s0.ReadHit;
-        if (dReq > 0) hitRate = (double)dHit / (double)dReq;
+        uint64_t dReadBytes = s1.ReadBytes - s0.ReadBytes;
+        uint64_t dHitBytes = s1.ReadHitBytes - s0.ReadHitBytes;
+        hitRate = RbBenchByteHitRate(dReadBytes, dHitBytes);
     }
 
     /* ioMode 组合标注（诚实降级，不伪装） */
     strcpy_s(ioMode, sizeof(ioMode), "no-buffered");
     if (tailBuffered) strcat_s(ioMode, sizeof(ioMode), "+tail-buffered");
     if (!driverOnline) strcat_s(ioMode, sizeof(ioMode), "+driver-offline");
+    if (!driverCold) strcat_s(ioMode, sizeof(ioMode), "+driver-cold-unverified");
+    strcat_s(ioMode, sizeof(ioMode), "+os-cache-unknown");
 
     printf("  第二遍（缓存）: %.1f MB/s，%.2f s   命中率: %s\n",
            secondMbps, secondSec,
            hitRate < 0 ? "不可测（驱动不在线）" : "（见结构化输出）");
     if (hitRate >= 0)
-        printf("  缓存命中率: %.2f%%\n", hitRate * 100.0);
-    /* 双格式输出：人类可读（上）+ 一行结构化（UI/遥测可解析；字段与 ColdWarmResult DTO 逐字对应） */
+        printf("  缓存字节命中率: %.2f%%\n", hitRate * 100.0);
+    /* 旧八字段保持顺序；driverCold 为可选追加字段，ioMode 携带 OS/驱动冷态。 */
     printf("bench firstMbps=%.1f firstSec=%.2f secondMbps=%.1f secondSec=%.2f "
-           "bytes=%llu secondHitRate=%.4f ioMode=%s toolVersion=\"%s\"\n",
+           "bytes=%llu secondHitRate=%.4f driverCold=%s ioMode=%s toolVersion=\"%s\"\n",
            firstMbps, firstSec, secondMbps, secondSec, (unsigned long long)bytes,
-           hitRate, ioMode, RB_BENCH_TOOL_VERSION);
+           hitRate, driverCold ? "true" : "false", ioMode, RB_BENCH_TOOL_VERSION);
 
 done:
     if (rc == 130) {
@@ -1279,6 +1287,9 @@ static int cli_license(int argc, char **argv)
         printf("许可已激活（%s；激活日期已记录）。\n",
                payload[0] == 'P' ? "专业版" : payload[0] == 'I' ? "个人版" : "正式版");
         printf("license ok=1 state=active\n");
+        /* [FIX F9] 诚实披露：当前许可为本地登记（占位 HMAC+无消费点），
+         * 激活与否不影响任何功能——明示给用户，不制造"解锁"错觉。 */
+        printf("[说明] 当前版本激活仅作本地登记，不影响任何功能（试用无上限口径）。\n");
         return 0;
     }
 
@@ -1425,7 +1436,7 @@ static int cli_print_config(void)
     printf("  脏高水位: %u%%   脏低水位: %u%%   系统卷缓存: %u\n",
            (unsigned)c.DirtyHighPct, (unsigned)c.DirtyLowPct,
            (unsigned)c.SystemVolumeCached);
-    printf("  空闲释放: %u (阈值 %u 秒)   并行回写: %u\n",
+    printf("  空闲释放: %u (阈值 %u 秒)   并行回写: %u 路 (1=串行, 2/4/8/16=并行)\n",
            (unsigned)c.IdleReclaimEnabled,(unsigned)c.IdleReclaimSec,
            (unsigned)c.ParallelFlush);
     printf("  块大小: %uK\n", (unsigned)(c.BlockSize ? c.BlockSize/1024u : 4));
@@ -1464,8 +1475,8 @@ static int cli_set(int argc, char **argv, int startIdx)
         { "idleSec",       &c.IdleReclaimSec },
         { "parallel",      &c.ParallelFlush },
         { "writeRelease",  &c.WriteRelease },
-        { "frozen",        &c.Frozen },
-        { "idleFlush",     &c.IdleFlush },
+        /* [FIX F3] frozen/idleFlush 已从表中移除：驱动侧零消费（设置后无任何
+         * 行为差异=假成功）。字段保留在协议结构（历史兼容），CLI 不再暴露。 */
     };
     const size_t nent = sizeof(ents) / sizeof(ents[0]);
 
@@ -1514,10 +1525,13 @@ static int cli_set(int argc, char **argv, int startIdx)
         }
         else if (!strcmp(key, "block")) {
             uint32_t kb = (uint32_t)strtoul(val, NULL, 0);
-            uint32_t ok_bytes[] = {4096,8192,16384,32768,65536,131072};
+            /* [F1 2026-11-06] 65536/131072 自白名单摘除，与驱动 rbctl.c rb_legal_bs /
+             * core cache.c legal[] 同步（11-03 64K 事故未归因，59-64k-audit §5；
+             * 归因+复现通过后恢复）。 */
+            uint32_t ok_bytes[] = {4096,8192,16384,32768};
             int j; c.BlockSize = 0;
-            for (j = 0; j < 6; j++) if (kb*1024u == ok_bytes[j]) c.BlockSize = ok_bytes[j];
-            if (c.BlockSize == 0) { fprintf(stderr, "[警告] block 仅支持 4/8/16/32/64/128 KB，已回退 4K\n"); c.BlockSize = 4096; }
+            for (j = 0; j < 4; j++) if (kb*1024u == ok_bytes[j]) c.BlockSize = ok_bytes[j];
+            if (c.BlockSize == 0) { fprintf(stderr, "[警告] block=%u KB 不在允许档位 {4/8/16/32 KB}，已回退 4K\n", kb); c.BlockSize = 4096; }
         }
         else if (!strcmp(key, "vol")) {
             /* 例：vol=C:,D: —— 逗号分隔，最多 RB_MAX_VOLUMES 个 */
@@ -1534,15 +1548,13 @@ static int cli_set(int argc, char **argv, int startIdx)
             }
             for (; n < RB_MAX_VOLUMES; n++)
                 c.VolumeFilter[n][0] = L'\0';
-            if (n == 0) {
-                /* vol= 清空 = 全部卷 */
-                for (n = 0; n < RB_MAX_VOLUMES; n++)
-                    c.VolumeFilter[n][0] = L'\0';
-            }
             /* [P2-4] 驱动未实现 VolumeFilter 消费点：旧代码静默接受并打印
-             * 成功，用户以为白名单已生效。此处显式告警，指向真实机制。 */
-            fprintf(stderr, "[警告] 驱动未实现缓存卷白名单（vol=）：该值仅被回显/存储，"
+             * 成功，用户以为白名单已生效。
+             * [FIX F4] 升级为用法错误（rc=2）：告警后仍回执"配置已应用"会让
+             * 脚本误判成功——与 WBCOAL 拦截式样对齐，半修复态收口。 */
+            fprintf(stderr, "[错误] 驱动未实现缓存卷白名单（vol=）：该值仅被回显/存储，"
                             "不改变缓存行为；请用 attach/detach 逐卷控制。\n");
+            return 2;
         }
         else fprintf(stderr, "[警告] 未知参数: %s\n", key);
     }
@@ -1921,10 +1933,12 @@ int main(int argc, char **argv)
         printf("  ramboostctl statval <字段>        机器可读数字: dirty_bytes/cur_bytes/wb_bytes\n");
         printf("  ramboostctl get-config            查看当前配置\n");
         printf("  ramboostctl set key=value ...     修改配置（自动回读实际生效值）\n");
-        printf("    可选键: enabled read write wb size flush high low sys vol\n");
-        printf("           idleOn idleSec parallel writeRelease frozen idleFlush block\n");
-        printf("    例:    ramboostctl set size=16384 wb=1 vol=C:,D:\n");
+        printf("    可选键: enabled read write wb size flush high low sys\n");
+        printf("           idleOn idleSec parallel writeRelease block\n");
+        printf("    例:    ramboostctl set size=16384 wb=1\n");
         printf("           ramboostctl set size=0        (0=动态自动，按需占用、不固定占满)\n");
+        printf("           ramboostctl set flush=infinite (0=关闭周期回写，显式 FLUSH/关机仍落盘)\n");
+        printf("  ramboostctl preset apply <safe|balanced|perf>   场景预设（快照+可回滚）\n");
         printf("  ramboostctl flush                 立即回写全部脏数据\n");
         printf("  ramboostctl safe-mode [off]       查看安全模式 / 确认退出\n");
         printf("  ramboostctl volumes               枚举全部卷（绑定/热开关/写模式/扇区）\n");

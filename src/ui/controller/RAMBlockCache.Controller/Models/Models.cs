@@ -7,7 +7,8 @@ namespace RAMBlockCache.Controller.Models;
 // 真实协议层（ctl/rb_proto.h, Protocol 9）—— 单一 IOCTL 0x222000 + RB_MSG.Type 分发。
 // 旧 ui/wpf/RbClient 已验证此布局能连上正在运行的 Build 17 驱动，逐字段对齐照抄。
 //   消息头: Type@0(u32) / Size@4(u32) / Status@8(i32, NTSTATUS) / Reserved@12(u32)
-//   联合体 Data@16，整块 RbMsgSize = 7704 字节。
+//   联合体 Data@16，整块 RbMsgSize = 8224 字节（[FIX 2026-10-24] B-7 事件环加入后
+//   RB_EVENT_LIST(8208) 成为 union 最大成员，原 7704 使驱动 Size 校验拒发——Win32 87）。
 //
 // [重构 P1-3 同步警示] 本协议布局共**三处手工副本**，无生成器、纯人工同步：
 //   ① ctl/rb_proto.h（C 权威，ABI 冻结，Protocol 9）
@@ -35,7 +36,7 @@ public static class RbP
     public const uint GET_EVENTS = 14;         /* [V10.6/B-7] 操作进度事件轮询 */
 
     public const int DataOffset = 16;
-    public const int MsgSize = 7704;
+    public const int MsgSize = 8224;   /* [FIX 2026-10-24] RB_EVENT_LIST(8208)>RB_LOG_LIST(7688)：信封16+8208（与 check_proto_sync 动态计算一致） */
 
     public const int MaxVolumes = 8;
     public const int Stripes = 64;
@@ -81,6 +82,10 @@ public struct RbStats
      * check_proto_sync --strict 把关）。UI 消费位：MainViewModel.LatencyDetailText
      * → V106Contracts.RbStatsLatency.FormatDetail（无样本显示「—」不画假值）。 */
     public uint CacheReadLatencyUs, DiskReadLatencyUs;
+    /* ---- [U1 2026-11-06] 读延迟分位数（微秒；log2 桶近似；0=尚无样本）----
+     * rb_proto.h RB_STATS 末尾纯追加；MainViewModel 分位明细展示消费。 */
+    public uint CacheReadLatP50Us, CacheReadLatP95Us, CacheReadLatP99Us;
+    public uint DiskReadLatP50Us, DiskReadLatP95Us, DiskReadLatP99Us;
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 8)]

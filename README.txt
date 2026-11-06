@@ -17,10 +17,10 @@
 部署门禁哈希锚点（重要）
 ----------------------------------------------------------------
   scripts\deploy.ps1 / verify_deploy_signature.ps1 内置
-  DefaultExpectedSha256 = 5ebde9e28441d861b1df33508d3b2c7d3f72beeac7ef1d8f2cc324bac47a629d
-  该值对应本包 dist\RAMBlockCache.sys（2026-10-17 0xA 整改轮：KMUTEX 换锁 +
-  WPF 自动挂载治理，CN=RAMBoostFS Root 重签名，WinVerifyTrust 链有效，
-  122,080 字节）。（2026-10-21 更正：原文字误写 115,424；哈希才是唯一权威标识，字节数仅供人工核对）
+  DefaultExpectedSha256 = 4099b7fb046231fe279ad6f4e1f7af24a1dc90fd79e4fe5c99ad7dc9b096d423
+  该值对应本包 dist\RAMBlockCache.sys（2026-11-06 夜战批：视图世代门控 +
+  变更窗 + TRIM 范围失效 + 分页 IO 旁路 + ResumeOnBoot 冷启动修复，
+  157,408 字节）。（2026-10-21 更正：原文字误写 115,424；哈希才是唯一权威标识，字节数仅供人工核对）
   任何源码改动后必须重新编译 + 重新签名，
   新二进制哈希会变化 —— 若未同步更新该锚点，部署会"失败关闭"（拒绝部署），
   这是刻意设计，不要为了绕过而删掉校验。
@@ -147,10 +147,37 @@
        （或仅从 MULTI_SZ 中摘除 RAMBlockCache，保留第三方过滤器）
     4) reg unload HKLM\OFFLINE
     5) 重启
-  一键版：在 WinRE 命令提示符运行 src\scripts\offline_rollback.cmd
+  一键版：offline_rollback.cmd 已随包安装在产品目录（与 README.txt 同目录）。
+    在 WinRE 命令提示符下进入该盘符目录运行它
     （自动完成上述 1-4，保留第三方过滤器，摘空回落 volsnap）。
+    注意 WinRE 下系统盘符常不是 C:，先用 diskpart/bcdedit 确认实际盘符。
   预防：部署前跑门禁⑤ check_signature.ps1（必须 PASS）+
     提权窗 bcdedit /enum {current} 确认 testsigning Yes。
+----------------------------------------------------------------
+三重回滚网（P1.5，2026-11-06）
+----------------------------------------------------------------
+  ① 引擎 WinVerifyTrust 预检：未签名/签名链无效的驱动在复制/建服务/写
+    UpperFilters 之前即被拒绝安装（零系统变更，机器保持原状）。
+  ② boot_guard 双计划任务（随安装器自动注册）：
+    - AtStartup（RAMBoostBootGuard）：仅在 FilterArmed=1 且 BootFailCount>=1
+      （确认引导失败）时把 RAMBlockCache 从卷类 UpperFilters 摘除，
+      其余情况零动作；
+    - AtLogOn（RAMBoostLogonDisarm）：健康到达桌面即写 LastBootHealthy=1、
+      DeployAck=DeploySeq 并解除武装（FilterArmed=0）。
+  ③ WinRE 兜底：offline_rollback.cmd（见上方一键版）。
+  注：若安全软件（如 360）拦截 schtasks 导致看门武装失败，安装器自动降级
+    为两层网（签名预检 + offline_rollback.cmd）并打印提示，安装不中止。
+
+桥接开机自启（P3.15，2026-11-06）
+----------------------------------------------------------------
+  安装器自动注册计划任务 RAMBlockCacheBridge（SYSTEM / ONSTART / HIGHEST），
+  动作 = 便携 node 运行 <安装目录>\webconsole\server\index.ts（Web 控制台
+  桥接，仅监听 127.0.0.1:5199，本机回环不可远程访问）。安装完成即启动一次，
+  之后每次开机自启；「应用与功能」卸载时自动摘除任务并结束桥接进程。
+  信任边界：桥接持有驱动控制面（挂载/配置），等价于本机管理员操作——
+  单用户桌面环境默认形态；多用户共用机器请自行评估后用
+  schtasks /Delete /TN RAMBlockCacheBridge /F 移除。手动起停：
+  schtasks /Run|/End /TN RAMBlockCacheBridge（管理员）。
 ================================================================
 W1.5 读写路径性能专项 · 真机验证手册（2026-10-20）
 ================================================================

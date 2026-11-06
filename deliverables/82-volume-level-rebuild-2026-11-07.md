@@ -67,7 +67,7 @@
 ### 3.1 序列（worker 内，PASSIVE）
 
 1. **单主**：`InterlockedCompareExchange(&g_Rb.Recreating, 1, 0) != 0` → 拒绝并发。**`Recreating=1` 期间拒绝除本请求外的所有 SET_CONFIG**（含 CLI、桥接 method=2、WPF Save、flushfile）—— 防 80 号 Q1-2 陷阱 B 在窗口内抹掉新几何。
-2. **持久化**：先 `RbSaveConfig` 写新 `BlockSize`，再 **`reg query` 回读确认**（80 号 Q7：`RbRegSetDW` 是 void、写失败只打日志、CLI 不校验 `Status`，存在假成功）。失败即中止并保留旧几何。
+2. **持久化**：先 `RbSaveConfig` 写新 `BlockSize`，再 **`reg query` 回读确认**（80 号 Q7：`RbRegSetDW` 是 VOID、丢弃 `RbRegSetValue` 的返回值、失败只打日志 ⇒ `SET_CONFIG` 仍 `STATUS_SUCCESS`；`reg query` 是唯一能覆盖这一层的手段）。失败即中止并保留旧几何。**02:5x 更正**：CLI 侧 `rb_send :117` 已按 `reply.Status` 判成败，不存在「CLI 假成功」，不需要改 CLI。
 3. **门控**：`g_Rb.Unloading = TRUE` 挡住所有新 IO 准入；记录当前 `IsAttached && Stream != NULL` 的卷集合及各卷 read/write/wm 标志快照。
 4. **逐卷安全摘除**：对每个卷走 `RbVolumeRemove` 等价链（flush 脏 → `RbInvalidateAfterFlush` → 等 `RbGetExt` 引用归零 / Reaper 排空 → `ext->Stream` 摘链置 NULL → `IsAttached=FALSE`）。**这一步是 `Rb2_PortFill` 等预留回调的安全屏障来源**，不需要停 worker 池。
 5. **销毁**：确认全部卷 `Stream==NULL`、无在途引用后 `rb_engine_destroy(g_Rb.Engine)` → `g_Rb.Engine = NULL`。
@@ -170,7 +170,7 @@
 | # | 裁定 |
 |---|---|
 | **A · 控制面门控精确化** | 不能一刀切。按 `msg->Type` 过滤：**拒** `SET_CONFIG`（发起重建者除外）/ `ATTACH_VOLUME` / `SET_VOLUME` / `PANIC*`，返回 `STATUS_DEVICE_BUSY`；**放行** `GET_CONFIG` / `GET_STATS` / `GET_LOG` / `GET_EVENTS` / `LOGQ` —— 否则 QA 在重建窗口内采不到 `GeometryRebuildInProgress=1` 与 `EngineBlockSize=0`，E1/E8 无证据。单主同源：`RbMsgSetConfig` 检测 `BlockSize` 变化先 CAS 抢主，抢到者放行并入队，其余见 `Recreating!=0` 拒。`IOCTL_RB_BOOTCFG`（`rbctl.c:855-890`）与 `IOCTL_RB_EXCLUDE`（`:914-920`）不进 RB_MSG switch，窗口内拒绝或至少 WARN，防污染 E2 卷集合判据。 |
-| **B · 补 `reply.Status` 校验** | `rb_set_config`（`ramboostctl.c:165-175`）只校验 `reply.Type` 不校验 `Status`；`RbMsgSetConfig`（`rbctl.c:311-332`）`:313 UNREFERENCED_PARAMETER(pst)` 恒成功 ⇒ 驱动正确返回 BUSY 时 CLI 仍报「配置已应用」，**E5 失败回滚注入从 CLI 侧看不到失败**。实施单补：CLI 校验 `reply.Status` + 驱动如实写回 `*pst`。`reg query` 双证据只证明注册表，不能替代。 |
+| **B · M2 收窄（02:5x 工程师自我更正，主理人独立核实采信）** | **原论断「`rb_set_config` 只校验 `reply.Type`、不校验 `Status`」是错的**：`ramboostctl.c:117 rb_send()` 明确 `return (reply->Status==0)?0:-1`，`:170 rb_set_config` 首行即判，`:1567 cli_set` 打印「设置配置失败」并 return 1，驱动 `rbctl.c:971 msg->Status=(int32_t)st` ⇒ **CLI 侧 Status 校验链完整，E5 从 CLI 侧能看到失败，CLI 零改动**。仍需修的只有驱动侧：`RbMsgSetConfig`（`rbctl.c:311-332`）`:313 UNREFERENCED_PARAMETER(pst)` 恒成功，入队失败/并发拒绝必须如实写回 `*pst`（`STATUS_DEVICE_BUSY` 等）。`reg query` 双证据仍是**唯一**覆盖「`RbRegSetDW` VOID 丢弃注册表写错误」这一层的手段，不可省略、不可被 `reply.Status` 替代。**83 号报告不得把「CLI 不校验 Status」写成事实**。 |
 | **C · BLOCKER 2 修复方案 → 主理人撤回「条件式」裁定，改采 QA 方案 A（无条件失效）** | 见下方 §4.7。**放行前置已成立**：`deliverables/81-directwrite-stale-repro-2026-11-07.md` + 主理人独立复跑确认复现。修复改为 `rbio.c:935` 无条件 `RbInvalidateAfterFlush`，**不动 `cache.c`**；并入同批第二笔提交。 |
 | **D · 锁范围澄清** | 工程师条件 GO 第 4 条「全程持 `s_AttachMutex`」与「不得回调 `RbAttachVolumeByLetter`（KMUTEX 自死锁）」并存有歧义。按 M4 执行：该锁**只覆盖快照 + 逐卷摘链 + 引擎销毁/重建，重挂前释放**；重挂走既有 `RbAttachVolumeByLetter`（不持锁），并发由 `Recreating` 门（M1 三处补门）挡住。若坚持全程持锁须给出不自死锁的实现与锁序证据。 |
 | **E · QA 用例保留两套断言** | 修复后的驱动两段式会多一步「写盘 + 失效（升 `view_gen`）+ 短 len commit」。`test_directwrite_stale.c` 须用 `--mode pre|post` 表达两种行为：PRE_FIX 期望 >4K 档 STALE/FAIL，POST_FIX 期望全档 CLEAN/PASS。否则「驱动已修、用例仍断言旧行为 FAIL」会在 E3/E4 制造假红。 |
@@ -277,6 +277,21 @@ v2 产物 `src/core/build/qa_stale_directwrite.exe` = 172,032 B / sha `3ba03e57�
 - 81 号报告由 QA 把「方案 A = 门控版」全部改为「方案 A = `rbio.c:935` 无条件 `RbInvalidateAfterFlush`（等价 `--mode post`）」，`--mode post-cond` 保留为负面对照，并补主理人独立复跑附录。
 - **79 号 §4.4 / §4.6 的矛盾措辞与 §8 的 E2/E4/E8 由工程师在实施单第 18 条一并落地，主理人只做复核**（避免两边重复改）：`GET_CONFIG` 保持配置副本语义、真实几何走 `GET_STATS.EngineBlockSize`；`p.length>=1284` 作废、按 §4.8 实算偏移分级守卫；§5 R10 最终措辞 = 「不得在 4K 读写路径新增原子写或锁；正确性所必需的失效允许，但须 4K A/B 结构 diff 0 + 吞吐回归留证」。
 - 78 号 §4.3.1 / §6 预热覆写序列补强、§5 吞吐不可比两条验收通过，不再改动。
+
+---
+
+## 4.10 QA v2.1 四模式矩阵与一处建模口径更正（03:0x）
+
+QA 在收到我「撤回新增 `--mode post-uncond`」之前已把 v2.1 补齐（时序交叉，**不回退**，多一套硬自检反而更严）：
+
+- `src/core/test_directwrite_stale.c`（21,335 B）、`build/qa_stale_directwrite.exe`、15 个 `qa_stale_*` 产物、`deliverables/81-directwrite-stale-repro-2026-11-07.md`（35,412 B）。
+- 四种模式：`PRE_FIX` / `POST_FIX_CONDITIONAL`（门控版负面对照） / `POST_FIX_UNCONDITIONAL`（方案 A） / `POST_FIX`（兼容别名，映射到 uncond）。全档、单档、残余复跑全 `exit=0`、`HARNESS_ERRORS=0`。
+- 结果：`post-cond` 仅 `4096/tail512` STALE；`post-uncond` 与 `post` **12/12 CLEAN**，且加 `invalidate=1` 硬自检（防「失效没调用却侥幸 CLEAN」的假绿）。`--mode post` 作为 E3/E4 正向断言模板交工程师。
+- 78 号本轮未动（§4.3.1 G4 强化序列 / §6 吞吐不可比 / §11 独立复核附录已在 v2 落地）。
+
+**主理人建模口径更正（采信 QA）**：我在给 QA 的一条消息里写过「`4K/4K + post-cond` 的 `invalidate=1`（条件恒真，故仍 CLEAN）」—— **错**。门控条件是 `invalidate = (bs>4096 && !full)`：4K 整子块写 `full=1` ⇒ `invalidate=0`，之所以仍 CLEAN 是因为 `full_cover=TRUE` 时 `rb_read_commit` 自行把新数据写进 clean 子块，与失效无关。`post-cond` 的 `invalidate=1` 只出现在 >4K 的 9 格；**关键负面对照是 `4K/tail512` STALE**（`bs>4096` 为假、512B 又是非整子块写，门控漏掉它）。82 号 §4.9 表格结论不变，此处只纠正过程描述。
+
+**裁定不变**：`rbio.c:935` 无条件 `RbInvalidateAfterFlush` 是唯一全覆盖解；方案 B 否决；作为同批第二笔提交并入；驱动侧实际效果仍待 S2 全链重放 + 重启验收确认。
 
 ---
 

@@ -170,6 +170,11 @@ export function decodeConfig(p: Buffer) {
   U32_HEAD.forEach((n, i) => (s[n] = p.readUInt32LE(i * 4)));
   // VolumeFilter wchar[8][4]@64..128（驱动明确忽略该字段，按原样解出备查）
   s.VolumeFilter = Array.from({ length: 8 }, (_, i) => readWide(p, 64 + i * 8, 4));
+  // [F1 2026-11-06] TinyLFU@152：RB_CONFIG 末尾「纯追加」（sizeof 152→156）。
+  // 偏移来源 src/ctl/rb_proto.h 的契约冻结规则——既有字段偏移不动、新字段只追加末尾；
+  // 必须与 check_proto_sync.py 的「三副本字段级比对」纪律联动（C 头 ↔ C# 三镜像），
+  // 并与本桥接 index.ts 的 SET_CONFIG 编码器、http-transport.ts 的 configSchema、
+  // protocol/types.ts 的 RbConfig 四处保持字段名/偏移同步。
   const U32_TAIL: Array<[string, number]> = [
     ['ReadaheadEnabled', 128],
     ['ReadaheadWindowKB', 132],
@@ -177,7 +182,13 @@ export function decodeConfig(p: Buffer) {
     ['MemReserveMB', 140],
     ['AutoUsePct', 144],
     ['BlockSize', 148],
+    ['TinyLFU', 152],
   ];
-  for (const [n, off] of U32_TAIL) s[n] = p.readUInt32LE(off);
+  for (const [n, off] of U32_TAIL) {
+    // [旧驱动兼容] 老驱动 RB_CONFIG 只有 152B、不含该字段，直接 readUInt32LE(152)
+    // 会 RangeError。0=OFF 缺省（新特性默认全关红线），是有意的向后兼容：
+    // 只放宽这一个末尾纯追加字段，其余字段仍按固定偏移严格解码、不静默吞其它错误。
+    s[n] = n === 'TinyLFU' ? (p.length >= 156 ? p.readUInt32LE(152) : 0) : p.readUInt32LE(off);
+  }
   return s;
 }

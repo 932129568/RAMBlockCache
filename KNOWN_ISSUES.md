@@ -1,7 +1,43 @@
 # 已知 Bug 与遗留问题清单（KNOWN_ISSUES）
 
-> 截至 2026-11-06 13:50 · 交接收口完成（详见 deliverables/65-handover-closure-2026-11-06.md + 63/64 号）
+> 截至 2026-11-06 18:4x · 收网脚本修复与重启验收工具就绪（详见 68/69/70/**71** 号文档）
 > 状态图例：✅ 已修复（有验证） · 🔧 已修复（待真机复验） · 🟡 已知限制/设计行为 · ⏳ 待评审/待做 · ⛔ 阻断
+
+## 0-G. 2026-11-06 18:1x-18:4x · 收网 UAC 中断修复（详见 71 号）
+
+| # | 项 | 状态 | 证据/说明 |
+|---|---|---|---|
+| G1 | ✅ **18:04 `RB-finalize-harvest.cmd` 中断定性**：日志只到 `vite build`；根因 = 提权 PS 5.1 的 `$ErrorActionPreference='Stop'` + native stderr 经 `2>&1` → 终止性 NativeCommandError，**不是构建失败**。没签名/没 gate5/没 `verifier /reset`。重打包已在本机普通会话 18:08:39 单独跑通（`BUILD_SETUP_EXIT=0`） | ✅ | 71 号 §0；`finalize-harvest.log` |
+| G2 | ✅ **替换脚本就绪**：`src\scripts\finalize_final.ps1` + `RB-finalize-final.cmd` = 不重打包，只「签 Setup → 门禁⑤ → `verifier /reset`」；`'Continue'` + 三个 native 全显式取 `$LASTEXITCODE`；旧 `RB-finalize-harvest.cmd` 改 DEPRECATED 护栏（`exit /b 1`）防误双击 | ✅ | 71 号 §1/§2；QA 独立复核 A–F 全 PASS |
+| G3 | ✅ **三处假绿路径封死**：① 门禁⑤改独立子进程 + `result: PASS` 文本双判据（同 runspace 时 `$LASTEXITCODE` 会继承 signtool 的 0 → 假 PASS）；② stage 残留 15:50 旧已签名 `7912d276…`（不含 #3/#6），276MB `Copy-Item` 非终止失败会重签旧载荷拷回 dist 而全门禁只校验 sys → 加四重哈希断言；③ 验收脚本 `[string]::Substring` 静态调用在 PS 5.1 抛 MethodNotFound，改 ISO-8601 字符串字典序切段 | ✅ | 71 号 §2；QA `qa-finalize` H 项 + 主理人实跑自查 |
+| G4 | ✅ **重启验收工具**：`src\scripts\verify_final_reboot.ps1`（只读、实现 64 号 §7、禁 `method=2`/Web 保存、桥接不可达给 WARN + 兜底）；`src\scripts\sync_setup_hash.ps1`（UAC 后回填新 Setup SHA/体积到 3 处当前基线，双源校验 + 拒绝未签名 + 回读断言） | ✅ | 71 号 §1/§6；两脚本实跑验证：验收 0 运行时异常、回填未签名时正确 `exit 1` |
+| G5 | 🟡 **桥接当前离线（18:35 / 18:56 两次只读实测）**：`127.0.0.1:5199` 无监听、`GET /rb/health` = 502（`upstream connect failed ... os error 10061`）。**18:5x 只读取证纠正口径**：17:33 keeper 其实成功自愈（`RB-restart-bridge.cmd` 杀 node pid=19044 → keeper 5s 后于 17:33:09 重拉 pid=21960，`GET_CONFIG 24 字段 TinyLFU=0`、ALL OK）；真正故障是此后 **keeper 进程本身也终止**（`keeper.log` 17:33:02 后再无行 + 5199 无监听，二者矛盾可证），架构根因是「keeper 监督 node，但无人监督 keeper」，确切死因 UNKNOWN。**不影响收网 UAC**（签名/门禁/Verifier 均不依赖桥接）；keeper 由 SYSTEM/ONSTART 开机任务 `RAMBlockCacheBridge` 唯一拉起（本机是 ad hoc `C:\ProgramData\rb-bridge\setup-task.ps1:16–21`，**非安装器**；本机无正规 `webconsole\` 安装），静态证据显示今天多次生效、依赖文件齐全 → 重启大概率自启，但任务实时在册状态本会话不可核验（**RISK / 条件 GO**）。若重启后仍 502：**不要**盲双击 `RB-restart-bridge.cmd`（`restart_bridge.ps1:25–26` health 不可达首步即 `exit 1`），按 71 号 §6d.5 先提权查任务，情形 A 用单条 `schtasks /Run /TN RAMBlockCacheBridge`、情形 B 重跑 `setup-task.ps1`，**无需再重启** | 🟡 观察项 | 71 号 §4/§6d（`bridge-postboot` 独立只读取证）；`verify_final_reboot.ps1:144` 自带兜底 WARN |
+| G6 | ✅ **收网闭环（19:20:21 重启，19:22:16 验收）**：`boot_utc 11:20:21.500Z > finalize_utc 11:12:32.068Z`（真实重启，X2 生效）；keeper 19:21:12 随 ONSTART 自启、`/rb/health` 200 `ok=true / node=v27 / pid=4364`，§6d 的 RISK 条件 GO 兑现，`schtasks /Run` 与第二次重启均不需要。`verify_final_reboot.ps1` = **`RESULT: FAIL=0 WARN=0` / `VERDICT: PASS` / `SCRIPT_EXIT=0` / 0 运行时异常**，19 个 PASS gate（Verifier off、D: `Attached=1` 且 C/E/F 仍 0、GET_CONFIG 24 字段含 `TinyLFU=0`、看门 RPC 前后不变、Setup/READMe 哈希同步、新开机段 `[562]`+`[1076]`+零 ERROR）。19:14 预演的 3 个重启前预期 FAIL 全部转 PASS | ✅ 已完成 | 71 号 §6f；`finalize-recovery.log` |
+| G7 | ✅ **QA Round 2 复核：收网脚本 GO，验收脚本 3 项必修已修**：X1 注册表读失败被判「Verifier off PASS」（fail-open）→ 改 `try/-ErrorAction Stop` + 断言 `VerifyDriverLevel`；X2 无「确实重启过」断言 → `finalize_final.ps1` 成功后写 `finalize-utc.txt` marker，验收脚本断言 `boot_utc > finalize_utc`、无 marker 直接 FAIL；X3 `\[630\]` 与当前 `rbattach.c:631` 行号漂移且条件触发 → 改按文本匹配并降为 `[INFO]` 条件判据，硬证据仍为 `[562]`+`[1076]`+`D.Attached=1`。补齐 C/E/F 仍 0、RPC 后看门复核、`^v?27\.`、日志缺失改 FAIL 等 | ✅ | 71 号 §6b；门禁④ 63 文件 0 失败；实跑 0 异常；X1/X2/X3 内存正负对照 |
+| G8 | 🟡 **Round 2 如实留档的残留**：① 幂等分支只排除已知 `7912d276`，外部把第三个「任意已签名 Setup」放进 dist 仍会 ALL OK（无脚本自诱导路径，需外部篡改）；② `verifier /reset` 退出码 0 只代表命令成功，内核状态须重启后由修好的 registry gate 复核 | 🟡 已知限制 | QA Round 2 Known Issues |
+| G9 | 🟡 **`verify_final_reboot.ps1` 的 `README Setup hash in sync` 把 G 变成硬门禁**：不执行 `sync_setup_hash.ps1` 回填新哈希，重启验收该 gate 必 FAIL | 🟡 设计意图 | QA Round 2 §G；71 号 §6 |
+| G10 | ⏳ **重启后三条禁令（防验收假 FAIL）**：① **不要再跑 `RB-finalize-final.cmd`** —— 会用晚于本次开机的 UTC 覆盖 `finalize-utc.txt`，使 `verify_final_reboot.ps1:51–60` 的 `boot_utc > finalize_utc` 变假而 FAIL（除非再重启一次）；② 开机后等 **60–90s** 再采样（ONSTART `/DELAY 0000:30` + keeper 5s 循环，过早误报）；③ 502 时 `RB-restart-bridge.cmd` 不是恢复手段（见 G5）。另：`finalize_final.ps1` 全文不动 bridge 任务，UAC 本身不破坏开机自启 | ⏳ 用户侧须知 | 71 号 §6d.4；`bridge-postboot` 取证 |
+| G11 | ✅ **19:05 UAC 的 `verifier /reset` exit=2 假失败（已修 + 已补完）**：`verifier.exe /reset` 在「需要重启才生效」时返回 **2**，原脚本 `if ($vrc -ne 0)` 判成致命 → 未写 marker / FINAL_* 台账 / ALL OK；但 Setup `6acb825f…` 签名 Valid、gate5 PASS、registry 实测已清（reset 实际生效）。修复：`finalize_final.ps1` step 3 接受 exit 0/2 并**改以 registry 状态 fail-closed 断言**（QA X2 的镜像：退出码 2 ≠ 失败），门禁④ 63 文件 0 失败 / AST 0 错 / 七态真值表全绿；修复版**未再真机提权复跑**（如实标注）。补完：因提权文件的文件级 ACL 只给 Users 读，采用「新建而非追加」——三项实测断言全过后写 `finalize-utc.txt`、字节级备份 19:05 原日志、新建 `final-hashes.txt` / `finalize-recovery.log`，`sync_setup_hash.ps1` 已回填 README.md/67 号（双源交叉按设计退化为 dist 单源，签名 + preflight + 回读断言仍强）。**用户无需第二次 UAC**，只剩重启一次 | ✅ 已修/已补完 | 71 号 §6e；`finalize-recovery.log`；19:14 预演 `FAIL=3` 全属重启前预期 |
+
+> **F8 口径更正**：#6 分发包入口修复已完成（`start-webconsole.cmd` / `SetupEngine.cs` 指向 `bridge\server\index.ts`，新载荷已验收），原「一次 UAC `RB-finalize-harvest.cmd`」**作废**（该脚本已 DEPRECATED），改按 G6 执行。
+> G3 的 stage 残留问题由 QA 独立复核发现并有现场哈希证据，属「假 ALL OK + 交付错载荷」的发布阻断级缺陷，已在本轮封死；未签名 Setup `8c5cf328…` **禁止分发**。
+
+## 0-F. 2026-11-06 16:11 重启验收 · 两个 BugFix · D: 恢复 · 收网判据
+
+| # | 项 | 状态 | 证据/说明 |
+|---|---|---|---|
+| F1 | ✅ **重启加载 `ed1bd99c`**：16:11:09 开机、System32 sha256 一致、签名 Valid、服务 Running/Boot；`DeploySeq=10 / Ack=10 / FilterArmed=0 / Healthy=1 / BootFailCount=0` 看门全周期自动闭环；`VerifyDrivers=[RAMBlockCache.sys]` | ✅ | 68 号 §2 门1–3；主理人只读复核。运行实例切换为 BOOT_START + 开机时间 + `[1476] DriverEntry` 行号跳变 + GET_VERSION 的**高置信推断**，未做内核镜像哈希实证 |
+| F2 | 🟡 **Verifier 1h 周期：时间条件满足、无人工干预成立，但缓存数据面覆盖不足**：17:30:20 实测 elapsed **79.2 min**（满点 17:11:09）；`verifier_harvest_check.ps1 -Hours 1` 面板全绿（BugCheck/41/6008/WHEA 全 0、新增 dump 0、`VERDICT: no crash evidence in window`）→ **周期判定有效、具备收网条件**。但 16:11–17:11 整个窗口内 D: 为 passthrough（Attached=0），**Verifier 下缓存引擎数据面读写路径未被覆盖**；本轮证明的是「目标驱动在 Verifier 下稳定」，**不等于缓存数据面真机功能验证** | 🟡 有限结论 | 64 号顶部回填；68 号 §6/§9；70 号 §Q6 |
+| F3 | ✅ **Web 配置页白屏 BugFix**（`expected number, received undefined`）：根因 = 66 号批给 `RB_CONFIG` 追加 `TinyLFU@152`（sizeof 152→156），但 `proto-decode.decodeConfig` 只读到 `BlockSize@148`、`index.ts` SET_CONFIG 编码器仍 `Buffer.alloc(152)`。前者白屏，后者**静默把 TinyLFU 清 0** | ✅ | 3 文件 +27/-7；C ABI 实测 `sizeof=156 / TinyLFU@152`；读写侧牙齿 18+5 全过；IS_PASS YES |
+| F4 | ✅ **QA 独立回归**：5 门全 PASS、22/22 独立用例、7/7 门禁、六处对称一致、0 FAIL；17:33 UAC 重启桥接后活体复验 V1/V3/V4/V6 全部解除「未生效」 | ✅ | 69 号（25KB）；`PID 19044→21960`、`GET_CONFIG 24 字段 TinyLFU=0`、`status=0` |
+| F5 | ✅ **D: 未自动恢复定性 = 纯配置态、非驱动回归**（证据强度高）：10:46 软分离清 `ResumeLetters`、11:49 九次 BOOTCFG SET 末条置 `ResumeOnBoot=0`；坏配置 11:49 形成、驱动 14:44 才签名 → 无因果可能；决定性门 `rbattach.c:585` 双 0 return | ✅ | 70 号取证报告 §Q1–Q7；`deploy.ps1`/`finalize_*`/看门脚本三个候选全部排除 |
+| F6 | ✅ **D: 已恢复**：裸桥接通道两步（`POST /rb/bootcfg {ResumeOnBoot:1}` + `POST /rb/rpc method=8 attach D`，严格避开 `method=2` 与 Web 保存）→ `{AutoAttach:0,ResumeOnBoot:1,ResumeLetters:"D"}`、`D: Attached=1`，C/E/F 仍 0，`ParallelFlush=1 / WriteBack=0` 未变 | ✅ | 17:33 实跑；70 号 §Q5。恢复发生在 17:30 验收之后，不污染已判有效的 1h 周期 |
+| F7 | 🟡 **文档口径更正**：三要素齐全、D: Attached=1 的是 **09:47:37** 开机；**12:06:26 开机实为 `[561] resume list empty`**。63/64/65 号此前记为「12:06 成功」与落盘日志不自洽，已在三份文档顶部加更正注 | 🟡 已更正 | 70 号 §Q3 时间线（UTC↔GMT+8 逐条对齐） |
+| F8 | ⏳ **待用户侧收尾**：① 任务 #6 修分发包入口路径（`start-webconsole.cmd` 与 `SetupEngine.cs:261` 指向 `server\index.ts`，`webconsole.zip` 实际只有 `bridge\server\index.ts`，新装机器 Web 控制台会起不来）② 一次 UAC `RB-finalize-harvest.cmd`（重打包带修复载荷 → 重签 Setup → 门禁⑤ → `verifier /reset`）③ **重启一次**，同时验证 Verifier 已关、D: 下次开机自动恢复、桥接带新模块起来 | ⏳ | 68 号 §9；70 号 §Q6 |
+| F9 | 🟡 **结构性门禁缺口**：`check_proto_sync.py` 只比对 `rb_proto.h ↔ 3 份 C# 镜像`，**不覆盖 `web/bridge` 的 TS 副本**，这是 66 号批「协议加字段而桥接漏改」却全门禁放行的根因。建议把 `RB_CONFIG` 尺寸/字段清单一致性纳入 `check_node_contract.py` 或新脚本 | 🟡 建议项 | 69 号 §4/§8；本次未擅自扩改门禁 |
+| F10 | 🟡 **本机运维特例**：本机没有已安装 `webconsole/` 目录，Web 控制台由 `C:\ProgramData\rb-bridge` 自定义 keeper 从**仓库 `web/`** 直跑 TS（Node 27 type-stripping）。因此 #3 修复只需重启桥接进程，无需拷贝文件；但正规安装路径仍须重打包 Setup 才生效 | 🟡 设计/运维事实 | 工程师 #3 生效路径说明；68 号 §7 |
+
+> 说明：F3 的 `isError` 是**纯 SPA zod schema ↔ 桥接解码字段错配**，与驱动版本无关（新驱动回包本就含 TinyLFU，只是桥接没解出来）；16:17 的报错不能推断为驱动加载异常。`web/dist/assets/*` mtime 已被 17:30 的 `npm run build` 重写，不可再作为历史时间戳证据（69 号 §7）。
 
 ## 0-E. 2026-11-06 14:45「F1 TinyLFU 准入」批（已发布，待重启加载）
 

@@ -3,6 +3,15 @@
 **日期**：2026-11-06 · 适用于刚发布的 `sys 4099b7fb…` / `Setup 5d210f52…`
 **目标**：用 1 小时日常负载在 **Verifier 监视下**给新驱动一个干净/收获窗口；蓝屏即取证，干净才收网。
 
+> **当前批次回填（16:20，用户已重启；操作以本节为准）**：正文写于 PF-16 批，之后 F1 TinyLFU 批（14:44）与 67 号 Node27 批（15:50）依次发布。**当前实际加载 `sys ed1bd99c…`（160,992 B）**；67 号只重打 Setup（`7912d276…`），sys 与三锚点未变。16:11:09 重启实测：服务 Running/Boot、`DeploySeq=10 / DeployAck=10 / FilterArmed=0 / LastBootHealthy=1 / BootFailCount=0`（看门全周期闭环）、`VerifyDrivers=[RAMBlockCache.sys]`、无新增 dump。
+> 正文判据按以下值替换：System32 哈希 `ed1bd99c…`；看门 `Seq=10 / Ack=10 / Armed=0 / Healthy=1 / BootFailCount=0`；**开机时间须晚于 14:44**（实测 16:11:09 ✓），§4「晚于 13:29」按 14:44 判定；PDB = `src\driver\x64\Release\RAMBlockCache.pdb`（**14:27:48**，与未签名编译 sys 同次产出；Authenticode 签名只追加证书表，不改 debug directory）。
+> **U-8 教训补充**：蓝屏取证后先跑 cdb `!itoldyouso RAMBlockCache` 校验 PDB 与 dump 内模块 sig 匹配，再采信 `ln` 结果 —— 10-17 旧 PDB 曾对 10-24 dump 给出 `sig MISMATCH` 的错配符号（见 67 号 §4）。
+> **口径更正（17:40）**：正文中「12:06 那次成功重启 / D: Attached=1」的表述与落盘日志不自洽 —— 成功的是 **09:47:37** 那次开机，12:06 开机段实为 `[561] resume list empty`（见 70 号取证报告 §Q3）。这不影响本文的收网流程与判据，只影响「上一次成功恢复」的时间锚点。
+> **本轮实测收网（17:30:20）**：`elapsed=79.2 min`（boot 16:11:09）已跑满；`verifier_harvest_check.ps1 -Hours 1` 面板全绿（sys `ed1bd99c` Valid、Running/Boot、`Seq=10/Ack=10/Armed=0/Healthy=1/BootFails=0`、`VerifyDrivers=[RAMBlockCache.sys]`、BugCheck/41/6008/WHEA 全 0、新增 dump 0、`VERDICT: no crash evidence in window`）→ **周期判定有效、具备收网条件**。D: 配置态问题已于验收之后用裸桥接通道恢复（不污染该周期），详见 70 号 §Q5/Q6。
+> **收获覆盖度限定（QA 口径，必须随结论一起引用）**：16:11:09–17:11:09 整个 1h 窗口内 D: 一直处于 passthrough（Attached=0，68 号门4/5 FAIL），**Verifier 监视下缓存引擎的数据面读写路径未被覆盖**。主理人「D: 恢复发生在验收之后、不污染该周期」只在「无人工干预配置」维度成立，不等于缓存路径已被负载覆盖。本轮收获证明的是**目标驱动在 Verifier 下稳定、无崩溃证据**，**不构成缓存数据面的真机功能验证**（后者需以 D: 正常挂载态另跑周期）。静态落地 ≠ 真机已验证。
+> **时间线一致性**：QA 16:23–16:27 采样时 elapsed 16.4min、满点 17:11:09 未到 → 当时「不具备收网条件」；主理人 17:30 复验已在满点之后 → 「具备收网条件」。两个结论随真实时间推进更新，彼此一致。
+> 正文其余流程（负载清单、蓝屏取证、`verifier_harvest_check.ps1 -Hours 1`、`verifier_disable.cmd` + 重启收网、收网后峰值复测）全部有效。收网已合并进 `RB-finalize-harvest.cmd`（重打包 + 重签 + `verifier /reset`），用户重启一次即可同时验证 Verifier 关闭与 D: 自动恢复。
+
 ---
 
 ## 0. 为什么必须先重启（最关键的一条）
@@ -118,3 +127,23 @@ powershell -ExecutionPolicy Bypass -File <repo>\src\scripts\verifier_harvest_che
 - `test_race1106 mode3` 的存量时序敏感项（63 号 §6，6 次中 2 次 `churn_err>0`）是用户态 core 既有测试，**与本批驱动改动无因果关系**，不要把它误判成本次真机回归失败。
 - 若重启后无法进桌面：`offline_rollback.cmd`（WinRE）是第三层兜底；`boot_guard` 双任务会在确认引导失败后自动摘 UpperFilters。自救卡见 `README.txt`。
 - 旧发布基线 `sys 9b1cdeb2` / `Setup d9e75a55` 停用；三锚点已同步到 `4099b7fb…`，门禁⑤ PASS。
+
+---
+
+## 7. 最后一次重启的验收判据（收网后，全部只读）
+
+> **18:2x 口径更正**：`RB-finalize-harvest.cmd` 于 18:04 的提权会话在 `vite build` 之后中断（`$ErrorActionPreference='Stop'` + native stderr 经 `2>&1` 变成终止性 NativeCommandError），**没有完成签名、门禁⑤、`verifier /reset`**。重打包已在本机普通会话 18:08:39 单独跑通（`BUILD_SETUP_EXIT=0`，产物未签名 `8c5cf328…`，载荷已验收含 #3/#6 修复）。收网改由 **`RB-finalize-final.cmd` + `src\scripts\finalize_final.ps1`** 完成：不重打包，只做「签 Setup → 门禁⑤（独立子进程，退出码可靠）→ `verifier /reset`」，日志 `C:\ProgramData\rb-deploy\finalize-final.log`。本节 §7 的重启验收判据全部不变。
+
+本批收网合并为一次 UAC，之后**重启一次**同时验证三件事。取证 worker 提供的精确判据：
+
+1. **等待 60–90 秒再采样**：恢复挂载由 `RbAutoAttachSweep` 在开机约 +30s 才执行（`rbfeat.c:309-312` 每 30s 一跳，`rbdriver.c:1463-1466` 冷启动修复保证特性层随 DriverEntry 启动）；过早采样会误判为「未恢复」。
+2. **新开机段三要素**（按 `boot_utc` 精确切段；`log-sink.ts:107` 的 `lastSeq=0` 会回补 ring 历史，别被 11-05 记录与重复段干扰）：
+   - `[562] resume list loaded`
+   - `[630] resume: boot-critical volume in user resume list (pagefile/dump) - allowed`
+   - `[1076] volume attached (hot switch on)`
+   - 且本次开机段 `ERROR=0`。
+3. **控制面复核**：`GET /rb/bootcfg` → `{AutoAttach:0, ResumeOnBoot:1, ResumeLetters:"D"}`；`POST /rb/rpc {"method":7}` → `D: Attached=1`（C/E/F 仍 0）。`rbattach.c:1075` 的 `RbResumeTrack(letter,TRUE)` 在恢复 attach 成功时会再写一次 `"D"`，故两个值应稳定；`DeploySeq/Ack/FilterArmed` 不因该路径变化（应保持 `Seq=10 / Ack=10 / Armed=0`）。
+4. **同一步顺带确认**：`VerifyDrivers=[]`（`verifier /reset` 生效）、桥接带新模块起来（`POST /rb/rpc {"method":4}` → 24 字段含 `TinyLFU`）、`GET /rb/health` 的 node 仍为 v27。
+5. **验证期间禁令**：只用裸 `GET /rb/bootcfg` 与 `POST /rb/rpc {"method":7}`；避开 `method=2 (SET_CONFIG)` 与 Web 配置页「保存」。
+
+> 收网完成后才具备可信峰值复测条件：最佳性能电源档 + 空闲多轮取中位，复测 1/2/4/8/16 路与 S2 16K 端到端。

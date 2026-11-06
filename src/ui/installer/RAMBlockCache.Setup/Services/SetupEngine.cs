@@ -250,7 +250,9 @@ public sealed class SetupEngine
 
         // ---- 3.5) [P3.15 2026-11-06] 桥接开机任务注册（Web 控制台自启）----
         /* RAMBlockCacheBridge：SYSTEM/HIGHEST/ONSTART，动作 = 便携 node 跑
-         * <安装目录>\webconsole\server\index.ts（仅监听 127.0.0.1:5199）。
+         * <安装目录>\webconsole\bridge\server\index.ts（仅监听 127.0.0.1:5199）。
+         * [FIX 2026-11-06] webconsole.zip 的入口在 bridge\server\ 下，没有顶层
+         * server\ 目录；旧路径使 File.Exists 恒假 → 任务永不注册。
          * /F 幂等（覆盖旧任务指向本安装目录）；注册失败 WARN 不阻断安装
          * （与快捷方式同纪律——用户仍可手动 start-webconsole.cmd）。
          * 成功后立即启动一次：本次安装后无需重启即可用 Web 控制台。 */
@@ -258,7 +260,7 @@ public sealed class SetupEngine
         try
         {
             var nodeExe = Path.Combine(opts.InstallDir, "webconsole", "node.exe");
-            var serverTs = Path.Combine(opts.InstallDir, "webconsole", "server", "index.ts");
+            var serverTs = Path.Combine(opts.InstallDir, "webconsole", "bridge", "server", "index.ts");
             if (File.Exists(nodeExe) && File.Exists(serverTs))
             {
                 var tr = $"\\\"{nodeExe}\\\" \\\"{serverTs}\\\"";

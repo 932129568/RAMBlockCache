@@ -115,12 +115,16 @@ $wcZip = Join-Path $pay "webconsole.zip"
 Compress-Archive -Path (Join-Path $wcStage '*') -DestinationPath $wcZip -Force
 Write-Host ("  payload: webconsole.zip  {0} KB" -f [int]((Get-Item $wcZip).Length/1KB))
 Remove-Item $wcStage -Recurse -Force
-# web console launcher (installed alongside; shortcut points here)
+# web console launcher (installed alongside; shortcut points here).
+# [FIX 2026-11-06] Entry MUST be bridge\server\index.ts to match webconsole.zip:
+# zip top-level = bridge/ + dist/ + node.exe, there is NO server/ directory.
+# cwd is %~dp0webconsole, so the relative path resolves to
+# <InstallDir>\webconsole\bridge\server\index.ts (same as MainWindow.xaml.cs).
 $startCmd = "@echo off`r`n" +
             "rem RAMBlockCache Web Console launcher (installed by Setup)`r`n" +
             'cd /d "%~dp0webconsole"' + "`r`n" +
             'if not exist "node.exe" ( echo [x] node.exe missing & pause & exit /b 1 )' + "`r`n" +
-            'start "" /b "node.exe" "server\index.ts"' + "`r`n" +
+            'start "" /b "node.exe" "bridge\server\index.ts"' + "`r`n" +
             "timeout /t 3 /nobreak >nul" + "`r`n" +
             "start http://127.0.0.1:5199/" + "`r`n"
 Set-Content -Path (Join-Path $pay "start-webconsole.cmd") -Value $startCmd -Encoding ASCII

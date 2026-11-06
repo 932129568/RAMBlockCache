@@ -28,7 +28,7 @@ U-6 说明：58 号交接标 `ramboostsetup.exe` 未签名（影响 SmartScreen/
 
 | # | 项 | 终态 | 依据 / 剩余动作 |
 |---|---|---|---|
-| U-1 | ResumeOnBoot boot-critical 修复未验证 | ✅ 闭环 | 12:06:26 重启加载 `245c6681`：日志 `[561] resume list loaded` + `boot-critical…allowed` + `volume attached`，D: 自动恢复加速、微信正常、当日零 ERROR（59 号 P0.1） |
+| U-1 | ResumeOnBoot boot-critical 修复未验证 | ✅ 闭环（09:47 那次开机实证） | **口径更正（17:40）**：三要素齐全的是 **09:47:37 重启**（日志 01:47:39Z：`[561] resume list loaded` + `boot-critical…allowed` + `volume attached`，D: Attached=1、微信正常、当日零 ERROR，59 号 P0.1）；原文误记为 12:06:26，而 04:06:29Z / 本地 12:06 开机段实为 `[561] resume list empty`。U-1 修复本身有效性不受影响（见 70 号取证报告 §Q4） |
 | U-2 | 绝对归因缺失（Verifier / WinDbg） | 🟡 工具就绪，周期在用户侧 | `verifier_enable/disable.cmd`、`verifier_harvest_check.ps1`、`64-verifier-harvest-2026-11-06.md` 协议、本批 PDB（12:24 同次编译）；1h 负载与 dump 归因需用户执行，见 §4 |
 | U-3 | 分发包陈旧（不得分发） | ✅ 闭环 | 已多次重打签名，最终 `8d86a90f…`（Valid）；旧 `0ee8538c` / `d9e75a55` / `5d210f52` 全部停用 |
 | U-4 | 64K BlockSize 禁令 | 🟡 维持禁令（防再现已落地） | `59-64k-audit` 全量几何审计完成；62 号 F1 从 clamp/core/CLI/WPF 四层封堵 64K 与 128K、F4 slab 字节上限、F5 单批自适应、`test_geom` 补档。**根因仍需 WinDbg 复现**，不在本会话可闭环 |

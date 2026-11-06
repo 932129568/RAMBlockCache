@@ -11,7 +11,7 @@
  *    "插件缺失"与"设备不可达"，不再混为一谈。
  *  - 设备在每次 /rpc 前惰性打开（S7-14 自愈语义：设备消失后恢复即自动重开）。
  *  - 读命令（1/4/7/9/10/14）结构化解码返回 JSON；写命令（2/6/8/13）params
- *    编码全部就绪（SET_CONFIG 全量 152B / SET_VOLUME / ATTACH / INVALIDATE_RANGE）；
+ *    编码全部就绪（SET_CONFIG 全量 156B / SET_VOLUME / ATTACH / INVALIDATE_RANGE）；
  *    驱动侧写命令实测留待隔离 TestMode 机（attach 红线，43 号 §8.2）。
  */
 
@@ -166,8 +166,12 @@ function encodeParams(method: number, params: unknown): Buffer | null {
     return b;
   }
   if (method === 2) {
-    // RB_CONFIG 全量回写（152B）：16×u32@0..64 + VolumeFilter wchar[8][4]@64..128
-    // + 6×u32@128..152。字段清单与 proto-decode.decodeConfig 严格对称（改动必须双向同步）。
+    // RB_CONFIG 全量回写（156B）：16×u32@0..64 + VolumeFilter wchar[8][4]@64..128
+    // + 7×u32@128..156，末尾纯追加 TinyLFU@152（F1，sizeof 152→156）。
+    // 与 rb_proto.h / proto-decode.decodeConfig / http-transport.configSchema 四处同步：
+    // 少编码一个字段，native lib.rs 的 8224B 全零缓冲会让驱动 RbApplyConfig 收到 0
+    // 并持久化（Web 保存时静默把 TinyLFU 清成 OFF）。
+    // 字段清单与 proto-decode.decodeConfig 严格对称（改动必须双向同步）。
     const c = configSchema.parse(params ?? {});
     const head: Array<[string, number]> = [
       ['Enabled', 0], ['ReadCacheEnabled', 4], ['WriteCacheEnabled', 8], ['WriteBack', 12],
@@ -177,9 +181,9 @@ function encodeParams(method: number, params: unknown): Buffer | null {
     ];
     const tail: Array<[string, number]> = [
       ['ReadaheadEnabled', 128], ['ReadaheadWindowKB', 132], ['AutoMemory', 136],
-      ['MemReserveMB', 140], ['AutoUsePct', 144], ['BlockSize', 148],
+      ['MemReserveMB', 140], ['AutoUsePct', 144], ['BlockSize', 148], ['TinyLFU', 152],
     ];
-    const b = Buffer.alloc(152);
+    const b = Buffer.alloc(156);
     for (const [k, off] of head) b.writeUInt32LE(u32(c[k]), off);
     const vf = Array.isArray(c.VolumeFilter) ? c.VolumeFilter : [];
     for (let i = 0; i < 8; i++) {

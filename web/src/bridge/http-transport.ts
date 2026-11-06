@@ -121,7 +121,12 @@ const configSchema = z.looseObject({
   WriteBack: z.number(),
   CacheSizeMB: z.number(),
   BlockSize: z.number(),
-  TinyLFU: z.number(),
+  // [F1 2026-11-06 / 旧桥接兼容] TinyLFU 是 RB_CONFIG 末尾纯追加字段：新桥接的
+  // decodeConfig 恒定回传（旧驱动回包按 0=OFF 兜底），但「新前端 + 旧桥接进程」混跑时
+  // 旧 decodeConfig 不含该字段，必填 z.number() 会让整页报 DECODE 失败（本次 Bug 现象）。
+  // 取 0=OFF 缺省，与驱动 RB_DEFAULT_TINYLFU=0 一致。取舍：字段真缺失时不再报错而是
+  // 按 OFF 处理，故仅放宽这一个末尾纯追加字段，其余 4 个必填字段保持强校验。
+  TinyLFU: z.number().default(0),
 });
 
 /* ---------------- 传输实现 ---------------- */

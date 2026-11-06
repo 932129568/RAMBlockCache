@@ -3,6 +3,8 @@
 **日期**：2026-11-06 12:10–13:30（GMT+8） · **团队**：software-rbc-parallelflush（主理人齐活林）
 **状态**：**已发布**（签名 + 部署排队完成，未重启；分发解锁）。Verifier 收获周期协议见 `64-verifier-harvest-2026-11-06.md`。
 
+> **口径更正（2026-11-06 17:40，以落盘日志为准）**：本文把「12:06:26 重启」记为成功且隐含 D: 自动恢复加速，与驱动日志不自洽。只读取证（`deliverables/70-attach-forensics-2026-11-06.md` §Q3 时间线）实测：三要素齐全（`[561] resume list loaded` + `boot-critical…allowed` + `volume attached`、D: Attached=1）的是 **01:47:39Z / 本地 09:47** 那次开机（59 号 §一标题即「09:47:37 重启」）；**04:06:29Z / 本地 12:06 开机段实为 `[561] resume list empty`**。原因是 10:46 软分离 D: 清空 `ResumeLetters`、11:49 九次 BOOTCFG SET 末条把 `ResumeOnBoot` 置 0，均发生在 12:06 之前，且与任何部署脚本无关。本文其余结论（看门全周期闭环、PF-16 发布与回归）不受影响 —— `DeploySeq/Ack/Armed/Healthy` 那组证据本身成立，只是不能外推为「D: 已自动恢复」。
+
 ## 0. 发布物（本批最终）
 
 | 项 | 值 |

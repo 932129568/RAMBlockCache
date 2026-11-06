@@ -12,6 +12,37 @@ $pay   = Join-Path $setup "Assets\payload"
 $dotnet = "C:\Users\陈\.dotnet\dotnet.exe"
 if (-not (Test-Path $dotnet)) { $dotnet = "dotnet" }
 
+# ---- [NODE27 2026-11-06] toolchain contract (fail-closed) ------------------
+# The shipped portable runtime MUST be Node 27 (user's D:\ install) and the SPA
+# MUST be built with npm 12.2.1. The old line used (Get-Command node.exe).Source,
+# which silently picked WorkBuddy's Node 22 depending on PATH order.
+# npm 12.2.1 prints a KNOWN FALSE-POSITIVE engines warning on Node 27 alpha:
+# its own engines says ">=26.0.0", and semver excludes 27.0.0-alpha prereleases.
+# Functional check: npm ci + npm run build both PASS; we suppress that single
+# warning with --loglevel=error at every npm entry point (user decision 15:14).
+function Resolve-Node27 {
+    $cands = @()
+    if ($env:RBC_NODE27) { $cands += $env:RBC_NODE27 }
+    $cands += 'D:\node-v27.0.0-alpha.0.0.0-win-x64\node.exe'
+    $cands += (Join-Path $env:USERPROFILE '.workbuddy\binaries\node\versions\node-v27.0.0-alpha.0.0.0-win-x64\node.exe')
+    try { $cands += (Get-Command node.exe -ErrorAction Stop).Source } catch { }
+    foreach ($c in $cands) {
+        if (-not $c -or -not (Test-Path -LiteralPath $c)) { continue }
+        $v = (& $c --version 2>$null)
+        if ($LASTEXITCODE -ne 0 -or "$v" -notlike 'v27.*') { continue }
+        $dir = Split-Path -Parent $c
+        $npmCli = Join-Path $dir 'node_modules\npm\bin\npm-cli.js'
+        if (-not (Test-Path -LiteralPath $npmCli)) { throw "npm-cli.js missing next to $c" }
+        $np = (& $c $npmCli --version --loglevel=error 2>$null | Select-Object -Last 1)
+        if ("$np" -notlike '12.2.1*') { throw "npm is '$np', expected 12.2.1 (Node 27 toolchain)" }
+        Write-Host ("  node27: {0}  ({1})" -f $v, $c)
+        Write-Host ("  npm   : {0}  (known alpha engines warning suppressed)" -f $np)
+        return @{ Node = $c; NpmCli = $npmCli; Dir = $dir }
+    }
+    throw "Node 27 + npm 12.2.1 not found. Set RBC_NODE27=<path to node.exe>; refusing to package a Node 22 runtime."
+}
+$tool = Resolve-Node27
+
 Write-Host "== [1/4] publish controller (self-contained) =="
 & $dotnet publish $ctl -c Release -r win-x64 --self-contained true -v q
 if ($LASTEXITCODE -ne 0) { throw "controller publish failed (exit=$LASTEXITCODE)" }
@@ -20,17 +51,50 @@ if ($LASTEXITCODE -ne 0) { throw "controller publish failed (exit=$LASTEXITCODE)
 # embeds flat names only (see Services/Payload.cs).
 $ctlPub = Join-Path $ctl "bin\Release\net10.0-windows\win-x64\publish"
 
-Write-Host "== [2/4] stage webconsole (portable node + bridge + SPA dist) =="
+Write-Host "== [2/4] build SPA + stage webconsole (Node 27 + npm 12.2.1) =="
 $webRoot = Join-Path $root "web"
+# [NODE27] SPA is always rebuilt with the pinned toolchain before packaging;
+# missing node_modules -> bootstrap with npm ci (same pinned npm).
+Push-Location $webRoot
+if (-not (Test-Path (Join-Path $webRoot 'node_modules'))) {
+    & $tool.Node $tool.NpmCli ci --no-audit --no-fund --loglevel=error
+    if ($LASTEXITCODE -ne 0) { Pop-Location; throw "npm ci failed (exit=$LASTEXITCODE)" }
+}
+& $tool.Node $tool.NpmCli run build --loglevel=error
+$rcWeb = $LASTEXITCODE
+Pop-Location
+if ($rcWeb -ne 0) { throw "web build failed (exit=$rcWeb) - refusing to package stale SPA" }
 $wcStage = Join-Path $env:TEMP ("rbc-webconsole-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $wcStage | Out-Null
 Copy-Item (Join-Path $webRoot "bridge") (Join-Path $wcStage "bridge") -Recurse -Force
 Copy-Item (Join-Path $webRoot "dist")   (Join-Path $wcStage "dist")   -Recurse -Force
-$nodeExe = (Get-Command node.exe -ErrorAction Stop).Source
-Copy-Item $nodeExe $wcStage -Force
+Copy-Item $tool.Node $wcStage -Force
+# [NODE27] "all built in": ship npm 12.2.1 alongside the portable node.exe, so a
+# target machine needs NO pre-installed Node/npm. npm.cmd shim resolves node.exe
+# from its own directory, so the pair is fully relocatable.
+$npmSrc = Join-Path $tool.Dir 'node_modules\npm'
+$npmDst = Join-Path $wcStage 'node_modules\npm'
+if (-not (Test-Path -LiteralPath (Split-Path -Parent $npmDst))) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $npmDst) | Out-Null
+}
+Copy-Item -LiteralPath $npmSrc -Destination $npmDst -Recurse -Force
+foreach ($shim in @('npm.cmd','npm.ps1','npm','npx.cmd','npx.ps1','npx')) {
+    $s = Join-Path $tool.Dir $shim
+    if (Test-Path -LiteralPath $s) { Copy-Item -LiteralPath $s -Destination $wcStage -Force }
+}
+# [NODE27] strip dev-only artifacts from the staged bridge (~100MB of Rust
+# target/ + .mimosa logs). Runtime needs only native/build/Release/*.node.
+Get-ChildItem -LiteralPath (Join-Path $wcStage 'bridge') -Recurse -Directory -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -in @('.mimosa','target','.cargo','.git') } |
+    Sort-Object { $_.FullName.Length } -Descending |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+Write-Host "  payload: portable Node 27 + npm 12.2.1 built in (zero target dependency)"
 
 Write-Host "== [3/4] refresh payload =="
-if (Test-Path $pay) { Remove-Item $pay -Recurse -Force }
+# [NODE27 2026-11-06] refresh by OVERWRITE, no recursive delete. Some hosts
+# (safe-delete hooks / AV) block Remove-Item -Recurse on this tree and abort the
+# whole build. Payload.cs extracts a fixed file list, so leftover files are
+# inert; every artifact below is written with -Force / Compress-Archive -Force.
 New-Item -ItemType Directory -Force -Path $pay | Out-Null
 # kernel side (staging consumer; engine and sys must sit side by side)
 Copy-Item (Join-Path $root "dist\RAMBlockCache.sys")      $pay -Force   # signed driver (same anchor source)

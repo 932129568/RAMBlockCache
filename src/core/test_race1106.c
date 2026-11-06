@@ -25,13 +25,23 @@
  *               writes bypass the cache while stream/chunks are RETAINED);
  *               g_passthrough=0. Readers must now see NEW gens through the
  *               kept cache -- stale serve here = THE BUG.
- *   1 trimmer : every ~1.7s -> rb_stream_flush(force); rb_stream_discard_all();
- *               then zero a random 1MB TRIMV range on g_disk (forwarded trim)
+ *   1 trimmer : every ~1.7s -> [FIX 2026-11-06] range-targeted TRIM model
+ *               (driver parity): view_mutating window ON -> flush force ->
+ *               zero ONE 1MB TRIMV range on g_disk -> invalidate ONLY that
+ *               range -> window OFF. The old whole-stream discard_all here
+ *               was removed; discard_all now belongs to the relocator (mode 4).
  *
  * Verdicts:
- *   f_err>0        -> immutable-region serve corruption (core serve bug)
- *   churn_err>0    -> stale/wrong serve (expect: nonzero right after
- *                     passthrough windows IF the kept-stream staleness exists)
+ *   f_err>0        -> immutable-region serve corruption (THE core serve bug).
+ *   churn_err>0    -> stale/wrong serve observation. In mode 0 (passthrough
+ *                     cycler) this is the expected tooth for the kept-stream
+ *                     staleness. Mode 3 has NO passthrough cycler; its
+ *                     churn_err is a KNOWN timing-sensitive observation:
+ *                     2026-11-06 reproduced 2 of 6 runs (4662 / 2909 errors),
+ *                     always with f_err=0 and a clean final F sweep = no
+ *                     application-visible stale DLL. See KNOWN_ISSUES C7.
+ *                     The hard verdict (exit 2) is kept ON PURPOSE - never
+ *                     weaken the judge to make a run look green.
  *   all zero @60s  -> core exonerated at this shape; suspect moves to driver layer
  */
 #include <windows.h>

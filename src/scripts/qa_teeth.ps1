@@ -35,6 +35,41 @@ $core = Join-Path $root 'src\core'
 $qa4  = Join-Path $core 'build\qa4'
 New-Item -ItemType Directory -Force -Path $qa4 | Out-Null
 
+# ── [FIX 2026-11-06] 变异体自动生成 ──
+# 旧流程假设 build\qa4\cache_mut.c 已存在（历史手工产物），文件缺失时 cl 直接
+# 报「找不到源文件」→ 整个变异门禁不可用（63 号 QA 报告已如实记录受阻点）。
+# 现在从**当前** cache.c 精确切两处生成，随产品源码演进自动同步；任何一处
+# 匹配数不为 1 立即 fail-closed 退出——绝不静默退化成「修复侧自比」的假牙齿。
+function New-MutantCache {
+    $srcPath = Join-Path $core 'cache.c'
+    $mutPath = Join-Path $qa4  'cache_mut.c'
+    $raw = [IO.File]::ReadAllBytes($srcPath)
+    $hadBom = ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF)
+    $src = [IO.File]::ReadAllText($srcPath, [Text.Encoding]::UTF8)
+    $nl = "`n"
+    if ($src.Contains("`r`n")) { $nl = "`r`n" }
+    $flat = $src.Replace("`r`n", "`n")
+
+    # 两处切点必须各自恰好命中 1 次；正则用「行首 }」收尾（函数体内闭合括号都有缩进）
+    $stageRx = 'static int stage_revalidate\(rb_stream \*s, rb_flushws \*ws, size_t nsl\)\n\{.*?\n\}'
+    $drainRx = 'static void wb_drain\(rb_stream \*s\)\n\{.*?\n\}'
+    $stageRepl = "static int stage_revalidate(rb_stream *s, rb_flushws *ws, size_t nsl)`n{`n    /* [MUTANT WS-RACE-2] revalidation neutered: always pass */`n    (void)s; (void)ws; (void)nsl; return 1;`n}"
+    $drainRepl = "static void wb_drain(rb_stream *s)`n{`n    /* [MUTANT WS-RACE-2] in-flight drain neutered: no wait */`n    (void)s;`n}"
+    $opts = [Text.RegularExpressions.RegexOptions]::Singleline
+    $nStage = [regex]::Matches($flat, $stageRx, $opts).Count
+    $nDrain = [regex]::Matches($flat, $drainRx, $opts).Count
+    if ($nStage -ne 1 -or $nDrain -ne 1) {
+        Write-Host "[X] mutant cut points drifted (stage_revalidate=$nStage wb_drain=$nDrain, expect 1/1) - cache.c changed, review qa_teeth.ps1" -ForegroundColor Red
+        exit 1
+    }
+    $mut = [regex]::Replace($flat, $stageRx, $stageRepl, $opts)
+    $mut = [regex]::Replace($mut,  $drainRx, $drainRepl, $opts)
+    if ($nl -eq "`r`n") { $mut = $mut.Replace("`n", "`r`n") }
+    [IO.File]::WriteAllText($mutPath, $mut, (New-Object System.Text.UTF8Encoding($hadBom)))
+    Write-Host "[ok] mutant generated from current cache.c (2 cuts, bom=$hadBom)" -ForegroundColor Green
+}
+New-MutantCache
+
 # ── 构建双侧（cl 退出码判定 + 链接前删陈旧 exe；QA5-1 纪律）──
 # [FIX #9 2026-10-21] 弃 cmd /c 包装改直接调用 cl：cmd /c 把含中文的绝对路径
 # 按 OEM 代码页搅乱（实测 陈 -> 乱码），且原命令行 /Fobuild\ 与 /Fo<绝对路径>

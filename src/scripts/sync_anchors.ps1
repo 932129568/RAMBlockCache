@@ -31,16 +31,35 @@ $targets = @(
     (Join-Path $root "src\scripts\verify_deploy_signature.ps1"),
     (Join-Path $root "README.txt")
 )
+$rx = [regex]'(?m)^(?<pre>.*DefaultExpectedSha256\s*=\s*''?)(?<old>[0-9a-fA-F]{64})(?<post>''?.*)$'
+$bad = 0
 foreach ($f in $targets) {
-    if (-not (Test-Path -LiteralPath $f)) { Write-Host "  [skip] missing: $f"; continue }
+    if (-not (Test-Path -LiteralPath $f)) { Write-Host "  [FAIL] missing: $f"; $bad = 1; continue }
     $bytes = [IO.File]::ReadAllBytes($f)
     $hadBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
     $text = [IO.File]::ReadAllText($f)
-    $rx = [regex]'(?m)^(?<pre>.*DefaultExpectedSha256\s*=\s*''?)(?<old>[0-9a-fA-F]{64})(?<post>''?.*)$'
-    $new = $rx.Replace($text, { param($m) $m.Groups["pre"].Value + $hash + $m.Groups["post"].Value })
-    if ($new -eq $text) { Write-Host "  [warn] no DefaultExpectedSha256 line changed in $f"; continue }
-    $enc = New-Object System.Text.UTF8Encoding($hadBom)
-    [IO.File]::WriteAllText($f, $new, $enc)
-    Write-Host "  [ok] anchor updated: $f (bom=$hadBom)"
+    $m = $rx.Match($text)
+    # [FIX 2026-11-06] 旧版把「已一致」也打印成 "[warn] no line changed"，
+    # 与「没匹配到锚点行」无法区分，发布验收时造成误判。现在三态分明。
+    if (-not $m.Success) { Write-Host "  [FAIL] no DefaultExpectedSha256 line in $f"; $bad = 1; continue }
+    $old = $m.Groups['old'].Value.ToLower()
+    if ($old -eq $hash) {
+        Write-Host "  [ok] already in sync: $f"
+    } else {
+        $new = $rx.Replace($text, { param($mm) $mm.Groups["pre"].Value + $hash + $mm.Groups["post"].Value })
+        $enc = New-Object System.Text.UTF8Encoding($hadBom)
+        [IO.File]::WriteAllText($f, $new, $enc)
+        Write-Host ("  [ok] updated {0}: {1} -> {2} (bom={3})" -f $f, $old, $hash, $hadBom)
+    }
 }
-Write-Host "=== anchors synced. Now run: powershell -File src\scripts\deploy.ps1 (or deploy.cmd), then reboot ==="
+# fail-closed：回读三处，必须都等于本次哈希，否则拒绝宣告成功
+foreach ($f in $targets) {
+    if (-not (Test-Path -LiteralPath $f)) { continue }
+    $back = [IO.File]::ReadAllText($f)
+    $mb = [regex]::Match($back, 'DefaultExpectedSha256\s*=\s*''?([0-9a-fA-F]{64})''?')
+    if (-not $mb.Success -or $mb.Groups[1].Value.ToLower() -ne $hash) {
+        Write-Host "  [FAIL] read-back mismatch: $f"; $bad = 1
+    }
+}
+if ($bad -ne 0) { Write-Host '=== anchors NOT synced ==='; exit 1 }
+Write-Host "=== anchors synced + read-back verified. Now run: powershell -File src\scripts\deploy.ps1 (or deploy.cmd), then reboot ==="

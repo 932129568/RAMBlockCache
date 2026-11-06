@@ -6,6 +6,8 @@
 
 > **后续更新（14:45，用户 13:56 指令）**：§3 的 P2-10 TinyLFU「有意冻结」决策与 §4 对应行**已撤销** —— F1 TinyLFU 准入已完整实现、全量回归并签名发布，详见 `66-tinylfu-delivery-2026-11-06.md`（`sys ed1bd99c…` / `Setup d4457ca4…`）。因此「剩余 5 项」变为 4 项（Verifier 1h 周期、64K WinDbg 复现、U-8、U-9），U-10 仍为用户侧决策。GitHub `README.md` / `README.txt` 亦已同步到 F1 批最新状态。
 
+> **后续更新 2（15:52）**：67 号批把 Node 27 + npm 12.2.1 全局工具链与「全内置」落地，Setup 重打包重签为 `7912d276…`（276,153,688 B，Valid）；sys 与三锚点不变。本表 §4 的 4 项边界不变，但 U-8 已用 `!itoldyouso` 证伪「现存 10-17 PDB 可解析 10-24 dump」这条路径（`sig MISMATCH`），U-9 补了 `check_coexist.ps1` 并更正「本机无 360」口径（实测有 ZhuDongFangYu）。详见 67 号。
+
 ---
 
 ## 1. 本次发布最终基线（U-6 补签后）
@@ -51,7 +53,7 @@ U-6 说明：58 号交接标 `ramboostsetup.exe` 未签名（影响 SmartScreen/
 | P2-7 | S2 16K BlockSize 实验 | ✅ 完成（安静模式初测） | 62 号：4K 17.16 / 8K 24.63 / 16K 30.01 / 32K 17.24 GB/s；**绝对值不作峰值宣称**，收网后最佳性能档复测 |
 | P2-8 | U1 延迟分位数 | ✅ 完成 | 62 号：`RB_STATS` +6 字段 / `ReadLatHist[2][32]` / 三 C# 镜像 + Web 四文件；顺带修 GET_STATS 应答回拷容量钳位 |
 | P2-9 | C1 per-CPU 统计分片 | ✅ 已落地 | `src/common/rb_percpu.h`（`RB_PCPU_SET`/`RB_PCPU_COUNTER`）+ `rbio.c:1060` 消费；R26 采样器架构 |
-| P2-10 | F1 TinyLFU 准入 | ⛔ **有意冻结，列入下版本** | 全库精确 grep 无实现。属性能优化而非 bug；实现需改 core 准入数据路径 + 全量回归 + 再次破锚点发布，会污染刚发布基线与未开始的 Verifier 归因周期。见 §4 决策说明 |
+| P2-10 | F1 TinyLFU 准入 | ✅ **冻结决策已撤销并完成**（14:45） | 用户 13:56 明确要求「现在做了」：4×1024 Count-Min Sketch 频率准入 + 频率感知淘汰 + 运行期可配，默认 OFF；Release/ASan 24/24、门禁五件套全绿，已签名发布 `sys ed1bd99c…` / `Setup d4457ca4…`。详见 66 号文档 |
 | P2-11 | F2 STATS 暴露 trim/lost 计数器 | ✅ 完成 | 62 号：驱动已填 + Web 展示 TRIM 次数；LostDirtyBytes 告警横幅既有 |
 | P2-12 | U-10 pagefile 处理 | 🟡 用户侧 | U-10 |
 | P3-13 | .gitignore 排除构建产物 | ✅ 完成并本轮重估 | P3.13 补 web 产物；本轮撤销 `src/ui/installer/` 整目录排除（46 源码入库、585 bin/obj 继续排除），新增归档/大快照/本地配置/临时 exe 规则 |
@@ -60,17 +62,16 @@ U-6 说明：58 号交接标 `ramboostsetup.exe` 未签名（影响 SmartScreen/
 
 另外 62 号之后新增的工作项（63/64 号批）也已闭环：ParallelFlush 1/2/4/8/16 运行期可配、QA 双轨 40/40 回归、发布、Verifier 收获协议与只读验收工具。
 
-## 4. 未在本会话闭环的 5 项（明确边界，不含糊）
+## 4. 未在本会话闭环的 4 项（明确边界，不含糊）
 
 | 项 | 为什么不能现在做 | 已交付的可执行替代 |
 |---|---|---|
 | Verifier 1h 负载 + 收网（U-2/P1-4） | 需真实时间流逝与用户重启；我不能替跑负载或替用户重启 | `64-verifier-harvest-2026-11-06.md` + `verifier_harvest_check.ps1`（只读判据）+ `verifier_disable.cmd` |
-| 64K 根因 WinDbg 复现（U-4/P1-6） | 需刻意以 64K 配置复现并拿到完整 dump，当前禁令与 Verifier 周期下不宜主动制造崩溃 | 四层封堵已防再现；`59-64k-audit` §5 给出复现步骤与解禁前置清单 |
-| U-8 蓝屏归因 | 对方机器零 dump/零 BugCheck 事件，缺旧二进制 + PDB | `61-crash-attribution` 证据链 + `RB-dumps-1106.cmd` + cdb 协议（PDB 需先拷 ASCII 路径） |
-| U-9 360 共存 | 本机无该安全软件环境 | 安装引擎 fail-soft 降级逻辑 + README 说明 |
-| TinyLFU（P2-10） | **工程决策冻结**：改 core 数据路径 → 需全量回归 + 第三次破锚点发布，且会污染未开始的 Verifier 归因基线 | 列入下版本功能批，与 C1 后续 profile-gated 优化一起评估；本轮明确记录为「有意延期」而非遗漏 |
+| 64K 根因 WinDbg 复现（U-4/P1-6） | 需刻意以 64K 配置复现并拿到完整 dump，当前禁令与 Verifier 周期下不宜主动制造崩溃 | 四层封堵已防再现；`59-64k-audit` §5 给出复现步骤与解禁前置清单；静态前置项闭环状态见 67 号 §3 |
+| U-8 蓝屏归因 | 对方机器零 dump/零 BugCheck 事件，缺旧二进制 + PDB | `61-crash-attribution` 证据链 + `RB-dumps-1106.cmd` + cdb 协议（PDB 需先拷 ASCII 路径）；旧 PDB 匹配尝试见 67 号 §4 |
+| U-9 360 共存 | 本机无该安全软件环境 | 安装引擎 fail-soft 降级逻辑 + `check_coexist.ps1` 分发机自检脚本（67 号 §5）+ README 说明 |
 
-**U-10 与最佳性能档复测**同属用户侧动作，已在 64 号协议中排期。
+> **TinyLFU 已从本表移除**（原第 5 项「工程决策冻结」按用户 13:56 指令撤销并完成，见 §3 与 66 号）。**U-10 与最佳性能档复测**同属用户侧动作，已在 64 号协议中排期。
 
 ## 5. git 提交与推送（P3-14 闭环）
 

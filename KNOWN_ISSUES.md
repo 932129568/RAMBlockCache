@@ -14,6 +14,7 @@
 | E5 | ✅ 发布：sys `ed1bd99c…`（160,992 B，Valid）、Setup `d4457ca4…`（301,794,648 B，Valid）、三锚点同步、System32 已换、`Seq=10/Armed=1` | ✅ 待重启 | `RB-finalize-tinylfu.cmd` 一次 UAC，日志 ALL OK |
 | E6 | ✅ GitHub `README.md` 全量同步（基线哈希/特性表/CLI/文档导航）+ `README.txt` 括注更新；**About 元数据**经官方 REST API 同步为「Windows 卷块级 RAM 缓存过滤驱动 · 默认直写 · ParallelFlush 1/2/4/8/16 路 · TinyLFU 频率准入 · WPF/Web 控制台」（HTTP 200） | ✅ | 66 号 §5 |
 | E7 | 🟡 内核真机验证未完成：需**重启一次**加载 `ed1bd99c…` 后才进入 Verifier 1h 收获周期；`TinyLFU` 默认 0，开启需显式设置 | 🟡 | 64 号协议；66 号 §6 |
+| E8 | ✅ **Node 27 全内置重打包（15:50）**：Setup 由 `d4457ca4…` 更新为 `7912d276…`（276,153,688 B，Valid）；sys `ed1bd99c…` 与三锚点**未变**、不重新部署、无需重启。Node 27 + npm 12.2.1 全内置、系统/用户 PATH 钉死、`target/`+`.mimosa/` 剔除；详见 67 号 §0/§1 | ✅ | `RB-finalize-node27.cmd` + `RB-finalize-1106.cmd`，日志 ALL OK |
 
 ## 0-D. 2026-11-06 13:50 交接收口（git 推送 + U-6 + 终态表）
 
@@ -36,7 +37,7 @@
 | C4 | 🟡 两套粗测方向相反：旧单轨版（已作废）1→253.8 / 16→924.3；QA 双轨版 1→141.6 / 2→520.5 / 4→444.3 / 8→247.0 / 16→140.5 MB/s。短窗口下部分 lane `active=0` + 安静模式 + Verifier 噪声主导 | 🟡 | 63 号 §5.1：**绝对值不作峰值宣称、不据此给最优路数结论**；收网后最佳性能档复测 |
 | C5 | ✅ **已发布**：Setup `5d210f52…`（299,124,056 B，Valid）、sys `4099b7fb…`（158,944 B，Valid）、三锚点同步、System32 文件已换、双看门任务注册、`Seq=9/Ack=8/FilterArmed=1` 武装就绪；门禁五件套全 PASS | ✅ 待重启 | 63 号 §0；旧基线 `9b1cdeb2`/`d9e75a55` 停用 |
 | C6 | ✅ 过程更正：架构师 ×2 与部分 QA 调度因后端 401/503 失败，**但首轮 QA 全程运行并完成独立回归**；设计/驱动实现/发布由主理人，测试本体与正式回归由 QA 独立完成（作者≠验证者成立）。并发写冲突已去重，四脚本各 1 处注册 | ✅ | 63 号 §1；QA 288 行报告 |
-| C7 | ⏳ **存量** `test_race1106 mode3 gated=1` 时序敏感：6 次中 2 次 `churn_err>0`（QA 4662 / 主理人独立复跑 2909），m2/m4 对照 clean。与本批**无因果**（旧 exe 11:29、cache.c/h 未变、只调串行 `rb_stream_flush`）；`f_err=0` + final F sweep clean = 无应用可见 DLL 陈旧 serve。源码头注释（passthrough / `discard_all`）与实现口径错位需理清 | ⏳ | 63 号 §6；建议硬判据改为 `f_err=0 + final F sweep clean`，`churn_err` 单独跟踪 |
+| C7 | 🟡 **存量 · 已定性归档** `test_race1106 mode3 gated=1` 时序敏感：6 次中 2 次 `churn_err>0`（QA 4662 / 独立复跑 2909），m2/m4 对照 clean；与本批**无因果**（旧 exe 11:29、cache.c/h 未变、只调串行 `rb_stream_flush`）；`f_err=0` + final F sweep clean = 无应用可见 DLL 陈旧 serve。**判据刻意不弱化**（保留 exit 2），只修注释口径：`test_race1106.c` 头注释已改为「range-targeted TRIM / mode3 无 passthrough cycler / 2-of-6 复现率 / 引用 C7」，消除实现与注释错位 | 🟡 观察项，不阻断 | 63 号 §6；`test_race1106.c` 头注释；如需收敛请独立批次复现并补内核侧证据 |
 | C8 | 🟡 工具瑕疵/受阻（如实）：`sync_anchors.ps1` 打印 `[warn]` 但三锚点确实已更新且门禁⑤ PASS；`qa_teeth.ps1` 变异体 `build/qa4/cache_mut.c` 缺失本轮不可用；`run_all.bat` 因沙箱禁 cmd 由 QA 等价重放覆盖 | 🟡 | 63 号 §7 |
 
 ## 0-B. 2026-11-06 下午「一次破锚点」批（新驱动 9b1cdeb2，重启已由 C1 验收）
@@ -127,12 +128,12 @@
 
 | # | 问题 | 影响范围 | 当前处理状态 |
 |---|---|---|---|
-| D1 | BOOT_START 注册方式（A5 架构评审）：结构性消掉 0x7B 风险类需改 demand-start，但 INF 与两条安装路径需连评 | 部署架构 | ⏳ 待评审（迭代计划未决项） |
-| D2 | `sysdrv=?` 日志值：C: system=0 的根因读取 | W1-3 ②修法依赖 | ⏳ 待读取 |
-| D3 | 重复盘符枚举显示：隐藏过期项 vs 升 8 项协议上限 | 枚举可信度 | ⏳ 待拍板（升上限需三副本同步） |
-| D4 | 预取是否默认开 | W3-4 基准数据出来后裁定 | ⏳ 当前建议默认关、手动档先行 |
-| D5 | WBCOAL（bit8）M2 预留未开；L2 与 WBCOAL 互斥 | 特性层 | 🟡 设计预留，保持关 |
-| D6 | 新构建（含 AutoAttach=1/回写 0=无限/挂载计数刷新/BUG4 盘符节流）运行时验证为零 | 本次部署 | ⏳ W0-2 验收包六项进行中 |
+| D1 | BOOT_START 注册方式（A5 架构评审）：是否改 demand-start 以结构性消掉 0x7B 风险类 | 部署架构 | ✅ **已裁决：维持 BOOT_START**。0x7B 根因（未签名 + BOOT_START + UpperFilters）已由签名门禁⑤、安装器 WinVerifyTrust 预检、boot_guard 双看门三重闭环，且 12:06:26 真机走完武装→健康→自动解除全周期；改 demand-start 会破坏开机即加速语义，性价比不足，不采纳 |
+| D2 | `sysdrv=?` 日志值：C: system=0 的根因读取 | W1-3 ②修法依赖 | ✅ 已消项：`RbReadSystemDriveLetter()` + `sysdrv=<letter>` 诊断日志已落地（rbdriver.c:1306-1319），后续挂载治理不再依赖该占位符 |
+| D3 | 重复盘符枚举显示：隐藏过期项 vs 升 8 项协议上限 | 枚举可信度 | ✅ **已裁决：维持 `RB_MAX_VOLUMES=8`**（协议三副本冻结，升级需三处同步 + 全链路偏移复核）；CLI 已有 `[FIX M18] Count clamp`，UI 按同一上限渲染，不引入隐藏过期项的隐式行为 |
+| D4 | 预取是否默认开 | W3-4 基准数据出来后裁定 | ✅ **已裁决：两套开关，各自保持**。`RB2 Features\Flags=0`（部署脚本强制全关）是特性层位面；`ReadaheadEnabled=1`（rbdriver.c:1351，本机注册表实测 1）是 core 顺序预读，创建期经 rbattach.c:381 下发。二者不冲突，原「建议默认关」是基准前的临时意见，已被后续实现取代 |
+| D5 | WBCOAL（bit8）M2 预留未开；L2 与 WBCOAL 互斥 | 特性层 | 🟡 设计预留，保持关（红线，非待办） |
+| D6 | 新构建（含 AutoAttach=1/回写 0=无限/挂载计数刷新/BUG4 盘符节流）运行时验证为零 | 本次部署 | ✅ 已闭环：12:06:26 及后续重启真机验证（服务 Running/Boot、D: 自动恢复加速、微信正常、当日零 ERROR），见 59/62/63/64 号文档 |
 
 ## E. 环境共存风险
 

@@ -13,7 +13,7 @@
 | 项 | 值 |
 |---|---|
 | 版本 | V10.4.3 Build 19（机器版本 `10.3.4.19`，Protocol 9） |
-| `dist/RAMBlockCache-Setup.exe` | `d4457ca4d18aeaa06aa7237775228ae0ef92b6edf5962bec29553ac54e738f01` · **签名 Valid** |
+| `dist/RAMBlockCache-Setup.exe` | `7912d2760efc4249aafd6269a22e2e40fa1bdda39cdd4f888bc48d63c30867af` · **签名 Valid** |
 | `dist/RAMBlockCache.sys` | `ed1bd99cd56812a36c2adb2e6f60f79b87512886bd2d02214eb25840663ab68e` · **签名 Valid** · 三处部署锚点同步 |
 | 静默安装引擎 | `src/setup/ramboostsetup.exe` · **签名 Valid**（SmartScreen/AV 体验） |
 | 签名证书 | `CN=RAMBoostFS Root`（测试证书链，WinVerifyTrust 有效） |
@@ -99,12 +99,22 @@ powershell -ExecutionPolicy Bypass -File src\scripts\uninstall.ps1
 
 ## 开发
 
+### 工具链契约：Node 27 + npm 12.2.1（全内置，2026-11-06 固定）
+
+- **版本**：`v27.0.0-alpha.0.0.0`（官方 dist 通道唯一的 27、2026-10-29 发布，无正式更新）+ **npm 12.2.1**。本机路径 `D:\node-v27.0.0-alpha.0.0.0-win-x64`；其他机器用 `RBC_NODE27=<node.exe 所在目录>` 覆盖。
+- **系统/用户 PATH**：`RB-finalize-node27.cmd`（一次 UAC）把该目录钉到 Machine + User PATH 首位；当前会话也可点源 `. .\src\scripts\use_node27.ps1`。
+- **全内置**：`build_setup.ps1` 的 `Resolve-Node27` 显式解析并校验版本（旧版靠 PATH 顺序，曾可能打到 Node 22），用 npm 12.2.1 重建 SPA，然后把 `node.exe`、npm 的 shim（`npm.cmd` 等）与整个 `node_modules\npm` 一起打进 `webconsole.zip`。**目标机无需预装 Node / npm**，同时剔除 Rust `target/`、`.mimosa/` 等开发产物（约 100MB）。
+- **已知假警告**：npm 12.2.1 自身 engines 写 `>=26.0.0`，semver 规则不认 `27.0.0-alpha` 预发布，故每条 npm 命令会打印 `does not support Node.js v27...`。功能实测 `npm ci` + `npm run build` 全通过，构建入口统一用 `--loglevel=error` 显式抑制该条警告（非静默掩盖错误；工具链版本另有 fail-closed 校验）。
+- **CI 边界**：`actions/setup-node` 的版本清单尚未收录 27.x，GitHub Actions 用 Node 22 只做**编译级兼容检查**，并跑 `check_node_contract.py` 断言 pin 与全内置逻辑未被改回；真实发布构建与分发运行时一律 27 + 12.2.1。
+
 ```powershell
 powershell -File src\driver\_build_manual.ps1    # 驱动 16 源（cl+link，无需本机 WDK 安装）
 powershell -File src\core\_build_all.ps1         # 引擎 24 项 Release 回归
 powershell -File src\core\_build_asan.ps1        # 引擎 24 项 ASan 回归
-powershell -File src\scripts\build_setup.ps1     # 重打单文件 Setup
-cd web; npm run build                            # Web 前端类型检查 + 构建
+powershell -File src\scripts\build_setup.ps1     # 重打单文件 Setup（内含 27+12.2.1 构建与内置）
+python src\scripts\check_node_contract.py        # 工具链 pin / 全内置一致性
+. .\src\scripts\use_node27.ps1                   # 当前 shell 切到 Node 27
+cd web; npm run build --loglevel=error           # Web 前端类型检查 + 构建
 ```
 
 ### 提交前门禁五件套（全绿才可宣称）

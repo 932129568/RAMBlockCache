@@ -1,7 +1,18 @@
 # 已知 Bug 与遗留问题清单（KNOWN_ISSUES）
 
-> 截至 2026-11-06 13:30 · 63 号 ParallelFlush 批已发布（详见 deliverables/63-parallelflush-2026-11-06.md + 63-flushpar-qa + 64-verifier-harvest）
+> 截至 2026-11-06 13:50 · 交接收口完成（详见 deliverables/65-handover-closure-2026-11-06.md + 63/64 号）
 > 状态图例：✅ 已修复（有验证） · 🔧 已修复（待真机复验） · 🟡 已知限制/设计行为 · ⏳ 待评审/待做 · ⛔ 阻断
+
+## 0-D. 2026-11-06 13:50 交接收口（git 推送 + U-6 + 终态表）
+
+| # | 项 | 状态 | 证据/说明 |
+|---|---|---|---|
+| D1 | ✅ **U-6 引擎本体签名**：59 号曾误标消项，实测 `NotSigned`；本轮补签 `a4e86536…` Valid，重打包重签 Setup `8d86a90f…`（301,790,552 B，Valid）；sys `4099b7fb` 未变、三锚点不变、门禁⑤ PASS | ✅ | `RB-finalize-u6.cmd` 一次 UAC，日志 `finalize-u6.log` ALL OK。**分发请用 `8d86a90f…`，不要用重打包中间态 `7965427E…`** |
+| D2 | ✅ **P3.14 git 提交推送**：`main` 原本无 upstream、停在 2 周前 `02a1445`；本轮提交 `7b4f5c3` 并 `push -u origin main` 成功，已建立跟踪 | ✅ | 301 文件 / 3.2MB；168 新增 + 72 删除 + 61 修改 |
+| D3 | ✅ `.gitignore` 重估：安装器 46 个源码入库、`bin/obj`/`Assets/payload`/Rust `target/` 排除；历史已完成文档与恢复快照按用户决定不保留（72 个删除保持、`archive/` 与 3 个大压缩包排除） | ✅ | 65 号 §5 |
+| D4 | ✅ 58 号交接 **U-1…U-11 与 P0…P3 共 15 项**逐项终态表落盘；C1 per-CPU 统计分片核实已落地（`rb_percpu.h` + `rbio.c:1060`） | ✅ | `deliverables/65-handover-closure-2026-11-06.md` |
+| D5 | ⛔ **TinyLFU 准入有意冻结**：全库无实现，属 P2 性能优化而非 bug；实现需改 core 数据路径 + 全量回归 + 第三次破锚点，会污染刚发布基线及未开始的 Verifier 归因周期 → 列入下版本功能批 | ⛔ 明确延期（非遗漏） | 65 号 §3/§4 |
+| D6 | 🟡 剩余均需真机周期 / 外部证据 / 第三方环境：Verifier 1h 负载与收网（64 号协议）、64K 根因 WinDbg 复现、U-8 旧二进制+PDB、U-9 360 环境、U-10 `D:\pagefile.sys` 64GB | 🟡 用户侧/环境限制 | 65 号 §4、§7 |
 
 ## 0-C. 2026-11-06「1/2/4/8/16 路可配」批（**已发布**，待重启加载 + Verifier 收获）
 

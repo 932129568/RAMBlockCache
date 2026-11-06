@@ -243,6 +243,20 @@ $after.data.Items  | Select Letter,Attached,ReadEnabled,WriteEnabled,WriteMode
 
 > **不要**用 `Get-FileHash` 作唯一判据（buffered，绕过块层）。**不要**沿用 77 §5 P0 的改造前 canary 基线。
 
+### 4.3.1 G4 强化序列（基于 81 号 BLOCKER 2 复现结论新增；主理人授权 QA 改本节）
+
+**为什么必须加**：`rbc_e2e_verify` 现有序列是「新建独立工作文件 → 写 pattern → 关闭 → unbuffered 读回」，目标 LBA 首次写时**无缓存块**（冷缓存），读回走 miss 下盘 ⇒ 对「热缓存覆写」场景**假绿**。`deliverables/81-directwrite-stale-repro-2026-11-07.md` 已在用户态 core 域复现：>4K 几何 + `WriteBack=0` 下，4K 覆盖写因 `cache.c:1486` 非整子块覆盖被跳过而**不失效**，读命中返回旧 clean 块 ⇒ silent stale read。
+
+**S4 必须增跑的强化序列**（独立工作文件 `D:\rbc-e2e-work.bin`，**不与 canary 混用**）：
+
+1. **预热**：以 unbuffered 读把目标 **16K 子块完整读进缓存**（先读满，使其成为 clean + loaded 热块）—— 这是复现成立的必要前提，冷缓存会假绿。
+2. **覆写**：对该子块**前 4K** 写入**不同**的确定性 pattern（4K 覆盖写 / 非整子块覆盖）。
+3. **读回比对**：关闭句柄后**重新以 unbuffered 打开**，逐字节比对；前 4K 必须是新 pattern、其余 12K 必须是旧 pattern。
+4. **判据**：`RESULT: PASS / MISMATCH_COUNT=0 / SHA256_EXPECTED==SHA256_ACTUAL`；任一字节差异、`RESULT: FAIL`、`exit≠0` ⇒ **STOP-ON-FAIL**，保留现场并按 §7 免重启回退。
+5. 同步取证：驱动日志出现 `[rebuild] geometry ... done`、零 ` ERROR ` / 零 `RbSetPanic`；`GET_STATS.RmwReads==0`（80 §1：直写下 `rb_write_pass2` 不可达，此值作「**H8 未覆盖**」的显式结论，**不是通过项**）。
+
+> 该序列是 81 号 core 域用例的真机等价形态：**修复前预期 FAIL，修复后预期 PASS**，因此它是 **E3/E4 回归的核心判据**。另需一档 **4K 几何 + 512B 扇区尾写**：81 号实测该写在「按 `bs>4096 && 非整子块写` 门控」的修复下**仍会 STALE**（残余风险，见 81 §6），若最终采用该门控方案，此档必须列入放行复核。
+
 ### 4.4 E4 回写态安全（**只在用户态 core 域**设计故障注入，不在真机切回写）
 
 | 项 | 设计 |
@@ -383,6 +397,7 @@ foreach ($N in 1,2,4,8,16) {
 8. **H8 措辞边界**：本工具的 `--threads N` 是**用户态多句柄并发写不同区间**，能在内核态触发 16K 几何下的 RMW 路径，但**不等价于内核并发驱逐**；`KNOWN_ISSUES H8` 状态应按实际证据写「内核态 RMW 路径真机有证据」，不要写成「并发驱逐已验证」。
 9. **S4 结论归属改造后驱动**：改造只加重建路径、不改数据面几何语义（79 §7），但**二进制已变**（重编 / 重签，`63ad0fa8…` 作废）；跨二进制的绝对值对比同样受限。
 10. **QA 自测 ≠ 真机证据**：`qa_e2e_verify_selftest.out` 只证明工具本身有牙齿，沙箱在 `C:\Users\Public\rbc-e2e-selftest\`，**不构成任何真机结论**。
+11. **修复后 S4 吞吐与修复前（72/75 号）绝对值不可比**：BLOCKER 2 的最小修复会在 >4K 几何的每次 4K 非整子块覆盖写前执行 `RbInvalidateAfterFlush` ⇒ **升 `view_gen` + `wb_drain`**，预取的 `rb_read_commit_gen` 因世代失配**放弃回填**、命中率下降属**预期代价，不是回归**；4K A/B 结构 diff 0 仍须实测留证（79 §5 R10 收窄后口径）。因此 S4 五路 / S2 16K 吞吐数字只能作**同机同批相对参考**，**不得与 72/75 号修复前的绝对值比较**，不作峰值 / 最优路数宣称（与第 2、3 条并列）。本条随 81 号复现结论新增。
 
 ---
 

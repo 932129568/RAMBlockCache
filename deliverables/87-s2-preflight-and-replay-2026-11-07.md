@@ -403,3 +403,29 @@ UAC 后十道门禁全绿；四个提交 `70a38f8` / `c20c732` / `ec7714e` / `b8
 2. 等 `impl-blocksize` 交付轻量重打包脚本 → 用户双击一次 `RB-repack-setup.cmd` → 主理人回填文档 → 分发包一致。
 3. 等 `software-qa-engineer` 的 S4 判据（已三次催办）→ 执行 4K → 16K → 4K 免重启切档真机验收（E1/E3/E8、canary、STOP-ON-FAIL）。
 4. S4/S5 全程 **0 次重启**；重启后严禁再运行任何 finalize 全链 wrapper。
+
+---
+
+## 16. Setup-only UAC 执行结果：分发包闭环（17:20:17 – 17:21:11，54 秒）
+
+用户双击 `RB-repack-setup.cmd`。日志 `C:\ProgramData\rb-deploy\finalize-setup-only.log`（28,191 B）**零 ABORT / 零 FAILED**，收尾 `ALL OK setup=d0eaa40dcb6d27fd79175ed49067540c4c3f8c3bc6e800adda60dec0e53132c0`。用户引用的 `SCOPE` 行正是脚本 :step1 打印并写入日志的范围声明。
+
+| 步 | 结果 |
+|---|---|
+| 1 | sys `10fb7009…` Valid + sidecar OK；三锚点回读全等；旧签名 Setup `db7006d7…` Valid；marker `2026-11-07T08:30:48.509Z` **仅读取** |
+| 2 | `build_setup.ps1` exit 0：Node27 + npm 12.2.1、SPA 2233 modules（产物含 `SettingsPage-CGJZ6Bdb.js` 48.88 kB）、controller 自包含发布、`webconsole.zip` 45,276 KB / `controller.zip` 62,398 KB 重建、未签名 Setup `992e9751…` / 272,870,514 B |
+| 3 | payload CLI 哈希 == `b24f0a23…` 且 5 statval 键齐；`rbfeatctl.exe` 与双 zip 新鲜；`webconsole.zip` 的 `proto-decode.ts` 五字段齐（8117 字符）；**新增四档断言**：`dist/assets/SettingsPage-CGJZ6Bdb.js` 含 `4/8/16/32 KB` + `[4096,8192,16384,32768]`（47,719 字符探查）⇒ 分发包已带四档 |
+| 4 | Setup 四重哈希断言：未签名基线 `992e9751…` → ASCII stage 覆盖 → signtool 成功 → signed stage `d0eaa40d…` → copy-back → dist Valid / 272,872,792 B |
+| 5 | ledger append FATAL 路径成功 + read-back OK，`FINAL_SETUP_SHA256=d0eaa40d…` 为最后一条 |
+| 6 | **scope intact**：sys `10fb7009…` + sidecar + 三锚点**逐字 byte-identical** + marker `08:30:48.509Z`（从未写入）+ dist Setup 仍是已签镜像 |
+
+**主理人独立复核 + 处置**：
+
+- 现场：sys `10fb7009…` / 172,768 B / Valid、三锚点 `distinct=1`、marker 未变；Setup `d0eaa40d…` / 272,872,792 B / **Valid**。
+- `sync_setup_hash.ps1 -RequireSetupChanged` → **`UPDATED / exit 0`**；5 行回填（README.md:16 Setup → `d0eaa40d…`、67:12 → `d0eaa40d…` / 272,872,792 B；sys 两行保持 `10fb7009…` 不变；67:130 前缀更新）；幂等复跑 `ALREADY IN SYNC / exit 0`。
+- 复跑 `verify_final_reboot.ps1` → **`FAIL=0 WARN=0 / VERDICT: PASS / SCRIPT_EXIT=0`**，19 个 PASS gate；`reboot after finalize` 仍 PASS（`boot 08:35:53.500Z > marker 08:30:48.509Z`，本次 UAC 未覆盖 marker）、`Setup signed` 与 `README Setup hash in sync` 均指向新哈希。
+- 十一道门禁全绿（含 Gate10 `check_blocksize_contract`、Gate9、`check_signature`、`check_ps_syntax` 68 文件 0 失败、`refcount_model`）。
+
+**结论**：本机 Web 控制台（刷新即可选 4/8/16/32 KB）与分发包 `dist\RAMBlockCache-Setup.exe` **现在一致**；sys、三锚点、`README.txt`、marker、部署态、boot 全部未变，**不需要重启**。
+
+**口径不变**：以上只证明签名产物与文档一致、驱动已加载稳定；B1/B2 运行时后果、免重启切档实效、>4K 数据面正确性、回写正确性、峰值性能、H8 仍待 S4/S5 真机取证，不得提前宣称「内核已修」。

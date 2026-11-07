@@ -137,7 +137,10 @@ typedef struct _RB_DEV_EXT {
 
 static __inline VOID RbNoteBypass(PRB_DEV_EXT ext, LONG reason)
 {
-    if (ext) InterlockedExchange(&ext->LastBypassReason, reason);
+    /* [100 §perf] read-first：常态（原因未变，多为 0→0）跳过 LOCK RMW；
+     * 竞态最坏=展示旧一拍的原因（纯诊断字段，无正确性消费）。 */
+    if (ext && ext->LastBypassReason != reason)
+        InterlockedExchange(&ext->LastBypassReason, reason);
 }
 
 /* 一条被拦截、转投 worker 的 IRP 上下文 */

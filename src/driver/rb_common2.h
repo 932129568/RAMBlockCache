@@ -100,6 +100,7 @@ VOID     RbHotPrewarm(PVOID Ext);
 
 /* ===== 写合并（默认 OFF） ===== */
 BOOLEAN  RbWbActive(PVOID Ext);
+VOID     RbWbMarkDead(VOID);   /* [101] RbWbInit 失败时置死标 → FlushSubmit 永久直投 */
 VOID     RbWbSubmit(PVOID Ext, ULONG64 LbaBytes, ULONG Len, VOID (*FlushFn)(PVOID), PVOID Ctx);
 
 /* ===== 每卷策略（注册表 Policies\<X>） ===== */

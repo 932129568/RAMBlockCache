@@ -264,122 +264,20 @@ static PVOID RbStageGet(PRB_IOWORKER w, SIZE_T need)
 FORCEINLINE VOID RbStagePut(PRB_IOWORKER w, PVOID p)
 { if (p && (!w || p != w->Stage)) RbFreeAligned(p); }
 
-/* ===== 同步盘 I/O（worker/flusher PASSIVE 调用） =====
- * [C5-r2 重写] 旧实现超时后直接放弃在飞 IRP：堆 ctx 泄漏，
- * 下层最终完成时向已释放缓冲写入（UAF/数据踩踏）。
- * 新实现核心不变式：【永不放弃缓冲 —— 我们从不停止等待】
- *   1) 挂自己的完成例程（STATUS_MORE_PROCESSING_REQUIRED），
- *      IRP 生命周期由本函数全程看护；
- *   2) 15s 步进观察；超时 → IoCancelIrp 请求取消 → 继续等待；
- *      取消后绝大多数栈在有限时间内完成（端口驱动自带超时兜底）；
- *   3) evt 置位（完成/取消完成）→ IoCompleteRequest 释放 MDL 锁定
- *      → 读 iosb → 释放 ctx。缓冲在完成前始终有效，无 UAF 无泄漏。
- * 极端情形（存储栈 bug 级永久挂起）：worker 线程驻留等待，
- * 与“物理盘真死”同域，由 RbStopIoWorkers 的 join 超时面处理。 */
-typedef struct _RB_SYNCCTX {
-    KEVENT          evt;
-    IO_STATUS_BLOCK iosb;
-} RB_SYNCCTX;
 
-/* [W1.5] RB_SYNCCTX 非分页旁视池（CTX-1 IoCtxLa 先例，见本文件 :76-77）。
- * 消除 RbSyncIo 每 IO 的 ExAllocatePool2+ExFreePoolWithTag 固定机制开销
- * （QD1 串行路径每 IO 成本主项，PRD §7.2 / L1-2）。函数封装（而非 rbdriver.c
- * 直调 Ex*）的原因：RB_SYNCCTX 定义在本文件。Init/Delete 挂点见 rbdriver.c
- * DriverEntry/RbUnload（Delete 必须晚于引擎销毁——writeback 回调在途）。
- * IRQL：RbSyncIo 全体调用方 PASSIVE（内部 KeWaitForSingleObject），
- * NP lookaside 合法。lookaside 分配不清零 → KeInitializeEvent 在
- * RbSyncIo 内每用每初始化（保留不动）。 */
-PVOID RbSyncCtxAlloc(VOID)   { return ExAllocateFromNPagedLookasideList(&g_Rb.SyncCtxLa); }
-VOID  RbSyncCtxFree(PVOID p) { if (p) ExFreeToNPagedLookasideList(&g_Rb.SyncCtxLa, p); }
-VOID  RbSyncCtxPoolInit(VOID)
-{
-    ExInitializeNPagedLookasideList(&g_Rb.SyncCtxLa, NULL, NULL, 0,
-                                    sizeof(RB_SYNCCTX), RB_POOL_TAG, 0);
-}
-VOID  RbSyncCtxPoolDelete(VOID) { ExDeleteNPagedLookasideList(&g_Rb.SyncCtxLa); }
-
-/* 同步盘 I/O 的步进等待上限：15s（LARGE_INTEGER 相对超时 = 100ns 单位取负）。
- * 语义：超过 15s 未完成即请求取消并继续等待（见 RbSyncIo 不变式），
- * 与 RbStopIoWorkers 的 30s join 宽限同族。 */
-#define RB_SYNC_IO_STEP_100NS  1500000000LL
-
-static NTSTATUS NTAPI RbSyncComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID c)
-{
-    RB_SYNCCTX *ctx = (RB_SYNCCTX *)c;
-    UNREFERENCED_PARAMETER(dev);
-    UNREFERENCED_PARAMETER(irp);
-    KeSetEvent(&ctx->evt, IO_NO_INCREMENT, FALSE);
-    return STATUS_MORE_PROCESSING_REQUIRED;   /* 保住 IRP，由等待方收尾 */
-}
-
-NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
-                  PVOID buf, ULONG len, PULONG_PTR pInfo)
-{
-    RB_SYNCCTX *ctx;
-    PIRP irp;
-    NTSTATUS s;
-
-    /* [W1.5] 池化分配（原 ExAllocatePool2 每 IO 一次非分页分配/释放） */
-    ctx = RbSyncCtxAlloc();
-    if (!ctx) return STATUS_INSUFFICIENT_RESOURCES;
-    KeInitializeEvent(&ctx->evt, NotificationEvent, FALSE);
-
-    irp = IoBuildSynchronousFsdRequest(doWrite ? IRP_MJ_WRITE : IRP_MJ_READ,
-                                       ext->LowerDevice,
-                                       buf, (ULONG)len, off,
-                                       &ctx->evt, &ctx->iosb);
-    if (!irp) {
-        RbSyncCtxFree(ctx);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    IoSetCompletionRoutine(irp, RbSyncComplete, ctx, TRUE, TRUE, TRUE);
-    RbDiagRecord(RB_DIAG_KIND_SYNC_IO, RB_DIAG_PHASE_ENTER, STATUS_SUCCESS,
-                 RB_DIAG_FLAG_UNKNOWN, irp, RbSyncComplete, ext, ext->Stream,
-                 ext->LowerDevice, NULL);
-
-    s = IoCallDriver(ext->LowerDevice, irp);
-    if (s == STATUS_PENDING) {
-        BOOLEAN cancelRequested = FALSE;
-        for (;;) {
-            LARGE_INTEGER to;
-            to.QuadPart = -RB_SYNC_IO_STEP_100NS;   /* 15s 步进 */
-            s = KeWaitForSingleObject(&ctx->evt, Executive, KernelMode, FALSE, &to);
-            if (s == STATUS_SUCCESS) break;   /* 下层完成（含取消完成） */
-            if (!cancelRequested) {
-                IoCancelIrp(irp);             /* [BUG-004] 请求取消，而非弃单 */
-                cancelRequested = TRUE;
-                RbLog(1, __LINE__, STATUS_IO_TIMEOUT,
-                      L"sync io slow, cancel requested");
-                continue;
-            }
-            /* 取消已请求仍未完成：继续等（绝不放弃缓冲） */
-            RbLog(1, __LINE__, STATUS_IO_TIMEOUT,
-                  L"sync io cancel pending, keep waiting");
-        }
-    }
-
-    /* evt 已置位（同步完成路径同样会跑完成例程），统一收尾（PASSIVE） */
-    IoCompleteRequest(irp, IO_NO_INCREMENT);
-    s = ctx->iosb.Status;
-    RbDiagRecord(RB_DIAG_KIND_SYNC_IO, RB_DIAG_PHASE_COMPLETE, s,
-                 RB_DIAG_FLAG_UNKNOWN, irp, RbSyncComplete, ext, ext->Stream,
-                 ext->LowerDevice, NULL);
-    /* [FIX DATA-8 R7] 短传归一：卷栈契约不产生 SUCCESS+Information<len，但
-     * 一旦出现（未来栈变化/过滤插入），短写会被当整段成功（core 清脏=数据
-     * 截断落盘）、短读会把不足部分当已提交 commit。归一为设备错误。 */
-    if (NT_SUCCESS(s) && ctx->iosb.Information < (ULONG_PTR)len)
-        s = STATUS_IO_DEVICE_ERROR;
-    if (pInfo) *pInfo = NT_SUCCESS(s) ? ctx->iosb.Information : 0;
-    RbSyncCtxFree(ctx);
-    return s;
-}
 
 /* [V10.1] 盘 I/O 记账：成功清零；连续失败 >=32 → 全局熔断透传。
  * 阈值意义：core 单次坏扇区已正确兜底，这里防"故障盘被缓存层反复踩"——
  * 持续失败即整个系统降级裸盘，让上层按裸盘语义处理错误。 */
 VOID RbNoteIoResult(PRB_DEV_EXT ext, NTSTATUS s)
 {
-    if (NT_SUCCESS(s)) { InterlockedExchange(&ext->IoFailRun, 0); return; }
+    /* [100 §perf] read-first：常态（IoFailRun==0）跳过 LOCK RMW——每成功 IO 省
+     * 一次跨核锁操作。竞态安全：失败计数只增不减（并发成功读旧值 1→重复清零
+     * = 幂等；并发失败读 0→漏清 = 下次成功再清，方向保守）。 */
+    if (NT_SUCCESS(s)) {
+        if (ext->IoFailRun != 0) InterlockedExchange(&ext->IoFailRun, 0);
+        return;
+    }
     if (InterlockedIncrement(&ext->IoFailRun) >= RB_IO_FAIL_PANIC)
         RbSetPanic(L"device I/O failing persistently");
 }
@@ -544,6 +442,18 @@ VOID RbInvalidateAfterFlush(rb_stream *st, rb_u64 off, rb_u64 len)
         rb_stream_invalidate_range(st, off, len);
     }
 }
+/* [101 §perf] 全覆盖对齐写可跳过失效：直写分支的「有脏先刷脏 + 无条件失效」中，
+ * 失效只对【非整块覆盖】的写是必要的（83 号 BLOCKER-2 的根因=部分子块写遗留
+ * 旧 clean 内容）。off/len 均按引擎块几何对齐时，随后 rb_read_commit_gen 的
+ * full_cover=TRUE 会整块替换缓存内容——失效是纯冗余（4K 页写/分页 IO 天然命中
+ * 此快路径）。QA 四模式仍覆盖非对齐尾/半块场景（core commit 语义未动）。
+ * 返回 TRUE = 需要失效（非全覆盖）。 */
+static __inline BOOLEAN RbWriteNeedsInvalidate(LONGLONG off, ULONG len, rb_u32 bs)
+{
+    if (bs == 0) bs = 4096;
+    return !((((rb_u64)off % bs) == 0) && ((len % bs) == 0));
+}
+
 static VOID RbReadDirectFallback(PRB_DEV_EXT ext, PVOID tgt, ULONG len,
                                  LONGLONG off, NTSTATUS *ps, ULONG_PTR *pinfo)
 {
@@ -902,7 +812,10 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
              * 同步执行；回写通道已断（panic）时 flush 无效，行为退回现状
              * （该状态本无保存通道）。 */
             rb_stream_flush(ext->Stream, 1);
-            RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
+            if (RbWriteNeedsInvalidate(off, len,
+                    g_Rb.Engine ? (rb_u32)rb_engine_block_size(g_Rb.Engine)
+                                : (rb_u32)g_Rb.Config.BlockSize))
+                RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
         }
         RbForward(ext->FilterDevice, irp);
         if (NT_SUCCESS(irp->IoStatus.Status))
@@ -932,7 +845,10 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
         if (ext->Stream) {
             if (rb_stream_has_dirty_range(ext->Stream, (rb_u64)off, (size_t)len))
                 rb_stream_flush(ext->Stream, 1);
-            RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
+            if (RbWriteNeedsInvalidate(off, len,
+                    g_Rb.Engine ? (rb_u32)rb_engine_block_size(g_Rb.Engine)
+                                : (rb_u32)g_Rb.Config.BlockSize))
+                RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
         }
         s = RbSyncIo(ext, TRUE, &o, tgt, len, NULL);
         info = NT_SUCCESS(s) ? len : 0;
@@ -1126,7 +1042,11 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
         if (ext->Stream) {
             if (rb_stream_has_dirty_range(ext->Stream, (rb_u64)off, (size_t)len))
                 rb_stream_flush(ext->Stream, 1);
-            RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
+            /* [101 §perf] 全覆盖对齐写跳过失效（commit full_cover 整块替换，见 helper） */
+            if (RbWriteNeedsInvalidate(off, len,
+                    g_Rb.Engine ? (rb_u32)rb_engine_block_size(g_Rb.Engine)
+                                : (rb_u32)g_Rb.Config.BlockSize))
+                RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
         }
         s = RbSyncIo(ext, TRUE, &o, tgt, len, NULL);
         if (NT_SUCCESS(s))
@@ -1889,7 +1809,36 @@ static VOID RbFlusherLoop(PVOID p)
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
+static VOID RbFlushSubmitCore(rb_stream *s, int zone, int nzones, int sidx);
+
+/* [101] WBCOAL 延迟回调：节奏线程到点后把作业交回直投路径。FlushJobs 计数在
+ * RbEngineFlushZones 入口已计入、RbFlushJobDone 由直投路径的既有完成/失败分支
+ * 恰好一次调用 ⇒ FlushDone 屏障覆盖延迟作业，快照 io 引用释放晚于全部落盘。 */
+static VOID RbWbDeferredFlush(PVOID Ctx)
+{
+    RB_FLUSHJOB *j = (RB_FLUSHJOB *)Ctx;
+    if (j) RbFlushSubmitCore(j->s, j->zone, j->nzones, 0);
+}
+
 static VOID RbFlushSubmit(rb_stream *s, int zone, int nzones, int sidx)
+{
+    /* [101] WBCOAL 活跃（Flags bit8 + 线程存活）：作业先入节奏线程，按每卷
+     * MaxWriteIops 节奏回交直投。直写态无脏数据 → 本分支零消费；
+     * 回写态才生效（O-9 周期真机验证）。s->file_id == ext（回调契约）。 */
+    if (RbWbActive(NULL)) {
+        RB_FLUSHJOB *wj = (RB_FLUSHJOB *)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                                         sizeof(*wj), RB_POOL_TAG);
+        if (wj) {
+            wj->s = s; wj->zone = zone; wj->nzones = nzones;
+            RbWbSubmit((PVOID)(ULONG_PTR)rb_stream_file_id(s), 0, 0, RbWbDeferredFlush, wj);
+            return;   /* 完成记账在直投路径；作业内存归 RbWbSubmit/直投路径 */
+        }
+        /* 分配失败：落回直投（绝不丢作业） */
+    }
+    RbFlushSubmitCore(s, zone, nzones, sidx);
+}
+
+static VOID RbFlushSubmitCore(rb_stream *s, int zone, int nzones, int sidx)
 {
     /* [PF-16] zone+sidx 交错映射；取模必须用【本轮生效路数】active，且必须与
      * RbEngineFlushZones 传给 core 的 nzones 严格一致：否则 zone_sel>=active

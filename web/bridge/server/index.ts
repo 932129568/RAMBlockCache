@@ -402,15 +402,57 @@ app.get('/rb/rbfeat', async (c) => {
   });
 });
 
+// [101] L2 容器管理：enable 需 letter + GB（容器=卷上文件 RAMBoostL2.idx/.dat，
+// 非破坏性 FILE_OPEN_IF）；约束=4K 块几何 / 单加速卷 / 与 WBCOAL 互斥（CLI 强制）。
+app.post('/rb/l2', async (c) => {
+  const body = await c.req.json().catch(() => null) as { op?: unknown; letter?: unknown; gb?: unknown } | null;
+  const op = String(body?.op ?? '');
+  if (op === 'enable') {
+    const letter = String(body?.letter ?? '').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 1);
+    const gb = Math.max(1, Math.min(512, Math.trunc(Number(body?.gb) || 0)));
+    if (!letter || !gb) return c.json({ code: -2, out: 'need letter A-Z and gb 1-512' }, 400);
+    const r = await rbfeatRun(['l2', 'enable', letter + ':', String(gb)]);
+    const s = await rbfeatRun(['l2', 'status']);
+    return c.json({ code: r.code, out: (r.out + s.out).slice(0, 800) });
+  }
+  if (op === 'disable') {
+    const r = await rbfeatRun(['l2', 'disable']);
+    const s = await rbfeatRun(['l2', 'status']);
+    return c.json({ code: r.code, out: (r.out + s.out).slice(0, 800) });
+  }
+  return c.json({ code: -2, out: 'op must be enable|disable' }, 400);
+});
+
+// [101] 排除集管理：原生注册表操作（rbfeatctl excl add/del/def，REFRESH 热载）。
+app.post('/rb/excl', async (c) => {
+  const body = await c.req.json().catch(() => null) as { op?: unknown; name?: unknown; on?: unknown } | null;
+  const op = String(body?.op ?? '');
+  if (op === 'add' || op === 'del') {
+    const nm = String(body?.name ?? '').trim().replace(/[^A-Za-z0-9_.\- ]/g, '').slice(0, 60);
+    if (!nm) return c.json({ code: -2, out: 'need process image name' }, 400);
+    const r = await rbfeatRun(['excl', op, nm]);
+    const s = await rbfeatRun(['excl']);
+    return c.json({ code: r.code, out: (r.out + '||' + s.out).slice(0, 1200) });
+  }
+  if (op === 'def') {
+    const on = body?.on === true;
+    const r = await rbfeatRun(['excl', 'def', on ? 'on' : 'off']);
+    const s = await rbfeatRun(['excl']);
+    return c.json({ code: r.code, out: (r.out + '||' + s.out).slice(0, 1200) });
+  }
+  return c.json({ code: -2, out: 'op must be add|del|def' }, 400);
+});
+
 app.post('/rb/rbfeat', async (c) => {
   const body = await c.req.json().catch(() => null) as { name?: unknown; on?: unknown } | null;
   const name = String(body?.name ?? '').toUpperCase();
   const on = body?.on === true;
   // 白名单：PREFETCH/HOT/THERMAL/ETW 热开关；WBCOAL=红线封禁（CLI 已拦，此处再封）；
   // L2 需 letter+GB 语义参数（走 l2 enable，CLI 保留）；MEMGUARD 语义未审计，暂不放开。
-  if (!['PREFETCH', 'HOT', 'THERMAL', 'ETW'].includes(name)) {
+  if (!['PREFETCH', 'HOT', 'THERMAL', 'ETW', 'WBCOAL'].includes(name)) {
     return c.json({ code: -2, out: `feature name not allowed: ${name}` }, 400);
   }
+  // WBCOAL 与 L2 互斥由 CLI 强制（code 4 + 文本），此处透传如实回显。
   const set = await rbfeatRun(['flags', on ? 'on' : 'off', name]);
   const st = await rbfeatRun(['stats', '-json']);
   return c.json({

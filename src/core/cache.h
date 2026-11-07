@@ -255,6 +255,8 @@ void rb_stream_drain_writeback(rb_stream *s);
  * rb_write_ex，write_req/write_bytes 原先恒不计 → 仪表「总写」直写态恒 0。
  * 成功交付后由驱动调用本 API 记账（仅统计，无数据面行为）。 */
 void rb_engine_note_direct_write(rb_engine *eng, rb_u64 len);
+/* [101] WBCOAL 延迟路径取卷身份（驱动侧 rb_stream 不透明）：file_id == ext 指针 */
+rb_u64 rb_stream_file_id(rb_stream *s);
 void rb_engine_note_flush_done(rb_engine *eng);
 void rb_engine_set_max_bytes(rb_engine *eng, rb_u64 max_bytes);
 void rb_engine_reclaim(rb_engine *eng);

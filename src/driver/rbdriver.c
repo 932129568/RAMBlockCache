@@ -623,24 +623,7 @@ VOID RbDeregisterCrashHooks(VOID)
     KeDeregisterBugCheckReasonCallback(&g_Rb.BugCheckRecord);
 }
 
-/* ---------------- 池分配（4KB 对齐，喂非缓存/直写磁盘 I/O） ---------------- */
-PVOID RbAllocAlignedNonPaged(SIZE_T sz)
-{
-    SIZE_T total = sz + RB_BUF_ALIGN - 1 + sizeof(PVOID);
-    PVOID raw = ExAllocatePool2(POOL_FLAG_NON_PAGED, total, RB_POOL_TAG);
-    ULONG_PTR aligned;
-    if (!raw) return NULL;
-    aligned = ((ULONG_PTR)raw + sizeof(PVOID) + RB_BUF_ALIGN - 1) & ~((ULONG_PTR)RB_BUF_ALIGN - 1);
-    ((PVOID *)aligned)[-1] = raw;
-    return (PVOID)aligned;
-}
-VOID RbFreeAligned(PVOID p)
-{
-    PVOID raw;
-    if (!p) return;
-    raw = ((PVOID *)p)[-1];
-    ExFreePoolWithTag(raw, RB_POOL_TAG);
-}
+
 
 /* ---------------- 设备表管理 ----------------
  * [V10.2] AddDevice 不再设盘符（挂载前无盘符、且不可阻塞）。
@@ -802,50 +785,9 @@ PRB_DEV_EXT RbFindExtByLetter(WCHAR letter)
     return found;
 }
 
-/* file_id -> ext 并加引用；flush/readback 回调在 PASSIVE 调用 */
-PRB_DEV_EXT RbGetExt(PVOID file_id)
-{
-    PRB_DEV_EXT ext = (PRB_DEV_EXT)file_id;
-    LONG r;
-    if (!ext) return NULL;
-    if (ext->Magic != RB_EXT_MAGIC) return NULL;   /* [Build15] 哨兵校验 */
-    if (ext->Removed) return NULL;
-    /* 该引用防"引擎 flush/readback 回调执行期间 ext 被 RbVolumeRemove 拆除"→
-     * UAF；由回调方用完后的 RbDerefExt 释放（PASSIVE 上下文调用）。
-     * [FIX M1] CAS 加引用、拒绝 0→1 复活：Refs 已到 0 说明拆除方已完成排空，
-     * 盲目 +1 会让回调持有即将 IoDeleteDevice 的内存。 */
-    for (;;) {
-        r = ext->Refs;
-        if (r <= 0) return NULL;
-        if (InterlockedCompareExchange(&ext->Refs, r + 1, r) == r) break;
-    }
-    return ext;
-}
-VOID RbDerefExt(PRB_DEV_EXT ext)
-{
-    if (!ext) return;
-    /* Refs 归零 = 最后一个持有者离开：置 RemoveEvent 唤醒等待拆除的一方
-     * （RbVolumeRemove 的排空循环 / RbUnload 的僵尸等待），由它们完成拆除 */
-    if (InterlockedDecrement(&ext->Refs) == 0) {
-        KeSetEvent(&ext->RemoveEvent, IO_NO_INCREMENT, FALSE);
-    }
-}
 
-/* ---------------- 通用 IRP 透传 ---------------- */
-NTSTATUS RbForward(PDEVICE_OBJECT dev, PIRP irp)
-{
-    PRB_DEV_EXT ext = (PRB_DEV_EXT)dev->DeviceExtension;
-    /* FIX[P11]: 控制设备没有 LowerDevice；误入的请求直接完成，
-     * 避免 IoCallDriver(NULL) 蓝屏。 */
-    if (!ext || !ext->LowerDevice) {
-        irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
-        irp->IoStatus.Information = 0;
-        IoCompleteRequest(irp, IO_NO_INCREMENT);
-        return STATUS_INVALID_DEVICE_REQUEST;
-    }
-    IoSkipCurrentIrpStackLocation(irp);
-    return IoCallDriver(ext->LowerDevice, irp);
-}
+
+
 
 /* CREATE/CLOSE 落在控制设备上 -> 总是成功 */
 NTSTATUS RbDispatchClo(PDEVICE_OBJECT dev, PIRP irp)

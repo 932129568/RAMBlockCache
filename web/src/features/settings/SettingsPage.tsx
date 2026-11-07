@@ -48,7 +48,7 @@ export default function SettingsPage() {
   // 并由 rbfeatctl 内建 refresh 热载，无需重启）。
   const [rbfeat, setRbfeat] = useState<{ stats: Record<string, number> | null; l2: string; excl: string; exe: string } | null>(null);
   const [rbfeatBusy, setRbfeatBusy] = useState<string | undefined>(undefined);
-  const loadRbfeat = () => {
+  const loadRbfeat = (): void => {
     fetch('/rb/rbfeat')
       .then((r) => r.json())
       .then((d) => setRbfeat({ stats: d.stats ?? null, l2: String(d.l2 ?? ''), excl: String(d.excl ?? ''), exe: String(d.exe ?? '') }))
@@ -70,8 +70,8 @@ export default function SettingsPage() {
       .catch((e) => toast('danger', 'RB2 切换请求失败', String(e)))
       .finally(() => setRbfeatBusy(undefined));
   };
-  const RB2_BITS: Record<string, number> = { PREFETCH: 1, HOT: 2, ETW: 32, THERMAL: 64 };
-  const flagOn = (k: 'PREFETCH' | 'HOT' | 'THERMAL' | 'ETW') => {
+  const RB2_BITS: Record<string, number> = { PREFETCH: 1, HOT: 2, ETW: 32, THERMAL: 64, WBCOAL: 8 };
+  const flagOn = (k: 'PREFETCH' | 'HOT' | 'THERMAL' | 'ETW' | 'WBCOAL') => {
     const f = rbfeat?.stats?.flags;
     const bit = RB2_BITS[k] ?? 0;
     return typeof f === 'number' ? (f & bit) !== 0 : false;
@@ -363,7 +363,7 @@ export default function SettingsPage() {
             </Group>
 
             <Group title="特性开关（RB2 · Features\Flags · 热生效）">
-              {([['PREFETCH', '预取（读 miss 窗口回填）'], ['HOT', '热区预热（Prewarm/衰减）'], ['THERMAL', '温度护栏（过热暂停预取）'], ['ETW', 'ETW 遥测']] as const).map(([k, label]) => (
+              {([['PREFETCH', '预取（读 miss 窗口回填）'], ['HOT', '热区预热（Prewarm/衰减）'], ['THERMAL', '温度护栏（过热暂停预取）'], ['ETW', 'ETW 遥测'], ['WBCOAL', '回写合写节奏（写合并/限速 · 已接线 · 默认关）']] as const).map(([k, label]) => (
                 <label key={k} className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
                   <span>{label} · {k}</span>
                   <Toggle
@@ -374,9 +374,11 @@ export default function SettingsPage() {
                   />
                 </label>
               ))}
-              <ReadOnly label="WBCOAL（bit8）" value="已封禁" note="红线：M2 预留未接线；CLI 与 Web 双层拦截" />
-              <ReadOnly label="L2 容器" value={(rbfeat?.l2 ?? '').split(String.fromCharCode(13, 10))[0] || '（不可达）'} note="启用走 CLI：rbfeatctl l2 enable <X:> <GB>（需卷/几何条件满足）" />
-              <ReadOnly label="排除集" value={(rbfeat?.excl ?? '').replace(/\s+/g, ' ').slice(0, 60) || '（空）'} note="完整管理走 CLI：rbfeatctl excl" />
+              <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
+                WBCOAL 与 L2 互斥（红线：两者不可同为 1）——CLI 与本页都强制；切换冲突时 CLI 返回 [blocked] 并如实显示。
+              </p>
+              <L2Manager rbfeat={rbfeat} reload={loadRbfeat} />
+              <ExclManager rbfeat={rbfeat} reload={loadRbfeat} />
               {rbfeat?.exe !== 'found' && (
                 <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)' }}>
                   rbfeatctl.exe 不可达（payload 布局异常？）——本区开关停用，功能本体不受影响。
@@ -496,6 +498,80 @@ function Select({
         ))}
       </select>
     </label>
+  );
+}
+
+type RbfeatState = { stats: Record<string, number> | null; l2: string; excl: string; exe: string } | null;
+
+function L2Manager({ rbfeat, reload }: { rbfeat: RbfeatState; reload: () => void }) {
+  const [letter, setLetter] = useState('');
+  const [gb, setGb] = useState(16);
+  const [busy, setBusy] = useState(false);
+  const l2Line = (rbfeat?.l2 ?? '').split(String.fromCharCode(13, 10)).filter(Boolean)[0] || '（不可达）';
+  const call = (op: string) => {
+    setBusy(true);
+    fetch('/rb/l2', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op, letter, gb }) })
+      .then((r) => r.json())
+      .then((d) => { if (d.code !== 0) toast('danger', `L2 ${op} 失败`, String(d.out ?? '').slice(0, 160)); reload(); })
+      .catch((e) => toast('danger', 'L2 请求失败', String(e)))
+      .finally(() => { setBusy(false); reload(); });
+  };
+  return (
+    <>
+      <div className="flex items-baseline justify-between gap-3 text-xs">
+        <span style={{ color: 'var(--rbc-text-secondary)' }}>L2 容器状态</span>
+        <span className="font-mono" style={{ color: 'var(--rbc-text-tertiary)' }}>{l2Line}</span>
+      </div>
+      <div className="flex items-center gap-2 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
+        <span>容器卷</span>
+        <input className="rbc-input" style={{ width: 64 }} maxLength={1} value={letter}
+               onChange={(e) => setLetter(e.target.value.toUpperCase().replace(/[^A-Z]/g, ''))} placeholder="X" />
+        <span>容量 GB</span>
+        <input type="number" className="rbc-input" style={{ width: 88 }} min={1} max={512} value={gb}
+               onChange={(e) => setGb(Math.max(1, Math.min(512, Number(e.target.value) || 1)))} />
+        <button type="button" className="rbc-input" disabled={busy || !letter || rbfeat?.exe !== 'found'}
+                onClick={() => call('enable')}>启用</button>
+        <button type="button" className="rbc-input" disabled={busy || rbfeat?.exe !== 'found'}
+                onClick={() => call('disable')}>停用</button>
+      </div>
+      <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
+        容器 = 卷上文件（RAMBoostL2.idx/.dat，非破坏性创建）。约束：仅 4K 块几何可用（记录粒度 64KB）；单加速卷；与 WBCOAL 互斥（CLI 强制）。
+      </p>
+    </>
+  );
+}
+
+function ExclManager({ rbfeat, reload }: { rbfeat: RbfeatState; reload: () => void }) {
+  const [name, setName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const call = (op: string, extra?: Record<string, unknown>) => {
+    setBusy(true);
+    fetch('/rb/excl', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op, name, ...extra }) })
+      .then((r) => r.json())
+      .then((d) => { if (d.code !== 0) toast('danger', `排除集 ${op} 失败`, String(d.out ?? '').slice(0, 160)); reload(); })
+      .catch((e) => toast('danger', '排除集请求失败', String(e)))
+      .finally(() => setBusy(false));
+  };
+  const useDef = /UseDefaultExcl=(1)/.test(rbfeat?.excl ?? '');
+  const entries = (rbfeat?.excl ?? '').split(String.fromCharCode(13, 10)).filter((l) => /^  \S/.test(l)).map((l) => l.trim());
+  return (
+    <>
+      <div className="flex items-baseline justify-between gap-3 text-xs">
+        <span style={{ color: 'var(--rbc-text-secondary)' }}>内置排除（defrag/dfrgui/wbengine/vssadmin/msmpeng）</span>
+        <Toggle checked={useDef} disabled={busy || rbfeat?.exe !== 'found'}
+                onChange={(b) => call('def', { on: b })} ariaLabel="UseDefaultExcl" />
+      </div>
+      <div className="flex items-center gap-2 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
+        <span>进程排除</span>
+        <input className="rbc-input" style={{ width: 180 }} value={name} maxLength={60}
+               onChange={(e) => setName(e.target.value)} placeholder="如 Weixin.exe" />
+        <button type="button" className="rbc-input" disabled={busy || !name.trim() || rbfeat?.exe !== 'found'}
+                onClick={() => { call('add'); setName(''); }}>加入</button>
+      </div>
+      <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
+        当前自定义排除：{entries.length ? entries.join('、') : '（空）'}——命中进程的读写直落盘不进缓存（AdmitRejects 可在诊断页观测）。
+      </p>
+    </>
   );
 }
 

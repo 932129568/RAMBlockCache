@@ -57,7 +57,7 @@ $clCommon = @(
     "/Fo$obj\"
 )
 
-$srcs = @("rbdriver.c","rbattach.c","rbio.c","rbctl.c","rb_stub.c","rbfeat.c",
+$srcs = @("rbdriver.c","rbdev.c","rbattach.c","rbio.c","rbctl.c","rb_stub.c","rbfeat.c",
           "rbpools.c","rbpref.c","rbhot.c","rbL2.c","rbwback.c","rbio_ports.c",
           "rbthermal.c","rbetw.c","rbrebuild.c","..\core\cache.c","..\core\read_plan.c")
 

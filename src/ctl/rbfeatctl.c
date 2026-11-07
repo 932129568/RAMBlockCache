@@ -164,7 +164,7 @@ int main(int argc, char **argv)
     if (argc < 2) {
         printf("usage: stats [-json] | flags on|off <NAME> | refresh | shrink <pct> | snapshot\n");
         printf("       l2 status | l2 enable <X:> <GB> | l2 disable\n");
-        printf("       pref on|off [<Letter>] | excl | vols | watch <sec>\n");
+        printf("       pref on|off [<Letter>] | excl [add <img>|del <img>|def on|off] | vols | watch <sec>\n");
         printf("       -d <devpath>   (control device, default \\\\.\\RAMBlockCache)\n");
         return 2;   /* [F2] 用法错误=2（对齐 ramboostctl.c [B7] 约定：机器可读） */
     }
@@ -183,10 +183,20 @@ int main(int argc, char **argv)
         if (!bit) { fprintf(stderr, "unknown feature\n"); return 2; }
         /* V10.3.1 -> 2026-10-15: L2 已接线（core evict_victim -> RbFeatOnEvict，
          * RB_WIRED_L2_ON_EVICT=1），可启用；WBCOAL（bit 8）仍为 M2 预留未接线，保持拦截。 */
-        if (!strcmp(argv[2], "on") && bit == 8) {
-            fprintf(stderr, "[blocked] WBCOAL reserved for M2 (write cache), not wired yet; keep OFF.\n");
-            fprintf(stderr, "           L2 is wired and enabled via 'l2 enable' or 'flags on L2'.\n");
-            return 4;
+        /* [101] WBCOAL 已接线（RB_WIRED_WBCOAL=1，默认仍 OFF=Flags bit8 未置位）。
+         * 红线保留：L2 与 WBCOAL 不可同为 1 —— 双向强制互斥。 */
+        if (!strcmp(argv[2], "on")) {
+            ULONG cur = FeatDW("Flags", 0);
+            if (bit == 8 && (cur & 4)) {
+                fprintf(stderr, "[blocked] L2 is ON: L2 and WBCOAL must not both be 1 (red line).\n");
+                fprintf(stderr, "           Turn L2 off first: flags off L2 / l2 disable.\n");
+                return 4;
+            }
+            if (bit == 4 && (cur & 8)) {
+                fprintf(stderr, "[blocked] WBCOAL is ON: L2 and WBCOAL must not both be 1 (red line).\n");
+                fprintf(stderr, "           Turn WBCOAL off first: flags off WBCOAL.\n");
+                return 4;
+            }
         }
         FlagsReg(!strcmp(argv[2], "on") ? bit : 0,
                  !strcmp(argv[2], "on") ? 0   : bit);
@@ -291,6 +301,66 @@ int main(int argc, char **argv)
         }
         Xfer(d, RB2_IOCTL_REFRESH, NULL, 0, NULL, 0, NULL);
         printf("refresh sent\n");
+    } else if (!strcmp(argv[1], "excl") && argc >= 3 && (!strcmp(argv[2], "add") || !strcmp(argv[2], "del") || !strcmp(argv[2], "def"))) {
+        /* [101] 排除集管理：excl add <img> / excl del <img> / excl def on|off
+         * 原生注册表 REG_MULTI_SZ 操作（绕开 reg.exe 0x5C 语义陷阱，O-6 同源）。
+         * 写后 REFRESH 热载（rbfeat Rb2ReloadFlags 消费 ProcessExclude）。 */
+        HKEY k; const char fk[] = "SYSTEM\\CurrentControlSet\\Services\\RAMBlockCache\\Features";
+        LONG rr;
+        if (!strcmp(argv[2], "def")) {
+            int on = !strcmp(argv[3], "on");
+            rr = RegOpenKeyExA(HKEY_LOCAL_MACHINE, fk, 0, KEY_SET_VALUE, &k);
+            if (rr != ERROR_SUCCESS) { fprintf(stderr, "registry open failed %ld\n", rr); return 1; }
+            {
+                DWORD v = on ? 1u : 0u;
+                rr = RegSetValueExA(k, "UseDefaultExcl", 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+                RegCloseKey(k);
+                if (rr != ERROR_SUCCESS) { fprintf(stderr, "write failed %ld\n", rr); return 1; }
+                printf("UseDefaultExcl=%u\n", (unsigned)v);
+            }
+        } else {
+            const char *nm = argv[3];
+            DWORD ty = 0, sz = 0; char *buf = NULL; DWORD n = 0;
+            if (strlen(nm) == 0 || strlen(nm) > 60) { fprintf(stderr, "bad name length\n"); return 2; }
+            rr = RegOpenKeyExA(HKEY_LOCAL_MACHINE, fk, 0, KEY_READ | KEY_SET_VALUE, &k);
+            if (rr != ERROR_SUCCESS) { fprintf(stderr, "registry open failed %ld\n", rr); return 1; }
+            RegQueryValueExA(k, "ProcessExclude", 0, &ty, NULL, &sz);
+            if (ty == REG_MULTI_SZ && sz >= 4) {
+                buf = (char *)calloc(1, sz + 128);
+                if (buf && RegQueryValueExA(k, "ProcessExclude", 0, &ty, (BYTE *)buf, &sz) == ERROR_SUCCESS) {
+                    char *p = buf; while (*p) { n++; p += strlen(p) + 1; }
+                } else { free(buf); buf = NULL; }
+            }
+            {
+                char out[4096]; DWORD off = 0; DWORD w = 0; DWORD q;
+                char *p = buf;
+                for (q = 0; q < n; q++) {
+                    DWORD L2 = (DWORD)strlen(p);
+                    int keep = 1;
+                    if (!_stricmp(p, nm)) { keep = (strcmp(argv[2], "del") == 0) ? 0 : 1; if (keep) w = 1; }
+                    if (keep && off + L2 + 1 < sizeof(out)) { memcpy(out + off, p, L2 + 1); off += L2 + 1; }
+                    p += L2 + 1;
+                }
+                if (!strcmp(argv[2], "add")) {
+                    for (q = 0; q < off;) {
+                        if (!_stricmp(out + q, nm)) { w = 1; break; }
+                        q += strlen(out + q) + 1;
+                    }
+                    if (!w && off + (DWORD)strlen(nm) + 1 < sizeof(out)) { memcpy(out + off, nm, strlen(nm) + 1); off += (DWORD)strlen(nm) + 1; }
+                }
+                out[off] = 0; off++;
+                rr = RegSetValueExA(k, "ProcessExclude", 0, REG_MULTI_SZ, (BYTE *)out, off);
+                RegCloseKey(k);
+                if (rr != ERROR_SUCCESS) { fprintf(stderr, "write failed %ld\n", rr); if (buf) free(buf); return 1; }
+                printf("ProcessExclude updated\n");
+            }
+            if (buf) free(buf);
+        }
+        {
+            HANDLE d = OpenDev(NULL);
+            if (d != INVALID_HANDLE_VALUE) { Xfer(d, RB2_IOCTL_REFRESH, NULL, 0, NULL, 0, NULL); CloseHandle(d); printf("refresh sent\n"); }
+        }
+        return 0;
     } else if (!strcmp(argv[1], "excl")) {
         /* excl：打印 Features\ProcessExclude + UseDefaultExcl + stats 的 AdmitRejects */
         HKEY k; DWORD useDef = FeatDW("UseDefaultExcl", 1);

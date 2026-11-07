@@ -2687,6 +2687,12 @@ void rb_stream_release_io(rb_stream *s)
 { if(s)InterlockedDecrement(&s->io_users); }
 /* Called after an externally-driven (zone-parallel) flush completes:
  * clear the need-flush flag only if no dirty data remains. */
+/* [101] 流身份访问器（file_id = 建流时传入的 ext 指针）。 */
+rb_u64 rb_stream_file_id(rb_stream *s)
+{
+    return s ? s->file_id : 0;
+}
+
 /* [100 §1] 直写路径漏计修复：见 cache.h 声明。仅统计面。 */
 void rb_engine_note_direct_write(rb_engine *eng, rb_u64 len)
 {

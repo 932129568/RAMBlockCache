@@ -1,13 +1,13 @@
 /* ============================================================================
  * rbwback.c — WB 合写后台线程
  *
- * 【当前状态：未接线】RbWbInit/RbWbStop 目前没有任何调用方，本模块的线程
- * 不会创建，WB-1 修复的计数槽(10/11/12)恒为 0。这是有意的：WBCOAL 特性
- * 维持 OFF（见 audit V10.3.4，L2 无数据来源）。
- *
- * 接线方法：在 RbFeatInit() 成功路径尾部调用 RbWbInit()，
- *          在 RbFeatShutdown() 开头调用 RbWbStop()。
- * 在接线之前，不要把本模块的计数当作真实遥测。
+ * 【已接线：[101] 2026-11-08】RbWbInit 于 RbFeatInit 成功路径尾部调用、
+ * RbWbStop 于 RbFeatShutdown 最前调用（RB_WIRED_WBCOAL=1，check_repo 守卫）。
+ * 数据面接线：RbFlushSubmit（rbio.c）在 RbWbActive() 时把 zone 作业改投本线程，
+ * 按每卷 MaxWriteIops 节奏再交回 flusher 池——FlushJobs 计数贯穿延迟路径，
+ * FlushDone 屏障语义不变（延迟作业完成后才放行快照 io 引用释放）。
+ * 运行期总开关仍 = Features\Flags bit8（默认 OFF；直写态零消费）。
+ * 红线：L2 与 WBCOAL 的 Flags 位不可同为 1（rbfeatctl flags 强制）。
  * ============================================================================ */
 /* rbwback.c —— 写合并/限速调度 v1（默认 OFF）。
  * rbio 把 zone 回写从"立即"改为"投递"，本模块按每卷 MaxWriteIops 节奏调 FlushFn。
@@ -27,7 +27,14 @@ static LONG s_Stop, s_Run; static ULONG64 s_Last;
 /* [P3] 回写线程对象引用（RbWbInit 取、RbWbStop 释放；旧代码无此状态=线程不可等待） */
 static PVOID s_Thread;
 
-BOOLEAN RbWbActive(PVOID Ext) { UNREFERENCED_PARAMETER(Ext); return ((g_Rb2Flags & RB2F_WBCOAL) && !s_Stop); }
+static LONG s_WbDead = 0;             /* [101] 线程创建失败 → 永久直投兜底 */
+VOID RbWbMarkDead(VOID) { InterlockedExchange(&s_WbDead, 1); }
+BOOLEAN RbWbActive(PVOID Ext)
+{
+    UNREFERENCED_PARAMETER(Ext);
+    if (s_WbDead) return FALSE;       /* 线程缺席：直投，绝不能让作业滞留 */
+    return ((g_Rb2Flags & RB2F_WBCOAL) && !s_Stop);
+}
 VOID RbWbSubmit(PVOID Ext, ULONG64 lba, ULONG len, VOID (*Fn)(PVOID), PVOID Ctx)
 {
     RB2_WB *w; KIRQL irql;
@@ -78,7 +85,7 @@ static VOID RbWbThread(PVOID Ctx)
 }
 NTSTATUS RbWbInit(VOID)
 {
-    s_Stop = 0; s_Run = 0;            /* [BSOD-fix] 幂等起点 */
+    s_Stop = 0; s_Run = 0; s_Last = 0; s_WbDead = 0;   /* [BSOD-fix]+[101] 幂等起点（含陈旧节拍戳清零） */
     InitializeListHead(&s_Q); KeInitializeSpinLock(&s_Lk);
     KeInitializeSemaphore(&s_Sem, 0, 0x7FFFFFFF);
     /* [P3] 保留线程对象引用：旧代码 PsCreateSystemThread 后既不引用也不关闭句柄

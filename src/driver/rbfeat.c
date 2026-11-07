@@ -327,6 +327,13 @@ NTSTATUS RbFeatInit(VOID)
 {
     HANDLE h; OBJECT_ATTRIBUTES oa; UNICODE_STRING u; NTSTATUS st;
     if (InterlockedCompareExchange(&s_Init, 1, 0)) return STATUS_SUCCESS;
+#if RB_WIRED_WBCOAL
+    /* [101] WBCOAL 后台线程随特性层起停（线程创建失败不阻断特性层——
+     * 回写退回 RbFlushSubmit 直投路径，RbWbActive 仍按 Flags 位决策；线程缺席时
+     * RbWbSubmit 的 Fn(Ctx) 直调兜底会破坏节奏——改为 RbWbInit 失败时置
+     * s_WbDead，RbFlushSubmit 据此永久走直投。见 rbwback.c。 */
+    if (!NT_SUCCESS(RbWbInit())) RbWbMarkDead();
+#endif
     /* [FIX R2-M3] 重试前必须解闩：上次 ObReference 失败回滚路径置过 s_Stop=1
      * 通知旧 Rb2Tick 退出，不复位则新 Rb2Tick 首轮（≤1s）即自退——init 假成功、
      * L2 落盘/热区/温控静默停摆。对照 Rb2PoolInit 的池闩解闩，两处闩语义对齐。
@@ -365,10 +372,16 @@ NTSTATUS RbFeatInit(VOID)
         return st;
     }
     s_TickH = h;
+#if RB_WIRED_WBCOAL
+    (void)RbWbInit();                     /* [101] Init 成功路径尾部接线（幂等起点；失败已置 s_WbDead，直投兜底） */
+#endif
     return STATUS_SUCCESS;
 }
 NTSTATUS RbFeatShutdown(VOID)
 {
+#if RB_WIRED_WBCOAL
+    RbWbStop();                           /* [101] 最先停 WBCOAL（PASSIVE；排空/直投残留队列，60s 兜底） */
+#endif
     InterlockedExchange(&s_Stop, 1);
     /* [P1-5] join Rb2Tick（1s 唤醒节奏，正常应 1s 内退出），再关句柄。
      * [FIX R2-W6] join 超时结果不再吞掉：卡在 L2 盘 I/O 的 Rb2Tick 仍在途，

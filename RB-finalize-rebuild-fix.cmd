@@ -10,6 +10,7 @@ rem  Log: C:\ProgramData\rb-deploy\finalize-rebuild-fix.log
 rem  AFTER UAC: lead runs sync_setup_hash.ps1 -RequireSetupChanged
 rem             then the user reboots ONCE and LOGS ON interactively
 rem             (logon_disarm must clear FilterArmed).
+rem  If System32 was locked, a queued replace may need a SECOND reboot.
 rem  DO NOT re-run any full-chain finalize wrapper afterwards.
 rem ============================================================
 net session >nul 2>&1

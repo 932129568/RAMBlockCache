@@ -34,7 +34,11 @@ TOL = 2.0
 STATVAL_KEYS = ["engine_bs", "rebuild_count", "rebuild_status",
                 "rebuild_in_progress", "rebuild_utc"]
 CTL_SOURCES = ["ramboostctl.c", "bench_policy.c", "bench_policy.h", "rb_proto.h"]
-FEAT_SOURCES = ["rbfeatctl.c"]
+# rbfeatctl.c:30 declares a hand-maintained RB_STATS2 mirror that MUST stay in
+# lockstep with src/driver/rb_common2.h. That header changed 2026-11-07 12:25;
+# an older rbfeatctl.exe would ship a stale control-plane copy. Relative path
+# is resolved below, so this also works from a CI checkout.
+FEAT_SOURCES = ["rbfeatctl.c", "../driver/rb_common2.h"]
 
 fails = []
 infos = []
@@ -56,12 +60,12 @@ def check(exe_name, sources, keys):
     try:
         exe_m = exe.stat().st_mtime
         for s in sources:
-            p = CTL / s
+            p = (CTL / s).resolve()
             if not p.is_file():
                 continue
             if exe_m < p.stat().st_mtime - TOL:
-                fails.append("%s is older than src/ctl/%s -- rebuild the CLI" %
-                             (exe_name, s))
+                fails.append("%s is older than %s -- rebuild the CLI" %
+                             (exe_name, p.relative_to(ROOT).as_posix()))
     except OSError as e:
         fails.append("%s mtime read failed: %s" % (exe_name, e))
 

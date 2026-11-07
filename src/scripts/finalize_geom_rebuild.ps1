@@ -92,6 +92,16 @@ $rebuildC    = Join-Path $root 'src\driver\rbrebuild.c'
 $payloadCtl  = Join-Path $root 'src\ui\installer\RAMBlockCache.Setup\Assets\payload\ramboostctl.exe'
 $gate8       = Join-Path $PSScriptRoot 'check_stats_contract.py'
 $gate9       = Join-Path $PSScriptRoot 'check_ctl_freshness.py'
+# [qa-s2-preflight 2026-11-07] additional payload-contract inputs.
+$ctlFeatExe  = Join-Path $root 'src\ctl\rbfeatctl.exe'
+$ctlFeatSrc  = Join-Path $root 'src\ctl\rbfeatctl.c'
+$rbCommon2   = Join-Path $root 'src\driver\rb_common2.h'
+$decodeTs    = Join-Path $root 'web\bridge\server\proto-decode.ts'
+$payloadFeat = Join-Path $root 'src\ui\installer\RAMBlockCache.Setup\Assets\payload\rbfeatctl.exe'
+$wcZip       = Join-Path $root 'src\ui\installer\RAMBlockCache.Setup\Assets\payload\webconsole.zip'
+$ctlZip      = Join-Path $root 'src\ui\installer\RAMBlockCache.Setup\Assets\payload\controller.zip'
+$tarExe      = Join-Path $env:WINDIR 'System32\tar.exe'
+$statsFields = @('EngineBlockSize','GeometryRebuildCount','GeometryRebuildLastStatus','GeometryRebuildInProgress','LastGeometryRebuildUtc')
 
 # Historical forbidden-resurrection payloads: DEFENCE IN DEPTH ONLY.
 # The authoritative forbidden set is built DYNAMICALLY below from the Setup
@@ -151,7 +161,8 @@ L ('=== finalize_geom_rebuild start pid=' + $PID + ' ===')
 foreach ($f in @($sigtool, $psExe, $verExe, $cacheC, $distSys, $setup,
                   $buildDriver, $gate, $syncAnchors, $buildSetup, $deploy,
                   $deployPs, $verifySig, $readme, $ctlExe, $ctlSrc, $ctlBench,
-                  $ctlProto, $rebuildC, $gate8, $gate9)) {
+                  $ctlProto, $rebuildC, $gate8, $gate9, $ctlFeatExe,
+                  $ctlFeatSrc, $rbCommon2, $decodeTs, $tarExe)) {
     if (-not (Test-Path -LiteralPath $f)) { Abort ('MISSING: ' + $f) }
 }
 Set-Location -LiteralPath $root
@@ -180,6 +191,25 @@ foreach ($s in @($ctlSrc, $ctlBench, $ctlProto)) {
     }
 }
 L ('[1] CLI fresh + all 5 statval keys OK sha=' + (HashOf $ctlExe))
+
+# rbfeatctl.exe carries the RB_STATS2 hand mirror (rbfeatctl.c:30), which must
+# track src\driver\rb_common2.h (changed 11-07 12:25). Gate9 guards it too.
+$featMtime = (Get-Item -LiteralPath $ctlFeatExe).LastWriteTimeUtc
+foreach ($s in @($ctlFeatSrc, $rbCommon2)) {
+    $sm2 = (Get-Item -LiteralPath $s).LastWriteTimeUtc
+    if ($featMtime -lt $sm2) {
+        Abort ('FEAT CLI NOT FRESH: rbfeatctl.exe (' + $featMtime.ToString('o') + ') predates ' + $s + ' (' + $sm2.ToString('o') + '). Rebuild the CLI pair.')
+    }
+}
+# web/bridge/server/proto-decode.ts is the source copied into webconsole.zip
+# by build_setup.ps1:69. Prove the INPUT carries the five fields before packing.
+$decodeText = [IO.File]::ReadAllText($decodeTs)
+foreach ($k in $statsFields) {
+    if ($decodeText -notmatch [regex]::Escape($k)) {
+        Abort ('TS DECODER DRIFT: web/bridge/server/proto-decode.ts missing ' + $k + ' (66 TinyLFU white-screen class)')
+    }
+}
+L ('[1] CLI pair fresh + 5 statval keys + TS decoder 5 fields OK')
 
 # (1c) The rebuild subject MUST be in the driver compile list. Without
 #      rbrebuild.c the signed sys would silently lack the whole feature.
@@ -311,6 +341,32 @@ foreach ($k in $statvalKeys) {
 }
 L ('[6] Setup payload CLI matches fresh src CLI ' + $srcCliHash)
 
+# (6c) [qa-s2-preflight WARN-1] The other three payload inputs were ALSO stale
+#      before step 6 (rbfeatctl.exe / controller.zip / webconsole.zip), and
+#      build_setup.ps1 overwrites them with -Force. Prove the overwrite really
+#      happened instead of assuming it.
+if (-not (Test-Path -LiteralPath $payloadFeat)) { Abort ('SETUP PAYLOAD FEAT CLI MISSING: ' + $payloadFeat) }
+if ((HashOf $payloadFeat) -ne (HashOf $ctlFeatExe)) { Abort 'SETUP PAYLOAD rbfeatctl.exe != src\ctl\rbfeatctl.exe' }
+foreach ($z in @($wcZip, $ctlZip)) {
+    if (-not (Test-Path -LiteralPath $z)) { Abort ('PAYLOAD ZIP MISSING AFTER REBUILD: ' + $z) }
+    if ((Get-Item -LiteralPath $z).LastWriteTimeUtc -lt $setupStart.AddSeconds(-30)) {
+        Abort ('PAYLOAD ZIP IS NOT FRESH after build_setup: ' + $z)
+    }
+}
+L '[6] payload rbfeatctl.exe + both zips refreshed OK'
+
+# (6d) The shipped bridge decoder MUST carry the five RB_STATS fields. The
+#      11-06 webconsole.zip held an 8217 B proto-decode.ts with NONE of them;
+#      S3 GET_STATS on a target machine would silently see zero. tar.exe is
+#      used instead of Add-Type/ZipFile (Add-Type is blocked on this host).
+$rZip = Invoke-Step -Tag '[6] webconsole decoder probe' -Exe $tarExe -ArgList @('-xOf', $wcZip, 'bridge/server/proto-decode.ts')
+if ($rZip.ExitCode -ne 0) { Abort ('WEBCONSOLE DECODER PROBE FAILED exit=' + $rZip.ExitCode) }
+$zipText = ($rZip.Output | ForEach-Object { [string]$_ }) -join "`n"
+foreach ($k in $statsFields) {
+    if (-not $zipText.Contains($k)) { Abort ('WEBCONSOLE ZIP STALE: bridge/server/proto-decode.ts missing ' + $k) }
+}
+L ('[6] webconsole.zip decoder carries all 5 RB_STATS fields (' + $zipText.Length + ' chars probed)')
+
 # ---- 7) sign Setup: FOUR hash assertions --------------------------------
 # (a) dist unsigned baseline
 if ($expectSetup -in $forbiddenSetup) { Abort 'UNSIGNED SETUP BASELINE IS A FORBIDDEN STALE HASH' }
@@ -360,13 +416,23 @@ if ($g8.ExitCode -ne 0 -or -not $g8TextOk) { Abort ('POST-DEPLOY GATE5 FAILED ex
 L '[8] post-deploy gate5 PASS (three anchors still consistent)'
 
 # ---- 9) ledger (best effort) then marker LAST ---------------------------
+# [qa-s2-preflight BLOCKER-2] This append MUST be FATAL. sync_setup_hash.ps1
+# cross-checks the LAST FINAL_SETUP_SHA256 against the new dist Setup with a
+# hard exit 1. A silent append failure would leave the previous generation's
+# hash in the ledger -> the post-UAC doc backfill aborts -> section 7 of
+# verify_final_reboot.ps1 gives a deterministic false FAIL. The elevated
+# process owns the ACL on batch-hashes.txt, so failure here is a real defect.
 try {
     Add-Content -LiteralPath $hashLedger -Value ('FINAL_SETUP_SHA256=' + $copyBackHash) -ErrorAction Stop
     Add-Content -LiteralPath $hashLedger -Value ('FINAL_SYS_SHA256=' + $sysHash) -ErrorAction Stop
-    L ('[9] hash ledger appended ' + $hashLedger)
 } catch {
-    L ('[warn] hash ledger append failed (non-fatal; dist remains authoritative): ' + $_.Exception.Message)
+    Abort ('HASH LEDGER APPEND FAILED (fatal: sync_setup_hash.ps1 would mis-compare): ' + $_.Exception.Message)
 }
+$lastLedger = @(Get-Content -LiteralPath $hashLedger | Where-Object { $_ -match '^FINAL_SETUP_SHA256=' } | Select-Object -Last 1)
+if ($lastLedger.Count -ne 1 -or (($lastLedger[0] -split '=', 2)[1]).Trim().ToLower() -ne $copyBackHash) {
+    Abort 'HASH LEDGER READ-BACK MISMATCH (FINAL_SETUP_SHA256 != signed Setup)'
+}
+L ('[9] hash ledger appended + read-back OK ' + $hashLedger)
 
 try {
     $markerText = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture)

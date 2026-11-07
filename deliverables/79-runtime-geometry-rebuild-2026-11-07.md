@@ -129,7 +129,7 @@ QA 在 78 号 §10 指出 B1：**若 `RbEngineGeometry()` 只存在于驱动内�
 
 1. `src/ctl/rb_proto.h:208` 前追加四个字段（末尾纯追加、不升 ProtocolVersion）。
 2. `src/driver/rbctl.c:41` `RbFillStats()` 填充：`EngineBlockSize` 读 `g_Rb.Engine ? rb_engine_block_size(g_Rb.Engine) : 0`；其余三个读新增的 `g_Rb` 状态。
-3. `src/ctl/ramboostctl.c:1969-1985` `statval` 白名单加 `engine_bs` / `rebuild_count` / `rebuild_status` / `rebuild_utc`，并同步 `:1935` 的 usage 文本与错误提示字段列表。
+3. `src/ctl/ramboostctl.c:1969-1985` `statval` 白名单加 `engine_bs` / `rebuild_count` / `rebuild_status` / `rebuild_in_progress` / `rebuild_utc`（5 键，与 Gate8 `STATVAL_KEYS` 一致），并同步 `:1935` 的 usage 文本与错误提示字段列表。
 4. `web/bridge/server/proto-decode.ts:49-88` `decodeStats` 加**分级长度守卫**：4 个 u32 各自 `p.length>=off+4` 才读，`LastGeometryRebuildUtc`（u64@1296）用 `p.length>=1304` 才 `readU64(p,1296)`；不足一律填 0，绝不抛 `RangeError`（66 号白屏同款防线）。~~`p.length>=1284`~~ **【83 号修订 2026-11-07：正式作废**——1284 是第二个字段 `GeometryRebuildCount` 的偏移，照抄会读错；实算值为 `EngineBlockSize@1280 / GeometryRebuildCount@1284 / GeometryRebuildLastStatus@1288 / GeometryRebuildInProgress@1292 / LastGeometryRebuildUtc@1296，`sizeof(RB_STATS)=1304`（`check_proto_sync.py --strict` Pack=8 实算）。**」**
 5. `web/src/protocol/types.ts:49` `RbStats` 接口 + `web/src/bridge/http-transport.ts` 的 `statsSchema` 同步（新增字段设 `.default(0)`，与 TinyLFU 修复同款）；`web/src/state/stats-history.test.ts` 夹具补五字段零值。
 6. C# 三副本同步：`src/ui/controller/RAMBlockCache.Controller/Models/Models.cs`、`.../Services/DriverService.cs`、`src/ui/wpf/Models/RbProto.cs`；`src/ctl/ramboostctl.c:1969-1985` `statval` 白名单加 5 键并同步 `:1935` usage。

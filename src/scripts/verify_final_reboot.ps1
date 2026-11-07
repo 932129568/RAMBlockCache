@@ -19,7 +19,14 @@
 #       current rbattach.c and is conditionally emitted (only when
 #       RbIsBootCriticalPdo hits). Match by TEXT, not line number, and treat it
 #       as a conditional INFO gate instead of a hard FAIL. The hard evidence
-#       for D: auto-resume remains [562] + [1076] + D.Attached=1.
+#       for D: auto-resume remains "resume list loaded" + "volume attached"
+#       + D.Attached=1.
+#   X4 [S2 2026-11-07, qa-s2-preflight]: EVERY "[NNN]" tag is a compile-time
+#       __LINE__ value (rbdriver.c:78-100 RbLog stores Src=__LINE__; call sites
+#       pass __LINE__). The 11-07 driver rebuild moves "resume list loaded"
+#       562 -> 676 and "volume attached" 1076 -> 1202 (rbattach.c). Pinning the
+#       old numbers would produce TWO deterministic false FAILs after the S2
+#       reboot. Match '[<digits>] TEXT' instead of a literal line number.
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 # [2026-11-06 23:2x, lead] DYNAMIC sys baseline.
@@ -61,7 +68,7 @@ if ($elapsed.TotalSeconds -lt 60) {
     W 'sampling too early' ("only " + [int]$elapsed.TotalSeconds + "s since boot; 64 #7.1 asks for 60-90s before sampling")
 }
 if (-not (Test-Path -LiteralPath $markerPath)) {
-    G 'reboot after finalize (marker)' $false 'finalize-utc.txt missing - the RB-finalize-final.cmd UAC did not complete'
+    G 'reboot after finalize (marker)' $false 'finalize-utc.txt missing - the RB-finalize-geom-rebuild.cmd UAC did not complete'
 } else {
     try {
         $markerText = ([IO.File]::ReadAllText($markerPath, (New-Object Text.UTF8Encoding($false)))).Trim()
@@ -141,12 +148,14 @@ if ($cand.Count -eq 0) {
         $s = [string]$_
         ($s.Length -ge 24) -and ($s.Substring(0, 24) -ge $cutStr)
     })
-    $has562 = [bool]($seg -match '\[562\] resume list loaded')
-    $has1076 = [bool]($seg -match '\[1076\] volume attached')
+    # X4: __LINE__-derived tags drift on EVERY driver rebuild (562->676,
+    # 1076->1202 for this release). Match the text after any numeric tag.
+    $hasResume = [bool]($seg -match '\[\d+\]\s+resume list loaded')
+    $hasAttach = [bool]($seg -match '\[\d+\]\s+volume attached')
     $hasBootCrit = [bool]($seg -match 'resume: boot-critical volume')
     $err = @($seg -match ' ERROR ').Count
-    G 'boot [562] resume list loaded' $has562 ("segment lines=" + $seg.Count)
-    G 'boot [1076] volume attached' $has1076 ("segment lines=" + $seg.Count)
+    G 'boot resume list loaded' $hasResume ("segment lines=" + $seg.Count)
+    G 'boot volume attached' $hasAttach ("segment lines=" + $seg.Count)
     # Do NOT report "zero ERROR" as PASS when the segment is empty.
     G 'boot segment zero ERROR' ($seg.Count -gt 0 -and $err -eq 0) ("ERROR lines=" + $err + " segment lines=" + $seg.Count)
     if ($seg.Count -eq 0) { W 'boot segment' 'no lines after boot cut; log sink may lag -- recheck in 60s' }

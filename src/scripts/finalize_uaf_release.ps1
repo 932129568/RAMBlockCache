@@ -4,6 +4,10 @@
 # aborts at step 1 and can leave a half-signed state. Kept ONLY as historical
 # evidence of the 2026-11-06 23:29 real-hardware replay. The wrapper
 # RB-finalize-uaf-release.cmd now refuses to execute outright.
+# Hard stop: this is a real guard, not just a comment. Direct invocation of
+# this .ps1 must also be a no-op (the wrapper alone is not a sufficient fence).
+Write-Host '[X] DEPRECATED 2026-11-07: use finalize_geom_rebuild.ps1. Nothing was changed.'
+exit 1
 # finalize_uaf_release.ps1 -- ONE UAC for the >4K geometry UAF fix FULL REPLAY.
 # 2026-11-06. Log: C:\ProgramData\rb-deploy\finalize-uaf-release.log
 #

@@ -20,6 +20,10 @@ $ErrorActionPreference = 'Stop'
 $ctlDir = $PSScriptRoot
 $vct    = 'C:\Program1\VC\Tools\MSVC\14.44.35207'
 $kit    = 'C:\Program Files (x86)\Windows Kits\10'
+# [88 H-9 2026-11-07] fail-closed on every hardcoded toolchain root.
+foreach ($p in @($vct, $kit)) {
+    if (-not (Test-Path -LiteralPath $p)) { throw "toolchain path missing: $p" }
+}
 $cl     = Join-Path $vct 'bin\Hostx64\x64\cl.exe'
 if (-not (Test-Path -LiteralPath $cl)) { throw "cl.exe not found: $cl" }
 

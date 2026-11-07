@@ -11,7 +11,10 @@ rem [FIX QA5-6b] test_evict_wire is NOT in the plain list: without
 rem /DRB_EVICT_HOOK_EXTERNAL it collides with cache.c's own RbFeatOnEvict stub
 rem (LNK2005/LNK1169). It is built only with the external-hook define below,
 rem and run_all.bat runs that exe. Single run-list source lives in run_all.bat.
-set TESTS=test_spinfast test_cache test_counter test_geom test_mixed test_parflush test_regress test_release test_v5 test_v6 test_bigread test_flush_many edge_v3 edge_v4 stress_v3 stress_v4 bench_readhit test_auditfix test_write_ex test_wsconc test_exclude test_flushpar test_tinylfu
+rem [88 H-10 2026-11-07] test_rebuild.c is now in the authoritative list.
+rem Its own header comment predates this addition and still says the opposite;
+rem that comment is historical text (core sources are out of batch-A scope).
+set TESTS=test_spinfast test_cache test_counter test_geom test_mixed test_parflush test_regress test_release test_v5 test_v6 test_bigread test_flush_many edge_v3 edge_v4 stress_v3 stress_v4 bench_readhit test_auditfix test_write_ex test_wsconc test_rebuild test_exclude test_flushpar test_tinylfu
 
 rem [FIX QA5-1] Judgement by cl exit code, not exe existence:
 rem a stale exe from an earlier build masked a real LNK1104 link failure as

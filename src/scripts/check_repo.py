@@ -112,7 +112,7 @@ TESTS = ["test_cache", "test_counter", "test_geom", "test_mixed",
          "test_parflush", "test_regress", "test_release", "test_v5",
          "test_v6", "test_bigread", "test_flush_many", "edge_v3", "edge_v4",
          "stress_v3", "stress_v4", "bench_readhit", "test_auditfix",
-         "test_write_ex", "test_wsconc", "test_evict_wire"]
+         "test_write_ex", "test_wsconc", "test_evict_wire", "test_rebuild"]  # [88 H-10]
 TOL = 2.0
 PRE_MODE = "--pre" in sys.argv      # run_all 入口预检：跳过 out 对
 def _pairs():

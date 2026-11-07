@@ -1,7 +1,7 @@
 ================================================================
  RAMBlockCache V10.5.0  Build 19  完整开发包
 ================================================================
-打包时间 : 2026-10-19
+打包时间 : 2026-11-07
 版本     : 10.4.1.19  (Protocol 9)
 ----------------------------------------------------------------
 版本标识说明（两轨并存，非笔误）
@@ -18,9 +18,9 @@
 ----------------------------------------------------------------
   scripts\deploy.ps1 / verify_deploy_signature.ps1 内置
   DefaultExpectedSha256 = 10fb700903caab564c028817474db3c9e1f9c7914bfbf1237e72958ddffaa981
-  该值对应本包 dist\RAMBlockCache.sys（2026-11-06 F1 TinyLFU 准入批：
-  Count-Min Sketch 频率准入 + 频率感知淘汰 + ParallelFlush 1/2/4/8/16 路，
-  160,992 字节）。（2026-10-21 更正：原文字误写 115,424；哈希才是唯一权威标识，字节数仅供人工核对）
+  该值对应本包 dist\RAMBlockCache.sys（2026-11-07 卷级免重启几何重建批：
+  79/83 号卷级重建 + 85 号审计修复，S2 全链重放真机验收 FAIL=0 / WARN=0，
+  172,768 字节）。（2026-10-21 更正：原文字误写 115,424；哈希才是唯一权威标识，字节数仅供人工核对）
   任何源码改动后必须重新编译 + 重新签名，
   新二进制哈希会变化 —— 若未同步更新该锚点，部署会"失败关闭"（拒绝部署），
   这是刻意设计，不要为了绕过而删掉校验。
@@ -42,7 +42,7 @@
     docs\     设计文档
   dist\
     RAMBlockCache.sys            已签名驱动（CN=RAMBoostFS Root，verify 通过）
-    wpf\RAMBlockCache.Controller.exe   WPF 控制台（需 .NET 8 Desktop Runtime）
+    wpf\RAMBlockCache.Controller.exe   WPF 控制台（self-contained，无需目标机安装 .NET）
   report\
     RAMBlockCache_V10.4.3_build19_专业审计.txt   本轮专业审计
 
@@ -62,8 +62,8 @@
 ----------------------------------------------------------------
 （入口口径 2026-10-21 统一 [FIX N-b]：普通用户=本页 GUI 安装器；开发者/脚本=
  src\scripts\deploy.ps1；install.ps1 / ramboostsetup.ps1=legacy 备选。）
-  dist\RAMBlockCache-Setup.exe（约 1.3MB，V10.5.0 起）
-  · 双击即运行（自动 UAC 提权；需 .NET 8 Desktop Runtime，与控制台同门槛）。
+  dist\RAMBlockCache-Setup.exe（272,872,792 B，V10.5.0 起）
+  · 双击即运行（自动 UAC 提权；安装器与控制台均 self-contained，无需目标机安装 .NET）。
   · 五页向导：欢迎 → 许可协议 → 安装位置与选项（自定义目录/快捷方式）→
     进度（提取 → 驱动签名校验 → 注册服务 → 写入配置）→ 完成（立即/稍后重启）。
   · 驱动本体固定装 System32\drivers（内核要求）；控制台/CLI/INF/README 落在
@@ -138,14 +138,14 @@
   根因：BOOT_START + 卷类 UpperFilters 中的驱动被 CI 拒载（未签名 /
   签名链无效 / testsigning 关闭），引导卷栈初始化失败。
   手动自救（进 PE / WinRE 命令提示符）：
-    1) reg load HKLM\OFFLINE C:\Windows\System32\config\SYSTEM
-    2) reg delete "HKLM\OFFLINE\ControlSet001\Services\RAMBlockCache" /f
+    1) reg load HKLM\RB_OFFLINE C:\Windows\System32\config\SYSTEM
+    2) reg delete "HKLM\RB_OFFLINE\ControlSet001\Services\RAMBlockCache" /f
        （ControlSet001 以实际当前集为准；删除服务即解除 BOOT_START 挂载）
-    3) reg delete "HKLM\OFFLINE\ControlSet001\Control\Class\
+    3) reg delete "HKLM\RB_OFFLINE\ControlSet001\Control\Class\
        {71a27cdd-812a-11d0-bec7-08002be2092f}" /v UpperFilters /f
        然后重新写入：volsnap
        （或仅从 MULTI_SZ 中摘除 RAMBlockCache，保留第三方过滤器）
-    4) reg unload HKLM\OFFLINE
+    4) reg unload HKLM\RB_OFFLINE
     5) 重启
   一键版：offline_rollback.cmd 已随包安装在产品目录（与 README.txt 同目录）。
     在 WinRE 命令提示符下进入该盘符目录运行它

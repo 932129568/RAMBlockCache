@@ -1,4 +1,6 @@
 ﻿# verify_install.ps1 - 一键安装验收（只读，不改任何状态）
+# [88 H-6 2026-11-07] 开发机专用：按仓库内 WPF 构建输出路径核对；
+#   目标机请用 verify_final_reboot.ps1（发布基线由该脚本验收）。
 # 用法（提权窗）：powershell -NoProfile -ExecutionPolicy Bypass -File src\scripts\verify_install.ps1
 # 覆盖：部署态/服务/过滤器/签名/testsigning/CLI 三通道/特性开关默认值
 
@@ -10,7 +12,7 @@ $distSys = Join-Path $root 'dist\RAMBlockCache.sys'
 $sysDest = Join-Path $env:SystemRoot 'System32\drivers\RAMBlockCache.sys'
 $ctl     = Join-Path $root 'src\ctl\ramboostctl.exe'
 $feat    = Join-Path $root 'src\ctl\rbfeatctl.exe'
-$wpf     = Join-Path $root 'src\ui\controller\RAMBlockCache.Controller\bin\Release\net8.0-windows\RAMBlockCache.Controller.exe'
+$wpf     = Join-Path $root 'src\ui\controller\RAMBlockCache.Controller\bin\Release\net10.0-windows\win-x64\publish\RAMBlockCache.Controller.exe'
 
 $pass = 0; $fail = 0
 function Ok   ([string]$m) { Write-Host "[PASS] $m" -ForegroundColor Green;  $script:pass++ }

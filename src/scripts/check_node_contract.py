@@ -12,6 +12,7 @@ Exit 0 = contract files agree; exit 1 = someone drifted the pin.
 """
 import json
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -44,6 +45,20 @@ def main():
         if marker not in setup:
             fails.append("%s: %s" % (why, marker))
 
+    # [88 H-11 2026-11-07] marker strings alone are not enough: prove the
+    # Resolve-Node27 body really COMPARES the versions.
+    m = re.search(r"function\s+Resolve-Node27\s*\{(.*?)\n\}", setup, re.S)
+    if not m:
+        fails.append("build_setup.ps1: function Resolve-Node27 not found")
+    else:
+        body = m.group(1)
+        if not re.search(r"-notlike\s+'v27\.\*'", body):
+            fails.append("Resolve-Node27 lost its v27.* node-version check")
+        if not re.search(r"-notlike\s+'12\.2\.1\*'", body):
+            fails.append("Resolve-Node27 lost its 12.2.1* npm-version check")
+        if "--version" not in body:
+            fails.append("Resolve-Node27 no longer probes --version")
+
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     if "check_node_contract.py" not in ci:
         fails.append("CI must call check_node_contract.py (guard against pin drift)")
@@ -53,6 +68,7 @@ def main():
     print("  package.json engines      : %s" % e_pkg)
     print("  package-lock.json engines : %s" % e_lock)
     print("  build_setup.ps1           : node27 resolver + npm pin + warning suppression")
+    print("  H-11 version guards       : v27.* + 12.2.1* + --version (AST-level regex)")
     if fails:
         for f in fails:
             print("[FAIL] " + f)

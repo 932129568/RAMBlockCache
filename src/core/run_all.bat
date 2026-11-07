@@ -13,7 +13,8 @@ if errorlevel 1 (
     exit /b 1
 )
 rem [FIX QA5-6] Single list source (same as build_all.bat): includes test_evict_wire.
-set TESTS=test_spinfast test_cache test_counter test_geom test_mixed test_parflush test_regress test_release test_v5 test_v6 test_bigread test_flush_many edge_v3 edge_v4 stress_v3 stress_v4 bench_readhit test_auditfix test_write_ex test_wsconc test_exclude test_evict_wire test_flushpar test_tinylfu
+rem [88 H-10 2026-11-07] test_rebuild.c added (see build_all.bat note).
+set TESTS=test_spinfast test_cache test_counter test_geom test_mixed test_parflush test_regress test_release test_v5 test_v6 test_bigread test_flush_many edge_v3 edge_v4 stress_v3 stress_v4 bench_readhit test_auditfix test_write_ex test_wsconc test_rebuild test_exclude test_evict_wire test_flushpar test_tinylfu
 
 set RUNFAIL=0
 

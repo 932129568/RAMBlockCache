@@ -126,7 +126,10 @@ catch { Write-Host ("  [warn] staging cleanup skipped (harmless): " + $_.Excepti
 # [FIX 2026-11-06] Entry MUST be bridge\server\index.ts to match webconsole.zip:
 # zip top-level = bridge/ + dist/ + node.exe, there is NO server/ directory.
 # cwd is %~dp0webconsole, so the relative path resolves to
-# <InstallDir>\webconsole\bridge\server\index.ts (same as MainWindow.xaml.cs).
+# <InstallDir>\webconsole\bridge\server\index.ts.
+# [88 L-1 2026-11-07] The old "same as MainWindow.xaml.cs" note was stale:
+# the bridge now resolves dist/ from import.meta.url, so a scheduled task's
+# default cwd no longer matters; only the entry path above must match the zip.
 $startCmd = "@echo off`r`n" +
             "rem RAMBlockCache Web Console launcher (installed by Setup)`r`n" +
             'cd /d "%~dp0webconsole"' + "`r`n" +

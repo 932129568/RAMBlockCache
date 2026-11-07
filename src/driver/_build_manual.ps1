@@ -23,6 +23,10 @@ $wdklib= Join-Path $root ".nuget\packages\microsoft.windows.wdk.x64\10.0.26100.6
 
 $cl   = Join-Path $msvc "bin\Hostx64\x64\cl.exe"
 $link = Join-Path $msvc "bin\Hostx64\x64\link.exe"
+# [88 H-9 2026-11-07] fail-closed on every hardcoded toolchain path.
+foreach ($p in @($kit, $wdkn, $wdklib)) {
+    if (-not (Test-Path -LiteralPath $p)) { throw "toolchain path missing: $p" }
+}
 if (-not (Test-Path -LiteralPath $cl))   { throw "cl.exe not found: $cl" }
 if (-not (Test-Path -LiteralPath $link)) { throw "link.exe not found: $link" }
 
@@ -62,6 +66,10 @@ try {
     }
     if ($fail -gt 0) { throw "$fail source(s) failed to compile" }
 
+    # [88 H-9 2026-11-07] link consumes $obj\*.obj; a source removed since
+    # the last build would otherwise leave a stale .obj linked into the new sys.
+    Get-ChildItem -LiteralPath $obj -Filter '*.obj' -File -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction Stop
     Write-Host "[2/2] linking RAMBlockCache.sys ..."
     & $link @(
         "/nologo","/DRIVER","/NODEFAULTLIB","/MANIFEST:NO","/SUBSYSTEM:NATIVE",

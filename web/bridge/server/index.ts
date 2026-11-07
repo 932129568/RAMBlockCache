@@ -16,6 +16,7 @@
  */
 
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { startLogSink } from './log-sink.ts';   /* [FEAT-LOGQ] 驱动日志落盘 */
 import { readFile } from 'node:fs/promises';
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';   /* [FEAT-LOGUI] 日志目录访问 */
@@ -44,7 +45,8 @@ const log = pino({ name: 'rb-bridge' });
 // 会导致插件构建成功后仍永远 503。显式 createRequire 才能真正加载 .node。
 const require = createRequire(import.meta.url);
 
-const PORT = 5199;
+// [88 B-3 2026-11-07] default 5199; env override is probe-only (isolated cwd/port test).
+const PORT = Number(process.env.RBC_BRIDGE_PORT ?? 5199);
 const HOST = '127.0.0.1';
 /** [FEAT-LOGUI] 驱动日志落盘目录（log-sink 与 /logs 路由共用同一路径） */
 const LOG_DIR = path.join(process.env.ProgramData ?? 'C:/ProgramData', 'RAMBlockCache', 'logs');
@@ -288,7 +290,7 @@ app.get('/rb/bootcfg', async (c) => {
     return c.json({
       AutoAttach: out.readUInt32LE(4),
       ResumeOnBoot: out.readUInt32LE(8),
-      ResumeLetters: out.toString('utf16le', 16, 16 + 64).replace(/ +$/, ''),
+      ResumeLetters: out.toString('utf16le', 16, 16 + 64).replace(/\u0000+$/, ''),
     });
   } catch (e) {
     return c.json({ error: messageOf(e) }, 500);
@@ -309,7 +311,7 @@ app.post('/rb/bootcfg', async (c) => {
       ok: true,
       AutoAttach: out.readUInt32LE(4),
       ResumeOnBoot: out.readUInt32LE(8),
-      ResumeLetters: out.toString('utf16le', 16, 16 + 64).replace(/ +$/, ''),
+      ResumeLetters: out.toString('utf16le', 16, 16 + 64).replace(/\u0000+$/, ''),
     });
   } catch (e) {
     return c.json({ error: messageOf(e) }, 500);
@@ -430,7 +432,10 @@ app.post('/rb/rpc', rpcHandler);
 
 // —— SPA 托管（生产形态：npm run build 后由桥接同端口直出，无需 vite dev）——
 // Hash 路由设计（41 号 §11.9 router.tsx）使服务端只需兜底 '/' 与静态资源。
-const distDir = path.resolve(process.cwd(), 'dist');
+// [88 B-3 2026-11-07] cwd-independent: bridge/server/index.ts -> up two levels
+// to webconsole/ (dev: web/) -> dist/. SYSTEM/ONSTART tasks default their
+// working directory to the system directory, so cwd MUST NOT participate here.
+const distDir = fileURLToPath(new URL('../../dist', import.meta.url));
 
 app.get('/', async (c) => {
   try {
@@ -444,7 +449,9 @@ app.get('/', async (c) => {
   }
 });
 
-app.use('/assets/*', serveStatic({ root: path.relative(process.cwd(), distDir) || '.' }));
+// [88 B-3] Hono serveStatic uses join(root, req.path); an absolute root is
+// accepted (verified in @hono/node-server/dist/serve-static.mjs:71,87).
+app.use('/assets/*', serveStatic({ root: distDir }));
 
 /* [HARDEN 2026-11-05] 进程级容错：桥接是控制台的单点，任何未捕获异常导致
  * 退出都表现为"控制台突然失联"，而此前完全没有兜底——

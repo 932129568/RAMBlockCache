@@ -84,3 +84,29 @@
 - 需授权：① 重编引擎与 Setup；② 运行 `build_setup.ps1` / 任何 finalize UAC wrapper；③ 新建隔离 VM / 切换 Secure Boot / WinRE 启动盘；④ 提权查询或注册计划任务；⑤ 双机 WinDbg；⑥ 提交推送（当前 `ahead 5`，代理 502/schannel 持续）。
 
 > 其余 4 路（内核逻辑 / 边界异常 / 并发时序 / Web 协议副本）审查结果回来后，在 `deliverables/88-*.md` 汇总为完整结论清单，再统一实施与独立验证。
+
+---
+
+## 8. 批次 A 实施与验证（零编译 / 零签名 / 零 UAC）
+
+`impl-blocksize` 交付 commit **`789f620`**（18 文件 / +332 −46），主理人已独立复核。
+
+| 项 | 落地 | 主理人独立验证 |
+|---|---|---|
+| B-3 | `web/bridge/server/index.ts:438` `distDir = fileURLToPath(new URL('../../dist', import.meta.url))`、`:454` `serveStatic({ root: distDir })`；先读 `web/node_modules/@hono/node-server/dist/serve-static.mjs:70-87` 确认 `join(root, filename)` 接受绝对路径。为隔离实跑增加 probe-only `RBC_BRIDGE_PORT`（默认仍 5199） | ✅ `process.cwd()` 命中 0、`import.meta.url` 存在；**主理人独立复跑**：临时 cwd（与 `web/` 无关）+ `RBC_BRIDGE_PORT=5318` + 隔离 `ProgramData` → `GET /` = **HTTP 200 / 538 B / `<!doctype html>` / 无「静态资源缺失」**；旧逻辑在该 cwd 会解析到 `<tmp>\dist`（`exists=False`），正是必 503 的原因。探针进程自行终止，`5199/rb/health` 仍 200、`pid=3792`、`deviceOpen=true` 未受影响 |
+| M-4 | 两处 `/\0+$/` 真 NUL → `/\u0000+$/` | ✅ NUL count 2 → **0**，size 19991 → 20537 B |
+| B-4 | 新增 `src/scripts/check_installer_contract.py`（Gate11，190 行，CI-safe）；`ci.yml` 注册 Gate11 + `dotnet build RAMBlockCache.Setup.csproj`，`setup-dotnet` 补 `8.0.x` | ✅ Gate11 `PASS (0 fail, 1 warn)`（1 warn = 按指示记录的 B-1 已知偏差）；成员注入漂移（移走 payload cer）→ `FAIL` / exit 1，恢复→PASS；模拟干净检出（移走整个 payload）→ 2 条 `[SKIP]` 仍 PASS。**CI run 28 (`6b00927`) `completed / success`**，run 29 (`1ae2547`) `in_progress` |
+| H-5 / H-6 / H-9 / H-10 / H-11 | `restart_bridge.ps1` health 失败改 `schtasks /Run` + 15×2s 有界重查；`verify_install.ps1` net8→net10；`_build_manual.ps1` 加 kit/wdkn/wdklib `Test-Path` + link 前清 `*.obj`；`test_rebuild` 进 4 个构建清单 + `check_repo.py` TESTS（先核验 5 个产物均新于源码，无假红）；`check_node_contract.py` 改正则抽 `Resolve-Node27` 函数体断言 `v27.*` / `12.2.1*` | ✅ Gate1–Gate11 全 PASS、`check_ps_syntax` 68 文件 0 失败、`check_signature` Valid + 三锚点同值；成员对 `check_node_contract.py` 注入 `v9.*` → FAIL，字节级恢复后 PASS |
+| M-1 / L-2 / M-2 / M-3 / L-1 / M-11 | `README.txt` 文案（172,768 B / 272,872,792 B / self-contained / `HKLM\RB_OFFLINE`）、版本口径、67 号历史行标注、根级 wrapper 编码纳入 Gate11 | ✅ `README.txt:20` 的 `DefaultExpectedSha256 = 10fb7009…` **一字未动**；dist sys 与 marker 原值未变 |
+
+**主理人复核时纠正的一处口径错误**：批次 A 把 `README.md:15` 写成 `V10.4.1 Build 19`，但 `src/common/version.h` 有两个独立串 —— `RB_VERSION_STRING = 10.4.1.19`（机器版本）与 `RB_RELEASE_STRING = V10.5.0 Build 19`（对外发布名），`README.txt:2/5/9/12` 已是该正确口径。已由主理人改回 **`V10.5.0 Build 19（机器版本 10.4.1.19，Protocol 9）`**，提交 `1ae2547`。
+
+**推送**：本地 7 个提交曾因代理 502 滞留，17:4x 恢复，`6b00927..1ae2547 main -> main` 全部上云，`ahead 0`。
+
+**批次 A 后仍未落地的 4 点（如实记录）**：
+1. **分发包尚未吃到 B-3 / M-1 修复**：`webconsole.zip` 内仍是旧 `index.ts` 与旧 `README.txt`（`build_setup.ps1` 按红线未运行），`web/dist` 已重建但桥接源码改动需重打包才进分发包 ⇒ 需用户再双击一次 UAC 重打并签名 Setup，之后跑 `sync_setup_hash.ps1 -RequireSetupChanged`。
+2. `src/core/test_rebuild.c` 文件头注释仍写「不加入 `_build_all.ps1` / `_build_asan.ps1` 的 `$Tests`」，与 H-10 现状矛盾（属 `src/core/*.c`，批次 A 红线未动，留批次 B 更正）。
+3. `version.h` 的 `RB_RELEASE_STRING` / `README.txt:12` / `README.md:15` 现均为 `V10.5.0 Build 19` ✅；仓库目录名 `V10.4.3-build19` 为历史遗留（已记入 KNOWN_ISSUES）。
+4. Gate11 的 1 条 `[WARN]` 是**刻意保留**的 B-1 已知偏差信号，不影响 `exit 0`；批次 B 修掉假日志后应转 `[INFO]` 或消失。
+
+**批次 B 待办**（需重编 `ramboostsetup.exe` + 重签 + 一次 UAC，且需等其余 4 路审查齐后统一实施）：B-1 假日志与 startType 口径、B-2 Secure Boot/testsigning 前移 + 失败回滚、H-1 INF 可安装段、H-2 覆盖升级返回值、H-3 控制器旧 DLL、H-4 WinRE PowerShell、H-7 磁盘预检、H-8 未签名 CLI、M-5/M-6 看门降级、M-7 进程定位、M-8 应用落地回滚、M-9 标准用户。

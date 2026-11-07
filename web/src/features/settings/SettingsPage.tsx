@@ -44,6 +44,39 @@ export default function SettingsPage() {
 
   const form = useForm<RbConfig>();
 
+  // [99 §3] RB2 Features\Flags 热开关（经 /rb/rbfeat：flags on/off 即时写注册表
+  // 并由 rbfeatctl 内建 refresh 热载，无需重启）。
+  const [rbfeat, setRbfeat] = useState<{ stats: Record<string, number> | null; l2: string; excl: string; exe: string } | null>(null);
+  const [rbfeatBusy, setRbfeatBusy] = useState<string | undefined>(undefined);
+  const loadRbfeat = () => {
+    fetch('/rb/rbfeat')
+      .then((r) => r.json())
+      .then((d) => setRbfeat({ stats: d.stats ?? null, l2: String(d.l2 ?? ''), excl: String(d.excl ?? ''), exe: String(d.exe ?? '') }))
+      .catch(() => setRbfeat(null));
+  };
+  useEffect(() => { loadRbfeat(); }, []);
+  const setFlag = (name: string, on: boolean) => {
+    setRbfeatBusy(name);
+    fetch('/rb/rbfeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, on }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.code !== 0) toast('danger', `RB2 ${name} 切换失败`, String(d.out ?? '').slice(0, 120));
+        loadRbfeat();
+      })
+      .catch((e) => toast('danger', 'RB2 切换请求失败', String(e)))
+      .finally(() => setRbfeatBusy(undefined));
+  };
+  const RB2_BITS: Record<string, number> = { PREFETCH: 1, HOT: 2, ETW: 32, THERMAL: 64 };
+  const flagOn = (k: 'PREFETCH' | 'HOT' | 'THERMAL' | 'ETW') => {
+    const f = rbfeat?.stats?.flags;
+    const bit = RB2_BITS[k] ?? 0;
+    return typeof f === 'number' ? (f & bit) !== 0 : false;
+  };
+
   // 配置首次到达（或刷新）→ reset 进 RHF（dirty 基线随之更新）
   useEffect(() => {
     // [BUG-1 修复 2026-10-31] 轮询数据仅在"无未保存修改"时灌入表单：
@@ -281,18 +314,69 @@ export default function SettingsPage() {
               </p>
             </Group>
 
+            <Group title="预取与分页（真实生效开关）">
+              <label className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
+                <span>分页 IO 进缓存 CachePagingIo（运行期即时生效）</span>
+                <Toggle
+                  checked={!!form.watch('CachePagingIo')}
+                  onChange={(b) => form.setValue('CachePagingIo', b ? 1 : 0, { shouldDirty: true })}
+                  ariaLabel="CachePagingIo"
+                />
+              </label>
+              <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
+                驱动自 2026-11-06 起逐 IO 消费此开关（映射节读写/加载器读 DLL 走此门）；默认 0 = 分页 IO 直读盘不进缓存（11-06 微信 DLL 事故加固）。开启可提高映射文件读命中率，但分页流进入缓存爆炸半径。
+              </p>
+              <label className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
+                <span>预取引擎 ReadaheadEnabled（创建期冻结）</span>
+                <Toggle
+                  checked={!!form.watch('ReadaheadEnabled')}
+                  onChange={(b) => form.setValue('ReadaheadEnabled', b ? 1 : 0, { shouldDirty: true })}
+                  ariaLabel="ReadaheadEnabled"
+                />
+              </label>
+              <Num
+                label="预取窗口 ReadaheadWindowKB（64–4096）"
+                min={64}
+                max={4096}
+                {...form.register('ReadaheadWindowKB', { valueAsNumber: true })}
+              />
+              <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
+                core 无运行期 setter：两项在下次几何重建/卷重挂（引擎重建）后生效，与 BlockSize 同纪律；保存即持久化。
+              </p>
+            </Group>
+
             <Group title="只读字段（高级/驱动侧语义，不在 Web 表单放开）">
               <ReadOnly label="SystemVolumeCached" value={cfg.SystemVolumeCached} note="系统卷已可在「卷加速」页手动开启（含回写，风险自负）" />
               <ReadOnly label="Frozen" value={cfg.Frozen} />
               <ReadOnly label="IdleFlush" value={cfg.IdleFlush} />
-              <ReadOnly label="CachePagingIo" value={cfg.CachePagingIo} note="块层忽略（V8 起一切 I/O 均缓存）" />
               <ReadOnly label="WriteRelease" value={cfg.WriteRelease} />
               <ReadOnly
                 label="VolumeFilter"
                 value={JSON.stringify(cfg.VolumeFilter)}
                 note="驱动明确忽略（逐卷策略走 ATTACH_VOLUME）"
               />
-              <ReadOnly label="ReadaheadEnabled / WindowKB" value={`${cfg.ReadaheadEnabled} / ${cfg.ReadaheadWindowKB}`} />
+            </Group>
+
+            <Group title="特性开关（RB2 · Features\Flags · 热生效）">
+              {([['PREFETCH', '预取（读 miss 窗口回填）'], ['HOT', '热区预热（Prewarm/衰减）'], ['THERMAL', '温度护栏（过热暂停预取）'], ['ETW', 'ETW 遥测']] as const).map(([k, label]) => (
+                <label key={k} className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
+                  <span>{label} · {k}</span>
+                  <Toggle
+                    checked={flagOn(k)}
+                    disabled={rbfeatBusy === k || rbfeat?.exe !== 'found'}
+                    onChange={(b) => setFlag(k, b)}
+                    ariaLabel={`RB2 ${k}`}
+                  />
+                </label>
+              ))}
+              <ReadOnly label="WBCOAL（bit8）" value="已封禁" note="红线：M2 预留未接线；CLI 与 Web 双层拦截" />
+              <ReadOnly label="L2 容器" value={(rbfeat?.l2 ?? '').split(String.fromCharCode(13, 10))[0] || '（不可达）'} note="启用走 CLI：rbfeatctl l2 enable <X:> <GB>（需卷/几何条件满足）" />
+              <ReadOnly label="排除集" value={(rbfeat?.excl ?? '').replace(/\s+/g, ' ').slice(0, 60) || '（空）'} note="完整管理走 CLI：rbfeatctl excl" />
+              {rbfeat?.exe !== 'found' && (
+                <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)' }}>
+                  rbfeatctl.exe 不可达（payload 布局异常？）——本区开关停用，功能本体不受影响。
+                </p>
+              )}
             </Group>
           </div>
 

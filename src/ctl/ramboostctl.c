@@ -1526,6 +1526,8 @@ static int cli_set(int argc, char **argv, int startIdx)
             }
         }
         else if (!strcmp(key, "block")) {
+            /* 注意：本键单位是 KB —— block=8 即 8 KB=8192 B（档位 {4/8/16/32/64}）。
+             * 直发 IOCTL 的程序请用字节（8192/16384/32768/65536），勿混用。 */
             uint32_t kb = (uint32_t)strtoul(val, NULL, 0);
             /* [64K-UNBAN 2026-11-08] 65536 恢复（59-64k-audit §5 前置清单满足，
              * 与驱动 rbctl.c / core cache.c legal[] / WPF / Web 五层同步）；

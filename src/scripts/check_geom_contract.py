@@ -23,8 +23,6 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-LEGAL = (4096, 8192, 16384, 32768, 65536)   # [64K-UNBAN] 2026-11-08; 131072 still banned
-LEGAL_STR = "{4096,8192,16384,32768}"
 
 
 def main():
@@ -70,25 +68,21 @@ def main():
         if bad_key in pass2:
             fails.append("cache.c: rb_write_pass2 contains the defective stripe key")
 
-    # --- 3) legal geometry whitelist must stay exactly the five values ---
+    # --- 3) 白名单一致性（值断言单一权威 = Gate10 check_blocksize_contract.py；
+    # 此处只查 cache.c legal[] 与 test_flushpar legal_block_size 两副本【互相一致】，
+    # 防止双门禁各自硬编码后漂移互相矛盾——99 号去重）---
     wl = re.search(r"static const rb_u32 legal\[\]\s*=\s*\{([^}]*)\}", cache)
+    twl = re.search(r"static int legal_block_size\s*\(unsigned long v\)\s*\{(.*?)\}", test, re.S)
     if not wl:
         fails.append("cache.c: legal[] whitelist not found")
-    else:
-        vals = tuple(int(x.strip()) for x in wl.group(1).split(",") if x.strip())
-        if vals != LEGAL:
-            fails.append("cache.c: legal[] = {%s}, expected %s" % (",".join(map(str, vals)), LEGAL_STR))
-        if 131072 in vals:
-            fails.append("cache.c: 128K geometry reintroduced (F1 ban; 64K unbanned 2026-11-08)")
-
-    twl = re.search(r"static int legal_block_size\s*\(unsigned long v\)\s*\{(.*?)\}", test, re.S)
     if not twl:
         fails.append("test_flushpar.c: legal_block_size() not found")
-    else:
-        body = twl.group(1)
-        found = tuple(int(x) for x in re.findall(r"v\s*==\s*(\d+)ul", body))
-        if found != LEGAL:
-            fails.append("test_flushpar.c: whitelist %r, expected %r" % (found, LEGAL))
+    if wl and twl:
+        vals = tuple(int(x.strip()) for x in wl.group(1).split(",") if x.strip())
+        found = tuple(int(x) for x in re.findall(r"v\s*==\s*(\d+)ul", twl.group(1)))
+        if vals != found:
+            fails.append("whitelist copies diverged: cache.c %s != test_flushpar %s"
+                         % (",".join(map(str, vals)), ",".join(map(str, found))))
         if not re.search(r"FAIL illegal block_size|fail-closed|illegal = FAIL-CLOSED", test, re.I):
             fails.append("test_flushpar.c: illegal geometry fail-closed guard missing")
     if "65536" in test and "摘除" not in test:
@@ -120,7 +114,7 @@ def main():
 
     print("== check_geom_contract ==")
     print("  guard       : rb_write_pass2 stripe key must be stripe_of(cs)")
-    print("  whitelist   : legal[] = %s" % LEGAL_STR)
+    print("  whitelist   : relational check (values owned by Gate10)")
     print("  dynamic gate: qa_geom_gate.ps1 -Rounds 30 (local only; needs MSVC/ASan)")
     print("  defective key occurrences: %d" % n_bad)
     if fails:

@@ -150,7 +150,7 @@
                 </Grid>
 
                 <Border Background="#22FFB900" CornerRadius="8" Padding="12,10" Margin="0,0,0,12">
-                    <TextBlock Text="⚠ 块大小在驱动启动时确定，不能即时热切换：选择并应用后，请卸载并重新加载驱动（或重启电脑）使其生效；新几何不会复用旧缓存数据。这不是异常。"
+                    <TextBlock Text="ℹ 块大小已支持免重启切换（驱动卷级重建引擎）：应用后驱动自动逐卷重建，期间 I/O 短暂回落磁盘、命中率冷启动，属正常现象。完整开关与五档（4/8/16/32/64K）请以 Web 控制台「设置」页为准；本页为其子集。"
                                Style="{StaticResource CaptionText}" Foreground="{StaticResource WarningBrush}" TextWrapping="Wrap"/>
                 </Border>
 

@@ -355,6 +355,71 @@ app.post('/rb/logs/open', (c) => {
 // 前端 http-transport 的相对前缀 /rb 命中同端口，不再依赖 vite 代理。
 app.get('/rb/health', healthHandler);
 
+// ---- [99 §2] RB2 特性开关通道（Features\Flags 热生效）----
+// 通过 rbfeatctl.exe 子进程（严格 argv 白名单，无 shell）：flags on/off + 内建
+// refresh（rbfeatctl flags 命令自身发 RB2_IOCTL_REFRESH）。WBCOAL 在 CLI 已拦
+// （bit8 红线），此处白名单再封一层；L2/MEMGUARD 需语义参数，仅读展示。
+// exe 定位：payload 根（webconsole.zip 解析后的上级）→ dist 内 → cwd，取先存在者。
+// 惰性解析（distDir 在本文件后段才声明；exe 每次解析成本可忽略）
+function rbfeatExe(): string | null {
+  // 不用工作目录相对路径（88 B-3 门禁禁令）：payload 布局下 exe 在 dist 上级，
+  // 扁平布局下在 dist 内，两条路径已覆盖。
+  const cands = [
+    path.join(distDir, '..', 'rbfeatctl.exe'),
+    path.join(distDir, 'rbfeatctl.exe'),
+  ];
+  return cands.find((p) => existsSync(p)) ?? null;
+}
+
+function rbfeatRun(args: string[]): Promise<{ code: number; out: string }> {
+  return new Promise((resolve) => {
+    const exe = rbfeatExe();
+    if (!exe) { resolve({ code: -1, out: 'rbfeatctl.exe not found (payload layout?)' }); return; }
+    execFile(exe, args, { timeout: 8000, windowsHide: true }, (err, stdout, stderr) => {
+      const ec = (err as (NodeJS.ErrnoException & { code?: number | string }) | null);
+      const code = typeof ec?.code === 'number' ? ec.code : ec ? 1 : 0;
+      resolve({ code, out: String(stdout || '') + String(stderr || '') });
+    });
+  });
+}
+
+function rbfeatParseFlags(out: string): { stats: Record<string, number> | null } {
+  const line = out.split(/\r?\n/).find((l) => l.trim().startsWith('{'));
+  if (!line) return { stats: null };
+  try { return { stats: JSON.parse(line) as Record<string, number> }; } catch { return { stats: null }; }
+}
+
+app.get('/rb/rbfeat', async (c) => {
+  const st = await rbfeatRun(['stats', '-json']);
+  const l2 = await rbfeatRun(['l2', 'status']);
+  const excl = await rbfeatRun(['excl']);
+  return c.json({
+    exe: rbfeatExe() ? 'found' : 'missing',
+    code: st.code,
+    stats: rbfeatParseFlags(st.out).stats,
+    l2: l2.out.slice(0, 500),
+    excl: excl.out.slice(0, 1000),
+  });
+});
+
+app.post('/rb/rbfeat', async (c) => {
+  const body = await c.req.json().catch(() => null) as { name?: unknown; on?: unknown } | null;
+  const name = String(body?.name ?? '').toUpperCase();
+  const on = body?.on === true;
+  // 白名单：PREFETCH/HOT/THERMAL/ETW 热开关；WBCOAL=红线封禁（CLI 已拦，此处再封）；
+  // L2 需 letter+GB 语义参数（走 l2 enable，CLI 保留）；MEMGUARD 语义未审计，暂不放开。
+  if (!['PREFETCH', 'HOT', 'THERMAL', 'ETW'].includes(name)) {
+    return c.json({ code: -2, out: `feature name not allowed: ${name}` }, 400);
+  }
+  const set = await rbfeatRun(['flags', on ? 'on' : 'off', name]);
+  const st = await rbfeatRun(['stats', '-json']);
+  return c.json({
+    code: set.code,
+    out: set.out.slice(0, 500),
+    stats: rbfeatParseFlags(st.out).stats,
+  });
+});
+
 const rpcHandler = async (c: Context) => {
   if (!native) {
     // 插件未链接 → 前端映射 DRIVER_ABSENT（见 http-transport mapNetworkError 503 分支）

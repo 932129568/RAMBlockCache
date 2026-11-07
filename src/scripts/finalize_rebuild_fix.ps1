@@ -7,9 +7,13 @@
 #   timeout, [334] stream(s) still attached). The fix touches rbattach.c /
 #   rbrebuild.c / rb_common.h, so the driver must be rebuilt and re-signed.
 #   A full-chain replay would overwrite the reboot marker and run unrelated
-#   test-flag reset / deployment steps. THIS chain is intentionally narrow:
+#   test-flag reset steps. THIS chain is intentionally narrow:
 #   sign the already-built driver, sync the three anchors, gate5, repack and
-#   re-sign the Setup, append the ledger. NO marker write, NO deployment,
+#   re-sign the Setup, deploy.ps1 (CHILD), post-deploy gate5, ledger.
+#   [92 3.1 ERRATA] deploy.ps1 is MANDATORY: it is the only step that copies
+#   dist\RAMBlockCache.sys into System32\drivers. Signing dist without
+#   deploying means the rebooted kernel still loads the OLD sys and the
+#   whole fix is a no-op. NO marker write, NO test-flag reset,
 #   NO reboot, NO SET_CONFIG.
 #
 # Derived from finalize_setup_only.ps1 / finalize_geom_rebuild.ps1.
@@ -33,12 +37,16 @@
 #   6) payload assertions (CLI pair, both zips, bridge decoder, cwd-independent
 #      bridge index.ts, four-size SPA, new sys in payload)
 #   7) sign Setup: four hash assertions
-#   8) FATAL ledger append FINAL_SETUP_SHA256 + own read-back
-#   9) final scope double-read
-#  10) ALL OK + NEXT hint
+#   8) deploy.ps1 (CHILD, -999 sentinel + explicit ExitCode) -> post-deploy
+#      gate5 (CHILD, exit code + 'result: PASS' text double judgement)
+#   9) FATAL ledger append FINAL_SETUP_SHA256 + own read-back
+#  10) final scope double-read
+#  11) ALL OK + NEXT hint
 #
 # NEXT (plain session, by the lead): sync_setup_hash.ps1 -RequireSetupChanged,
-# then ONE reboot, then verify_final_reboot.ps1 and the S4 geometry matrix.
+# then ONE reboot AND AN INTERACTIVE LOGON (logon_disarm must run to clear
+# FilterArmed, otherwise verify_final_reboot.ps1 gives a deterministic false
+# FAIL), then verify_final_reboot.ps1 and the S4 geometry matrix.
 $ErrorActionPreference = 'Continue'
 $global:LASTEXITCODE = 0
 
@@ -68,6 +76,7 @@ $hashLedger  = Join-Path $logDir 'batch-hashes.txt'
 $gate        = Join-Path $PSScriptRoot 'check_signature.ps1'
 $syncAnchors = Join-Path $PSScriptRoot 'sync_anchors.ps1'
 $buildSetup  = Join-Path $PSScriptRoot 'build_setup.ps1'
+$deploy      = Join-Path $PSScriptRoot 'deploy.ps1'   # [92 3.1] MANDATORY child
 $readme      = Join-Path $root 'README.txt'
 $ctlExe      = Join-Path $root 'src\ctl\ramboostctl.exe'
 $ctlFeatExe  = Join-Path $root 'src\ctl\rbfeatctl.exe'
@@ -78,10 +87,13 @@ $payloadSys  = Join-Path $pay 'RAMBlockCache.sys'
 $wcZip       = Join-Path $pay 'webconsole.zip'
 $ctlZip      = Join-Path $pay 'controller.zip'
 
-# The three sys-hash anchors. Anchor A is assembled from parts so that the
-# static scope guard stays unambiguous: this script READS the anchors and
-# invokes the anchor-sync tool, but never invokes the deployment tool.
-$anchorA     = Join-Path $PSScriptRoot ('deploy' + '.ps1')
+# The three sys-hash anchors. Anchor A is the deployment tool itself, which
+# carries the $DefaultExpectedSha256 pin. [92 3.1] That tool is ALSO invoked
+# as a CHILD at step 8 (mandatory, see the errata); it is an anchor READ here,
+# not a deployment call. It does not write the reboot marker (marker is owned
+# by the full-chain wrapper, which this chain never runs) and does not touch
+# bootcfg (AutoAttach / ResumeOnBoot / ResumeLetters use a separate ABI).
+$anchorA     = $deploy
 $anchorB     = Join-Path $PSScriptRoot 'verify_deploy_signature.ps1'
 $anchorC     = $readme
 $anchorFiles = @($anchorA, $anchorB, $anchorC)
@@ -167,7 +179,7 @@ L ('=== finalize_rebuild_fix start pid=' + $PID + ' ===')
 
 # ---- 1) preconditions + dynamic baselines + scope statement --------------
 $required = @($sigtool, $psExe, $tarExe, $builtSys, $distSys, $sidecar,
-              $setup, $marker, $hashLedger, $gate, $syncAnchors, $buildSetup,
+              $setup, $marker, $hashLedger, $gate, $syncAnchors, $buildSetup, $deploy,
               $ctlExe, $ctlFeatExe, $payloadCtl, $payloadFeat,
               $payloadSys, $wcZip, $ctlZip) + $anchorFiles
 foreach ($f in $required) {
@@ -207,7 +219,7 @@ $readmeBeforeNorm = $rxNorm.Replace($readmeBefore, 'DefaultExpectedSha256 = <HAS
 Invoke-Gate5 '[1] gate5 precheck'
 L ('[1] built sys ' + $builtHash + ' NotSigned; old Setup ' + $oldSetup + ' Valid; marker ' + $markerText0 + ' (READ ONLY)')
 
-$scope = 'SCOPE: this run re-signs the driver + Setup and syncs the three sys anchors. marker / deployed state / config are NOT modified. No deployment, no reboot, no SET_CONFIG, no test-flag reset.'
+$scope = 'SCOPE: this run re-signs the driver + Setup, syncs the three sys anchors, and DEPLOYS the new sys to System32\drivers via the deploy child (92 3.1 errata). marker / bootcfg / config are NOT modified. No reboot, no SET_CONFIG, no test-flag reset. deploy rewrites the watchdog baseline and re-arms it: an INTERACTIVE LOGON after reboot is REQUIRED.'
 L $scope
 Write-Host ('[i] ' + $scope)
 
@@ -353,7 +365,25 @@ if ($copyBackHash -ne $signedStageHash) { Abort ('SETUP COPY-BACK MISMATCH: ' + 
 if ((SigOf $setup) -ne 'Valid') { Abort 'DIST SETUP NOT VALID AFTER COPY-BACK' }
 L ('[7] (d) final signed Setup sha256=' + $copyBackHash + ' size=' + (Get-Item -LiteralPath $setup).Length)
 
-# ---- 8) ledger append is FATAL + own read-back ---------------------------
+# ---- 8) deploy.ps1 (CHILD) -> post-deploy gate5 -------------------------
+# [92 3.1 勘误 2026-11-07] 只签 dist 而不部署，重启后内核加载的仍是旧 sys
+# （dist 与 System32 两份当前同为 10fb7009…），本次修复等于白做。deploy.ps1
+# 是幂等 + verify-before-change + 完整回滚的既有链；其前置 gate 读 sidecar /
+# 三锚点做 fail-closed，故必须排在第 2/3 步（dist 已签名 + 三锚点已同步 +
+# sidecar 已写）之后——上面的顺序已满足。
+# 它不写 marker、不碰 bootcfg；会重写看门基线（DeploySeq+1 / Armed=1 /
+# Healthy=0 / BootFails=0）并重注册两个看门任务。重启后必须【交互登录】
+# 让 logon_disarm 解除武装，否则 verify_final_reboot.ps1 会假 FAIL。
+$r8 = Invoke-Step -Tag '[8] deploy' -Exe $psExe -ArgList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$deploy)
+if ($r8.ExitCode -ne 0) { Abort ('DEPLOY FAILED exit=' + $r8.ExitCode) }
+L ('[8] deploy OK (new sys deployed to System32\drivers; no reboot triggered)')
+$deployedSys = Join-Path $env:WINDIR 'System32\drivers\RAMBlockCache.sys'
+if (Test-Path -LiteralPath $deployedSys) {
+    L ('[8] deployed sys sha256=' + (HashOf $deployedSys) + ' (informational: a locked file may be queued for next-boot replace)')
+}
+Invoke-Gate5 '[8] gate5 post-deploy'
+
+# ---- 9) ledger append is FATAL + own read-back ---------------------------
 # sync_setup_hash.ps1 hard cross-checks the LAST FINAL_SETUP_SHA256 against
 # dist Setup and the LAST FINAL_SYS_SHA256 against dist sys. A silent append
 # failure would abort the post-UAC documentation backfill.
@@ -375,15 +405,15 @@ if ($lastSetup.Count -ne 1 -or (($lastSetup[0] -split '=', 2)[1]).Trim().ToLower
 if ($lastSys.Count -ne 1 -or (($lastSys[0] -split '=', 2)[1]).Trim().ToLower() -ne $sysHash) {
     Abort 'HASH LEDGER READ-BACK MISMATCH (FINAL_SYS_SHA256 != signed sys)'
 }
-L ('[8] hash ledger appended + read-back OK ' + $hashLedger)
+L ('[9] hash ledger appended + read-back OK ' + $hashLedger)
 
-# ---- 9) final fail-closed scope double-read ------------------------------
+# ---- 10) final fail-closed scope double-read -----------------------------
 if ((HashOf $distSys) -ne $sysHash) { Abort 'SYS HASH DRIFT AT END (expected the NEW signed sys)' }
 if ((SigOf $distSys) -ne 'Valid') { Abort 'SYS SIGNATURE NO LONGER VALID' }
 try { $sideText2 = ([IO.File]::ReadAllText($sidecar)).Trim() }
 catch { Abort ('SYS SIDECAR RE-READ FAILED: ' + $_.Exception.Message) }
 if ($sideText2 -ne ('SHA256: ' + $sysHash)) { Abort ('SYS SIDECAR CHANGED: ' + $sideText2) }
-$a1 = Get-AnchorState '[9]'
+$a1 = Get-AnchorState '[10]'
 for ($i = 0; $i -lt $anchorFiles.Count; $i++) {
     if ($a1[$i] -ne $sysHash) { Abort ('SYS ANCHOR DRIFT AT END: ' + $anchorFiles[$i]) }
 }
@@ -400,12 +430,14 @@ if ($markerText1 -ne $markerText0) { Abort ('MARKER CHANGED (must never be writt
 if ((HashOf $setup) -ne $copyBackHash -or (SigOf $setup) -ne 'Valid') {
     Abort 'FINAL DIST SETUP IS NOT THE SIGNED IMAGE'
 }
-L ('[9] scope intact: new sys=' + $sysHash + ' + sidecar + 3 anchors + README hash-line-only + marker=' + $markerText1 + ' (never written)')
+L ('[10] scope intact: new sys=' + $sysHash + ' + sidecar + 3 anchors + README hash-line-only + marker=' + $markerText1 + ' (never written)')
 
-# ---- 10) ALL OK + NEXT ---------------------------------------------------
+# ---- 11) ALL OK + NEXT ---------------------------------------------------
 L ('ALL OK sys=' + $sysHash + ' setup=' + $copyBackHash)
 L 'NEXT: lead runs sync_setup_hash.ps1 -RequireSetupChanged (plain session), then ONE reboot.'
-L 'After reboot: verify_final_reboot.ps1 FAIL=0, then the S4 4K->8K->16K->32K->4K matrix.'
+L 'IMPORTANT: after reboot an INTERACTIVE LOGON is REQUIRED (logon_disarm clears FilterArmed);'
+L '           without it verify_final_reboot.ps1 gives a deterministic false FAIL.'
+L 'Then: verify_final_reboot.ps1 FAIL=0, then the S4 4K->8K->16K->32K->4K matrix.'
 Write-Host ('=== finalize_rebuild_fix OK sys=' + $sysHash + ' setup=' + $copyBackHash + ' ===')
-Write-Host 'NEXT: lead runs sync_setup_hash.ps1 -RequireSetupChanged; then reboot ONCE.'
+Write-Host 'NEXT: lead runs sync_setup_hash.ps1 -RequireSetupChanged; reboot ONCE; LOG ON interactively.'
 exit 0

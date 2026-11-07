@@ -17,7 +17,7 @@
 部署门禁哈希锚点（重要）
 ----------------------------------------------------------------
   scripts\deploy.ps1 / verify_deploy_signature.ps1 内置
-  DefaultExpectedSha256 = 63ad0fa8edb1355965a7bdf805e2b05188c89edacf63dec2fe6dafe27bd3377a
+  DefaultExpectedSha256 = 10fb700903caab564c028817474db3c9e1f9c7914bfbf1237e72958ddffaa981
   该值对应本包 dist\RAMBlockCache.sys（2026-11-06 F1 TinyLFU 准入批：
   Count-Min Sketch 频率准入 + 频率感知淘汰 + ParallelFlush 1/2/4/8/16 路，
   160,992 字节）。（2026-10-21 更正：原文字误写 115,424；哈希才是唯一权威标识，字节数仅供人工核对）

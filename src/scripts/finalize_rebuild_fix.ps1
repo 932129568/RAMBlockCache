@@ -219,7 +219,7 @@ $readmeBeforeNorm = $rxNorm.Replace($readmeBefore, 'DefaultExpectedSha256 = <HAS
 Invoke-Gate5 '[1] gate5 precheck'
 L ('[1] built sys ' + $builtHash + ' NotSigned; old Setup ' + $oldSetup + ' Valid; marker ' + $markerText0 + ' (READ ONLY)')
 
-$scope = 'SCOPE: this run re-signs the driver + Setup, syncs the three sys anchors, and DEPLOYS the new sys to System32\drivers via the deploy child (92 3.1 errata). marker / bootcfg / config are NOT modified. No reboot, no SET_CONFIG, no test-flag reset. deploy rewrites the watchdog baseline and re-arms it: an INTERACTIVE LOGON after reboot is REQUIRED.'
+$scope = 'SCOPE: this run re-signs the driver + Setup, syncs the three sys anchors, DEPLOYS the new signed image to System32\drivers, and re-arms the watchdog (DeploySeq+1 / FilterArmed=1 / LastBootHealthy=0 / BootFails=0 + two guard tasks). deployed sys updated to the new signed image; marker untouched; config / bootcfg / Features Flags unchanged (Flags already 0). No reboot, no SET_CONFIG, no test-flag reset. After reboot an INTERACTIVE LOGON is REQUIRED (logon_disarm clears FilterArmed) or verify_final_reboot.ps1 false-FAILs.'
 L $scope
 Write-Host ('[i] ' + $scope)
 
@@ -381,6 +381,16 @@ $deployedSys = Join-Path $env:WINDIR 'System32\drivers\RAMBlockCache.sys'
 if (Test-Path -LiteralPath $deployedSys) {
     L ('[8] deployed sys sha256=' + (HashOf $deployedSys) + ' (informational: a locked file may be queued for next-boot replace)')
 }
+# deploy.ps1:528-530 prints an explicit marker when MoveFileEx queued the
+# replace because System32\drivers\RAMBlockCache.sys was locked. Capture it
+# so the final scope read can distinguish "deployed" from "queued".
+$deployPending = [bool]($r8.Output -match 'queued for replace on next reboot')
+if ($deployPending) {
+    L '[8] deploy reported a queued MoveFileEx replace-on-reboot (System32 sys was locked).'
+    Write-Host '[i] System32 sys replace is queued for next boot; a SECOND reboot may be needed.'
+} else {
+    L '[8] deploy performed an immediate System32 replacement.'
+}
 Invoke-Gate5 '[8] gate5 post-deploy'
 
 # ---- 9) ledger append is FATAL + own read-back ---------------------------
@@ -430,13 +440,43 @@ if ($markerText1 -ne $markerText0) { Abort ('MARKER CHANGED (must never be writt
 if ((HashOf $setup) -ne $copyBackHash -or (SigOf $setup) -ne 'Valid') {
     Abort 'FINAL DIST SETUP IS NOT THE SIGNED IMAGE'
 }
-L ('[10] scope intact: new sys=' + $sysHash + ' + sidecar + 3 anchors + README hash-line-only + marker=' + $markerText1 + ' (never written)')
+
+# [92 3.1 返工] DIRECT EVIDENCE that the fix will be live after reboot: the
+# deployed System32 copy must BE the newly signed image (hash + Valid).
+# No false FAIL on a locked file: deploy.ps1:516 passes -AllowPendingReplace
+# to verify_deploy_signature.ps1, whose :154-161 accepts a matching PFRO
+# (source,target) replace-on-reboot pair and exits 0; deploy.ps1:528-530 then
+# prints the marker captured above. In that one case we do NOT Abort - we
+# corroborate the PFRO queue and emit an actionable second-reboot hint.
+if (-not (Test-Path -LiteralPath $deployedSys)) {
+    Abort 'DEPLOYED SYS MISSING in System32\drivers (deploy did not land)'
+}
+$deployedHash = HashOf $deployedSys
+$deployedSig  = SigOf $deployedSys
+if ($deployPending -and $deployedHash -ne $sysHash) {
+    $pfroKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    $pfro = (Get-ItemProperty -Path $pfroKey -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+    $pfroHit = $false
+    if ($pfro) { $pfroHit = [bool](@($pfro) -match 'RAMBlockCache\.sys') }
+    if (-not $pfroHit) {
+        Abort 'DEPLOYED SYS HASH MISMATCH and NO PendingFileRenameOperations replace queued - fix would NOT be live after reboot'
+    }
+    L ('[10] deployed sys still old (' + $deployedHash + ') but a matching replace-on-reboot is queued (PFRO); -AllowPendingReplace accepted it.')
+    L '[10] ACTION: reboot ONCE to apply the queued replace; if driver log / GET_STATS still show the old build, reboot ONE more time.'
+    Write-Host '[!] System32 sys replace is queued for next boot. A SECOND reboot may be required before S4.'
+} else {
+    if ($deployedHash -ne $sysHash) { Abort ('DEPLOYED SYS HASH != NEW SIGNED SYS (' + $deployedHash + ') - fix would NOT be live after reboot') }
+    if ($deployedSig -ne 'Valid') { Abort ('DEPLOYED SYS SIGNATURE NOT VALID (' + $deployedSig + ')') }
+    L ('[10] deployed sys == new signed sys ' + $deployedHash + ' and Valid (fix will be live after reboot)')
+}
+L ('[10] scope intact: new sys=' + $sysHash + ' + deployed sys verified + sidecar + 3 anchors + README hash-line-only + marker=' + $markerText1 + ' (never written)')
 
 # ---- 11) ALL OK + NEXT ---------------------------------------------------
 L ('ALL OK sys=' + $sysHash + ' setup=' + $copyBackHash)
 L 'NEXT: lead runs sync_setup_hash.ps1 -RequireSetupChanged (plain session), then ONE reboot.'
 L 'IMPORTANT: after reboot an INTERACTIVE LOGON is REQUIRED (logon_disarm clears FilterArmed);'
 L '           without it verify_final_reboot.ps1 gives a deterministic false FAIL.'
+L '           If deploy reported a queued replace-on-reboot, a SECOND reboot may be needed.'
 L 'Then: verify_final_reboot.ps1 FAIL=0, then the S4 4K->8K->16K->32K->4K matrix.'
 Write-Host ('=== finalize_rebuild_fix OK sys=' + $sysHash + ' setup=' + $copyBackHash + ' ===')
 Write-Host 'NEXT: lead runs sync_setup_hash.ps1 -RequireSetupChanged; reboot ONCE; LOG ON interactively.'

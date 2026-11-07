@@ -213,6 +213,21 @@
 
 ---
 
+## G. [87 号] S2 全链重放前置新发现与处置（2026-11-07）
+
+> 详见 `deliverables/87-s2-preflight-and-replay-2026-11-07.md`。本节只记录**新增**问题；全部为脚本 / 构建产物 / CI 层，产品源码零改动。
+
+| # | 项 | 状态 | 说明 |
+|---|---|---|---|
+| G1 | **分发包 CLI 陈旧（阻断级）** | ✅ 已修 | `src/ctl/ramboostctl.exe`（11-06 06:27）比 `ramboostctl.c`（11-06 17:52）旧，ASCII 扫描五个 `RB_STATS` statval 键全为 False；`build_setup.ps1:139` 原样打进 payload，会打穿 79 号 §4.6 的 E1-c 判据。`check_repo.py` §7 只配 `core/test_*.c`，Gate8 只校验 CLI **源码**，两者都覆盖不到交付二进制。处置：重编两个 CLI（五键全部进入 exe）；新增 Gate9 `check_ctl_freshness.py`（内容级五键断言 CI 可靠 + 本机 mtime 断言，产物缺失时跳过不误报）并注册进 `ci.yml`；新 UAC 脚本 (1b)/(6b) 双重 fail-closed 断言。 |
+| G2 | **`_build_ctl_both.cmd` 缺 `bench_policy.c`** | ✅ 已修 | 实测重编报 LNK2019 ×3（`RbBenchExtentsUsable` / `RbBenchTryGetClusterBytes` / `RbBenchByteHitRate`）+ LNK1120，根本不产出 exe，是 G1 长期未重编的原因之一。处置：修 .cmd，并新增纯 PowerShell 权威入口 `_build_ctl_both.ps1`（手工 INCLUDE/LIB/PATH、绝对路径、成功后校验五键）。 |
+| G3 | **`finalize_uaf_release.ps1` ONE-SHOT 常量过时** | ✅ 已停用 | `$oldSys='ed1bd99c…'`（当前 dist 是 `63ad0fa8…`）会让重跑在第 1 步 abort；`$forbiddenSetup` 漏当前 `0269fb50…`。处置：旧 .ps1 加 DEPRECATED 注释且逻辑一字未改（保留 23:29 真机验收历史证据）；旧 wrapper 改为**拒绝执行** `exit /b 1`；新写 `finalize_geom_rebuild.ps1` + `RB-finalize-geom-rebuild.cmd`，所有基线动态解析，`cache.c` pin 改可覆盖参数。 |
+| G4 | **执行顺序约束：文档回填必须先于重启验收** | ✅ 已固化 | `verify_final_reboot.ps1` §7 检查 `README.md` 含**新** Setup SHA，该值由 `sync_setup_hash.ps1` 在 UAC 后回填。顺序必须是 UAC → `sync_setup_hash.ps1` → 重启 → `verify_final_reboot.ps1`。已预演 `sync_setup_hash.ps1`（当前 `ALREADY IN SYNC`、3 行基线各命中 1 次、ledger 交叉校验 MATCH、README.md 零写入），并把顺序写进新脚本 step 9 日志。 |
+| G5 | **重启后严禁再双击 finalize wrapper** | 🟡 纪律 | 会覆盖 `finalize-utc.txt`，令 X2 的 `boot_utc > finalize_utc` 变假。S4/S5 免重启切档既不需要 UAC 也不需要重启，marker 保持不变。 |
+| G6 | **本轮 `qa_geom_gate -Rounds 30` 未重跑的口径** | ⏸ 引用既有 | 86 号 QA 第二层已 `GATE: PASS (cells=12 runs=360 asan_reports=0)`；本轮 `cache.c` / `read_plan.c` 等 core 源码零改动，重跑只会扰动 `core/build/*.exe` mtime 并制造 `check_repo.py` 假 stale。UAC 前改跑十道门禁 + `test_rebuild` C1–C17 + 四模式矩阵 + 驱动 17 源编译，全部复绿。 |
+
+---
+
 ## 验证声明
 
 - 当前恢复候选离线门禁：`check_repo`、`check_proto_sync --strict`、`refcount_model`、`check_xaml_resources`、`check_ps_syntax`、`check_signature` 均通过；core Release/ASAN 21/21、标准 C# 13/13、bench policy 12/12。

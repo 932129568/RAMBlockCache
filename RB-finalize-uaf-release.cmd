@@ -1,16 +1,11 @@
 @echo off
 rem ============================================================
-rem  RB-finalize-uaf-release.cmd - ONE UAC for >4K UAF fix full replay
-rem  Rebuild sys -> sign -> sync anchors -> gate5 -> rebuild Setup ->
-rem  sign Setup -> verifier /reset -> deploy -> reboot marker.
-rem  DO NOT RUN AFTER REBOOT: it would overwrite finalize-utc.txt.
-rem  Log: C:\ProgramData\rb-deploy\finalize-uaf-release.log
+rem  DEPRECATED 2026-11-07 - THIS WRAPPER REFUSES TO RUN.
+rem  It targets finalize_uaf_release.ps1, a ONE-SHOT script whose hardcoded
+rem  sys/Setup pins describe the 2026-11-06 UAF release. Replaying it now
+rem  aborts at step 1 and can leave a half-signed state.
+rem  USE INSTEAD: RB-finalize-geom-rebuild.cmd
 rem ============================================================
-net session >nul 2>&1
-if %errorlevel% neq 0 (
-  echo [..] Requesting elevation ...
-  powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"%~dp0src\scripts\finalize_uaf_release.ps1\"'"
-  exit /b 0
-)
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\scripts\finalize_uaf_release.ps1"
-exit /b %errorlevel%
+echo [X] DEPRECATED wrapper. Use RB-finalize-geom-rebuild.cmd instead.
+echo [X] Nothing was changed. No UAC was requested.
+exit /b 1

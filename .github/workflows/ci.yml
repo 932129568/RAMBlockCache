@@ -103,6 +103,15 @@ jobs:
       - name: Gate8 check_stats_contract
         run: python src/scripts/check_stats_contract.py
 
+      # —— [S2 2026-11-07] CLI 产物新鲜度（Gate9）——
+      # 2026-11-07 实测：ramboostctl.exe 停留在 11-06 06:27，而 ramboostctl.c
+      # 17:52 才加上五个 RB_STATS statval 键；build_setup.ps1:139 会把这个 exe
+      # 原样打进安装包，导致分发包 CLI 无法回答 `statval engine_bs`，打穿
+      # 79 号 E1-c 验收门。check_repo.py 只配 core/ 测试产物，覆盖不到 ctl/。
+      # 内容级断言（五个键字符串）在 CI 可靠；产物不存在时跳过而非误报。
+      - name: Gate9 check_ctl_freshness
+        run: python src/scripts/check_ctl_freshness.py
+
       # —— Web 类型检查 + 生产构建（41 号 §11.5 阶段 2 接入）——
       # --loglevel=error 抑制 Node 27 alpha 上 npm 12.2.1 的已知 engines 假警告
       # （CI 侧同时抑制 Node 22 与 package.json engines 的 EBADENGINE 提示）。

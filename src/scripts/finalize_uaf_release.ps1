@@ -1,4 +1,10 @@
-﻿# finalize_uaf_release.ps1 -- ONE UAC for the >4K geometry UAF fix FULL REPLAY.
+﻿# DEPRECATED 2026-11-07 -- DO NOT RUN. Use finalize_geom_rebuild.ps1 instead.
+# This ONE-SHOT script pins $oldSys='ed1bd99c...' plus two stale Setup hashes;
+# replaying it against the current dist (sys 63ad0fa8... / Setup 0269fb50...)
+# aborts at step 1 and can leave a half-signed state. Kept ONLY as historical
+# evidence of the 2026-11-06 23:29 real-hardware replay. The wrapper
+# RB-finalize-uaf-release.cmd now refuses to execute outright.
+# finalize_uaf_release.ps1 -- ONE UAC for the >4K geometry UAF fix FULL REPLAY.
 # 2026-11-06. Log: C:\ProgramData\rb-deploy\finalize-uaf-release.log
 #
 # Sequence (73 #5 steps 2..8, fail-closed at EVERY step):

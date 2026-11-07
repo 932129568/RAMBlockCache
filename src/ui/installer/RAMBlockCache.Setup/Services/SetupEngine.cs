@@ -135,18 +135,52 @@ public sealed class SetupEngine
         /* [COVERAGE 2026-11-05] 覆盖安装：除控制器/安装器外，还要结束
          * node 桥接（它会锁住 webconsoleridge 下的 .node 与 server 文件）。
          * 只杀"命令行里含本项目路径"的 node，绝不动用户其它 Node 进程。 */
+        /* [88 M-7 2026-11-07] MainModule.FileName is the module PATH (not the
+         * command line) and throws / returns null for SYSTEM-owned processes,
+         * so the real bridge was silently skipped. Locate the process that
+         * actually owns 127.0.0.1:5199 via netstat, keep the legacy path
+         * check as a fallback, and never swallow exceptions silently. */
+        var bridgePids = new HashSet<int>();
+        try
+        {
+            var netPsi = new System.Diagnostics.ProcessStartInfo("netstat", "-ano -p TCP")
+            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true };
+            using var netProc = System.Diagnostics.Process.Start(netPsi);
+            if (netProc != null)
+            {
+                var netOut = netProc.StandardOutput.ReadToEnd();
+                netProc.WaitForExit(5000);
+                foreach (var nl in netOut.Split('\n'))
+                {
+                    var f = nl.Split(new[] { ' ', '\t', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (f.Length < 5 || !f[0].Equals("TCP", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!f[1].EndsWith(":5199", StringComparison.Ordinal)) continue;
+                    if (!f[3].Equals("LISTENING", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (int.TryParse(f[4], out int ownerPid) && ownerPid > 0) bridgePids.Add(ownerPid);
+                }
+            }
+        }
+        catch (Exception ex) { SetupLog.Warn($"netstat 5199 probe failed: {ex.Message}"); }
+
         foreach (var p in System.Diagnostics.Process.GetProcessesByName("node"))
         {
             try
             {
                 if (p.Id == Environment.ProcessId) continue;
-                var cmd = p.MainModule?.FileName ?? "";
-                if (!cmd.Contains("webconsole", StringComparison.OrdinalIgnoreCase)) continue;
+                var isBridge = bridgePids.Contains(p.Id);
+                if (!isBridge)
+                {
+                    var cmd = "";
+                    try { cmd = p.MainModule?.FileName ?? ""; }
+                    catch (Exception ex) { SetupLog.Warn($"node PID {p.Id} MainModule unreadable: {ex.Message}"); }
+                    isBridge = cmd.Contains("webconsole", StringComparison.OrdinalIgnoreCase);
+                }
+                if (!isBridge) continue;
                 p.Kill(entireProcessTree: true);
                 p.WaitForExit(3000);
                 line.Report($"      已结束残留桥接进程 node (PID {p.Id})");
             }
-            catch { /* 无权限/已退出：忽略 */ }
+            catch (Exception ex) { SetupLog.Warn($"kill bridge node PID failed: {ex.Message}"); }
         }
         foreach (var pn in new[] { "RAMBlockCache.Controller", "RAMBlockCache-Setup" })
         {
@@ -201,6 +235,23 @@ public sealed class SetupEngine
              * 改为显式作用域块，块结束即释放句柄。 */
             using (var archive = System.IO.Compression.ZipFile.OpenRead(zipPath))
             {
+                /* [88 H-3 2026-11-07] 覆盖升级时控制器是 self-contained 的
+                 * 根目录散落文件：新 controller.zip 只增不删，旧版本残留的
+                 * DLL / WebView2 会与新 net10.0.14 混杂。解压前按【新清单】
+                 * 删除安装目录根中的同名旧文件（不改 zip 结构、不动快捷方式）。 */
+                if (string.IsNullOrEmpty(destSub))
+                {
+                    int staleCount = 0;
+                    foreach (var e in archive.Entries)
+                    {
+                        if (string.IsNullOrEmpty(e.FullName) || e.FullName.EndsWith("/") || e.FullName.EndsWith("\\")) continue;
+                        var stale = Path.Combine(destDir, e.FullName);
+                        if (!File.Exists(stale)) continue;
+                        try { File.Delete(stale); staleCount++; }
+                        catch (Exception ex) { SetupLog.Warn($"H-3 stale controller file delete failed: {stale}: {ex.Message}"); }
+                    }
+                    if (staleCount > 0) line.Report($"      已清理旧控制器文件（{staleCount} 项，按 controller.zip 新清单）");
+                }
                 foreach (var entry in archive.Entries)
                 {
                     var target = Path.Combine(destDir, entry.FullName);
@@ -226,7 +277,10 @@ public sealed class SetupEngine
                 line.Report("      [!] start-webconsole.cmd 缺失（旧载荷包），Web 控制台快捷方式将不可用");
         }
         catch { /* 观察性提示，不阻塞安装 */ }
-        /* [FIX D#7] 安装器自身副本落地：原 ARP UninstallString 指向当前运行的安装器
+        /* [88 H-7 2026-11-07] 本步再拷一份约 272 MB 的 Setup.exe 到安装目录，
+         * 与 %TEMP%\.net\ 的 PublishSingleFile 自解压叠加；InstallerViewModel
+         * 预检的 1.2 GB 阈值已把这两份计入。
+         * [FIX D#7] 安装器自身副本落地：原 ARP UninstallString 指向当前运行的安装器
          * 路径（用户从 Downloads/临时目录运行即指向临时目录）——临时目录被清理后
          * "应用与功能→卸载"调用一个不存在的路径，卸载入口必坏。复制一份到安装
          * 目录，卸载入口改为 installDir\RAMBlockCache-Setup.exe /Uninstall。 */
@@ -374,7 +428,13 @@ public sealed class SetupEngine
         {
             string? l;
             while ((l = await p.StandardOutput.ReadLineAsync(ct).ConfigureAwait(false)) is not null)
-            { line.Report(l); SetupLog.Info($"[engine] {l}"); }
+            {
+                line.Report(l);
+                SetupLog.Info($"[engine] {l}");
+                /* [88 M-5] 引擎在无看门降级时打印该标记，GUI 再显式提示一次。 */
+                if (l.Contains("NO AUTOMATIC ROLLBACK NET", StringComparison.OrdinalIgnoreCase))
+                    line.Report("[!!] 本次安装无自动回滚网：仅剩 WinRE offline_rollback.cmd 兜底");
+            }
         }, ct);
         var errPump = Task.Run(async () =>
         {

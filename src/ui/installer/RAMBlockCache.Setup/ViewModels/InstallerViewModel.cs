@@ -264,15 +264,30 @@ public sealed class InstallerViewModel : ObservableObject
          * 上次安装残留（服务存在但文件缺失）。 */
         {
             var problems = new List<string>();
-            // ① 目标盘剩余空间（引擎+控制器+webconsole 约需 700MB）
+            // ① [88 H-7 2026-11-07] 目标盘 + %TEMP% 所在盘剩余空间。
+            //    PublishSingleFile 自解压到 %TEMP%\.net\（约 272 MB Setup.exe），
+            //    SetupEngine 另拷一份 272 MB 安装器副本到安装目录，
+            //    再加控制器 + webconsole 解压（约 260 MB）→ 阈值提到 1.2 GB。
+            const long RequiredBytes = 1200L * 1024 * 1024;
+            var roots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try { roots.Add(Path.GetPathRoot(Path.GetFullPath(_installDir.Trim())) ?? "C:\\"); }
+            catch (Exception ex) { Log.Add($"[precheck] 目标盘解析失败：{ex.Message}"); }
             try
             {
-                var root = Path.GetPathRoot(Path.GetFullPath(_installDir.Trim())) ?? "C:\\";
-                var di = new DriveInfo(root);
-                if (di.AvailableFreeSpace < 800L * 1024 * 1024)
-                    problems.Add($"目标盘剩余空间不足（{di.AvailableFreeSpace / 1024 / 1024} MB，至少需要 800 MB）");
+                var tmpRoot = Path.GetPathRoot(Path.GetFullPath(Path.GetTempPath()));
+                if (!string.IsNullOrEmpty(tmpRoot)) roots.Add(tmpRoot);
             }
-            catch (Exception ex) { Log.Add($"[precheck] 磁盘检查跳过：{ex.Message}"); }
+            catch (Exception ex) { Log.Add($"[precheck] TEMP 盘解析失败：{ex.Message}"); }
+            foreach (var root in roots)
+            {
+                try
+                {
+                    var di = new DriveInfo(root);
+                    if (di.AvailableFreeSpace < RequiredBytes)
+                        problems.Add($"{root.TrimEnd('\\')} 剩余空间不足（{di.AvailableFreeSpace / 1024 / 1024} MB，至少需要 1200 MB；含 Setup.exe 自解压与安装器副本各约 272 MB）");
+                }
+                catch (Exception ex) { Log.Add($"[precheck] 磁盘检查跳过（{root}）：{ex.Message}"); }
+            }
 
             // ② 测试模式状态（仅为信息：引擎会再开一次，失败即中止）
             try

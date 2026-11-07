@@ -18,6 +18,7 @@
 | 静默安装引擎 | `src/setup/ramboostsetup.exe` · **签名 Valid**（SmartScreen/AV 体验） |
 | 签名证书 | `CN=RAMBoostFS Root`（测试证书链，WinVerifyTrust 有效） |
 | 平台 | Windows 10/11 x64；需管理员 + 测试签名模式 |
+| 权限 | 控制器与 CLI 需管理员；标准用户账户不可用（控制设备 SDDL 仅 SYSTEM/管理员） |
 | 安全默认 | `Features/Flags=0` 全关 · 直写 · `ParallelFlush=1`（串行）· `TinyLFU=0` · `AutoAttach=0` |
 
 > ⚠️ **内核驱动警告**：未签名驱动 + BOOT_START + UpperFilters = 0x7B 启动循环。

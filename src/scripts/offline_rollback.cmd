@@ -11,9 +11,9 @@ REM
 REM  Usage (boot into WinRE):
 REM    1. Boot from Windows install media / enter WinRE
 REM       (Troubleshoot -> Advanced -> Command Prompt).
-REM    2. Find the Windows drive (often not C: in WinRE).
-REM       If it is NOT C:, edit the SYSROOT line below to match,
-REM       e.g.  set SYSROOT=D:\Windows
+REM    2. The Windows drive is auto-detected below (C:..Z:).
+REM       WinRE drive letters often differ from the booted system;
+REM       no manual SYSROOT edit is needed.
 REM    3. Run this script, e.g.:
 REM          X:\path\to\offline_rollback.cmd
 REM    4. Reboot. No network required.
@@ -32,15 +32,23 @@ REM Original order queried before loading -> in a clean WinRE session _CSN is
 REM always empty -> unconditional exit 1 (the only 0x7B rescue script was 100%
 REM dead in a clean session). Build16 archive confirms load-then-detect order.
 
-set "SYSROOT=C:\Windows"
-set "HIVE=%SYSROOT%\System32\config\SYSTEM"
-
-if not exist "%HIVE%" (
-  echo [X] Offline SYSTEM hive not found: %HIVE%
-  echo     Edit this script and set SYSROOT= to your Windows drive
-  echo     (try D:, E: ...). Then re-run.
+REM [88 H-4 2026-11-07] Auto-detect the Windows installation drive instead of
+REM hardcoding C:\Windows (WinRE commonly assigns D:, E:, ...).
+set "SYSROOT="
+for %%D in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
+  if not defined SYSROOT if exist "%%D:\Windows\System32\config\SYSTEM" set "SYSROOT=%%D:\Windows"
+)
+if not defined SYSROOT (
+  echo [X] Could not locate a Windows installation (C:..Z:\Windows\System32\config\SYSTEM).
+  echo     Use diskpart to find the Windows volume, then re-run. No changes made.
   exit /b 1
 )
+set "HIVE=%SYSROOT%\System32\config\SYSTEM"
+if not exist "%HIVE%" (
+  echo [X] Offline SYSTEM hive not found: %HIVE%
+  exit /b 1
+)
+echo [..] Detected Windows: %SYSROOT%
 
 echo [..] Loading offline SYSTEM hive ...
 reg load HKLM\RB_OFFLINE "%HIVE%" >nul
@@ -84,7 +92,40 @@ REM prevent volsnap from loading).
 REM [FIX sev-5 2026-10-18] The strip step no longer fails silently
 REM (no errorlevel check before: strip failure still printed [OK] later,
 REM user reboots believing rollback happened while registry was untouched).
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='HKLM:\RB_OFFLINE\%CLS%'; $v=(Get-ItemProperty -Path $p -Name UpperFilters -ErrorAction SilentlyContinue).UpperFilters; if($null -ne $v){ $keep=@($v | Where-Object { $_ -ne 'RAMBlockCache' }); if($keep.Count -eq 0){ $keep=@('volsnap') }; New-ItemProperty -Path $p -Name UpperFilters -PropertyType MultiString -Value $keep -Force | Out-Null; Write-Host ('[ok] UpperFilters now: ' + ($keep -join '; ')); exit 0 } else { Write-Host '[..] UpperFilters not present, nothing to strip'; exit 0 }"
+REM [88 H-4 2026-11-07] Pure reg.exe read-modify-write, no PowerShell dependency
+REM (stock WinRE often has no powershell.exe). reg query renders REG_MULTI_SZ
+REM as one line whose entries are joined by literal \0; convert to ';', drop
+REM only RAMBlockCache, keep every other filter, fall back to volsnap when
+REM empty. reg add with /t REG_MULTI_SZ and \0 separators writes it back.
+set "UF_RAW="
+set "UF_TYPE="
+for /f "tokens=2,*" %%A in ('reg query "HKLM\RB_OFFLINE\%CLS%" /v UpperFilters 2^>nul ^| findstr /i /c:"UpperFilters"') do (
+  set "UF_TYPE=%%A"
+  set "UF_RAW=%%B"
+)
+if not defined UF_RAW goto UF_ABSENT
+if /i not "%UF_TYPE%"=="REG_MULTI_SZ" (
+  echo [X] UpperFilters is not REG_MULTI_SZ (got %UF_TYPE%). Refusing to rewrite.
+  reg unload HKLM\RB_OFFLINE >nul 2>&1
+  exit /b 1
+)
+set "UF_LIST=!UF_RAW:\0=;!"
+set "UF_NEW="
+set "UF_REST=!UF_LIST!"
+:UF_LOOP
+if not defined UF_REST goto UF_WRITE
+set "UF_E="
+for /f "tokens=1* delims=;" %%A in ("!UF_REST!") do (
+  set "UF_E=%%A"
+  set "UF_REST=%%B"
+)
+if defined UF_E if /i not "!UF_E!"=="RAMBlockCache" (
+  if defined UF_NEW (set "UF_NEW=!UF_NEW!\0!UF_E!") else (set "UF_NEW=!UF_E!")
+)
+goto UF_LOOP
+:UF_WRITE
+if not defined UF_NEW set "UF_NEW=volsnap"
+reg add "HKLM\RB_OFFLINE\%CLS%" /v UpperFilters /t REG_MULTI_SZ /d "!UF_NEW!" /f >nul 2>&1
 if errorlevel 1 (
   echo [X] UpperFilters strip FAILED - the offline hive was NOT modified.
   echo     Do NOT reboot believing this is rolled back. Inspect with:
@@ -92,6 +133,11 @@ if errorlevel 1 (
   reg unload HKLM\RB_OFFLINE >nul 2>&1
   exit /b 1
 )
+echo [ok] UpperFilters rewritten without RAMBlockCache: !UF_NEW!
+goto UF_DONE
+:UF_ABSENT
+echo [..] UpperFilters not present, nothing to strip
+:UF_DONE
 
 echo [..] Clearing armed flag in service Parameters ...
 reg add "HKLM\RB_OFFLINE\%CS%\Services\RAMBlockCache\Parameters" /v FilterArmed /t REG_DWORD /d 0 /f >nul 2>&1

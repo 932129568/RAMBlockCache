@@ -5,8 +5,9 @@
  * 动作：
  *   1) 清理旧版本残留（旧服务；旧非标准卷类 GUID {536670a4-...} 下的 UpperFilters）
  *   2) 复制驱动到 %SystemRoot%\system32\drivers
- *   3) 创建服务（KERNEL_DRIVER + BOOT_START + "System Bus Extender" 组）
- *      + 写 Parameters 默认值；旧服务存在则 ChangeServiceConfig 幂等升级
+ *   3) 创建服务（KERNEL_DRIVER + 首装 DEMAND_START / 显式 /BootStart 才
+ *      BOOT_START + "System Bus Extender" 组）+ 写 Parameters 默认值；
+ *      旧服务存在则 ChangeServiceConfig 只做幂等升级，绝不降级既有 BOOT_START
  *   4) 向标准卷类 {71a27cdd-...} 的 UpperFilters 读-改-写【追加】RAMBlockCache
  *      （保留 volsnap；已存在则幂等跳过）
  *   5) 提示重启一次生效；之后 ATTACH/DETACH 热开关免重启
@@ -25,9 +26,20 @@
  * 编译：cl /W4 /O2 /utf-8 ramboostsetup.c /link advapi32.lib wintrust.lib shell32.lib user32.lib
  *        （wintrust.lib 供 [FIX A2] 签名预检；pragma comment 已冗余保险；
  *          /utf-8 防中文注释 C4819；shell32/user32 供 IsUserAnAdmin 与退出码路径）
+ *
+ * [88 B-2 2026-11-07] 不可逆变更前的顺序约束（严禁再把预检挪回后面）：
+ *   VerifyDriverSignature() -> SecureBootAllowsInstall() -> EnableTestSigning()
+ *   -> 才允许 DeleteServiceIfExists / RegMultiSzRemove / CopyDriverFile /
+ *      CreateService / RegMultiSzAppend。
+ *   Secure Boot 开启、或 testsigning 开启失败，必须在【任何】旧服务摘除、
+ *   UpperFilters 改写、驱动映像覆盖、服务创建之前 return 1。否则会留下
+ *   「测试签名 sys + 服务 + UpperFilters 引用它 + testsigning OFF」的半装态，
+ *   开机 0x7B，且 FilterArmed 未置 1 使 boot_guard 跳过。失败时机器保持原状，
+ *   最多残留 testsigning=on 而无驱动引用（安全方向）。
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winsvc.h>         /* [88 B-1/B-2] QueryServiceConfigW / SERVICE_NO_CHANGE */
 #include <stdio.h>
 #include <string.h>
 #include <shellapi.h>
@@ -151,28 +163,64 @@ static LONG RegMultiSzRemove(LPCWSTR sub, LPCWSTR val, LPCWSTR entry)
     return r;
 }
 
-static void DeleteServiceIfExists(void)
+/* [88 H-2 2026-11-07] 原实现吞掉 ControlService / DeleteService / 超时，
+ * 并无条件打印 [ok] old service removed：覆盖升级时旧驱动仍加载、映像被覆盖，
+ * 失败被静默忽略。现在所有返回值都判，失败一律 FALSE 让调用方 return 1。 */
+static BOOL DeleteServiceIfExists(void)
 {
     SC_HANDLE m = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     SC_HANDLE s;
-    if (!m) return;
+    if (!m) { Fail(L"OpenSCManager (cleanup)"); return FALSE; }
     s = OpenServiceW(m, SVC_NAME, SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
-    if (s) {
+    if (!s) {
+        DWORD e = GetLastError();
+        CloseServiceHandle(m);
+        if (e == ERROR_SERVICE_DOES_NOT_EXIST) return TRUE;   /* 正常首装 */
+        Fail(L"OpenService (cleanup) - refusing to continue with unknown service state");
+        return FALSE;
+    }
+    {
         SERVICE_STATUS st;
         int wait;
-        ControlService(s, SERVICE_CONTROL_STOP, &st);   /* 触发干净卸载/落盘 */
-        /* [FIX W20] 等到 SERVICE_STOPPED（上限 ~15s）再 DeleteService，
-         * 否则重装时 ERROR_SERVICE_MARKED_FOR_DELETE 中断 */
-        for (wait = 0; wait < 30; wait++) {
-            if (!QueryServiceStatus(s, &st)) break;
-            if (st.dwCurrentState == SERVICE_STOPPED) break;
+        BOOL stopped = FALSE, ok = TRUE;
+        WCHAR b[200];
+        ZeroMemory(&st, sizeof(st));
+        if (!ControlService(s, SERVICE_CONTROL_STOP, &st)) {
+            DWORD e = GetLastError();
+            if (e == ERROR_SERVICE_NOT_ACTIVE || e == ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
+                Ok(L"old service already stopped (STOP control not needed)");
+                stopped = TRUE;
+            } else {
+                wsprintfW(b, L"ControlService(STOP) failed err=%lu - refusing to overwrite a live driver", e);
+                Fail(b);
+                ok = FALSE;
+            }
+        }
+        for (wait = 0; ok && !stopped && wait < 30; wait++) {
+            if (!QueryServiceStatus(s, &st)) {
+                wsprintfW(b, L"QueryServiceStatus failed err=%lu while waiting for stop", GetLastError());
+                Fail(b);
+                ok = FALSE;
+                break;
+            }
+            if (st.dwCurrentState == SERVICE_STOPPED) { stopped = TRUE; break; }
             Sleep(500);
         }
-        DeleteService(s);
+        if (ok && !stopped) {
+            Fail(L"old service did not reach SERVICE_STOPPED within ~15s - refusing to overwrite a live driver image");
+            ok = FALSE;
+        }
+        if (ok && !DeleteService(s)) {
+            wsprintfW(b, L"DeleteService failed err=%lu (marked-for-delete means the old service is still referenced)", GetLastError());
+            Fail(b);
+            ok = FALSE;
+        }
         CloseServiceHandle(s);
-        wprintf(L"[ok] old service removed\n");
+        CloseServiceHandle(m);
+        if (!ok) return FALSE;
+        Ok(L"old service removed (verified: stopped + DeleteService OK)");
+        return TRUE;
     }
-    CloseServiceHandle(m);
 }
 
 /* ---- [FIX A2] 签名预检：未签名/签名链无效的驱动绝不进入引导路径 ----
@@ -295,10 +343,73 @@ static BOOL VerifyDriverSignature(void)
     return FALSE;
 }
 
+/* [88 B-2 2026-11-07] Secure Boot preflight. A test-signed driver cannot
+ * load while Secure Boot is enabled: bcdedit /set testsigning on is ignored
+ * by policy and the machine ends up with an UpperFilters reference to an
+ * unloadable filter -> 0x7B. Refuse BEFORE the first machine change.
+ * Missing State key/value = legacy BIOS -> warn and continue.
+ * Any other registry error = fail closed (cannot prove Secure Boot is off). */
+static BOOL SecureBootAllowsInstall(void)
+{
+    HKEY h = NULL;
+    LONG r = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
+        0, KEY_READ | KEY_WOW64_64KEY, &h);
+    if (r == ERROR_FILE_NOT_FOUND) {
+        Ok(L"Secure Boot state not exposed (legacy BIOS / no State key) - continuing");
+        return TRUE;
+    }
+    if (r != ERROR_SUCCESS) {
+        Fail(L"read Secure Boot state (HKLM SecureBoot\\State)");
+        return FALSE;
+    }
+    {
+        DWORD val = 0, cb = sizeof(val), type = 0;
+        LONG qr = RegQueryValueExW(h, L"UEFISecureBootEnabled", NULL, &type,
+                                   (LPBYTE)&val, &cb);
+        RegCloseKey(h);
+        if (qr == ERROR_FILE_NOT_FOUND) {
+            Ok(L"UEFISecureBootEnabled not present - assuming Secure Boot off");
+            return TRUE;
+        }
+        if (qr != ERROR_SUCCESS || type != REG_DWORD) {
+            Fail(L"read UEFISecureBootEnabled (expected REG_DWORD)");
+            return FALSE;
+        }
+        if (val == 1) {
+            Fail(L"ABORT: Secure Boot is ENABLED - a test-signed driver cannot load.");
+            Fail(L"Enter BIOS/UEFI setup, disable Secure Boot, then re-run this installer.");
+            Fail(L"No service, driver file or UpperFilters were changed (machine untouched).");
+            return FALSE;
+        }
+        Ok(L"Secure Boot is off (UEFISecureBootEnabled=0)");
+        return TRUE;
+    }
+}
+
 static BOOL CopyDriverFile(void)
 {
     WCHAR src[MAX_PATH], dst[MAX_PATH];
     int retry;
+    /* [88 H-2] Overwriting a still-loaded image is unsafe. If a previous
+     * cleanup somehow left a RUNNING service, say so loudly and stop. */
+    {
+        SC_HANDLE sm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+        if (sm) {
+            SC_HANDLE ss = OpenServiceW(sm, SVC_NAME, SERVICE_QUERY_STATUS);
+            if (ss) {
+                SERVICE_STATUS sst;
+                if (QueryServiceStatus(ss, &sst) && sst.dwCurrentState == SERVICE_RUNNING) {
+                    Fail(L"old RAMBlockCache service is STILL RUNNING - refusing to overwrite its image; run 'sc stop RAMBlockCache' and re-run");
+                    CloseServiceHandle(ss);
+                    CloseServiceHandle(sm);
+                    return FALSE;
+                }
+                CloseServiceHandle(ss);
+            }
+            CloseServiceHandle(sm);
+        }
+    }
     GetModuleFileNameW(NULL, src, MAX_PATH);
     WCHAR *sl = wcsrchr(src, L'\\'); if (sl) *sl = 0;
     wcscat_s(src, MAX_PATH, L"\\RAMBlockCache.sys");
@@ -741,12 +852,23 @@ int wmain(int argc, LPWSTR *argv)
      * （摘过滤器是安全方向）但"失败零副作用"不成立：安装失败且原功能消失。
      * 现移到最前：验签不过，机器保持原状。 */
     if (!VerifyDriverSignature()) return 1;
-    wprintf(L"[i] if this is a self-signed test cert, make sure testsigning is ON\n");
-    wprintf(L"    (bcdedit /enum {current} -^> look for testsigning Yes),\n");
-    wprintf(L"    otherwise the kernel will still refuse to load it at boot.\n");
+    /* [88 B-2] BOTH irreversible-risk preconditions pass BEFORE the first
+     * DeleteService / UpperFilters rewrite / CopyFile / CreateService below. */
+    if (!SecureBootAllowsInstall()) return 1;
+    if (!opt.NoTestSigning) {
+        if (!EnableTestSigning(opt.Silent)) {
+            Fail(L"ABORT: testsigning could not be enabled - driver would fail to load at boot (0x7B).");
+            Fail(L"Disable security software blocking bcdedit, then re-run the installer.");
+            Fail(L"Manual: admin cmd -> bcdedit /set testsigning on -> reboot -> install again.");
+            return 1;   /* zero machine changes so far except the testsigning attempt */
+        }
+    } else {
+        Ok(L"/NoTestSigning: skipping bcdedit (formally signed distribution only)");
+    }
+    wprintf(L"[i] self-signed test cert: testsigning is ON (setting needs ONE reboot to take effect)\n");
 
-    /* 1) 旧残留清理 */
-    DeleteServiceIfExists();
+    /* 1) 旧残留清理（此后失败都可能留下部分变更，故上面的预检已前置） */
+    if (!DeleteServiceIfExists()) return 1;
     RegMultiSzRemove(CLS_BAD,   L"UpperFilters", L"RAMBlockCache");  /* 旧非标准 GUID（BUG-009） */
     RegMultiSzRemove(CLS_VOLUME,L"UpperFilters", L"RAMBlockCache");  /* 幂等重装 */
     Ok(L"stale state cleaned");
@@ -754,7 +876,8 @@ int wmain(int argc, LPWSTR *argv)
     /* 2) 驱动文件 */
     if (!CopyDriverFile()) return 1;
 
-    /* 3) 服务（V10.2：BOOT_START + System Bus Extender 组；旧服务幂等升级。
+    /* 3) 服务（首装 DEMAND_START；仅显式 /BootStart 才 BOOT_START +
+     *      System Bus Extender 组。旧服务幂等升级但绝不降级既有 BOOT_START。
      *      [U0-1] TestMode：DEMAND_START + 无组 = 不碰任何启动路径） */
     m = OpenSCManagerW(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
     if (!m) { Fail(L"open SCM"); return 1; }
@@ -783,14 +906,32 @@ int wmain(int argc, LPWSTR *argv)
         if (!s && GetLastError() == ERROR_SERVICE_EXISTS)
             s = OpenServiceW(m, SVC_NAME, SERVICE_ALL_ACCESS);
         if (s) {
-            /* 幂等升级：旧 demand-start 服务同步为 boot-start / 组 / error-normal
-             * （TestMode 反向同步为 demand-start / 无组） */
+            /* [88 B-1 2026-11-07] QueryServiceConfigW first: an existing
+             * BOOT_START service must NEVER be downgraded to DEMAND_START by
+             * a plain reinstall (only an explicit /BootStart is an upgrade).
+             * lpLoadOrderGroup=NULL means "no change" per Win32 contract. */
+            DWORD effectiveStart = startType;
+            LPCWSTR effectiveGroup = svcGroup;
+            DWORD need = 0;
+            LPQUERY_SERVICE_CONFIGW cfg = NULL;
+            BOOL queried = FALSE;
+            QueryServiceConfigW(s, NULL, 0, &need);
+            if (need) {
+                cfg = (LPQUERY_SERVICE_CONFIGW)HeapAlloc(GetProcessHeap(), 0, need);
+                if (cfg && QueryServiceConfigW(s, cfg, need, &need)) queried = TRUE;
+            }
+            if (queried && cfg->dwStartType == SERVICE_BOOT_START && !opt.BootStart) {
+                effectiveStart = SERVICE_NO_CHANGE;
+                effectiveGroup = NULL;
+                Ok(L"existing BOOT_START service preserved (no downgrade on reinstall)");
+            }
+            if (cfg) HeapFree(GetProcessHeap(), 0, cfg);
             if (!ChangeServiceConfigW(s,
                                       SERVICE_KERNEL_DRIVER,
-                                      startType,
+                                      effectiveStart,
                                       SERVICE_ERROR_NORMAL,
                                       NULL,                      /* binPath 保持不变 */
-                                      svcGroup,
+                                      effectiveGroup,
                                       NULL, NULL, NULL, NULL, NULL)) {
                 Fail(L"ChangeServiceConfig (start-type sync)");
             }
@@ -807,8 +948,17 @@ int wmain(int argc, LPWSTR *argv)
                   g_lastRegFail);
         Ok(b);   /* 用 Ok 通道保证输出不丢；不 Fail——驱动服务已装好，缺省可补 */
     }
-    Ok(opt.TestMode ? L"service created (DEMAND_START, no boot group)"
-                    : L"service created (BOOT_START, group=System Bus Extender)");
+    /* [88 B-1] 如实按 startType / svcGroup 输出，不再谎报 BOOT_START。 */
+    {
+        WCHAR b[256];
+        wsprintfW(b, L"service created (%s, %s)",
+                  (startType == SERVICE_BOOT_START) ? L"BOOT_START" : L"DEMAND_START",
+                  svcGroup ? svcGroup : L"no boot group");
+        Ok(b);
+    }
+    if (!opt.BootStart && !opt.TestMode) {
+        Ok(L"first install is DEMAND_START by design (0x7B-safe); boot-time acceleration needs a manual second pass with /BootStart");
+    }
 
     if (opt.TestMode) {
         /* [U0-1] 测试模式注册表开关：驱动 RbAttachVolumeRuntime 的总门（默认关）。
@@ -822,16 +972,9 @@ int wmain(int argc, LPWSTR *argv)
             RegSetValueExW(h, L"TestMode", 0, REG_DWORD, (const BYTE*)&one, sizeof(one));
             RegCloseKey(h);
         }
-        Ok(L"TestMode=1 (runtime attach armed; UpperFilters untouched)");
-        /* [USER-REQ 2026-11-05] testsigning 是硬前提：测试签名驱动未开
-         * testsigning 会在开机被 Code Integrity 拒载 → 0x7B 蓝屏循环。
-         * 失败即中止安装（此前只警告继续，是 0x7B 的真实成因之一）。 */
-        if (!opt.NoTestSigning && !EnableTestSigning(opt.Silent)) {
-            Fail(L"ABORT: testsigning could not be enabled - driver would fail to load at boot (0x7B).");
-            Fail(L"Close 360/security software and re-run the installer, or run:");
-            Fail(L"    bcdedit /set testsigning on   (as admin)   then reboot and install again.");
-            return 1;
-        }
+        /* [88 B-2] testsigning 已在任何机器变更前完成（见 wmain 预检段），
+         * 这里只复用结果，绝不重复调 bcdedit。 */
+        Ok(L"TestMode=1 (runtime attach armed; UpperFilters untouched; testsigning preflight already done)");
         wprintf(L"\n>>> DONE (TestMode). NO REBOOT NEEDED for install; testsigning needs ONE reboot.\n");
         wprintf(L">>> Then:  sc start RAMBlockCache   /   ramboostctl attach <X:>\n");
         wprintf(L">>> Uninstall = sc stop (clean unload, dirty flushed). Production mode:\n");
@@ -855,13 +998,8 @@ int wmain(int argc, LPWSTR *argv)
     if (RegMultiSzAppend(CLS_VOLUME, L"UpperFilters", L"RAMBlockCache"))
         { Fail(L"append Volume UpperFilters"); return 1; }
     Ok(L"Volume UpperFilters appended (volsnap kept)");
-    /* [USER-REQ 2026-11-05] 同上：testsigning 失败必须中止，绝不留下
-     * "驱动已装但开机加载不了"的半成品（那正是对方机器 0x7B 的现场）。 */
-    if (!opt.NoTestSigning && !EnableTestSigning(opt.Silent)) {
-        Fail(L"ABORT: testsigning could not be enabled - driver would fail to load at boot (0x7B).");
-        Fail(L"Disable security software blocking bcdedit, then re-run the installer.");
-        return 1;
-    }
+    /* [88 B-2 2026-11-07] testsigning 预检已前移到验签之后、任何不可逆变更
+     * 之前完成并 fail-closed；此处不得再重复调用，失败路径不再产生半装态。 */
 
     /* [P1.5 2026-11-06] 武装 boot_guard 看门（deploy.ps1 步骤 3/4/5 的分发链移植）。
      * 语义（严格）：① 三件套（guard 脚本 + RAMBoostBootGuard/RAMBoostLogonDisarm
@@ -869,6 +1007,8 @@ int wmain(int argc, LPWSTR *argv)
      * ② 任一失败不 return 1、不中止安装（分发机可能被 360 等拦 schtasks，
      * 硬拒 = 装不上），打 Fail 后继续，回滚网降级为
      * 签名预检 + offline_rollback.cmd 两层。 */
+    /* [88 M-5/M-6] 看门失败降级必须显式输出「本次安装无自动回滚网」，
+     * SetupEngine.RunEngineAsync 会把本行原样转发到 GUI。 */
     if (InstallGuardScripts() &&
         RegisterGuardTask(L"RAMBoostBootGuard",   L"ONSTART",
                           L"C:\\ProgramData\\RAMBoost\\boot_guard.ps1") &&
@@ -900,10 +1040,13 @@ int wmain(int argc, LPWSTR *argv)
             /* 基线写不进去（Parameters 刚被 SetDefaults 建过，理论上几乎不可能）
              * ——FilterArmed 未置 1 = 未武装，方向安全：看门任务空转即退出。 */
             Fail(L"write armed baseline (Parameters key) - FilterArmed NOT set");
+            Fail(L"NO AUTOMATIC ROLLBACK NET: guard tasks exist but FilterArmed was not set; only WinRE offline_rollback.cmd remains.");
         }
         StampSignerState();
     } else {
-        Fail(L"boot guard not armed (guard scripts/schtasks unavailable) - install continues; rollback net = signature gate + offline_rollback.cmd");
+        Fail(L"NO AUTOMATIC ROLLBACK NET: boot guard NOT armed (guard scripts/schtasks unavailable).");
+        Fail(L"NO AUTOMATIC ROLLBACK NET: install continues with ONLY WinRE offline_rollback.cmd as fallback.");
+        Fail(L"NO AUTOMATIC ROLLBACK NET: close security software and re-run the installer to restore the guard.");
     }
 
     wprintf(L"\n>>> DONE. Reboot ONCE to bring the filter into every volume stack\n");

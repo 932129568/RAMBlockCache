@@ -8,8 +8,10 @@
  *     （SIM）验证门控/屏障/回滚/计数/中间态不变量，并用**真实 core 引擎**
  *     rb_engine_create/destroy + rb_stream_create/destroy 验证几何切换与数据
  *     正确性。驱动二进制本身的真机验收由 QA E1–E8 覆盖，本文件不冒充之。
- *   - 按实施单硬边界：本文件**不加入** _build_all.ps1 / _build_asan.ps1 的
- *     $Tests，不改 CI。独立编译命令：
+ *   - [88 H-10 2026-11-07 注释更正] 批次 A 已把本文件加入
+ *     build_all.bat / run_all.bat / _build_all.ps1 / _build_asan.ps1 的权威
+ *     清单与 check_repo.py 的 TESTS（产物新鲜度由该门禁校验）。下面这条
+ *     独立编译命令仍保留作单用例调试入口，不再是唯一入口：
  *       cl /nologo /O2 /W4 /utf-8 /I. test_rebuild.c cache.c /Fe:build\test_rebuild.exe
  *       build\test_rebuild.exe
  *

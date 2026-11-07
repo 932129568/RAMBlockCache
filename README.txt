@@ -64,6 +64,8 @@
  src\scripts\deploy.ps1；install.ps1 / ramboostsetup.ps1=legacy 备选。）
   dist\RAMBlockCache-Setup.exe（272,872,792 B，V10.5.0 起）
   · 双击即运行（自动 UAC 提权；安装器与控制台均 self-contained，无需目标机安装 .NET）。
+  · 控制器与 CLI 需管理员：控制设备 \\.\RAMBlockCache 的 SDDL 仅 SYSTEM/
+    管理员可访问，标准用户账户下控制器与 CLI 不可用（安装器本身会自动 UAC）。
   · 五页向导：欢迎 → 许可协议 → 安装位置与选项（自定义目录/快捷方式）→
     进度（提取 → 驱动签名校验 → 注册服务 → 写入配置）→ 完成（立即/稍后重启）。
   · 驱动本体固定装 System32\drivers（内核要求）；控制台/CLI/INF/README 落在

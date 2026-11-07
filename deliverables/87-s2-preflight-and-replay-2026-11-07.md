@@ -293,3 +293,53 @@ ramboostctl.new.exe : fatal error LNK1120: 3 个无法解析的外部命令
 **重启后仍须额外确认（不在 `verify_final_reboot.ps1` 内）**：预演里 bridge pid 仍是 `8376`（11-06 23:30 启动的旧解码器，`GET_STATS` 仍是 45 字段）。keeper 由 SYSTEM/ONSTART 约 30 s 重起后须先查 pid 已变 + `GET_STATS` 字段数 = **50** 且五键存在，再跑验收与 S3 专项（§11.4 / §8）。
 
 **口径**：以上只证明**新签名驱动已部署到 System32、服务/注册态已武装、分发包与文档一致**；内核内存镜像仍是旧驱动，**不构成 B1/B2 运行时后果、免重启切档实效、缓存数据面正确性或回写性能的真机验证**。Verifier `/reset` 的内核侧落实也须重启后复核。
+
+---
+
+## 14. 重启后验收、S3 专项与「只能选 4 KB」根因（16:35–16:45）
+
+### 14.1 重启验收：S2 闭环
+
+用户重启一次，boot `2026-11-07T08:35:53.500Z` > marker `2026-11-07T08:30:48.509Z`。`verify_final_reboot.ps1` = **`RESULT: FAIL=0 WARN=0` / `VERDICT: PASS` / `SCRIPT_EXIT=0`**，19 个 PASS gate（对照 §13 的重启前预演 `FAIL=2`，两项预期项全部转绿）：
+
+| 判据 | 实测 |
+|---|---|
+| reboot after finalize | `08:35:53.500Z > 08:30:48.509Z` |
+| Verifier off | `VerifyDrivers=[]` / `VerifyDriverLevel=` 空 |
+| System32 sys | `10fb7009…` / Valid / == 新 dist sys |
+| service | `Running / Boot` |
+| watchdog | `Seq=12 Ack=12 Armed=0 Healthy=1 BootFails=0` |
+| bootcfg reg / GET /rb/bootcfg | `AA=0 RB=1 Letters=D` |
+| 新开机段 | `resume list loaded` / `volume attached`（**X4 文本匹配**）/ 24 行零 ERROR / boot-critical 条件 INFO |
+| bridge health | `pid=3792` / `node=v27.0.0-alpha.0.0.0` / `native=True`（旧 pid 8376 已换，keeper ONSTART 重起兑现） |
+| D: / 其它卷 | `Attached=1`；C/E/F 全 0 |
+| GET_CONFIG | 24 字段，`TinyLFU=0`；看门 RPC 前后 `12/12/0` 不变 |
+| Setup / README | `db7006d7…` Valid，README.md 含该哈希 |
+
+UAC 后十道门禁全绿；四个提交 `70a38f8` / `c20c732` / `ec7714e` / `b8bc1fa` 全部推送；GitHub Actions run **25 / 26 / 27 全部 `completed / success`**（Gate9 在 hosted runner 上不误报得到确认）。
+
+### 14.2 S3 专项（超出 `verify_final_reboot.ps1` 的部分）
+
+- `GET_STATS` **50 字段**，五键全在：`EngineBlockSize=4096`、`GeometryRebuildCount=0`、`GeometryRebuildLastStatus=0`、`GeometryRebuildInProgress=0`、`LastGeometryRebuildUtc=0` —— 引擎真实几何与配置副本一致，重建计数初值正确。
+- `GET_CONFIG`：`BlockSize=4096 / WriteBack=0 / Enabled=1`。
+- **CLI `statval` 口径限制（非缺陷）**：普通会话执行 `ramboostctl.exe statval engine_bs|rebuild_count|rebuild_status|rebuild_in_progress|rebuild_utc` 全部输出 `-1 / exit=1`。根因实测：当前会话 `is_admin=False`，而 `src/ctl/ramboostctl.c:71-79` 明确控制设备 SDDL = `D:P(A;;GA;;;SY)(A;;GA;;;BA)`（仅 SYSTEM / 管理员），`:61-67` `CreateFileW` 失败即 `rb_connect()` 返回 -1，`:1981` `rb_get_stats` 失败就打印 `-1`。桥接 keeper 是 SYSTEM 进程，故 `GET_STATS` 正常。⇒ **E1-c 的桥接侧证据已具备；CLI 侧需经 `ramboostctl.cmd` 自提权复核**，不得把 `-1` 误判为新驱动回归。S4 切档入口选型须考虑这一点（见 14.3）。
+
+### 14.3 用户反馈「为什么现在还不能选」：纯前端历史限制
+
+用户截图显示 Web 设置页 `缓存块大小 BlockSize` 下拉展开只有 `4 KB` 一项。根因定位：
+
+- `web/src/features/settings/SettingsPage.tsx:13` = `const BLOCK_SIZES = [4096];`；`:194-196` 用 `${b/1024} KB` 渲染 ⇒ 只有「4 KB」。`:10-12` 注释写明这是 11-06 F1 批的**刻意**限制：当时切档必须整机重启，故「UI 只提供 4K」；64K/128K 因 11-03 事故封禁。
+- 对照 **WPF 控制台早就有 4 档**：`src/ui/wpf/Views/MemoryView.xaml.cs:20` = `{ 4096, 8192, 16384, 32768 }`。只有 Web 落后。
+- **驱动与桥接链路已完全打通**（逐环节核实）：`rbctl.c:172-176` 白名单 `{4096,8192,16384,32768}` → `:348-365` 先 clamp 副本再判 `newBs != g_Rb.Config.BlockSize` ⇒ `isRebuildRequest=TRUE` → `rbrebuild.c:294-295` 同款白名单 → 卷级免重启重建；桥接 `web/bridge/server/index.ts:184/195` 把 `BlockSize` 原样写 `@148`，`:212-216` `u32()` 不钳位；`web/src/bridge/http-transport.ts:129` 仅 `z.number()` 无 enum 限制。**唯一卡点就是那一行数组**。
+- 已知边界：`src/driver/rbL2.c:307-311` 的 L2 块粒度门（`BlockSize*16 != 64KB` 时拒绝 L2），当前 `Features\Flags=0`、L2 默认 OFF，不在本批影响范围；H8 仍「未覆盖」。
+
+**处置（并行派单，不改驱动 / 不动 sys / 不动三锚点 / 不重启 / 不写 marker）**：
+- `software-engineer`：`BLOCK_SIZES` 改 4 档 + 下拉旁加切档提示（引擎重建、命中率归零、直写下无脏数据不丢）+ 新增 `check_blocksize_contract.py`（Gate10，断言 UI 档位 == `rbctl.c` 白名单 == `rbrebuild.c` 白名单、不含 65536/131072、`configSchema` 无 enum 限制、CI 持续注册）+ Node27 SPA build + 全门禁 + 提交。
+- `software-qa-engineer`：独立只读核查整条写回链有无隐藏门控，产出 S4（4K → 16K → 4K）真机切档的基线清单、E1/E3/E8 判据、STOP-ON-FAIL 与口径限制。
+
+本机桥接由 keeper 从仓库 `web/` 直跑并服务 `web/dist`，因此**前端 build 完成后刷新页面即可看到四档，无需再重启、无需再双击 UAC**；分发包 `webconsole.zip` / Setup 的一致性由主理人另起轻量签名流程处理。
+
+### 14.4 口径边界（S3 之后仍然成立）
+
+- 已证明：新签名驱动**已加载并稳定运行**、五字段 ABI 可读、看门全周期闭环、Verifier 已清、D: 自动恢复、分发包与文档一致。
+- **仍未证明**：B1/B2 两个内核 UAF 的运行时后果、`sc stop` 与免重启切档真机实效、缓存数据面 >4K 正确性、回写正确性、峰值性能、H8。S4/S5 才是这些结论的取证窗口；单轮 16K、单卷 D:、直写、单次会话不构成全几何/全模式验证，吞吐绝对值不作峰值宣称。

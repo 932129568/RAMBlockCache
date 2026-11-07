@@ -234,6 +234,20 @@
 
 ---
 
+## H. [90 号] 真机性能 A/B 与免重启几何重建首测（2026-11-07）
+
+| # | 项 | 状态 | 说明 |
+|---|---|---|---|
+| H1 | **免重启 `BlockSize` 切换在真机失败并回滚（S4 NO-GO）** | 🔴 阻断 | 切 8192 后 `GET_CONFIG.BlockSize=8192` 但 `GET_STATS.EngineBlockSize=4096`、`GeometryRebuildCount=0`、`InProgress=1`；驱动日志 `ERROR [453] rebuild: detach drain timeout, abort (engine kept)` + `ERROR [327] rebuild: detach failed, rolling back` + `WARN [510] 0xc0000001 rolled back, service restored`。根因静态定位 `rbattach.c:448`：等待 `ext->Refs <= 1+selfRefs` 的 20ms×3000 步（60s）上限超时，走 `:452-463` 就地复原 `IsAttached` 并保留 Stream（B5 硬约束），`rbrebuild.c:183` 逐卷失败 → 回滚。**Refs 为何排不空未定位**（本机无 WDK/Verifier/双机 WinDbg，不能读内核实时引用来源），不作推测结论。按 STOP-ON-FAIL 未继续 16K/32K、未重跑掩盖；`finally` 无条件回 4K。回滚完整性已复核：cfg/engine 均 4096、InProgress=0、DirtyBytes=0、RmwReads=0、卷集合与 bootcfg 未变、服务 Running/Boot、canary PASS、无 BugCheck/disk 事件。 |
+| H2 | **直写下 `ParallelFlush` 五路无稳定区分度** | 🟡 结论 | 真机 `rbbench`（`FILE_FLAG_NO_BUFFERING`）3 轮/档取中位：16 路 6 项指标中位数值均最高，但逐轮离散度 1.0–57.2%、非单调（8 路 RND4K_R_QD1 最低）、各档区间大量重叠 ⇒ **不给最优路数**。与 75 号用户态基准（1 路最高/16 路最低）方向相反，因 75 号显式建模 write-back 脏分片，而本机 `WriteBack=0` 直写 `DirtyBytes=0`。印证 78 号 §5.2。 |
+| H3 | **本机读加速由缓存命中主导** | ℹ️ 观察 | 累计 `ReadReq=544770 / ReadHit=544763` → 命中率 **99.9987%**；SEQ1M_R 6.9–9.7 GiB/s 是内存命中速度，非 SATA SSD 盘速（SEQ1M_W≈400 MiB/s 才接近盘速）。当前 `Enabled=1 / ReadCacheEnabled=1 / AutoMemory=1`(38,877 MB) + 直写是唯一经真机验收的组合，没有证据表明单项调整能稳定再提速。 |
+| H4 | **`verify_final_reboot.ps1` 当前 `FAIL=1` 是测试日志痕迹，不是回归** | 🟡 纪律 | 唯一失败项 `boot segment zero ERROR -> ERROR lines=2`，来自 H1 的两条 ERROR（按 boot UTC 切段计入）。按纪律**不改日志、不放宽判据**；下次重启后新开机段自然不含这两条（marker/boot 语义不变，X2 仍 PASS）。其余 18 项全 PASS。 |
+| H5 | **未测/不可评估** | ⏸ | `WriteBack=1`（H8 未覆盖、回写正确性未验证）、64K/128K（76 号 NO-GO）、电源计划（实测仍「平衡」，属 OS 设置未改）、8K/16K/32K 几何吞吐（H1 阻断）、真机 S2 16K 端到端、峰值性能。所有数字为平衡电源+直写+单卷 D:+32 MiB 短窗口的相对参考，不作峰值宣称、不与 62/75 号跨 env 比较。 |
+
+> 完整数据、命令、离散度与复现证据见 `deliverables/90-real-machine-speed-ab-2026-11-07.md`。测试文件 `D:\rbc-e2e-canary.bin`(64 MiB) / `D:\rbc-e2e-work.bin`(32 MiB) 保留作复现证据。
+
+---
+
 ## 验证声明
 
 - 当前恢复候选离线门禁：`check_repo`、`check_proto_sync --strict`、`refcount_model`、`check_xaml_resources`、`check_ps_syntax`、`check_signature` 均通过；core Release/ASAN 21/21、标准 C# 13/13、bench policy 12/12。

@@ -17,7 +17,7 @@
 部署门禁哈希锚点（重要）
 ----------------------------------------------------------------
   scripts\deploy.ps1 / verify_deploy_signature.ps1 内置
-  DefaultExpectedSha256 = 10fb700903caab564c028817474db3c9e1f9c7914bfbf1237e72958ddffaa981
+  DefaultExpectedSha256 = f5048ef271566a536e0e330ba0e8eaa509de352d52abef3ed8fb2488438d0a0b
   该值对应本包 dist\RAMBlockCache.sys（2026-11-07 卷级免重启几何重建批：
   79/83 号卷级重建 + 85 号审计修复，S2 全链重放真机验收 FAIL=0 / WARN=0，
   172,768 字节）。（2026-10-21 更正：原文字误写 115,424；哈希才是唯一权威标识，字节数仅供人工核对）

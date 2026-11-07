@@ -110,3 +110,24 @@
 4. Gate11 的 1 条 `[WARN]` 是**刻意保留**的 B-1 已知偏差信号，不影响 `exit 0`；批次 B 修掉假日志后应转 `[INFO]` 或消失。
 
 **批次 B 待办**（需重编 `ramboostsetup.exe` + 重签 + 一次 UAC，且需等其余 4 路审查齐后统一实施）：B-1 假日志与 startType 口径、B-2 Secure Boot/testsigning 前移 + 失败回滚、H-1 INF 可安装段、H-2 覆盖升级返回值、H-3 控制器旧 DLL、H-4 WinRE PowerShell、H-7 磁盘预检、H-8 未签名 CLI、M-5/M-6 看门降级、M-7 进程定位、M-8 应用落地回滚、M-9 标准用户。
+
+---
+
+## 9. 批次 B 实施与验证（源码层，未执行 UAC）
+
+`impl-blocksize` 交付 commit **`fb7384c`**（12 文件 / +850 −135），主理人已独立复核。
+
+| 项 | 落地 | 主理人独立验证 |
+|---|---|---|
+| **B-2**（最危险） | 新增 `SecureBootAllowsInstall()`（`ramboostsetup.c:352-388`）读 `HKLM\...\SecureBoot\State\UEFISecureBootEnabled`；=1 直接 Fail 并声明机器未改动；key/value 缺失按 legacy BIOS 放行；其它错误 fail-closed。顺序钉死：`:854 VerifyDriverSignature` → `:857 SecureBoot` → `:859 EnableTestSigning` → `:871 DeleteServiceIfExists` → `:877 CopyDriverFile` → `:998 RegMultiSzAppend` | ✅ 读实码确认顺序索引全部递增；`EnableTestSigning(opt.Silent)` 调用点从 3 降到 **1**；`SecureBootAllowsInstall` 的 `qr!=ERROR_SUCCESS || type!=REG_DWORD` 分支返回 FALSE（fail-closed）；失败时零机器变更，最多残留 `testsigning=on` 无驱动引用 |
+| **B-1** | 假日志改按 `startType`/`svcGroup` 如实输出；`QueryServiceConfigW` 读原值，原为 BOOT_START 且未 `/BootStart` 时传 `SERVICE_NO_CHANGE` + group=NULL（只升级不降级）；过时注释更正 | ✅ 旧串 `BOOT_START, group=System Bus Extender` 命中 **0**；`SERVICE_NO_CHANGE` 命中 2；**未动** `verify_install.ps1:47` / `verify_final_reboot.ps1:109`，**未**在 GUI 加二阶段入口（留产品决策） |
+| **H-1** | INF 移除 `[DefaultInstall*]` / 服务段 / `CatalogFile` / `StartType` / `LoadOrderGroup`，仅保留 `[Version]`（`DriverVer` 保留供 `check_proto_sync --strict`）+ `[Strings]` | ✅ 实测 sections = `[Version] \| [Strings]`；5 个可安装关键字命中全 0 |
+| **H-2 / H-3 / H-4 / H-7 / M-5 / M-6 / M-7 / M-9 / H-10 残留** | `DeleteServiceIfExists` 改 BOOL 并判全部返回值、旧服务 RUNNING 时拒覆盖；`SetupEngine.cs` 按新 `controller.zip` 清单删旧根 DLL；`offline_rollback.cmd` 改纯 `reg` + 自动探测盘符；磁盘预检双盘 + 1200MB；看门失败明示「NO AUTOMATIC ROLLBACK NET」+ `boot_guard.ps1` 覆盖未武装半装态；杀 node 改 5199 端口定位；README 标注管理员要求；`test_rebuild.c` 注释更正 | ✅ 全门禁 PASS；`dotnet build Setup.csproj` 0 警告 0 错误；`_build_engine.ps1` 临时输出编译 exit 0（4 条 warning 均为既有代码）；`check_ps_syntax` **70 文件 0 失败** |
+
+**新增 UAC 链（本轮未执行）**：`src/setup/_build_engine.ps1`（默认输出 `%TEMP%\rbc-engine-<guid>`，**绝不默认覆盖已签名 exe**）、`src/scripts/finalize_distribution_fix.ps1`（375 行）、`RB-finalize-distribution-fix.cmd`。主理人静态自查：`verifier` / `sync_anchors` / `deploy.ps1` / `WriteAllText($marker` 命中**全 0**；marker 仅 2 处 `ReadAllText`；2 处 `signtool sign` 目标分别是 `$stageEngine` 与 `$stageSetup`，**绝无 `RAMBlockCache.sys`**；scope 回读项齐全。
+
+**红线原值复核**：`dist sys = 10fb7009… / Valid`、`dist Setup = d0eaa40d… / Valid`、`src/setup/ramboostsetup.exe = a4e86536… / Valid`（未被覆盖）、`README.txt:20` 哈希行未动、marker `08:30:48.509Z` 未动。**批次 A + B 全部提交已推送，`ahead 0`。**
+
+**批次 B 后仍需一次 UAC 才生效**（`RB-finalize-distribution-fix.cmd`）：重编 + 重签分发引擎 → `build_setup.ps1` 重打 Setup（带新引擎 / 新 INF / 新救援脚本 / 新 README / cwd 无关的 `webconsole.zip`）→ 重签 Setup → 主理人跑 `sync_setup_hash.ps1 -RequireSetupChanged`。**该 UAC 应在其余 4 路审查结果齐、确认无新增源码改动之后执行**，避免重复重打包。
+
+**本机无法验证、需隔离 VM / WinRE / 双机 WinDbg 的项（如实标注）**：Secure Boot ON 的前置拒绝与重启后 0x7B 是否消失、`/BootStart` 二阶段升级、右键 INF 不可安装、旧服务 RUNNING 的覆盖升级、两代控制器 DLL 混杂、低磁盘双盘预检、`schtasks` 被拦的无看门降级、SYSTEM 拥有的 node 按 5199 定位、标准用户 SDDL 行为、`offline_rollback.cmd` 在 WinRE 的 `reg add /t REG_MULTI_SZ` 语义（本机 `reg.exe` 被沙箱禁用，只做静态结构校验）。**H-8（未签名 CLI / SmartScreen）与 M-8（应用落地原子回滚）不在批次 A/B 范围，仍未修**。

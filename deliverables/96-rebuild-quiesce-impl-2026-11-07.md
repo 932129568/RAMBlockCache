@@ -195,8 +195,30 @@ N2 放行+Count 递增 / N3 持续 IO 不假绿+有界回滚+停止收敛 / N4 �
 
 ## 8. Git 与下一步
 
-- 本地 commit（不 push）：见仓库 log（`impl(96)` 系列）。工作区干净后 push 仍留主理人。
-- **下一步只有一件事**：独立复核（作者≠验证者）对准 94 号 §7 五项验收 + 本报告 §2/§3 论证，给出 `SPEC OK` / `NO-GO`。`SPEC OK` 前：
-  - `94-SPEC-OK-LIFTED.ok` 保持不存在（实测确认）；
-  - `RB-finalize-rebuild-fix.cmd` 硬护栏保持 `exit /b 1`；
-  - 新编译产物 `2442A6BD…` 禁止签名、禁止部署。
+- 本地 commit（不 push）：`a648932`（实施）+ 加固 commit（见 log）。工作区干净后 push 仍留主理人。
+- **独立复核已完成**：`deliverables/qa-rebuild-spec-96-review-2026-11-07.md` → **SPEC OK**（无 BLOCKER/HIGH；两项 MEDIUM R-1/R-2，R-1 已于本报告 §9 加固修复，R-2 登记维持）。`SPEC OK` 后仍须：
+  - 主理人**人工**创建 `C:\ProgramData\rb-deploy\94-SPEC-OK-LIFTED.ok`；
+  - 用户双击一次 `RB-finalize-rebuild-fix.cmd`（UAC）→ 重启一次并交互登录 → `sync_setup_hash.ps1 -RequireSetupChanged` → `verify_final_reboot.ps1`；
+  - 复核报告同款口径：**不宣称「内核已修」**，运行时后果需 WDK/Verifier/双机 WinDbg。
+
+---
+
+## 9. 复核回应与 R-1 加固（复核报告 R-1/R-2 处置）
+
+独立复核（qa-rebuild-spec，第二层只读，作者≠验证者）结论 **SPEC OK**，配对审计表、O-2 定位、io_users 论证、N1 双臂输出、红线零违规全部核实属实。两项 MEDIUM 处置：
+
+### 9.1 R-1（PRCB 迁移窗口）——已加固修复（`8562C8AE…`）
+
+复核者建议「复读 CPU 号不一致即全局原子补记」。**作者否决该方案并说明理由**（这是作者对复核者的技术回应，非拒绝整改）：补记使该 IO 的 issue 记 2 次、completion 仍 1 次 ⇒ `(issued-completed)==0` 永久不成立 ⇒ **重建永久超时**（fail-closed 但功能坏死）；若为补对称缺口而放宽判据，假绿回归。丢失与重复在「无身份的计数对」里不可区分，纠偏方向无法选择。
+
+**采用方案：DISPATCH 短窗自增**——`KeRaiseIrql(DISPATCH_LEVEL)` **先于**取号（顺序关键：取号必须在 raise 之后，否则取号→raise 之间仍有迁移窗），自增后 `KeLowerIrql`。raise 到 lower 之间无调度点 ⇒ 迁核不可能 ⇒ 「槽的唯一写者 = 本核唯一执行流」恢复数学完备。PRCB 迁移只能发生在调度点，DISPATCH_LEVEL 上不存在。成本：PASSIVE 路径每 IO 一对 CR8 写（本地 CPU 字段，~几十周期，无 LOCK 前缀、无跨核缓存行流量）；DISPATCH 入口（paging IO）raise 为 no-op 等价零成本。R10 口径：不新增原子写 ✓（复核者原文建议会新增跨核 Interlocked）。
+
+### 9.2 R-2（`rbio.c` DATA-10 分支无 Unloading 门，摘流瞬间微秒级竞态）——登记维持
+
+属既有同源风险（先于 96 号实施存在，窗口量级未扩大），修复需触碰 `:1452` 透传写失效分支的纪律语义：加 `!Unloading` 门会在**回滚场景**重开 P0-1 旧盖新窗口（透传写不失效同区间旧缓存），两害相权后本批不动。登记为回写验证批（O-9）的必改项——该批将一并处理 §7 表中 O-9 的 `:1394` 门。
+
+### 9.3 加固后的验证状态
+
+- 驱动重建 **BUILD OK**（`8562C8AE…`，172,544 B，未签名，仅编译目录——前次 `2442A6BD…` 作废）。
+- `cache.c`/`read_plan.c` 仍零改动；`check_repo` / `check_proto_sync --strict` 复跑 PASS。
+- core 用户态回归与本加固无耦合（core 源未变，产物新鲜度由 check_repo 判定 PASS）。

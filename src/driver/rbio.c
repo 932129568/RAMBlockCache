@@ -189,22 +189,42 @@ static __inline ULONG RbIoCpuIndex(VOID)
 
 VOID RbIoIssueMark(VOID)
 {
-    ULONG c = RbIoCpuIndex();
+    /* [96 §9 R-1 加固] DISPATCH 短窗自增：PASSIVE 下取号与自增之间线程可被
+     * 抢占迁核（PRCB 迁移），写旧槽 = 与旧核并发 RMW 丢更新（复核 R-1）。
+     * 修法：先 raise 到 DISPATCH（此后到 lower 之前无调度点 = 迁核不可能），
+     * 再取 CPU 号、自增。槽的唯一写者 = 本核唯一执行流，恢复数学完备。
+     * 复核者建议的「复读 CPU 号不一致即全局原子补记」被否：补记使该 IO 的
+     * issue 记 2 次而 completion 只记 1 次 ⇒ (issued-completed)==0 永久不成立
+     * ⇒ 重建永久超时；放宽判据补这个对称缺口则假绿回归。CR8 写为本地 CPU
+     * 状态：零 LOCK 前缀、零跨核缓存行流量，R10 合规（成本注记见 96 号
+     * 报告 §9）。入口已在 DISPATCH（paging IO 等）时 raise 为 no-op 等价。 */
+    KIRQL oldIrql;
+    ULONG c;
+    BOOLEAN raised = (KeGetCurrentIrql() < DISPATCH_LEVEL);
+    if (raised) KeRaiseIrql(DISPATCH_LEVEL, &oldIrql);
+    c = RbIoCpuIndex();
     if (c < 64) {
         g_Rb.IoIssuedSlots[c].Cnt++;        /* 单写者 plain ++（单条 inc 指令） */
     } else {
         InterlockedIncrement(&g_Rb.IoIssuedG);
     }
+    if (raised) KeLowerIrql(oldIrql);
 }
 
 VOID RbIoCompleteMark(VOID)
 {
-    ULONG c = RbIoCpuIndex();
+    /* [96 §9 R-1 加固] 同 RbIoIssueMark：先 raise 后取号再自增。 */
+    KIRQL oldIrql;
+    ULONG c;
+    BOOLEAN raised = (KeGetCurrentIrql() < DISPATCH_LEVEL);
+    if (raised) KeRaiseIrql(DISPATCH_LEVEL, &oldIrql);
+    c = RbIoCpuIndex();
     if (c < 64) {
         g_Rb.IoCompletedSlots[c].Cnt++;     /* 单写者 plain ++（单条 inc 指令） */
     } else {
         InterlockedIncrement(&g_Rb.IoCompletedG);
     }
+    if (raised) KeLowerIrql(oldIrql);
 }
 
 /* 屏障后求和（重建线程 PASSIVE 独占调用；单调计数，撕裂不可能——8 字节

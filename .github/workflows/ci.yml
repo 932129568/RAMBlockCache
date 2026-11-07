@@ -92,7 +92,7 @@ jobs:
 
       # —— >4K 条纹锁修复契约（2026-11-06，73 号）——
       # 静态只读：断言 rb_write_pass2 用 stripe_of(cs) 而非子块起点、
-      # 几何白名单恰为 4096/8192/16384/32768、动态门禁资产合规、CI 持续调用本检查。
+      # 几何白名单恰为 4096/8192/16384/32768/65536（64K 已解禁 2026-11-08）、动态门禁资产合规、CI 持续调用本检查。
       # 完整的 30 轮 Release+ASan 实跑由本机 qa_geom_gate.ps1 -Rounds 30 承担：
       # hosted runner 无本机 MSVC cl / ASan 运行时 / llvm-symbolizer / ASCII 中转路径，
       # 且全量约 9 分钟，故 CI 只做防回退的静态契约，不做动态压测。
@@ -120,7 +120,7 @@ jobs:
       # —— [2026-11-07] UI 档位 ↔ 驱动白名单漂移守卫（Gate10）——
       # 防「Web 下拉只给 4K、驱动白名单却已放开 4 档」这类 UI 档位 ↔ 驱动白名单
       # 漂移：静态只读断言 SettingsPage.tsx BLOCK_SIZES、rbctl.c rb_legal_bs[]、
-      # rbrebuild.c 重建目标白名单三者恰为 {4096,8192,16384,32768} 且顺序一致，
+      # rbrebuild.c 重建目标白名单三者恰为 {4096,8192,16384,32768,65536} 且顺序一致，
       # 三者均不含 64K/128K（76 号 NO-GO 封禁），且桥接 configSchema 未用
       # z.enum / z.literal / refine 把 BlockSize 重新锁死。CI 持续调用本脚本。
       - name: Gate10 check_blocksize_contract

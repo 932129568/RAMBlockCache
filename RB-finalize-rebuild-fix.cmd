@@ -1,26 +1,31 @@
 @echo off
-rem [93 SPEC NO-GO] FROZEN - DO NOT DEPLOY (31cf870 / 76aacfc / 931ed53)
-echo [X] FROZEN: 93 SPEC NO-GO - DO NOT DEPLOY (31cf870 / 76aacfc / 931ed53)
-echo     Reason: fail-open UAF / silent data corruption (Refs-baseline drain).
-echo     See   : deliverables/93-spec-nogo-freeze-2026-11-07.md
-echo     No signing, no deploy.ps1, no reboot. This chain must NOT run.
-echo     Manual lift only, see src\scripts\finalize_rebuild_fix.ps1.
-exit /b 1
 rem ============================================================
-rem  RB-finalize-rebuild-fix.cmd - ONE UAC for the 92 A/B/C fix
-rem  DO NOT DEPLOY: 31cf870 / 76aacfc / 931ed53 are AUDIT RECORDS ONLY.
-rem  2026-11-07. Re-signs the rebuilt driver, syncs the three sys
-rem  hash anchors, repacks + re-signs the Setup, then DEPLOYS the new
-rem  signed sys to System32\drivers in one narrow chain (92 3.1).
-rem  Does NOT write the reboot marker, does NOT reset any test flag,
-rem  does NOT reboot. An INTERACTIVE LOGON after reboot is REQUIRED.
+rem  RB-finalize-rebuild-fix.cmd - ONE UAC deploy chain (94 spec)
+rem  2026-11-08 UNFROZEN: 94-spec implementation (a648932/fb8a54f)
+rem  passed independent review SPEC OK
+rem  (deliverables/qa-rebuild-spec-96-review-2026-11-07.md).
+rem  Gate is now conditional on the lead-created lift file:
+rem    C:\ProgramData\rb-deploy\94-SPEC-OK-LIFTED.ok
+rem  If it is missing this wrapper exits WITHOUT elevation (fail-closed).
+rem  Chain: sign rebuilt sys -> dist + sidecar -> 3 anchors -> gate5 ->
+rem  rebuild+sign Setup -> payload assertions -> deploy.ps1 (CHILD) ->
+rem  post gate5 -> ledger -> reboot marker written LAST.
 rem  Log: C:\ProgramData\rb-deploy\finalize-rebuild-fix.log
-rem  AFTER UAC: lead runs sync_setup_hash.ps1 -RequireSetupChanged
-rem             then the user reboots ONCE and LOGS ON interactively
-rem             (logon_disarm must clear FilterArmed).
+rem  AFTER UAC: lead runs sync_setup_hash.ps1 -RequireSetupChanged,
+rem  then ONE reboot AND AN INTERACTIVE LOGON (logon_disarm must run
+rem  to clear FilterArmed), then verify_final_reboot.ps1 and the S4
+rem  five-tier matrix (4K/8K/16K/32K/64K).
 rem  If System32 was locked, a queued replace may need a SECOND reboot.
 rem  DO NOT re-run any full-chain finalize wrapper afterwards.
 rem ============================================================
+if not exist "C:\ProgramData\rb-deploy\94-SPEC-OK-LIFTED.ok" (
+  echo [X] FROZEN: 94-SPEC-OK-LIFTED.ok missing - DO NOT DEPLOY.
+  echo     31cf870/76aacfc/931ed53 frozen by 93 SPEC NO-GO; the 94-spec
+  echo     implementation is SPEC OK but deploy stays fail-closed until
+  echo     the lead manually creates the lift file. No UAC is requested.
+  exit /b 1
+)
+echo [i] 94 SPEC OK lift present - proceeding.
 net session >nul 2>&1
 if %errorlevel% neq 0 (
   echo [..] Requesting elevation ...

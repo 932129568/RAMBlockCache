@@ -14,11 +14,12 @@ Background (2026-11-07 BugFix):
   {4096, 8192, 16384, 32768}; only the Web UI lagged behind.
 
 Guarded drift:
-  - SettingsPage.tsx BLOCK_SIZES literal must be exactly [4096, 8192, 16384, 32768];
+  - SettingsPage.tsx BLOCK_SIZES literal must be exactly [4096, 8192, 16384, 32768, 65536];
   - rbctl.c rb_legal_bs[] and rbrebuild.c rebuild-target condition must carry the
-    same four values in the same order;
-  - none of the three may contain 65536 / 131072 (76 NO-GO, 11-03/11-04 BSOD
-    unattributed, must never reappear in any UI);
+    same five values in the same order;
+  - none of the three may contain 131072 (76 NO-GO: 11-03/11-04 BSOD unattributed
+    for the 128K tier; 65536 was un-banned 2026-11-08 after the 59-64k-audit §5
+    preconditions were met and the 64K test package went green);
   - web/src/bridge/http-transport.ts configSchema must not clamp BlockSize with
     z.enum / z.literal / .refine (which would silently re-lock the UI to 4K);
   - .github/workflows/ci.yml must keep calling this script as Gate10, placed
@@ -31,9 +32,9 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-LEGAL = (4096, 8192, 16384, 32768)
-LEGAL_STR = "{4096,8192,16384,32768}"
-BANNED_STR = ("65536", "131072")
+LEGAL = (4096, 8192, 16384, 32768, 65536)
+LEGAL_STR = "{4096,8192,16384,32768,65536}"
+BANNED_STR = ("131072",)   # [64K-UNBAN] 65536 restored 2026-11-08 (59-64k-audit §5 preconditions met); 128K still banned
 
 SETTINGS_TS = ROOT / "web" / "src" / "features" / "settings" / "SettingsPage.tsx"
 RBCTL_C = ROOT / "src" / "driver" / "rbctl.c"
@@ -106,7 +107,7 @@ def main() -> int:
             if b in ctl_snippet:
                 fails.append("rbctl.c: rb_legal_bs[] contains banned %s (F1 / 76 NO-GO)" % b)
 
-    # --- 3) rbrebuild.c rebuild-target guard (four `newBlockSize != Nu` terms) ---
+    # --- 3) rbrebuild.c rebuild-target guard (five `newBlockSize != Nu` terms) ---
     m_rb = re.search(r"if\s*\(([^)]*newBlockSize\s*!=[^)]*)\)", rebuild, re.S)
     if not m_rb:
         fails.append("rbrebuild.c: newBlockSize whitelist guard not found")
@@ -116,8 +117,8 @@ def main() -> int:
         if rb_vals != ui_vals:
             fails.append("rbrebuild.c: rebuild whitelist = {%s}, UI = [%s] (whitelist drift)"
                          % (_fmt(rb_vals), _fmt(ui_vals)))
-        if len(rb_vals) != 4:
-            fails.append("rbrebuild.c: rebuild whitelist has %d values, expected 4" % len(rb_vals))
+        if len(rb_vals) != 5:
+            fails.append("rbrebuild.c: rebuild whitelist has %d values, expected 5" % len(rb_vals))
         for b in BANNED_STR:
             if b in rb_snippet:
                 fails.append("rbrebuild.c: rebuild whitelist contains banned %s (76 NO-GO)" % b)
@@ -159,7 +160,7 @@ def main() -> int:
     print("== check_blocksize_contract (Gate10) ==")
     print("  legal whitelist   : %s" % LEGAL_STR)
     print("  UI BLOCK_SIZES    : [%s]" % _fmt(ui_vals))
-    print("  banned (76 NO-GO) : 65536 / 131072")
+    print("  banned (76 NO-GO) : 131072 (65536 restored 2026-11-08)")
     print("  guarded copies    : SettingsPage.tsx / rbctl.c rb_legal_bs[] / "
           "rbrebuild.c / configSchema / ci.yml")
     if fails:

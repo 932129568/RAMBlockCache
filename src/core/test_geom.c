@@ -40,7 +40,7 @@ static int run_one(rb_u32 bs){
     /* [F1 2026-11-06] 白名单外档位（65536/131072）创建期回落 4096（cache.c
      * legal[] 与驱动 rbctl.c rb_legal_bs 同步摘除）；合法档位原样生效。 */
     eff=rb_engine_block_size(e);
-    if(bs==4096u||bs==8192u||bs==16384u||bs==32768u){
+    if(bs==4096u||bs==8192u||bs==16384u||bs==32768u||bs==65536u){
         if(eff!=bs){ printf("[FAIL] bs=%u 合法档回读 block_size=%u\n",bs,eff); return 1; }
     }else{
         if(eff!=4096u){ printf("[FAIL] bs=%u 摘档后应回落 4096，实际=%u\n",bs,eff); return 1; }
@@ -79,10 +79,10 @@ static int test_f4_slab(void){
     printf("--- F4 slab 字节上限 ---\n"); fflush(stdout);
     /* ① 各档 cap = min(2048, 256MB/chunk) 直接断言（chunk=bs*16） */
     {
-        static const rb_u32 bss[4]={4096u,8192u,16384u,32768u};
-        static const rb_u32 caps[4]={2048u,2048u,1024u,512u};
+        static const rb_u32 bss[5]={4096u,8192u,16384u,32768u,65536u};
+        static const rb_u32 caps[5]={2048u,2048u,1024u,512u,256u};
         size_t z;
-        for(z=0;z<4;z++){
+        for(z=0;z<5;z++){
             rb_config c; memset(&c,0,sizeof(c));
             c.max_bytes=64ull*1024*1024; c.writeback=wb_nop; c.readback=rb_nop;
             c.block_size=bss[z];
@@ -330,12 +330,13 @@ int main(void){
     fail|=run_one(8192);
     fail|=run_one(16384);
     fail|=run_one(32768);
-    fail|=run_one(65536);    /* [F1] 摘档：回落 4096 档等价 + block_size 回读断言 */
-    fail|=run_one(131072);   /* [F1] 同上 */
+    fail|=run_one(65536);    /* [64K-UNBAN] 64K 档全量几何回归（59 §5.2 #1） */
+    fail|=run_one(131072);   /* [F1] 128K 仍封禁：回落 4096 档等价断言 */
     fail|=test_f4_slab();
     fail|=test_f5_batch();
     fail|=test_tail(16384);
     fail|=test_tail(32768);
+    fail|=test_tail(65536);   /* [64K-UNBAN] 卷尾非对齐 + truncate 清尾（59 §5.2 #1） */
     printf(fail? "几何测试 FAILED\n" : "几何测试 PASS\n");
     return fail;
 }

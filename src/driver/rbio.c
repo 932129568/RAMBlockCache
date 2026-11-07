@@ -1397,7 +1397,12 @@ NTSTATUS RbStopIoWorkers(VOID)   /* FIX[UNLOAD]: 必须等待线程真正退出�
 
 static VOID RbSubmitIo(PRB_IOCTX ctx)
 {
-    ULONG start = (ULONG)InterlockedIncrement(&g_Rb.IoRR) - 1;
+    /* [PERF-97] IoRR 轮询游标自增【移入轮询兜底分支】：原实现无条件做一次
+     * 全局 LOCK 自增（g_Rb.IoRR 单行 = 全核乒乓热行），但当前核亲和路径
+     * （绝大多数 IO 命中）根本不消费 start —— 纯浪费的每 IO 全局原子。
+     * start 改在亲和路径两次尝试都失败后才取（下方唯一消费点之前），
+     * 语义不变（兜底轮询的起点仍单调轮转）。 */
+    ULONG start;
     ULONG i, n = g_Rb.IoWorkerCount;
     KIRQL irql;
 
@@ -1434,7 +1439,9 @@ static VOID RbSubmitIo(PRB_IOCTX ctx)
     }
 
     /* [V10.1] 从轮询起点起找第一个存活 worker；
-     * 全死（线程创建失败/极端退出）→ 落系统队列兜底，绝不丢请求。 */
+     * 全死（线程创建失败/极端退出）→ 落系统队列兜底，绝不丢请求。
+     * [PERF-97] 此刻才取轮询起点（唯一消费点；见函数头）。 */
+    start = (ULONG)InterlockedIncrement(&g_Rb.IoRR) - 1;
     for (i = 0; i < n; i++) {
         RB_IOWORKER *w = &g_Rb.IoWorkers[(start + i) % n];
         /* [FIX D6-10] Alive 判定在锁内（同亲和路径）：锁外检查与停机竞态=孤儿节点 */

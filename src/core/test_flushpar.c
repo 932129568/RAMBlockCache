@@ -128,7 +128,7 @@
  * 故测试必须在 create 之前自行 fail-closed 校验，否则「跑 8192」实为跑 4096。 */
 static int legal_block_size(unsigned long v)
 {
-    return v == 4096ul || v == 8192ul || v == 16384ul || v == 32768ul;
+    return v == 4096ul || v == 8192ul || v == 16384ul || v == 32768ul || v == 65536ul;   /* [64K-UNBAN] */
 }
 
 /* 运行期几何：main 解析 argv[4] 后一次性冻结，之后只读，无锁安全。

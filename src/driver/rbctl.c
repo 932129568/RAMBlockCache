@@ -169,7 +169,10 @@ VOID RbClampConfig(RB_CONFIG *c)
      * （U-4/U-8，见 59-64k-audit §5 前置清单），128K 同族且滞留更甚；归因+
      * Verifier+WinDbg 复现通过后按审计 §5 恢复。 */
     {
-        static const ULONG rb_legal_bs[] = {4096, 8192, 16384, 32768};
+        /* [64K-UNBAN 2026-11-08] 65536 恢复（59-64k-audit §5 前置清单全部满足；
+         * 与 core cache.c legal[] / CLI ok_bytes[] / WPF / Web 五层同步）。
+         * 131072 仍封禁。见 deliverables/97-64k-unban-perf-2026-11-08.md。 */
+        static const ULONG rb_legal_bs[] = {4096, 8192, 16384, 32768, 65536};
         int rb_ok = 0, rb_z;
         for (rb_z = 0; rb_z < (int)(sizeof(rb_legal_bs) / sizeof(rb_legal_bs[0])); rb_z++)
             if (c->BlockSize == rb_legal_bs[rb_z]) { rb_ok = 1; break; }

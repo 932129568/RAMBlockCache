@@ -32,14 +32,24 @@ static RB2_PORT_SHRINK s_Shrink;
 static HANDLE   s_TickH;
 static PVOID    s_TickObj;
 
-/* ---- 分片计数器（热路径零锁；每槽 32 分片，查询时聚合） ---- */
+/* ---- 分片计数器（热路径零锁；每槽 32 分片，查询时聚合） ----
+ * [PERF-97] 64B 独占槽：原 `volatile LONG64 s_Cnt[16][32]` 相邻分片共享
+ * cache line（8B × 8 分片/行）——命中读热路径每 IO 两次 InterlockedAdd64
+ * （slot 0/2），相邻 CPU 各写同一行的相邻 8 字节 = 每次命中两次跨核行乒乓。
+ * 垫成 64B 独占槽后（16×32×64B = 32KB 静态）行乒乓归零。与 RB_GLOB 的
+ * RB_IOCNT_SLOT 同款手法。 */
 #define RB2_SHARDS 32
+typedef struct _RB2_CNT_SLOT {
+    volatile LONG64 v;
+    UCHAR           Pad[56];
+} RB2_CNT_SLOT;
+C_ASSERT(sizeof(RB2_CNT_SLOT) == 64);
 /* [D6] 14→16：新槽 14=ThermalStops（rbthermal 暂停事件）15=AdmitRejects（准入排除拒绝） */
-static volatile LONG64 s_Cnt[16][RB2_SHARDS];
+static RB2_CNT_SLOT s_Cnt[16][RB2_SHARDS];
 VOID Rb2Count(ULONG slot, LONG64 d)
 {
     if (slot < 16)
-        InterlockedAdd64((PLONG64)&s_Cnt[slot][KeGetCurrentProcessorNumberEx(NULL) % RB2_SHARDS], d);
+        InterlockedAdd64(&s_Cnt[slot][KeGetCurrentProcessorNumberEx(NULL) % RB2_SHARDS].v, d);
 }
 VOID Rb2CountersInit(VOID)
 {
@@ -48,7 +58,7 @@ VOID Rb2CountersInit(VOID)
 static LONG64 Rb2CntSum(ULONG slot)
 {
     ULONG i; LONG64 s = 0;
-    for (i = 0; i < RB2_SHARDS; i++) s += s_Cnt[slot][i];
+    for (i = 0; i < RB2_SHARDS; i++) s += s_Cnt[slot][i].v;
     return s;
 }
 VOID Rb2StatsFill(PRB_STATS2 o)

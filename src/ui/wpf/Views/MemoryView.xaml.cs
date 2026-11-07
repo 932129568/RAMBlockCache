@@ -14,10 +14,10 @@ public partial class MemoryView : UserControl
     private RbSession? _s;
     private bool _suppressBlockEvent;
     private bool _suppressFlushEvent;
-    // [F1 2026-11-06] 65536/131072 自下拉摘除（11-03 64K 事故未归因，59-64k-audit F1）：
-    // 驱动白名单/CLI/core legal[] 已同步摘除，此处与 MemoryView.xaml 的 ComboBoxItem 对齐（4 项）。
-    // 旧配置回读 64K/128K 时 Array.IndexOf 返回 -1 → 落回第 0 项（4K），不越界。
-    private static readonly uint[] _blockSizes = { 4096, 8192, 16384, 32768 };
+    // [64K-UNBAN 2026-11-08] 65536 恢复（59-64k-audit §5 前置清单满足；与驱动/
+    // CLI/core legal[]/Web 五层同步，见 MemoryView.xaml ComboBoxItem 5 项对齐）。
+    // 131072 仍封禁；旧配置回读 128K 时 Array.IndexOf 返回 -1 → 落回第 0 项（4K），不越界。
+    private static readonly uint[] _blockSizes = { 4096, 8192, 16384, 32768, 65536 };
     private static readonly uint[] _flushMs = { 60000, 120000, 300000, 0xFFFFFFFF };
 
     public MemoryView()

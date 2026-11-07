@@ -424,7 +424,8 @@ NTSTATUS RbRecreateEngineGeometry(ULONG newBlockSize)
     RtlZeroMemory(vols, sizeof(vols));
 
     if (newBlockSize != 4096u && newBlockSize != 8192u &&
-        newBlockSize != 16384u && newBlockSize != 32768u) {
+        newBlockSize != 16384u && newBlockSize != 32768u &&
+        newBlockSize != 65536u) {   /* [64K-UNBAN] */
         /* [85 B3] 早退也必须回滚配置副本：RbApplyConfig 已同步写新 BlockSize
          * 并持久化，直接 return 会留下「显示 16K、实际 4K」，且再次
          * set block=<同一 new> 因 rbctl.c:355 判等失败而不入队 → 永久卡死。
@@ -724,7 +725,8 @@ NTSTATUS RbRequestGeometryRebuild(ULONG newBlockSize)
 {
     PAGED_CODE();
     if (newBlockSize != 4096u && newBlockSize != 8192u &&
-        newBlockSize != 16384u && newBlockSize != 32768u)
+        newBlockSize != 16384u && newBlockSize != 32768u &&
+        newBlockSize != 65536u)      /* [64K-UNBAN] */
         return STATUS_INVALID_PARAMETER;
     /* [83 第二笔 + 85 B2] 卸载窗口拒绝：RbUnload 已置 Unloading=1 并正在等待
      * 本 work item 排空；此时若再入队一个，会在卸载销毁引擎/删池/删控制设备时

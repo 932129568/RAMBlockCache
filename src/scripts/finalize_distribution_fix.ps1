@@ -91,7 +91,7 @@ $rxAnchor    = [regex]'DefaultExpectedSha256\s*=\s*''?([0-9a-fA-F]{64})''?'
 $statsFields  = @('EngineBlockSize','GeometryRebuildCount','GeometryRebuildLastStatus','GeometryRebuildInProgress','LastGeometryRebuildUtc')
 $statvalKeys  = @('engine_bs','rebuild_count','rebuild_status','rebuild_in_progress','rebuild_utc')
 $blockLabels  = @('4 KB','8 KB','16 KB','32 KB')
-$rxBlockArray = [regex]'\[\s*4096\s*,\s*8192\s*,\s*16384\s*,\s*32768\s*\]'
+$rxBlockArray = [regex]'\[\s*4096\s*,\s*8192\s*,\s*16384\s*,\s*32768\s*,\s*65536\s*\]'
 $rxChunk      = [regex]'SettingsPage-[A-Za-z0-9_-]+\.js$'
 
 function L([string]$m) {
@@ -299,7 +299,7 @@ foreach ($lbl in $blockLabels) {
 if (-not $rxBlockArray.IsMatch($chunkText)) {
     Abort 'WEBCONSOLE ZIP STALE: SettingsPage chunk missing the 4-value block-size array'
 }
-L ('[5] webconsole.zip ' + $chunkName + ' carries 4/8/16/32 KB + [4096,8192,16384,32768] (' + $chunkText.Length + ' chars probed)')
+L ('[5] webconsole.zip ' + $chunkName + ' carries 4/8/16/32/64 KB + [4096,8192,16384,32768,65536] (' + $chunkText.Length + ' chars probed)')
 
 # ---- 6) sign Setup: FOUR hash assertions (Setup ONLY, never the driver) --
 if ((SigOf $setup) -ne 'NotSigned') { Abort 'SETUP BASELINE BEFORE SIGNING IS NOT UNSIGNED' }

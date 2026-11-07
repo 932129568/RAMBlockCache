@@ -7,12 +7,13 @@ import { confirmDialog } from '@state/confirm-store';
 import { toast } from '@state/toast-store';
 import { Badge, PageHeader, Toggle } from '@components/ui';
 
-/** 合法缓存块大小（驱动 rbctl.c rb_legal_bs[] / rbrebuild.c 四档白名单同款） */
+/** 合法缓存块大小（驱动 rbctl.c rb_legal_bs[] / rbrebuild.c 五档白名单同款） */
 // [2026-11-07 BugFix] 79/83 号卷级免重启几何重建已落地：切档由驱动在卷级重建
 // 引擎，无需整机重启；S2 全链重放真机验收 FAIL=0 / WARN=0。UI 恢复开放
 // {4K,8K,16K,32K} 四档，与 WPF MemoryView.xaml.cs:20 及驱动白名单对齐。
-// 64K/128K 依 76 号（11-03/11-04 蓝屏未归因）仍 NO-GO 封禁，不出现在任何 UI。
-const BLOCK_SIZES = [4096, 8192, 16384, 32768];
+// [64K-UNBAN 2026-11-08] 64K 恢复（59-64k-audit §5 前置清单满足，S4 五档矩阵
+// 真机验证）；128K 依 76 号仍封禁，不出现在任何 UI。
+const BLOCK_SIZES = [4096, 8192, 16384, 32768, 65536];
 
 /**
  * 设置页（§11.5 迁移顺序第 5 页，六页收尾）。
@@ -198,7 +199,7 @@ export default function SettingsPage() {
                 {...form.register('BlockSize', { valueAsNumber: true })}
               />
               <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
-                切换块大小会触发驱动内部引擎重建（无需重启整机）：重建期间缓存中的干净块会被丢弃，命中率短时归零；默认直写（WriteBack=0）下无脏数据、不丢数据。重建窗口内 I/O 回落至磁盘、性能会短暂下降，建议避开高负载时段切换。开放档位：4 KB / 8 KB / 16 KB / 32 KB。
+                切换块大小会触发驱动内部引擎重建（无需重启整机）：重建期间缓存中的干净块会被丢弃，命中率短时归零；默认直写（WriteBack=0）下无脏数据、不丢数据。重建窗口内 I/O 回落至磁盘、性能会短暂下降，建议避开高负载时段切换。开放档位：4 KB / 8 KB / 16 KB / 32 KB / 64 KB（64K 档经 59 号前置审计+测试包后解禁，大块顺序场景 per-chunk 开销最低，小随机场景建议 4K）。
               </p>
             </Group>
 

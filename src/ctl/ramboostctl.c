@@ -1527,13 +1527,13 @@ static int cli_set(int argc, char **argv, int startIdx)
         }
         else if (!strcmp(key, "block")) {
             uint32_t kb = (uint32_t)strtoul(val, NULL, 0);
-            /* [F1 2026-11-06] 65536/131072 自白名单摘除，与驱动 rbctl.c rb_legal_bs /
-             * core cache.c legal[] 同步（11-03 64K 事故未归因，59-64k-audit §5；
-             * 归因+复现通过后恢复）。 */
-            uint32_t ok_bytes[] = {4096,8192,16384,32768};
+            /* [64K-UNBAN 2026-11-08] 65536 恢复（59-64k-audit §5 前置清单满足，
+             * 与驱动 rbctl.c / core cache.c legal[] / WPF / Web 五层同步）；
+             * 131072 仍封禁。 */
+            uint32_t ok_bytes[] = {4096,8192,16384,32768,65536};
             int j; c.BlockSize = 0;
-            for (j = 0; j < 4; j++) if (kb*1024u == ok_bytes[j]) c.BlockSize = ok_bytes[j];
-            if (c.BlockSize == 0) { fprintf(stderr, "[警告] block=%u KB 不在允许档位 {4/8/16/32 KB}，已回退 4K\n", kb); c.BlockSize = 4096; }
+            for (j = 0; j < 5; j++) if (kb*1024u == ok_bytes[j]) c.BlockSize = ok_bytes[j];
+            if (c.BlockSize == 0) { fprintf(stderr, "[警告] block=%u KB 不在允许档位 {4/8/16/32/64 KB}，已回退 4K\n", kb); c.BlockSize = 4096; }
         }
         else if (!strcmp(key, "vol")) {
             /* 例：vol=C:,D: —— 逗号分隔，最多 RB_MAX_VOLUMES 个 */

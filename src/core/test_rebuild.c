@@ -470,7 +470,7 @@ static int sim_reattach_by_detached(SIM *s)
 /* [85 B10] RbClampConfig 的 BlockSize 分支镜像。 */
 static unsigned sim_clamp_bs(unsigned v)
 {
-    if (v == 4096u || v == 8192u || v == 16384u || v == 32768u) return v;
+    if (v == 4096u || v == 8192u || v == 16384u || v == 32768u || v == 65536u) return v;
     return 4096u;
 }
 /* [85 B3/B10] 与修复后 rbctl.c:355「先对副本 clamp 再比」同构。 */
@@ -489,7 +489,8 @@ static int sim_recreate(SIM *s, unsigned newBs)
     int engineDestroyed = 0;
 
     /* [85 B3] 3 个早退改 goto clear_gate（回滚配置副本，堵住「再次 set 同值卡死」）。 */
-    if (newBs != 4096u && newBs != 8192u && newBs != 16384u && newBs != 32768u) {
+    if (newBs != 4096u && newBs != 8192u && newBs != 16384u && newBs != 32768u &&
+        newBs != 65536u) {
         rc = -2; goto clear_gate;
     }
     if (!s->eng) { rc = -3; goto clear_gate; }
@@ -999,10 +1000,11 @@ static void case_C16_clamp(void)
     sim_init(&s, 16384u, 1);
     s.recreating = 1;
     {
-        unsigned raw = 65536u;                 /* 绕过 CLI ok_bytes[] 的非法值 */
+        unsigned raw = 131072u;                /* [64K-UNBAN] 65536 已解禁，非法值改用仍封禁的 128K */
         unsigned clamped = sim_clamp_bs(raw);
         int old_isRebuild = (raw != s.config_bs) &&
-                            (raw == 4096u || raw == 8192u || raw == 16384u || raw == 32768u);
+                            (raw == 4096u || raw == 8192u || raw == 16384u ||
+                             raw == 32768u || raw == 65536u);
         CHECK(clamped == 4096u, "C16 非法值经 RbClampConfig 回落 4096");
         CHECK(old_isRebuild == 0,
               "C16 旧判定用未 clamp 原始值 -> 漏判 isRebuildRequest（会静默持久化 4096 且引擎仍 16K）");

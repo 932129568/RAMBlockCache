@@ -948,11 +948,14 @@ rb_engine *rb_engine_create(const rb_config *cfg)
     if(eng->cfg.readahead_window==0)eng->cfg.readahead_window=2ull*1024*1024;
     {
         rb_u32 bs = eng->cfg.block_size;
-        /* [F1 2026-11-06] 65536/131072 自白名单摘除，与驱动 rbctl.c rb_legal_bs
-         * 完全同款（注释互相引用）：11-03 64K 系统级事故未归因（U-4/U-8，
-         * 59-64k-audit §5 前置清单），128K 同族且 slab 滞留更甚；归因+Verifier+
-         * WinDbg 复现通过后按审计 §5 恢复。非法值回落 4096（下方，行为不变）。 */
-        static const rb_u32 legal[] = {4096,8192,16384,32768};
+        /* [64K-UNBAN 2026-11-08] 65536 恢复进白名单（59-64k-audit §5 前置清单
+         * 已全部满足：F1 摘档落地→F4 slab 字节上限（RB_SLAB_RETAIN_BYTES）→
+         * F5 批次自适应→F10 几何 getter→F13 卷尾钳位（rbio.c LINK-3）→
+         * test_geom 64K 全量测试绿；当年崩溃架构（自旋快路径 A39AF94C）已被
+         * 内联读快路径替代且无 dump 可归因，用户态审计 48R2/R3+59F1-F16
+         * P0/P1=零。解禁后由 S4 五档矩阵真机验证；131072 仍封禁（slab 滞留
+         * 同族且资源面放大 2×，无对应测试包）。 */
+        static const rb_u32 legal[] = {4096,8192,16384,32768,65536};
         int ok=0; size_t z;
         for(z=0;z<sizeof(legal)/sizeof(legal[0]);z++) if(legal[z]==bs){ok=1;break;}
         if(!ok) bs=4096;

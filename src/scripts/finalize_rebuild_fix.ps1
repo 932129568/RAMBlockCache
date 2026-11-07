@@ -105,8 +105,8 @@ $rxNorm      = [regex]'DefaultExpectedSha256\s*=\s*''?[0-9a-fA-F]{64}''?'
 
 $statsFields  = @('EngineBlockSize','GeometryRebuildCount','GeometryRebuildLastStatus','GeometryRebuildInProgress','LastGeometryRebuildUtc')
 $statvalKeys  = @('engine_bs','rebuild_count','rebuild_status','rebuild_in_progress','rebuild_utc')
-$blockLabels  = @('4 KB','8 KB','16 KB','32 KB')
-$rxBlockArray = [regex]'\[\s*4096\s*,\s*8192\s*,\s*16384\s*,\s*32768\s*\]'
+$blockLabels  = @('4 KB','8 KB','16 KB','32 KB','64 KB')
+$rxBlockArray = [regex]'\[\s*4096\s*,\s*8192\s*,\s*16384\s*,\s*32768\s*,\s*65536\s*\]'
 $rxChunk      = [regex]'SettingsPage-[A-Za-z0-9_-]+\.js$'
 
 # ---- [93 SPEC NO-GO] FAIL-CLOSED FREEZE GATE -----------------------------
@@ -122,16 +122,17 @@ $rxChunk      = [regex]'SettingsPage-[A-Za-z0-9_-]+\.js$'
 # This gate runs after the variable area and BEFORE the first write operation
 # (log init / Copy-Item / Set-Content / Invoke-Step), so a frozen chain cannot
 # sign, deploy or reboot anything.
-$nogoLift = 'C:\ProgramData\rb-deploy\93-NOGO-LIFTED.ok'
+$nogoLift = 'C:\ProgramData\rb-deploy\94-SPEC-OK-LIFTED.ok'
 if (-not (Test-Path -LiteralPath $nogoLift)) {
-    Write-Host '[X] FROZEN: 93 SPEC NO-GO - DO NOT DEPLOY (31cf870 / 76aacfc / 931ed53)'
-    Write-Host '    Reason: fail-open UAF / silent data corruption (Refs-baseline drain criterion).'
-    Write-Host '    See   : deliverables/93-spec-nogo-freeze-2026-11-07.md'
-    Write-Host '    No signing, no deploy.ps1, no reboot. This chain must NOT run.'
+    Write-Host '[X] FROZEN: 94-SPEC-OK-LIFTED.ok missing - DO NOT DEPLOY.'
+    Write-Host '    History: 31cf870/76aacfc/931ed53 were frozen by 93 SPEC NO-GO (fail-open UAF).'
+    Write-Host '    The 94-spec implementation (a648932/fb8a54f) passed independent review'
+    Write-Host '    SPEC OK (deliverables/qa-rebuild-spec-96-review-2026-11-07.md), but the'
+    Write-Host '    deploy gate stays fail-closed until the lead MANUALLY creates the lift file.'
     Write-Host ('    Manual lift file required (lead only): ' + $nogoLift)
     exit 1
 }
-Write-Host ('[i] 93 NO-GO lift present: ' + $nogoLift + ' - continuing (route A must be SPEC OK)')
+Write-Host ('[i] 94 SPEC OK lift present: ' + $nogoLift + ' - continuing')
 
 function L([string]$m) {
     Add-Content -LiteralPath $log -Value ("[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m)
@@ -246,7 +247,7 @@ $readmeBeforeNorm = $rxNorm.Replace($readmeBefore, 'DefaultExpectedSha256 = <HAS
 Invoke-Gate5 '[1] gate5 precheck'
 L ('[1] built sys ' + $builtHash + ' NotSigned; old Setup ' + $oldSetup + ' Valid; marker ' + $markerText0 + ' (READ ONLY)')
 
-$scope = 'SCOPE: this run re-signs the driver + Setup, syncs the three sys anchors, DEPLOYS the new signed image to System32\drivers, and re-arms the watchdog (DeploySeq+1 / FilterArmed=1 / LastBootHealthy=0 / BootFails=0 + two guard tasks). deployed sys updated to the new signed image; marker untouched; config / bootcfg / Features Flags unchanged (Flags already 0). No reboot, no SET_CONFIG, no test-flag reset. After reboot an INTERACTIVE LOGON is REQUIRED (logon_disarm clears FilterArmed) or verify_final_reboot.ps1 false-FAILs.'
+$scope = 'SCOPE: this run re-signs the driver + Setup, syncs the three sys anchors, DEPLOYS the new signed image to System32\drivers, and re-arms the watchdog (DeploySeq+1 / FilterArmed=1 / LastBootHealthy=0 / BootFails=0 + two guard tasks). deployed sys updated to the new signed image; [94 5.2] the reboot marker is written LAST (only after every check passed) so X2 boot_utc > marker genuinely proves this UAC rebooted; config / bootcfg / Features Flags unchanged (Flags already 0). No reboot, no SET_CONFIG, no test-flag reset, no verifier /reset. After reboot an INTERACTIVE LOGON is REQUIRED (logon_disarm clears FilterArmed) or verify_final_reboot.ps1 false-FAILs.'
 L $scope
 Write-Host ('[i] ' + $scope)
 
@@ -367,7 +368,7 @@ foreach ($lbl in $blockLabels) {
 if (-not $rxBlockArray.IsMatch($chunkText)) {
     Abort 'WEBCONSOLE ZIP STALE: SettingsPage chunk missing the 4-value block-size array'
 }
-L ('[6] webconsole.zip ' + $chunkName + ' carries 4/8/16/32 KB + [4096,8192,16384,32768] (' + $chunkText.Length + ' chars probed)')
+L ('[6] webconsole.zip ' + $chunkName + ' carries 4/8/16/32/64 KB + [4096,8192,16384,32768,65536] (' + $chunkText.Length + ' chars probed)')
 
 # ---- 7) sign Setup: FOUR hash assertions (Setup ONLY) -------------------
 if ((SigOf $setup) -ne 'NotSigned') { Abort 'SETUP BASELINE BEFORE SIGNING IS NOT UNSIGNED' }
@@ -498,13 +499,26 @@ if ($deployPending -and $deployedHash -ne $sysHash) {
 }
 L ('[10] scope intact: new sys=' + $sysHash + ' + deployed sys verified + sidecar + 3 anchors + README hash-line-only + marker=' + $markerText1 + ' (never written)')
 
-# ---- 11) ALL OK + NEXT ---------------------------------------------------
+# ---- 11) reboot marker LAST (94 5.2 / B-1+H-7) ---------------------------
+# Written ONLY here, after every check above passed, so verify_final_reboot X2
+# (boot_utc > finalize_utc) genuinely proves "this UAC actually rebooted".
+$markerText = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture)
+try {
+    Set-Content -LiteralPath $marker -Value $markerText -Encoding ASCII -ErrorAction Stop
+    $mBack = ([IO.File]::ReadAllText($marker, (New-Object Text.UTF8Encoding($false)))).Trim()
+} catch { Abort ('MARKER WRITE/READ FAILED: ' + $_.Exception.Message) }
+if ($mBack -ne $markerText -or $mBack.Length -ne 24 -or -not $mBack.EndsWith('Z')) {
+    Abort ('MARKER VERIFY FAILED: ' + $mBack)
+}
+L ('[11] reboot marker written LAST utc=' + $markerText)
+
+# ---- 12) ALL OK + NEXT ---------------------------------------------------
 L ('ALL OK sys=' + $sysHash + ' setup=' + $copyBackHash)
 L 'NEXT: lead runs sync_setup_hash.ps1 -RequireSetupChanged (plain session), then ONE reboot.'
 L 'IMPORTANT: after reboot an INTERACTIVE LOGON is REQUIRED (logon_disarm clears FilterArmed);'
 L '           without it verify_final_reboot.ps1 gives a deterministic false FAIL.'
 L '           If deploy reported a queued replace-on-reboot, a SECOND reboot may be needed.'
-L 'Then: verify_final_reboot.ps1 FAIL=0, then the S4 4K->8K->16K->32K->4K matrix.'
+L 'Then: verify_final_reboot.ps1 FAIL=0, then the S4 five-tier matrix 4K->8K->16K->32K->64K->4K.'
 Write-Host ('=== finalize_rebuild_fix OK sys=' + $sysHash + ' setup=' + $copyBackHash + ' ===')
 Write-Host 'NEXT: lead runs sync_setup_hash.ps1 -RequireSetupChanged; reboot ONCE; LOG ON interactively.'
 exit 0

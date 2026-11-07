@@ -23,7 +23,7 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-LEGAL = (4096, 8192, 16384, 32768)
+LEGAL = (4096, 8192, 16384, 32768, 65536)   # [64K-UNBAN] 2026-11-08; 131072 still banned
 LEGAL_STR = "{4096,8192,16384,32768}"
 
 
@@ -70,7 +70,7 @@ def main():
         if bad_key in pass2:
             fails.append("cache.c: rb_write_pass2 contains the defective stripe key")
 
-    # --- 3) legal geometry whitelist must stay exactly the four values ---
+    # --- 3) legal geometry whitelist must stay exactly the five values ---
     wl = re.search(r"static const rb_u32 legal\[\]\s*=\s*\{([^}]*)\}", cache)
     if not wl:
         fails.append("cache.c: legal[] whitelist not found")
@@ -78,8 +78,8 @@ def main():
         vals = tuple(int(x.strip()) for x in wl.group(1).split(",") if x.strip())
         if vals != LEGAL:
             fails.append("cache.c: legal[] = {%s}, expected %s" % (",".join(map(str, vals)), LEGAL_STR))
-        if 65536 in vals or 131072 in vals:
-            fails.append("cache.c: 64K/128K geometries reintroduced (F1 ban)")
+        if 131072 in vals:
+            fails.append("cache.c: 128K geometry reintroduced (F1 ban; 64K unbanned 2026-11-08)")
 
     twl = re.search(r"static int legal_block_size\s*\(unsigned long v\)\s*\{(.*?)\}", test, re.S)
     if not twl:

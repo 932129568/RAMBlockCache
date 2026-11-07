@@ -374,13 +374,24 @@ UAC 后十道门禁全绿；四个提交 `70a38f8` / `c20c732` / `ec7714e` / `b8
 
 实测：`src/ui/installer/RAMBlockCache.Setup/Assets/payload/webconsole.zip` 仍是 `08:30:31Z` 的旧包，内部只有 `dist/assets/SettingsPage-B5cxqUq9.js`（单档）；`dist\RAMBlockCache-Setup.exe` 仍是 `db7006d7…` / 272,868,696 B / Valid / `08:30:39Z`。**别人安装当前 Setup 依然只能选 4 KB**。
 
-处置：已派 `impl-blocksize` 写**只重打 Setup**的轻量提权链 `src/scripts/finalize_setup_only.ps1` + `RB-repack-setup.cmd`。硬约束：
+处置：`impl-blocksize` 已交付 commit **`e22dc59`**（`feat(scripts): 新增 Setup-only 重打包签名轻量 UAC 链`，仅新增 2 文件 / 334 行）：`src/scripts/finalize_setup_only.ps1`（314 行，UTF-8 BOM + CRLF）+ 仓库根 `RB-repack-setup.cmd`（20 行，纯 ASCII + CRLF）。硬约束：
 
 - 只跑 `build_setup.ps1` → 签 Setup → ledger append（fatal + read-back）；
 - **不重编驱动、不签 sys、不同步三锚点、不部署、不 `verifier /reset`、不写 marker**（marker `08:30:48.509Z` 必须保持，否则 X2 的 `boot_utc > finalize_utc` 变假）、不重启；
 - 前后各回读一次 sys 哈希与三锚点，断言完全一致；
 - 新增断言：用 `tar.exe` 从 `webconsole.zip` 读出 `dist/assets/SettingsPage-*.js`，确认含 `8/16/32 KB` 与四档数组（本次重打包的目的）；
 - 用户双击一次后，由主理人跑 `sync_setup_hash.ps1 -RequireSetupChanged` 回填 README.md / 67 号的 Setup 行（sys 行不变）。
+
+**主理人独立复核（作者≠验证者，全部通过）**：
+
+- 编码 `.ps1` BOM `EF BB BF` / CRLF 314 / bare LF 0；`.cmd` 纯 ASCII / CRLF 20 / bare LF 0；AST `parse_errors=0`（2465 tokens）；`check_ps_syntax` 全库 `files=68 fail=0`。
+- 禁止项静态扫描全 0 命中：`verifier`、`sync_anchors`、`WriteAllText($marker`、`Set-Content -LiteralPath $marker`、`Add-Content -LiteralPath $marker`；marker 只有 2 次 `ReadAllText`（开头读 + 收尾复读），**只读不写**；唯一一次 `signtool sign` 的 ArgList 目标是 `$stageSetup`，脚本内无任何针对驱动文件的签署调用。
+- 红线现场未变：`dist sys = 10fb7009…`、三锚点 `distinct=1` 同值、marker `2026-11-07T08:30:48.509Z`、Setup 仍 `db7006d7… / Valid`。
+- **第 1 步前置断言干跑全真**：sys Valid、sidecar 精确等于 `SHA256: <sys>`、三锚点三处正则均 success 且等值、Setup Valid、marker 24 字符以 Z 结尾、11 项前置文件 + signtool / tar.exe / ledger 全部存在。
+- **「恰 1 个 SettingsPage chunk」不会误 abort**：当前旧 zip 内确为 1 个（`SettingsPage-B5cxqUq9.js`）；实测 `Compress-Archive -Force` 会**完全替换**旧条目（同一 zip 第二次压缩只剩新文件，旧条目不残留），而 `web/dist` 的新 chunk `SettingsPage-CGJZ6Bdb.js` 含 `8 KB / 16 KB / 32 KB` 与四档数组 ⇒ 重打包后断言必然成立。
+- 工程师另记录一处环境坑：Git Bash 的 GNU `tar` 读 zip 会报 `This does not look like a tar archive`，必须用 `%WINDIR%\System32\tar.exe`（bsdtar）；脚本已固定该路径。
+
+⇒ **判定：可放行用户双击 `RB-repack-setup.cmd`**。UAC 后主理人核验日志 `ALL OK` → 跑 `sync_setup_hash.ps1 -RequireSetupChanged`（须 `UPDATED`）→ 复跑 `verify_final_reboot.ps1`（marker/boot 未变，应仍 `FAIL=0`）→ 补推并确认 CI。
 
 ### 15.4 推送与 CI（如实记录）
 

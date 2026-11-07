@@ -198,6 +198,21 @@
 | E1 | 360 安全软件过滤驱动共存（360FsFlt 等在卷栈上） | IRP 处理交互未充分测试 | 🟡 已知；0xA 事故的间接嫌疑 |
 | E2 | YXCalendar.exe 周期性崩溃（约 10 分钟一次） | 外部软件，非本项目 | 🟡 与本项目无关，但曾叠加干扰排查 |
 
+## F. [85 号第三笔 / 83 号 §11] 系统审查必要修复：残余边界与归档项（2026-11-07）
+
+> 本批按 `deliverables/85-system-audit-and-fix-plan-2026-11-07.md` 定点修复 B1–B13 + B15；以下为**如实留痕**的残余边界与本批明确不改（归档）项。本批全部为静态/用户态/编译域证据，B1/B2 内核 UAF 的运行时后果须 S2 真机验证，不得提前宣称「内核已修」。
+
+| # | 项 | 状态 | 说明 / S2 规避条件 |
+|---|---|---|---|
+| F1 | **B15 L2/ETW 复位复核的语义边界**（部分落地留痕） | 🟡 | `RbFeatFullRecover()` 已完整复活 `rbpools.c` 池闩（与 B4 共用 `Rb2PoolRevive()`）+ feat 层闩 + `Rb2Tick` + 返回值留痕 + 如实日志，并修正 `RbFeatRecover():421` 半死态假象。关于 L2/ETW：`RbFeatShutdown()` 的两条超时返回（`:372`/`:391`）都在 `RbL2Close()`/`RbEtwShutdown()`（`:394-395`）**之前**，故卸载中止路径 L2/ETW 实际未被关闭；`RbFeatFullRecover()` 调用 `RbL2LazyOpen()`（与 REFRESH `:450` 同款幂等复核）与 `RbEtwEnsure()`（CAS 幂等、按 `RB2F_ETW` Flags 门）是**幂等复核，非强制重开**。**S2 规避条件**：`sc stop` join 超时中止后如需确认 L2/ETW 状态，用 REFRESH / `l2 status` 复核；`RbL2LazyOpen` 是控制面函数，Flags 关闭 / 卷身份变更时有条件收尾语义，若现场出现 L2 意外关闭应经 REFRESH 重开。 |
+| F2 | **B11 attach/detach TOCTOU** | ⏸ 归档 | 三份审查未发现实际反向锁嵌套/死锁；本批按裁定**不改锁模型**，仅把「卸载/重建窗口 + PnP surprise-removal + 并发 attach/detach 交错」纳入 QA 故障注入用例（B2 闩落地后）。 |
+| F3 | **B14 R10 未闭环** | ⏸ 归档 | 方案 A（无条件失效）已由 `qa_stale_directwrite` 四模式 12/12 CLEAN 确证，本批**不做代码改动**；仅修正 `rbrebuild.c:201` / 79 号 §5 R10 注释措辞（`InterlockedCompareExchange(&X,0,0)` = `lock cmpxchg`，非纯 volatile 只读），并把 4K 双二进制 A/B 吞吐 + 命中率压测 + `wb_drain` 开销量化写入 S2 待办。S4 吞吐与 72/75 号绝对值不可比。 |
+| F4 | **85 号 §1.2 归档项 A1–A14** | ⏸ 归档 | 全部不构成本批改动：A1 `RB_MAX_VOLUMES=8` 静默截断（无 UAF，仅功能不可用）、A2 `rb_stream_destroy` 注释与实现不符（双硬判据第②条冗余，无害）、A3 `GeometryRebuildOldBs` 死字段、A4 `RbCreateEngineOnly` 已存在时静默成功、A5 `RbReattachVolumeForRebuild` 绕过门仅靠注释、A6 `RbResumeTrack` 窗口崩溃丢记录、A7 `:1052` 注释陈旧、A8 S2–S5 推迟窗、A9 兼容性已闭环、A10 `EngineBlockSize=0` 混合部署语义、A11 `check_proto_sync.py:20` 注释过时、A12 锁序主体闭环但不含 7 个 `PsCreateSystemThread` 入口门控维度（B1 独立发现）、A13 4K 正确性必需原子代价、A14 动态 work item 完整方案（本批不实施）。 |
+| F5 | **H8（内核侧 >4K 非对齐写 + 并发驱逐）** | 🟡 | 仍未「覆盖」：直写 `WriteBack=0` 下 `rb_write_pass2` 不可达、`RmwReads` 恒 0；BLOCKER 2 / 方案 A 修复不解决 H8。 |
+| F6 | **B7/B6 收尾发布序的口径说明** | ✅ 已落地 | work item 统计（Utc/LastStatus/Count）发布移到四道门控归零**之前**：GET_STATS 观察者见 `InProgress=0` 时统计已可见（B7），`s_RebuildInFlight=0` 为最后一条共享写（B6）。B7 原文「最后清 `GeometryRebuildInProgress`」与 B6「`s_RebuildInFlight` 最后一条共享写」不能同时字面成立，裁定以「统计先于**任一**归零」统一满足（见 83 号 §11 偏差说明）。 |
+
+---
+
 ## 验证声明
 
 - 当前恢复候选离线门禁：`check_repo`、`check_proto_sync --strict`、`refcount_model`、`check_xaml_resources`、`check_ps_syntax`、`check_signature` 均通过；core Release/ASAN 21/21、标准 C# 13/13、bench policy 12/12。

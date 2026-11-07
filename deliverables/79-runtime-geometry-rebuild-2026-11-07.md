@@ -157,7 +157,7 @@ QA 在 78 号 §10 指出 B1：**若 `RbEngineGeometry()` 只存在于驱动内�
 | R7 | `CachePagingIo=0` 分页 IO 透传 | 重建窗口内 pagefile/转储 IO 本就透传，不受影响；仍须复核无遗漏路径 |
 | R8 | 并发 attach/detach 与重建竞争 | `rbattach.c:1231` 已有 `Unloading` 拒绝 attach；detach 路径需补 `Recreating` 检查 |
 | R9 | 控制面阻塞 | 重建必须在 PASSIVE work item 内；`SET_CONFIG` 立即返回 |
-| R10 | 4K 热路径回归 | **不得**在 4K 读写路径新增原子写或锁；正确性所必需的失效允许（82 号 §4.7.2 方案 A），但须 4K A/B 结构 diff 0 + 吞吐回归留证。门控只在入口判断一次，4K 默认态不触发重建 |
+| R10 | 4K 热路径回归 | **不得**在 4K 读写路径新增原子写或锁；正确性所必需的失效允许（82 号 §4.7.2 方案 A），但须 4K A/B 结构 diff 0 + 吞吐回归留证。门控只在入口判断一次，4K 默认态不触发重建。**[85 号 B14 第三笔措辞修订]**：「零原子写」口径不严谨——`InterlockedCompareExchange(&X,0,0)` 在 x86 编译为 `lock cmpxchg`（非纯 volatile 只读）；正确性必需的代价为 4K 常态每 IO 两次 `lock` 原子（`DataPathInFlight ±1`）+ 一次 `lock cmpxchg`（`RbIsDataPathFrozen`）+ 每次直写一次 `RbInvalidateAfterFlush`（无条件失效，升 `view_gen` + `wb_drain`）。83 号 C7「diff 0」是**引擎几何/记账结构 diff**，非双二进制行为 A/B。S2 待办（B14 仅补验证、不改代码）：4K 双二进制 A/B 吞吐 + 读命中率压测留证、`wb_drain` 开销量化、R10 逐条复核；S4 五路吞吐与 72/75 号绝对值**不可比**，只作同机同批相对参考。 |
 
 ---
 

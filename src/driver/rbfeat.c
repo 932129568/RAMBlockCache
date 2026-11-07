@@ -418,7 +418,17 @@ VOID RbFeatRecover(VOID)
     if (NT_SUCCESS(PsCreateSystemThread(&h, 0, NULL, NULL, NULL, Rb2Tick, NULL)) &&
         NT_SUCCESS(ObReferenceObjectByHandle(h, 0, *PsThreadType, KernelMode, &s_TickObj, NULL))) {
         s_TickH = h;
-        RbLog(0, __LINE__, 0, L"feat layer recovered (Rb2Tick restarted)");
+        /* [85 B15] 不得在池闩未解时谎报「recovered」：如实列出池闩 / L2 状态。
+         * 池闩(rbpools.c:16)与本文件 feat 层 s_Stop 是两个同名变量，
+         * RbFeatRecover() 只解后者；池闩仍置 1 时预取/淘汰/预热永久静默丢弃，
+         * 必须以 PANIC 级日志暴露（卸载中止分支应改走 RbFeatFullRecover）。 */
+        if (Rb2PoolLatch()) {
+            RbLog(2, __LINE__, (LONG)Rb2PoolLatch(),
+                  L"feat recover: Rb2Tick restarted BUT POOL LATCH STILL SET (PANIC) - use RbFeatFullRecover");
+        } else {
+            RbLog(1, __LINE__, (LONG)RbL2State(),
+                  L"feat layer recovered (Rb2Tick restarted; pool latch clear; L2 state in Status)");
+        }
     } else {
         /* [FIX A-12] PsCreateSystemThread 成功但 ObReference 失败：h 句柄必须关
          * （原泄漏），且线程未登记 s_TickObj/s_TickH = 幽灵线程（join 够不到）——
@@ -427,6 +437,32 @@ VOID RbFeatRecover(VOID)
         RbLog(2, __LINE__, 0, L"feat recover: Rb2Tick restart failed (retry via REFRESH)");
         InterlockedExchange(&s_Stop, 1);       /* 复活失败保持闩：下轮 REFRESH 重试 */
     }
+}
+
+/* [85 B15] 卸载中止分支专用完整复活（成功卸载路径 :1311 不得调用）。
+ * 背景：RbFeatShutdown() 池 join 超时(:391)返回时，rbpools.c:16 池闩已置 1；
+ * 而原 RbFeatRecover() 只解 feat 层同名 s_Stop + 重建 Rb2Tick、不碰池闩 →
+ * Rb2PoolSubmit 永久 STATUS_SHUTDOWN_IN_PROGRESS，预取/淘汰/预热静默丢弃，
+ * :421 还谎报「recovered」形成半死态假象。用户以为 sc stop 失败无影响，
+ * 实际特性层已死。与 B4 共用唯一 helper Rb2PoolRevive()（解池闩，有界重试）。
+ * L2/ETW：RbFeatShutdown 的两条超时返回(:372/:391)都在 RbL2Close()/
+ * RbEtwShutdown()(:394-395)之前，故本路径 L2/ETW 实际未被关闭；这里做幂等
+ * 复核（RbL2LazyOpen 与 REFRESH :450 同款、RbEtwEnsure CAS 幂等且按 Flags 门），
+ * 并把 RbL2State() 如实入日志。返回值留痕：池闩仍死返回非成功，交 S2/REFRESH。 */
+NTSTATUS RbFeatFullRecover(VOID)
+{
+    NTSTATUS poolSt = Rb2PoolRevive();         /* 解池闩（与 B4 共用，有界重试 1 次） */
+    RbFeatRecover();                          /* 解 feat 层闩 + 重建 Rb2Tick（幂等） */
+    RbL2LazyOpen();                           /* 幂等复核（REFRESH 同款） */
+    if (Rb2Flags() & RB2F_ETW) RbEtwEnsure(); /* CAS 幂等，按 Flags 门，避免无条件注册 */
+    if (!NT_SUCCESS(poolSt)) {
+        RbLog(2, __LINE__, poolSt,
+              L"feat full recover: POOL LATCH STILL SET (PANIC) - prefetch/evict/prewarm dead; feat revived; manual REFRESH/reboot required");
+        return poolSt;                        /* 非成功：服务降级留痕 */
+    }
+    RbLog(1, __LINE__, (LONG)RbL2State(),
+          L"feat full recover: pool latch cleared, feat layer revived, L2/ETW rechecked (L2 state in Status)");
+    return STATUS_SUCCESS;
 }
 
 /* ---- IOCTL 分发（rbctl.c 主 switch 转发进来；V3-06 改返回 NTSTATUS，内部完成 IRP） ---- */

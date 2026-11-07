@@ -58,6 +58,24 @@ static volatile LONG s_RebuildInFlight = 0;
 static WORK_QUEUE_ITEM s_RebuildWork;
 static ULONG          s_PendingNewBs = 0;
 
+/* [85 B2] 卸载提交闩：RbUnload 起始与 Unloading=1 同处置 1（先闩后 Unloading），
+ * 7 处卸载中止分支统一经 RbUnloadAbort() 清 0（漏一处即服务恢复后闩恒 1、
+ * 永久拒绝所有重建）；成功卸载路径不复位（驱动即将卸下）。
+ * 根因：RbRebuildIsActive() 判据不含 Unloading，而 work item 尾部 :417 先清
+ * Unloading 再清其余三态，:417→rbdriver.c:1142 之间 Unloading=0 恒成立（约一个
+ * 20ms tick），新 SET_CONFIG 可经 rbctl.c:365 / 本文件 :444 抢主入队，与卸载
+ * :1259 rb_engine_destroy 并发 = UAF。本闩封死该窗口。
+ * 读点：rbio.c flush 入口门（B1）+ rbctl.c / 本文件重建拒绝门（B2）。 */
+static volatile LONG s_UnloadCommitted = 0;
+BOOLEAN RbIsUnloadCommitted(VOID)
+{
+    return InterlockedCompareExchange(&s_UnloadCommitted, 0, 0) != 0;
+}
+VOID RbUnloadCommitSet(LONG v)
+{
+    InterlockedExchange(&s_UnloadCommitted, v);
+}
+
 /* ---- [83 第二笔] 卸载 ↔ 重建 work item 互斥排空判据（实现 rb_common.h 声明） ----
  * 三态任一非 0 都表示重建 work item 仍在飞：
  *   Recreating                 —— RbMsgSetConfig CAS 抢主成功即置 1（最早）
@@ -170,17 +188,23 @@ static BOOLEAN RbRebuildDetachAll(RB_REBUILD_VOL *vols, ULONG count)
     return TRUE;
 }
 
-/* ---- 工具：逐卷重挂 + 标志复原（单卷失败只记 ERROR，不回滚整个引擎） ---- */
-static ULONG RbRebuildReattachAll(RB_REBUILD_VOL *vols, ULONG count)
+/* ---- 工具：逐卷重挂 + 标志复原（单卷失败只记 ERROR，不回滚整个引擎） ----
+ * [85 B7] 返回 restored（成功重挂卷数），并以 *pFailed 回传失败卷数；失败卷
+ * 在日志里列出盘符（Status 参数带盘符，与 :162 同款）。调用方以
+ * restored != volCount 判「部分失败」→ 非成功码、阻止 Count 递增、写 LastStatus。 */
+static ULONG RbRebuildReattachAll(RB_REBUILD_VOL *vols, ULONG count, ULONG *pFailed)
 {
-    ULONG k, restored = 0;
+    ULONG k, restored = 0, failed = 0;
     PAGED_CODE();
+    if (pFailed) *pFailed = 0;
     for (k = 0; k < count; k++) {
         NTSTATUS st;
         if (!vols[k].WasAttached) continue;
         st = RbReattachVolumeForRebuild(vols[k].Letter);
         if (!NT_SUCCESS(st)) {
-            RbLog(2, __LINE__, st, L"rebuild: volume reattach failed (left passthrough)");
+            failed++;
+            RbLog(2, __LINE__, (LONG)vols[k].Letter,
+                  L"rebuild: volume reattach FAILED (drive letter in Status), left passthrough");
             continue;
         }
         if (vols[k].FlagValid)
@@ -188,17 +212,25 @@ static ULONG RbRebuildReattachAll(RB_REBUILD_VOL *vols, ULONG count)
                                  vols[k].WriteEnabled, vols[k].WriteMode);
         restored++;
     }
+    if (pFailed) *pFailed = failed;
     return restored;
 }
 
-/* ---- 屏障：6 项在途判据全部归零（30/60s 有界） ----
+/* ---- 屏障：7 项在途判据全部归零（30/60s 有界） ----
  * [83 收窄#1] DataPathInFlight 是 RbCtxAlloc/RbCtxFree 严格配对的**真实计数**
  * （只统计重建窗口内分配的 ctx）。窗口前置入的 ctx 由「每卷 ext->Refs
  * 回基准」判据兜底。故此处**只读不写** DataPathInFlight，判据 =
  *   DataPathInFlight==0 && refsQuiet && FallbackInFlight==0 &&
- *   ZombiePending==0 && s_PrefInFlight==0 && FlushJobs==0（6 项）。
+ *   ZombiePending==0 && s_PrefInFlight==0 && FlushJobs==0 &&
+ *   FlushThreadInLoop==0（7 项）。
  * 旁路作业由 M5 各入口 RbIsDataPathFrozen 早退，不新增计数。
- * R10：4K 常态两值皆 0 时 RbCtxAlloc 只做 volatile 读分支，零原子写。 */
+ * [85 B1] 第 7 项 FlushThreadInLoop：RbFlushThread 的入口门只在循环入口判一次，
+ * 已进循环体的那一轮仍会解引用 g_Rb.Engine；必须等它离开循环体（归零）才允许
+ * 销毁引擎。无脏常态 cnt==0 使 FlushJobs 恒 0、六项几乎立即满足，正是本项
+ * 补上「flush 主线程 tick 在途」这一唯一缺失的代表。
+ * R10：4K 常态两值皆 0 时 RbCtxAlloc 只做 volatile 读分支；但注意
+ * InterlockedCompareExchange(&X,0,0) 在 x86 编译为 lock cmpxchg（非纯 volatile
+ * 只读），热路径仍有 1 次 lock 原子读，措辞以本行为准（85 号 B14 口径）。 */
 NTSTATUS RbWaitDataPathQuiesce(ULONG timeoutMs)
 {
     LARGE_INTEGER tick;
@@ -226,13 +258,14 @@ NTSTATUS RbWaitDataPathQuiesce(ULONG timeoutMs)
             InterlockedCompareExchange(&g_Rb.FallbackInFlight, 0, 0) == 0 &&
             InterlockedCompareExchange(&g_Rb.ZombiePending, 0, 0) == 0 &&
             RbPrefInFlightCount() == 0 &&
-            InterlockedCompareExchange(&g_Rb.FlushJobs, 0, 0) == 0) {
+            InterlockedCompareExchange(&g_Rb.FlushJobs, 0, 0) == 0 &&
+            InterlockedCompareExchange(&g_Rb.FlushThreadInLoop, 0, 0) == 0) {  /* [85 B1] 第 7 项 */
             return STATUS_SUCCESS;             /* 允许销毁引擎 */
         }
         KeDelayExecutionThread(KernelMode, FALSE, &tick);
     }
-    RbLog(2, __LINE__, (LONG)InterlockedCompareExchange(&g_Rb.DataPathInFlight, 0, 0),
-          L"rebuild: datapath quiesce timeout - engine kept, rolling back");
+    RbLog(2, __LINE__, (LONG)InterlockedCompareExchange(&g_Rb.FlushThreadInLoop, 0, 0),
+          L"rebuild: datapath quiesce timeout (7 criteria) - engine kept, rolling back");
     return STATUS_TIMEOUT;                     /* 超时：绝不销毁引擎（R2） */
 }
 
@@ -243,21 +276,31 @@ NTSTATUS RbWaitDataPathQuiesce(ULONG timeoutMs)
 NTSTATUS RbRecreateEngineGeometry(ULONG newBlockSize)
 {
     RB_REBUILD_VOL vols[RB_MAX_VOLUMES];
-    ULONG volCount = 0, restored = 0;
+    ULONG volCount = 0, restored = 0, failed = 0;
     ULONG oldBs = 4096u;
     RB_CONFIG saved;
     NTSTATUS st = STATUS_UNSUCCESSFUL;
     BOOLEAN engineDestroyed = FALSE;
-    BOOLEAN detachDone = FALSE;
-    BOOLEAN needReattach = FALSE;
+    /* [85 B4] RbFeatQuiesce 失败后池闩复活（Rb2PoolRevive）二次仍失败：特性层
+     * 预取/淘汰/预热永久静默死。置位时 out_clear_gate 写 LastStatus + PANIC 日志、
+     * 且不得再宣称「service restored」。 */
+    BOOLEAN featPoolDead = FALSE;
+    /* [85 B5] 删去 detachDone/needReattach 聚合标志：重挂改按 vols[k].Detached
+     * 逐项判定，避免「多卷第 m+1 卷排空超时 ⇒ 前 m 卷已摘链却不重挂」丢卷。 */
 
     PAGED_CODE();
     RtlZeroMemory(vols, sizeof(vols));
 
     if (newBlockSize != 4096u && newBlockSize != 8192u &&
-        newBlockSize != 16384u && newBlockSize != 32768u)
-        return STATUS_INVALID_PARAMETER;       /* 未置门控，直接返回是安全的 */
-    if (!g_Rb.Engine) return STATUS_DEVICE_NOT_READY;
+        newBlockSize != 16384u && newBlockSize != 32768u) {
+        /* [85 B3] 早退也必须回滚配置副本：RbApplyConfig 已同步写新 BlockSize
+         * 并持久化，直接 return 会留下「显示 16K、实际 4K」，且再次
+         * set block=<同一 new> 因 rbctl.c:355 判等失败而不入队 → 永久卡死。
+         * 此时 Unloading 未置、volCount=0、各卷 Detached=FALSE，fallthrough 安全。 */
+        st = STATUS_INVALID_PARAMETER;
+        goto out_clear_gate;
+    }
+    if (!g_Rb.Engine) { st = STATUS_DEVICE_NOT_READY; goto out_clear_gate; }
 
     oldBs = (ULONG)rb_engine_block_size(g_Rb.Engine);
     InterlockedExchange(&g_Rb.GeometryRebuildOldBs, (LONG)oldBs);
@@ -270,21 +313,21 @@ NTSTATUS RbRecreateEngineGeometry(ULONG newBlockSize)
     RbSaveConfig(&saved);
     if (!RbRebuildVerifyPersistedBs(newBlockSize)) {
         RbLog(2, __LINE__, 0, L"rebuild: BlockSize persist verify failed, abort (old geometry kept)");
-        return STATUS_UNSUCCESSFUL;            /* 未置门控，直接返回安全 */
+        st = STATUS_UNSUCCESSFUL;             /* [85 B3] 早退也须回滚配置副本 */
+        goto out_clear_gate;
     }
 
     /* c) 门控 + 快照（从这里起 Unloading=1，所有出口必须清零） */
     InterlockedExchange(&g_Rb.Unloading, 1);
     volCount = RbRebuildSnapshotVolumes(vols, RB_MAX_VOLUMES);
 
-    /* d) 逐卷软摘链 */
+    /* d) 逐卷软摘链。[85 B5] 不再用聚合标志；vols[k].Detached 已由
+     * RbRebuildDetachAll(:166) 逐项置位，回滚重挂按逐项判定。 */
     if (!RbRebuildDetachAll(vols, volCount)) {
         RbLog(2, __LINE__, 0, L"rebuild: detach failed, rolling back to old geometry");
         st = STATUS_UNSUCCESSFUL;
         goto out_rollback;
     }
-    detachDone = TRUE;
-    needReattach = TRUE;
 
     /* e) 判据复核 + 屏障 + 特性层池排空/恢复 */
     if (!RbRebuildAllStreamsDetached()) {
@@ -296,19 +339,44 @@ NTSTATUS RbRecreateEngineGeometry(ULONG newBlockSize)
     if (!NT_SUCCESS(st)) goto out_rollback;
     st = RbFeatQuiesce();
     if (!NT_SUCCESS(st)) {
+        NTSTATUS rev;
         RbLog(2, __LINE__, st, L"rebuild: feat quiesce failed, rolling back (engine kept)");
+        /* [85 B4] 只在这一支回滚里复活池闩：RbFeatQuiesce 失败时 rbpools.c:16
+         * 的 s_Stop 可能仍为 1（Shutdown 超时 / Init 失败回调 Shutdown 又置回 1），
+         * Rb2PoolSubmit 会永久 STATUS_SHUTDOWN_IN_PROGRESS。必须与 B15 共用
+         * Rb2PoolRevive()（有界重试 1 次），**绝不调 RbFeatRecover()**（只解
+         * feat 层同名闩、不碰池闩）。仍失败：置 featPoolDead → out_clear_gate
+         * 写 LastStatus + PANIC 日志、禁止再写「service restored」。
+         * :302 二次 RbWaitDataPathQuiesce 超时（下面的第二次屏障）走 out_rollback
+         * 不经本支，池已由上面成功的 FeatQuiesce 恢复，不会重复 Init。 */
+        rev = Rb2PoolRevive();
+        if (!NT_SUCCESS(rev)) {
+            featPoolDead = TRUE;
+            RbLog(2, __LINE__, rev,
+                  L"rebuild: PANIC - feat pool latch stuck after retry; prefetch/evict/prewarm permanently dead");
+        }
         goto out_rollback;
     }
     st = RbWaitDataPathQuiesce(30000u);       /* Init 后复核一次 */
     if (!NT_SUCCESS(st)) goto out_rollback;
 
-    /* f) 销毁旧引擎 → 新几何重建（不启池） */
-    ExAcquireFastMutex(&g_Rb.EngineMutex);
-    if (g_Rb.Engine) {
-        rb_engine_destroy(g_Rb.Engine);        /* 内部 flush；SyncCtxLa 池未删 */
+    /* f) 销毁旧引擎 → 新几何重建（不启池）。
+     * [85 B9] EngineMutex 是 FAST_MUTEX，持有会抬 IRQL 到 APC_LEVEL；而
+     * rb_engine_destroy → rb_engine_flush(eng,1) → RbWritebackCb → RbSyncIo
+     * 是 PASSIVE-only 长时操作（可能分页），违反 rbattach.c:125 [FIX C-5]
+     * 「耗时长/可能分页的操作禁止持 FAST_MUTEX」纪律。故锁内只把
+     * g_Rb.Engine 原子换出到局部并置 NULL，释放锁后在 PASSIVE 调
+     * rb_engine_destroy(eng)。换出后无线程能拿到半销毁引擎：B2 闩 +
+     * Unloading 门 + B1 flush 入口门/FlushThreadInLoop 第 7 项 + 六项
+     * quiesce 共同提供（销毁发生前已全部通过）。 */
+    {
+        rb_engine *eng;
+        ExAcquireFastMutex(&g_Rb.EngineMutex);
+        eng = g_Rb.Engine;
         g_Rb.Engine = NULL;
+        ExReleaseFastMutex(&g_Rb.EngineMutex);
+        if (eng) rb_engine_destroy(eng);      /* PASSIVE，锁外 */
     }
-    ExReleaseFastMutex(&g_Rb.EngineMutex);
     engineDestroyed = TRUE;
     ExAcquireFastMutex(&g_Rb.CfgLock);
     g_Rb.Config.BlockSize = newBlockSize;
@@ -327,6 +395,18 @@ NTSTATUS RbRecreateEngineGeometry(ULONG newBlockSize)
             /* 两次都失败：解门控 + PANIC 日志 + LastStatus，等人工干预/重启。
              * 不靠 Unloading 长期透传（禁哑服役）。 */
             RbLog(2, __LINE__, st, L"rebuild: both geometries failed - PANIC, service in passthrough by no-engine");
+            /* [85 B8] Engine==NULL 时重挂前显式以旧几何回建引擎（不启池），
+             * 避免 out_rollback 逐卷重挂走 RbReattachVolumeForRebuild →
+             * RbAttachVolumeByLetterImpl:1180 → RbEnsureEngine 的 created
+             * 分支对「全程未停」的 worker/flusher/flush 线程二次启动
+             * （正是第一批阻断 B 用 RbCreateEngineOnly 规避的问题）。
+             * 与 out_clear_gate 的 effOld(oldBs) 口径对齐。 */
+            if (!g_Rb.Engine) {
+                NTSTATUS est = RbCreateEngineOnly(oldBs);
+                if (!NT_SUCCESS(est))
+                    RbLog(2, __LINE__, est,
+                          L"rebuild: old-geometry engine re-create before reattach FAILED (PANIC)");
+            }
             goto out_rollback;
         }
         RbSaveConfig(&revert);                 /* 回写旧几何，注册表与运行值一致 */
@@ -337,8 +417,7 @@ NTSTATUS RbRecreateEngineGeometry(ULONG newBlockSize)
     RbRefreshMemoryBudget();
 
     /* g) 逐卷重挂 + 标志复原 */
-    restored = RbRebuildReattachAll(vols, volCount);
-    needReattach = FALSE;
+    restored = RbRebuildReattachAll(vols, volCount, &failed);
 
     /* h) L2 反向静默降级：16K→4K 回退不会自动重开 */
     RbL2LazyOpen();
@@ -347,6 +426,15 @@ NTSTATUS RbRecreateEngineGeometry(ULONG newBlockSize)
 
     (void)engineDestroyed;
     InterlockedExchange(&g_Rb.Unloading, 0);
+    if (restored != volCount) {
+        /* [85 B7] 部分卷重挂失败：几何已切换但不得报成功、不得递增 Count。
+         * 返回非成功码 → work item :424 写 LastStatus、不增 Count；失败盘符
+         * 已由 RbRebuildReattachAll 逐卷列出（Status 参数带盘符）。 */
+        st = STATUS_UNSUCCESSFUL;
+        RbLog(2, __LINE__, (LONG)failed,
+              L"rebuild: PARTIAL reattach - N volume(s) left passthrough (letters logged above); status=FAILED");
+        return st;
+    }
     RbLog(0, __LINE__, (LONG)restored,
           L"rebuild: geometry switched, volumes restored, cache cold");
     return STATUS_SUCCESS;
@@ -354,14 +442,20 @@ NTSTATUS RbRecreateEngineGeometry(ULONG newBlockSize)
 out_restore:
     /* 引擎已用旧几何回建成功：重挂所有卷，返回失败但运行几何保持原值。 */
     RbApplyEngineConfig(&g_Rb.Config);
-    (void)RbRebuildReattachAll(vols, volCount);
-    needReattach = FALSE;
+    (void)RbRebuildReattachAll(vols, volCount, &failed);
     RbL2LazyOpen();
     goto out_clear_gate;
 
 out_rollback:
-    /* 引擎未销毁（或已用旧几何回建）：重挂所有已摘链卷。 */
-    if (needReattach && detachDone) {
+    /* [85 B5] 引擎未销毁（或已用旧几何回建）：按 vols[k].Detached **逐项**
+     * 重挂已成功软摘链的卷。删除原 detachDone/needReattach 聚合标志——
+     * 多卷第 m+1 卷 60s 排空超时时聚合标志只在「全部成功」后才置 TRUE，
+     * 导致前 m 卷已摘链却不重挂 → 卷永久透传/无缓存。:166 已逐项置
+     * Detached，超时卷 Detached=FALSE（RbDetachStreamForRebuild 在 :452-455
+     * return FALSE 前复原 IsAttached、保留 Stream），故天然不走
+     * RbReattachVolumeForRebuild，满足 B5 硬约束（Stream 非 NULL 才能触发
+     * rbio.c:1400/:1452 的「刷脏 + 无条件失效」判据，避免重开 DATA-11 旧盖新）。 */
+    {
         ULONG k;
         for (k = 0; k < volCount; k++) {
             if (!vols[k].Detached) continue;
@@ -397,9 +491,24 @@ out_clear_gate:
         }
         ExReleaseFastMutex(&g_Rb.CfgLock);
         if (revert.BlockSize == effOld) RbSaveConfig(&revert);
+        /* [85 B3] 回读复核：RbSaveConfig 在 IRQL!=PASSIVE 会静默跳过，
+         * 持久化失败则三副本（注册表/GET_CONFIG/引擎）仍不一致；留 PANIC 日志。
+         * 同时堵住「失败后再次 set block=<同一 new> 因 rbctl.c:355 判等失败
+         * 不入队、用户永久卡在显示 16K 实际 4K」的次生后果。 */
+        if (!RbRebuildVerifyPersistedBs(effOld))
+            RbLog(2, __LINE__, 0,
+                  L"rebuild: config rollback persist verify FAILED (PANIC, three-copy inconsistency)");
     }
     InterlockedExchange(&g_Rb.Unloading, 0);   /* 必达：rbdriver.c:1140 纪律 */
-    RbLog(1, __LINE__, (LONG)st, L"rebuild: rolled back to old geometry, service restored");
+    if (featPoolDead) {
+        /* [85 B4] 池闩卡死：如实写 LastStatus（work item :424 也会用返回的 st 写
+         * 同一非成功值）+ PANIC 日志，**不得**再宣称「service restored」。 */
+        InterlockedExchange(&g_Rb.GeometryRebuildLastStatus, (LONG)st);
+        RbLog(2, __LINE__, st,
+              L"rebuild: rolled back BUT feat pool latch dead (PANIC) - service NOT fully restored");
+    } else {
+        RbLog(1, __LINE__, (LONG)st, L"rebuild: rolled back to old geometry, service restored");
+    }
     return st;
 }
 
@@ -413,17 +522,29 @@ static VOID RbRebuildWorkItem(PVOID Parameter)
 
     st = RbRecreateEngineGeometry(newBs);
 
-    /* 无论成败：门控三件套必清（防止任何早退路径遗留哑服役或永久 Recreating）。 */
-    InterlockedExchange(&g_Rb.Unloading, 0);
-    InterlockedExchange(&g_Rb.GeometryRebuildInProgress, 0);
-    InterlockedExchange(&g_Rb.Recreating, 0);
-    InterlockedExchange(&s_RebuildInFlight, 0);
-
+    /* [85 B6+B7] 统计发布先于门控归零。
+     * B7：以 GeometryRebuildInProgress 归零作为「重建完成」的原子发布点，
+     *      Utc/LastStatus/Count 必须在其归零之前全部可见，否则按归零判定
+     *      完成的观察者（GET_STATS / UI）会读到上一次的结果。
+     * B6：把原 :422-426 统计写入移到清 s_RebuildInFlight 之前，使该清零
+     *      成为本函数最后一条共享写、其后仅剩 return——避免静态
+     *      WORK_QUEUE_ITEM 在统计仍写入期间被新请求 ExInitializeWorkItem 复用
+     *      （不改 work item 模型：83 号 §10.3 已否决绑定，且挪后清零会拉长
+     *      B2 窗口）。
+     * B2：Unloading 仍按 :417 原样在此清零（闩在 rbdriver.c 独立把关）。 */
     KeQuerySystemTimePrecise(&nowUtc);
     g_Rb.LastGeometryRebuildUtc.QuadPart = nowUtc.QuadPart;
     InterlockedExchange(&g_Rb.GeometryRebuildLastStatus, (LONG)st);
     if (NT_SUCCESS(st))
         InterlockedIncrement(&g_Rb.GeometryRebuildCount);
+
+    /* 无论成败：门控三件套必清（防止任何早退路径遗留哑服役或永久 Recreating）。
+     * 清标志顺序维持原样 Unloading→InProgress→Recreating→s_RebuildInFlight；
+     * 统计已在上面全部发布，故 InProgress 归零时观察者读到的是本轮结果。 */
+    InterlockedExchange(&g_Rb.Unloading, 0);
+    InterlockedExchange(&g_Rb.GeometryRebuildInProgress, 0);
+    InterlockedExchange(&g_Rb.Recreating, 0);
+    InterlockedExchange(&s_RebuildInFlight, 0);   /* 最后一条共享写，其后仅剩 return */
 }
 
 /* ---- SET_CONFIG 侧：校验 + 入队 + 立即返回（绝不阻塞控制面） ----
@@ -437,11 +558,15 @@ NTSTATUS RbRequestGeometryRebuild(ULONG newBlockSize)
     if (newBlockSize != 4096u && newBlockSize != 8192u &&
         newBlockSize != 16384u && newBlockSize != 32768u)
         return STATUS_INVALID_PARAMETER;
-    /* [83 第二笔] 卸载窗口拒绝：RbUnload 已置 Unloading=1 并正在等待本 work
-     * item 排空；此时若再入队一个，会在卸载销毁引擎/删池/删控制设备时并发
-     * rb_engine_destroy + 逐卷摘链 → UAF。与 RbMsgSetConfig 的 Recreating
-     * CAS 双保险：那条挡「重建窗口内并发 set」，这条挡「卸载窗口内新 set」。 */
-    if (InterlockedCompareExchange(&g_Rb.Unloading, 0, 0) != 0)
+    /* [83 第二笔 + 85 B2] 卸载窗口拒绝：RbUnload 已置 Unloading=1 并正在等待
+     * 本 work item 排空；此时若再入队一个，会在卸载销毁引擎/删池/删控制设备时
+     * 并发 rb_engine_destroy + 逐卷摘链 → UAF。与 RbMsgSetConfig 的 Recreating
+     * CAS 双保险：那条挡「重建窗口内并发 set」，这条挡「卸载窗口内新 set」。
+     * [85 B2] 追加 RbIsUnloadCommitted()：work item 尾部 :417 先清 Unloading，
+     * :417→rbdriver.c:1142 之间 Unloading=0 恒成立，单靠 Unloading 门挡不住
+     * 该窗口内的新 SET_CONFIG；闩由 RbUnload 起始置 1、7 处中止分支才清 0，
+     * 成功卸载路径不复位。 */
+    if (InterlockedCompareExchange(&g_Rb.Unloading, 0, 0) != 0 || RbIsUnloadCommitted())
         return STATUS_DEVICE_NOT_READY;
     /* 第二道单主防御：控制面 Recreating 抢主是第一道；此处防止 work item 已排队但
      * 尚未执行完时再次入队覆盖 s_PendingNewBs。 */

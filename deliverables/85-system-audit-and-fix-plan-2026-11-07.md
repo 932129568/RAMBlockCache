@@ -25,6 +25,31 @@
 
 ## 1. 问题清单
 
+### 1.0 本批（第三笔）落实状态标注（2026-11-07 补，`impl-audit`）
+
+> 依据本规格逐条定点修复，自验详见 `83-volume-rebuild-impl-2026-11-07.md` §11。
+> 状态：✅ 已落地 · ◐ 部分落地/仅补验证（见 KNOWN_ISSUES） · ⏸ 明确不改（归档）。
+> 本批为**静态/用户态/编译域**证据；B1/B2 内核 UAF 的运行时后果须 S2 真机验证，不得提前宣称「内核已修」。
+
+| # | 状态 | 落点 |
+|---|---|---|
+| B1 | ✅ | `rbio.c` 入口门（`RbIsDataPathFrozen() \|\| RbIsUnloadCommitted()`）+ `FlushThreadInLoop` 第 7 项 + `:2185` 局部快照；`rbrebuild.c RbWaitDataPathQuiesce` 第 7 项判据 |
+| B2 | ✅ | `rbrebuild.c` `s_UnloadCommitted` 闩 + `RbIsUnloadCommitted()` getter；`rbdriver.c` `RbUnloadAbort()` 收敛 7 处中止 + `:1142` 后复核 + 先闩后 Unloading；`rbctl.c`/`rbrebuild.c` 拒绝门 |
+| B3 | ✅ | `rbrebuild.c` 三个早退改 `goto out_clear_gate` + `RbRebuildVerifyPersistedBs(effOld)` 回读复核 |
+| B4 | ✅ | `rbpools.c` `Rb2PoolRevive()`（与 B15 共用 helper）+ `rbrebuild.c` FeatQuiesce 失败支复活 + `featPoolDead` PANIC/抑制 service-restored + `rb_common2.h:73-77` 规格补「回滚须复活池」 |
+| B5 | ✅ | `rbrebuild.c` 按 `vols[k].Detached` 逐项重挂（删 `detachDone/needReattach`）+ `rbattach.c` 超时卷 `IsAttached=TRUE; KeMemoryBarrier();` 且保留 Stream |
+| B6 | ✅ | `rbrebuild.c RbRebuildWorkItem` 统计写入移到清 `s_RebuildInFlight` 之前（不改 work item 模型） |
+| B7 | ✅ | `RbRebuildReattachAll` 返回 `(restored, failed)` + `restored!=volCount` 非成功码 / Count 不增 / LastStatus / 失败盘符日志；收尾发布序与 B6 合并设计 |
+| B8 | ✅ | 两次 `rb_engine_create` 失败且 `Engine==NULL` 时重挂前 `RbCreateEngineOnly(oldBs)` 回建（不启池） |
+| B9 | ✅ | `rbrebuild.c:306-311` 锁内换出 `Engine` 置 NULL、释放锁后 PASSIVE `rb_engine_destroy(eng)` |
+| B10 | ✅ | `rbctl.c` 先对副本 `RbClampConfig` 再比 `isRebuildRequest`（合法值零行为变化） |
+| B11 | ⏸ | 归档：仅补回归用例（QA 故障注入），不改锁模型 |
+| B12 | ✅ | 新增 `src/scripts/check_stats_contract.py`（Gate8）+ `ci.yml` 注册一步；不改既有 Gate 结构、不改已通过 guard 的 TS 代码 |
+| B13 | ✅ | `qa_geom_gate.ps1` 默认参数自动探测 MSVC 工具集（staged exe 单跑探针）+ `:135` 升 fail-closed + 明确诊断；不合并 6 脚本，BOM+CRLF+ASCII 保持 |
+| B14 | ◐ | 仅注释措辞（`rbrebuild.c:201` / 79 号 §5 R10 `lock cmpxchg`）+ 4K 双二进制 A/B 吞吐压测写入 S2 待办；**不改代码** |
+| B15 | ✅ | `rbfeat.c RbFeatFullRecover()`（池闩复活 + feat 层复活 + L2/ETW 幂等复核 + 返回值留痕 + 如实日志）+ `:421` 日志如实化 + `rbdriver.c:1197` 改调用 + 成功卸载路径不调用；与 B4 共用 `Rb2PoolRevive()`。L2/ETW 复位复核语义边界见 `KNOWN_ISSUES.md` |
+| A1–A14 | ⏸ | 全部归档，不构成本批改动（见 §1.2） |
+
 ### 1.1 必修（S2 前落地）
 
 | # | 位置 | 触发条件 | 影响范围 | 严重程度 | 修复建议 |
@@ -88,7 +113,7 @@
 | 双构建 | `_build_all.ps1` Release 25/25 + `_build_asan.ps1` ASan 25/25；驱动 17 源完整编译链接（验证跨 TU 声明，历史曾抓出 `RB_IOCTX.Rsvd[2]` C2039）；每次重编译后**重跑用例刷新 `.out`**，否则 `check_repo` mtime 假 FAIL |
 | 新增故障注入 | B1 flush tick 恰落 NULL 窗口 + 循环体内在途 + `FlushThreadInLoop` 第 7 项判据、B2 卸载与 SET_CONFIG 并发（7 处中止分支逐一验闩复位、`:417→:1142` 窗口）、B3 注册表回读失败/`Engine=NULL` 早退 + 再次 `set block=<同值>` 不卡死、B4 Shutdown 超时与 `Rb2PoolInit` 失败**及其二次失败兜底**、B5 多卷第 m+1 卷排空超时 + **超时卷同 LBA 后续直写/读回一致**（验 DATA-11 旧盖新）、B8 两次 `rb_engine_create` 失败后重挂、B10 非法 BlockSize 直发 IOCTL、B7 部分卷重挂失败、B15 `sc stop` join 超时中止后池闩状态 |
 | 既有回归 | `test_rebuild` 8 类（C1–C8，含 C2 三副本一致、C7 结构 diff 0）、`qa_stale_directwrite` 四模式（pre 10 STALE / post 与 post-uncond 12 CLEAN / post-cond 仅 4K/tail512 STALE）、`qa_geom_gate.ps1 -Rounds 30`（**默认参数**验证 B13 修复）、`qa_teeth.ps1`、`test_wsconc` 全模式、`test_race1106` 按 63 号硬判据、`test_cache`/`test_write_ex`/`test_geom`/`test_evict_wire`/`test_tinylfu` |
-| 性能（B14） | 4K 双二进制 A/B 吞吐 + 读命中率压测留证；`wb_drain` 开销量化；R10「4K 热路径无新增锁/原子写」逐条复核；明确与 72/75 号绝对值不可比 |
+| 性能（B14） | **S2 待办（本批不做，仅补注释措辞）**：4K 双二进制 A/B 吞吐 + 读命中率压测留证；`wb_drain` 开销量化；R10 正确性必需原子代价（`DataPathInFlight ±1` / `RbIsDataPathFrozen` 的 `lock cmpxchg` / 每次直写无条件失效）逐条复核；明确与 72/75 号绝对值不可比（79 号 §5 R10 已按 85 号 B14 修订措辞） |
 | 协议/前端 | 1280B 旧回包五字段全 0 不抛 `RangeError`、1304B 新回包五偏移正确、`decodeStats` 分级守卫 17 档、CLI `statval` 五键、`check_proto_sync.py --strict` 三副本 + 新 Gate8 TS 契约、前端 `tsc`/vitest；混合部署下 `EngineBlockSize=0` 语义（A10） |
 | 门禁全套 | `check_repo` / `check_proto_sync --strict` / `refcount_model.py` / `check_ps_syntax.ps1` / `check_signature.ps1`（Valid + 三锚点）/ `check_geom_contract.py` / `check_node_contract.py` / `check_xaml_resources.py` / `check_coexist.ps1` / **Gate8** |
 | 真机（S2 之后，本批不做） | 重签 sys + 三锚点、重打签名 Setup、部署、一次 UAC + 一次重启、`verify_final_reboot.ps1` 须 `FAIL=0`；S3 4K 基线、S4 免重启切 16K 的 E1/E2/E3/E8、S5 免重启回 4K；G4 预热覆写序列、canary SHA256、五路相对吞吐（不作峰值宣称） |

@@ -336,3 +336,119 @@ cd web ; ./node_modules/.bin/tsc --noEmit ; ./node_modules/.bin/tsc -p tsconfig.
 ## 纪律声明（第二笔补充）
 
 第二笔同样严格未修改/删除任何已签名产物、三锚点、Setup、`README.txt`/`README.md`、部署脚本、CI、注册表、服务、运行配置；未碰 D: 卷与 `D:\pagefile.sys`；未跑 `rbbench`/`bench-d.cmd`；未 UAC、未重启、**未 commit/push**（主理人统一提交第二笔）。编译输出落在 `%TEMP%\rbc_rebuild_obj2` 与 `src/core/build/`。`git status` 仅显示 §10.1 的 6 个 `M` 文件。
+
+---
+
+# 11. 第三笔：系统审查必要修复（85 号定点落实）· 2026-11-07
+
+> 实施者：`impl-audit`。依据：`deliverables/85-system-audit-and-fix-plan-2026-11-07.md` §1（B1–B15 清单）、§2 修改范围、§3 回归范围、§4 口径限制；设计背景 82 号、前两笔实现见本文件 §1–§10。
+> 状态：**代码 + 第一层自验完成，未 commit/push**（主理人统一提交）。本笔**不重做**前两笔已落地代码，仅在必要范围落实 85 号定点修复；用户要求「仅调整必要范围、避免无关重构、优先正确性/稳定性」逐项守住。
+> 口径限制：全部结论为**静态/用户态/编译域**证据；B1/B2 内核 UAF 的运行时后果须 S2 真机验证，**不得提前宣称「内核已修」**。逐项状态另见 85 号 §1.0 表。
+
+## 11.1 改动文件清单（sha256 前 16 位）
+
+**产品源码 / 测试 / 门禁脚本（13 = 12 改 + 1 新增）**
+
+| sha256 | 文件 | 对应项 |
+|---|---|---|
+| `edfaa68093f7e667` | `src/driver/rb_common.h` | B1 `FlushThreadInLoop` 字段；B2 `RbIsUnloadCommitted()` / `RbUnloadCommitSet()` 声明 |
+| `c49603d3b3d01949` | `src/driver/rb_common2.h` | B4 规格补「回滚须复活池」+ 禁误用 `RbFeatRecover`；`Rb2PoolRevive()` / `Rb2PoolLatch()` / `RbFeatFullRecover()` 声明 |
+| `f62faff505e66916` | `src/driver/rbio.c` | B1 flush 入口门 + `FlushThreadInLoop` 置/清（4 条退出路径）+ `:2185` 局部引擎快照 |
+| `af0498c269301bd8` | `src/driver/rbrebuild.c` | B1 第 7 项判据；B2 闩/getter；B3 早退回滚 + 回读复核；B4 池复活 + `featPoolDead`；B5 逐项重挂；B6 统计序；B7 `(restored,failed)` + 部分失败非成功；B8 回建引擎；B9 锁外 destroy |
+| `6702c7699c01dbe7` | `src/driver/rbdriver.c` | B2 `RbUnloadAbort()` 收敛 7 处 + 先闩后 Unloading + `:1142` 后复核；B15 `:1197` 改 `RbFeatFullRecover()` |
+| `a474ff3cba17a296` | `src/driver/rbctl.c` | B2 拒绝门 `Unloading \|\| RbIsUnloadCommitted()`；B10 clamp 副本判定 |
+| `3044e5cd1f749b20` | `src/driver/rbattach.c` | B5 超时卷就地 `IsAttached=TRUE; KeMemoryBarrier();`，Stream 保留 |
+| `57c3c1d02a3010a0` | `src/driver/rbpools.c` | B4/B15 共用 helper `Rb2PoolRevive()`（有界重试）+ `Rb2PoolLatch()` |
+| `6064cadcacfdbd0a` | `src/driver/rbfeat.c` | B15 `RbFeatFullRecover()` + `RbFeatRecover():421` 日志如实化（池闩未解不宣称 recovered） |
+| `4d257d183ce86026` | `src/core/test_rebuild.c` | 原 8 类 C1–C8 语义保持 + 新增故障注入 C9–C17（SIM 与新状态机逐分支同构） |
+| `37bda7b25b594329` | `src/scripts/qa_geom_gate.ps1` | B13 默认参数自动探测 MSVC 工具集 + `:135` 升 fail-closed + 明确诊断；**BOM + CRLF + 纯 ASCII 保持** |
+| `045f06bdfd311c93` | `.github/workflows/ci.yml` | B12 注册 Gate8 一步（不改既有 Gate 结构、不改已通过 guard 的 TS 代码） |
+| `5918a42105668f81` | `src/scripts/check_stats_contract.py` | **新增** B12 Gate8 静态契约脚本（仿 `check_geom_contract.py`） |
+
+**文档（4 文件）**
+
+| sha256 | 文件 | 内容 |
+|---|---|---|
+| `e135b9ab766da0bb` | `deliverables/85-system-audit-and-fix-plan-2026-11-07.md` | §1.0 本批落实状态标注；§3 性能（B14）标为 S2 待办 |
+| `5d0b34e06edc1f73` | `deliverables/79-runtime-geometry-rebuild-2026-11-07.md` | §5 R10 措辞修订（`lock cmpxchg`）+ 4K 双二进制 A/B 压测 S2 待办 |
+| `60cf0e82acf9c290` | `deliverables/82-volume-level-rebuild-2026-11-07.md` | §3.3 补 P7/P8（B1/B2 两个设计后新发现 UAF）及补漏说明 |
+| `1d824d0ef18eeb39` | `KNOWN_ISSUES.md` | 新增 §F F1–F6：B15 语义边界 / 归档项 / B6·B7 口径说明 / H8 未覆盖 |
+
+> 83 号本文档自身的 sha256 为自引用，不列入。合计 **16 个 `M` + 1 个新增脚本**（13 代码/脚本 + 4 文档 = 17 个改动文件，其中 83 号自身为第 17 个）。红线核对：`cache.c` / `read_plan.c` / `RB_CONFIG` 24 字段 / `ProtocolVersion` / `dist` 三锚点 / `README.txt` / `README.md` / Setup / 部署脚本 / 运行态 / 注册表 / 服务 / 真机 D: 卷 / `_build_all.ps1`·`_build_asan.ps1` 的 `$Tests` 列表**全部零改动**；`git diff --stat` 对 `cache.c`/`read_plan.c` 为空（4K A/B 结构 diff 0）。唯一 CI 改动是 B12 明确要求的 Gate8 一步（9 行新增）。
+
+## 11.2 逐项对应 B1–B13 + B15
+
+| # | 状态 | 落地 |
+|---|---|---|
+| **B1** | ✅ | `rbio.c RbFlushThread`：1s `KeWaitForMultipleObjects` + `FlushWake` 清理**之后**插 `if (RbIsDataPathFrozen() \|\| RbIsUnloadCommitted()) continue;`（`FlushStop break` 在门之前，免 100% CPU 自旋）；进门置 `FlushThreadInLoop=1`，`:2101 continue` / `:2076 break` / 循环体末尾 / `PsTerminateSystemThread` 前 4 条退出路径清零；`:2185` 改 `rb_engine *eng = g_Rb.Engine; if (eng) RbEngineFlushZones(eng, active);`。`RbWaitDataPathQuiesce` 增**第 7 项** `FlushThreadInLoop==0`。不持 `EngineMutex` 覆盖整块、不挂起线程。 |
+| **B2** | ✅ | `rbrebuild.c` `static volatile LONG s_UnloadCommitted` + `RbIsUnloadCommitted()` getter + `RbUnloadCommitSet(LONG)`；`rbdriver.c:1110` **先闩后 Unloading**；`static RbUnloadAbort()`（清闩 → 清 Unloading）收敛 **7 处** `:1138/:1178/:1184/:1190/:1198/:1259/:1274`；`:1142` 保留 + 追加一次 `RbRebuildIsActive()` 有界复核（超时同样走 `RbUnloadAbort()`）；成功卸载路径不复位；`rbctl.c:365` / `rbrebuild.c:444` 改 `Unloading \|\| 闩`。 `:349/:401` 无条件清 Unloading 不动、`:417` 维持原样、不改 `RbRebuildIsActive` 判据、不动 10 处数据面闸门、不把 work item 的 Unloading 清理改成「仅当闩为 0 才清」。 |
+| **B3** | ✅ | `rbrebuild.c:259/:260/:273` 三个直接 `return` 改 `st=...; goto out_clear_gate;`（此时 Unloading 未置、`volCount=0`、各卷 `Detached=FALSE`，fallthrough 安全）；`:399` 回写后补 `RbRebuildVerifyPersistedBs(effOld)` + 失败 PANIC 日志。堵住次生后果：失败后 `再次 set block=<同一 new>` 判等成立、不永久卡在「显示 16K、实际 4K」。 |
+| **B4** | ✅ | `rbpools.c` 新增 `Rb2PoolRevive()`（`Rb2PoolInit()` 有界重试 1 次）作 B4/B15 **唯一共用 helper**；`rbrebuild.c` 仅在 `RbFeatQuiesce` 失败支调用（`:302` 二次屏障超时不经本支、不重复 Init）；仍失败置 `featPoolDead` → 写 `GeometryRebuildLastStatus` + PANIC 日志 + `out_clear_gate` 不写「service restored」；`rb_common2.h:73-77` 补规格「回滚须复活池」+ 禁误用 `RbFeatRecover`（两个同名 `s_Stop`）。**绝不调 `RbFeatRecover()`**。 |
+| **B5** | ✅ | `rbrebuild.c` 删 `detachDone/needReattach` 聚合标志，`out_rollback` 按 `vols[k].Detached` **逐项**重挂；`rbattach.c:452-455 return FALSE` 前就地 `ext->IsAttached=TRUE; KeMemoryBarrier();`。硬约束满足：超时卷 Stream **保留、不摘除/销毁、不走 `RbReattachVolumeForRebuild`**（`Detached=FALSE` 自动跳过），`rbio.c:1400/:1452` 刷脏+失效判据可达，不重开 DATA-11 旧盖新窗口。 |
+| **B6** | ✅ | `RbRebuildWorkItem` 的 `:422-426` 统计写入移到 `:420` 清 `s_RebuildInFlight` **之前**，使 `:420` 成为函数最后一条共享写、其后仅剩 return。**不改 work item 模型**（83 号 §10.3 已否决绑定，且挪后清零会拉长 B2 窗口）；事实更正：`rbctl.c:396-403` 已覆盖入队失败回滚，无需新增代码；`ExQueueWorkItem`/`IoQueueWorkItem` 为 VOID，不加不存在的返回值判断。 |
+| **B7** | ✅ | `RbRebuildReattachAll(vols, count, ULONG *pFailed)` 返回 `restored` + 失败盘符日志（Status 带盘符）；`restored != volCount` 返回非成功 NTSTATUS、阻止 `GeometryRebuildCount` 递增、写 LastStatus；收尾发布序与 B6 合并（见 §11.4 F6 偏差说明）。 |
+| **B8** | ✅ | 两次 `rb_engine_create` 失败且 `Engine==NULL` 时，`goto out_rollback` 前显式 `RbCreateEngineOnly(oldBs)` 回建（不启池），与 `out_clear_gate` 的 `effOld` 口径对齐，避免 `RbReattachVolumeForRebuild → RbAttachVolumeByLetterImpl:1180 → RbEnsureEngine` created 分支二次启池。 |
+| **B9** | ✅ | `:306-311` 改为「锁内 `eng = g_Rb.Engine; g_Rb.Engine = NULL;`，释放 `EngineMutex`，锁外 `rb_engine_destroy(eng)`」，消除 FAST_MUTEX 抬 APC_LEVEL 与 `RbSyncIo` PASSIVE-only 的 IRQL 契约违反（`rbattach.c:125` [FIX C-5]）；换出安全由 B1/B2 门 + 7 项 quiesce 共同提供。 |
+| **B10** | ✅ | `rbctl.c:354-357` 先对 `RB_CONFIG` 副本 `RbClampConfig` 再比 `isRebuildRequest`（合法值零行为变化，非法值与合法值一样参与重建判定，config 副本与重建目标恒为同一 clamp 后值）。 |
+| **B11** | ⏸ 不改 | 按裁定**不改锁模型**，仅把「卸载/重建窗口 + PnP surprise-removal + 并发 attach/detach 交错」纳入 QA 故障注入用例（B2 闩落地后）。归档 KNOWN_ISSUES F2。 |
+| **B12** | ✅ | 新增 `check_stats_contract.py`：断言五字段偏移 1280/1284/1288/1292(u32)/1296(u64)、`sizeof(RB_STATS)=1304`、`decodeStats` 分级长度守卫（1280B 旧回包五字段填 0 不抛 `RangeError`）、`types.ts`/`statsSchema`/`statval`/`stats-history.test.ts` 五字段齐备、CI 持续调用；`ci.yml` 加 Gate8 一步。**不改本批已通过 guard 的 TS 代码、不改既有 Gate 结构**。注入漂移实测 `FAIL (1)/exit 1`，还原后 `PASS (0 fail, 0 warn)`，fail-closed 确证。 |
+| **B13** | ✅ | `qa_geom_gate.ps1:13` 默认 `-VcBin` 由硬编码 14.44 改 `''`；枚举本机 MSVC 工具集 bin + staged exe 单跑探针确定性选出同源 ASan 运行时（显式 `-VcBin` 仍优先并同样校验）；`:135` 的 `[warn]` 升 fail-closed（`Add-Fail` + 明确诊断）。**不合并 6 个硬编码脚本**、BOM+CRLF+纯 ASCII 保持。84 号 §5 两轮实测的 `0xC0000139` 假 FAIL 在**默认参数**下被根除。 |
+| **B14** | ⏸ 不改 | 仅注释措辞：`rbrebuild.c:201` / 79 号 §5 R10 改「`InterlockedCompareExchange(&X,0,0)` 在 x86 编译为 `lock cmpxchg`，非纯 volatile 只读」+ 列正确性必需原子代价；4K 双二进制 A/B 吞吐 + 命中率压测写入 S2 待办（85 号 §3 性能行）。**不做代码改动**（方案 A 已由四模式 12/12 CLEAN 确证）。归档 KNOWN_ISSUES F3。 |
+| **B15** | ✅ | `rbfeat.c RbFeatFullRecover()` 供**卸载中止分支专用**：`Rb2PoolRevive()` 解池闩（与 B4 共用）+ `RbFeatRecover()` feat 层复活 + `RbL2LazyOpen()`/`RbEtwEnsure()` 幂等复核 + 返回值留痕 + 如实日志；`:421` 修正为「池闩未解不宣称 recovered、如实列池/L2 状态、失败 PANIC」；`rbdriver.c:1197` 改调 `RbFeatFullRecover()`；**成功卸载路径不得调用**。L2/ETW 复位复核语义边界见 §11.4 F1 / KNOWN_ISSUES F1。 |
+
+## 11.3 自验输出（第一层，全部实测）
+
+| 项 | 结果 |
+|---|---|
+| 驱动 17 源完整编译 + 链接（`_build_manual.ps1`，14.44.35207 + WDK 10.0.26100.6584） | **PASS**：`COMPILE_FAIL=0/17`、`LINK_EXIT=0`、`=== BUILD OK ===`、`RAMBlockCache.sys` 170,496 B、SHA256 `567AC26A20C6A561CB3AACB6F50C86B2CFBA170652149EE0FFFB8CADE81E3685`（仅落 `src/driver/x64/Release`，未进 `dist`）。跨 TU 新符号 `RbIsUnloadCommitted` / `RbUnloadCommitSet` / `Rb2PoolRevive` / `Rb2PoolLatch` / `RbFeatFullRecover` / `g_Rb.FlushThreadInLoop` 全部解析通过；`RB_IOCTX.Rsvd[2]` 字段存在（无 C2039 回归） |
+| 用户态 Release 全量（`_build_all.ps1`） | **PASS**：`REL_OK=24 REL_FAIL=0 RUN_FAIL=0`（脚本清单 23 + `test_evict_wire`）；`test_rebuild.exe` 单独编译运行 → `RESULT: PASS (FAIL=0)`。合计 **25/25** |
+| 用户态 ASan 全量（`_build_asan.ps1`） | **PASS**：`ASAN_OK=24 ASAN_FAIL=0 ASAN_RUN_FAIL=0`；`asan_test_rebuild.exe` 单独编译运行 → `RESULT: PASS (FAIL=0)`、`asan_*.err` 0 B、0 `AddressSanitizer` 报告。合计 **25/25** |
+| `test_rebuild` 原 8 类 + 新增 9 类故障注入（Release + ASan 双份） | **PASS**：C1–C8 语义保持、C9–C17 全 `[ok]`、`RESULT: PASS (FAIL=0)`。`rel_test_rebuild.out`（12:51 刷新）含 C9 B1 第7项/入口门、C10 B2 七处闩复位、C11 B3 再次 set 同值不卡死、C12 B4 Init 二次失败、C13 B5 超时卷 Stream 保留 + 同 LBA 直写读回一致、C14 B7 部分重挂、C15 B8 回建、C16 B10 clamp、C17 B15 池闩复活 |
+| `qa_stale_directwrite.exe` 四模式（不受影响） | **PASS**：`pre` 10 STALE / 2 CLEAN；`post` 0 STALE / 12 CLEAN；`post-uncond` 0 STALE / 12 CLEAN；`post-cond` 1 STALE / 11 CLEAN（仅 4K/tail512）；四模式 `HARNESS_ERRORS=0`、`exit=0` |
+| `qa_geom_gate.ps1` **默认参数**（B13 修复验证） | **PASS**：`-Rounds 3` → `GATE: PASS (cells=12 runs=36 asan_reports=0)`、`GATE_EXIT=0`，`[info] auto-detected ASan MSVC toolset bin: ...\14.51.36231\bin\Hostx64\x64`；`-Rounds 2` 亦 PASS（12 cells / 24 runs）。**fail-closed 对照**：显式传错配 `-VcBin ...14.44...` → `GATE: FAIL`、`EXITCODE=1`、打印 `-VcBin ... does NOT match the ASan runtime ... (0xC0000139 false-FAIL risk); pass the toolset that built asan_*.exe or leave default`，且不再产生 360 runs 误导性假 FAIL |
+| 全套门禁 | **全 PASS**：`check_repo` `PASS (0 fail, 0 warn)`（全量重编后刷新 `.out` 时序，无 mtime 假 FAIL）；`check_proto_sync.py --strict` `PASS (0 fail, 0 warn)`；`refcount_model.py` PASS；`check_xaml_resources.py` PASS；`check_ps_syntax.ps1` `files=65 fail=0 (bom_miss=0 syntax_err=0 dup_sw=0)`（含本笔改动的 `qa_geom_gate.ps1`）；`check_signature.ps1` `Valid` + 三锚点 `63ad0fa8…` 一致；`check_geom_contract.py` PASS；`check_node_contract.py` PASS；`check_coexist.ps1` 基线 WARN；**Gate8 `check_stats_contract.py` `PASS (0 fail, 0 warn)`**（注入漂移 → `FAIL (1)/exit 1`，还原 → PASS） |
+| 4K A/B 结构 diff 0 | **PASS**：`git diff --stat -- src/core/cache.c src/core/read_plan.c` 为空；C7 A/B 引擎几何/写请求/吸收/块数/脏量逐字相等、`rmw_reads==0` |
+| 红线 | `cache.c` / `read_plan.c` / `RB_CONFIG` / `ProtocolVersion` / `dist` / 三锚点 / `README` / Setup / 部署脚本 / `$Tests` 列表 / 注册表 / 服务 / 真机 D: 卷 **全部零改动**；签名产物 `63ad0fa8…` 未触碰 |
+
+> 说明：`qa_geom_gate.ps1 -Rounds 30`（360 runs）全量压测在会话中断中丢失了后台任务，**未取得该一轮的最终输出**；本笔以默认参数 `-Rounds 3` / `-Rounds 2` 冒烟 + 错配 fail-closed 对照确证 B13 修复有效，完整 360 runs 列入 §11.6 QA 复跑清单（85 号 §3 既列必跑项）。此为如实留痕，非判据放宽、未改产品源码。
+
+## 11.4 与规格的偏差 / 口径说明（含 KNOWN_ISSUES F1–F6）
+
+1. **F6（B6 与 B7 收尾顺序，最重要的裁定）**：85 号 B7 要求「收尾顺序改 `Utc → LastStatus → Count → 最后清 GeometryRebuildInProgress`」，B6 要求「`:420` 清 `s_RebuildInFlight` 成为**最后一条共享写**」。二者**不能字面同时成立**（若 InProgress 绝对最后，则 `s_RebuildInFlight` 之后仍有一条共享写，违反 B6；反之 InProgress 不是「最后清」）。**统一裁定**：把统计（Utc/LastStatus/Count）发布移到**所有**门控归零之前，使 `GeometryRebuildInProgress` 归零时统计已可见（满足 B7「按归零判定完成的观察者读到本轮结果」），并保留 `s_RebuildInFlight=0` 为**绝对最后一条共享写、其后仅剩 return**（满足 B6 静态 item 复用窗口最小化）。清标志顺序维持原样 `Unloading→InProgress→Recreating→s_RebuildInFlight`（B2「`:417` 维持原样」）。两类观察者（GET_STATS 轮询 InProgress / `RbRebuildIsActive()` 三态）都看到一致状态，B7 的「原子发布」实质要求被更强地满足。此为实现口径澄清，**非改方向**。
+2. **F1（B15 L2/ETW 复位复核边界）**：`RbFeatShutdown()` 的两条超时返回（`:372`/`:391`）都在 `RbL2Close()`/`RbEtwShutdown()`（`:394-395`）**之前**，故卸载中止路径 L2/ETW 实际未被关闭；`RbFeatFullRecover()` 调用 `RbL2LazyOpen()`（REFRESH `:450` 同款幂等）与 `RbEtwEnsure()`（CAS 幂等、按 `RB2F_ETW` Flags 门）是**幂等复核而非强制重开**。池闩复活 + feat 层 + 返回值/日志 + `:421` 如实化**全部完整落地**；L2/ETW 语义边界与 S2 规避条件（REFRESH / `l2 status` 复核）写入 KNOWN_ISSUES F1。
+3. **B2 闩的实现细节**：规格写 `static volatile LONG s_UnloadCommitted`（`rbrebuild.c`）+ getter。为满足 `rbdriver.c` 7 处 `RbUnloadAbort()` 清闩与 `:1110` 置闩，额外导出 `RbUnloadCommitSet(LONG)`（`rbrebuild.c` 定义、`rb_common.h` 声明）；闩本体仍 `static` 于 `rbrebuild.c` 不外泄。行为与规格一致，仅是把跨 TU 的置/清收敛到同一处，避免「漏一处即永久拒绝」。
+4. **B2 `:1142` 后复核**：规格「TRUE 回 `:1133` 等待」实现为「`:1142` 保留 + 追加一次自带 60s 预算的有界复核等待，超时同样经 `RbUnloadAbort()` 中止」；闩=1 封死新入队故不反复开窗、无活锁。等价，未改方向。
+5. **B13 自动探测选路**：规格允许「自动探测实际工具集」或「同源校验」；采用「枚举本机 MSVC 工具集 bin + staged exe 单跑探针」的确定性自动探测（不依赖版本号猜测，适配任意并存工具集），显式 `-VcBin` 仍优先且同样做同源校验；探针为前置校验、**不计入** 360 runs 任何 cell。
+6. **B10 选路**：采用规格首选「先对副本 `RbClampConfig` 再比」，未采用「非法值直接 `STATUS_INVALID_PARAMETER`」；合法值零行为变化，非法值与合法值一样参与重建判定，config 与重建目标恒为同一 clamp 后值。
+7. **B8 落点**：在两次失败分支内（85 号 B8 引用的 `:326-331`）调用 `RbCreateEngineOnly(oldBs)`，而非 `out_rollback` 起点。
+8. **F2/F3/F4/F5（归档）**：B11 不改锁模型（只补 QA 用例）、B14 只改注释 + S2 待办、85 号 §1.2 A1–A14 全部归档不构成本批改动、H8 仍未覆盖（直写 `WriteBack=0` 下 `rb_write_pass2` 不可达、`RmwReads` 恒 0）。详见 `KNOWN_ISSUES.md` §F。
+
+## 11.5 残余风险
+
+1. **真机未覆盖（最重要）**：B1（flush 入口门 + 第 7 项判据）、B2（卸载闩 + 7 处中止）、B9（锁外 destroy）、B15（`RbFeatFullRecover`）的**内核侧实效**均需 S2 全链重放 + 一次 UAC + 一次重启 + `verify_final_reboot.ps1` 取证；用户态 SIM / 编译域只能证明机理，**不得宣称「内核已修」**。
+2. **`-Rounds 30` 全量几何门禁**：本轮因会话中断未取得 360 runs 最终输出（见 §11.3 说明）；默认参数修复已由小轮次 + fail-closed 对照确证，完整压测交 QA 第二层。
+3. **B15 L2/ETW**：幂等复核的语义边界与 S2 规避条件见 §11.4 F1 / KNOWN_ISSUES F1；`RbL2LazyOpen` 为控制面函数，Flags 关闭 / 卷身份变更时有条件收尾语义。
+4. **B4/B15 共用 helper 的极端场景**：`Rb2PoolInit()` 两次都失败时如实写 `GeometryRebuildLastStatus` + PANIC 日志、不报 service restored；此时预取/淘汰/预热仍静默死，须人工 REFRESH / 重启，属「宁泄漏勿崩溃」纪律下的已知降级。
+5. **B7 部分卷重挂失败**：几何已切换但返回非成功、Count 不增；此时部分卷 `IsAttached=FALSE` / 纯透传，结构性「最小复原重挂」本批不做（无关重构）。
+6. **静态 work item 模型未改**（B6 仅顺序调整、B2 用闩正交兜住）：A14 动态 work item 完整方案仍归档；`:417→:1142` 窗口靠闩封死而非改生命周期模型。
+7. **B11 TOCTOU / B14 R10 / H8 / A1–A14**：均为归档或已知限制，见 KNOWN_ISSUES §F；`check_coexist` 4 个基线 WARN（SYSTEM 计划任务可见性 + AV）与前两笔相同，未引入新项。
+8. **工具链双套并存**：`_build_all.ps1`/`_build_asan.ps1`/`_build_manual.ps1` 仍硬编码 14.44（按裁定不改构建脚本路径）；B13 只在 `qa_geom_gate.ps1` 内做自动探测，不合并 6 个脚本、不抽公共配置。
+
+## 11.6 给 QA 的第二层独立复跑清单（不自行充当验证者）
+
+1. `python src/scripts/check_stats_contract.py` → `PASS (0 fail, 0 warn)`；注入漂移（删 `statsSchema.GeometryRebuildInProgress`）→ `FAIL (1)/exit 1`，还原 → PASS。
+2. `python src/scripts/check_repo.py` / `check_proto_sync.py --strict` / `check_geom_contract.py` / `check_node_contract.py` / `check_xaml_resources.py` / `deliverables/gstack/model/refcount_model.py` → 全 PASS；`check_ps_syntax.ps1`（65 文件、含 `qa_geom_gate.ps1` BOM+CRLF+ASCII）→ `fail=0`；`check_signature.ps1` → Valid + 三锚点一致。
+3. 驱动 17 源完整编译 + 链接（`_build_manual.ps1`）→ `LINK_EXIT=0`；重点核 6 个新符号跨 TU 解析 + `RB_IOCTX.Rsvd[2]` 存在。
+4. `_build_all.ps1` Release 25/25 + `_build_asan.ps1` ASan 25/25 → `RUN_FAIL=0`；重编后**立即重跑用例刷新 `rel_*.out`/`asan_*.out`**（否则 `check_repo` mtime 假 FAIL）。
+5. `test_rebuild.exe` / `asan_test_rebuild.exe` → C1–C17 全 `RESULT: PASS (FAIL=0)`、0 ASan 报告；重点复核 C9（第 7 项判据 + 入口门）、C10（7 处闩逐一复位）、C11（再次 set 同值不卡死）、C12（Init 二次失败）、C13（超时卷 Stream 保留 + 同 LBA 读回一致）、C15（B8 回建）、C17（B15 池闩）。
+6. `qa_stale_directwrite.exe --mode pre\|post\|post-uncond\|post-cond` → `pre` 10 STALE / `post`·`post-uncond` 12/12 CLEAN / `post-cond` 仅 4K/tail512 STALE、`HARNESS_ERRORS=0`。
+7. **`powershell -File src/scripts/qa_geom_gate.ps1 -Rounds 30`（默认参数，不传 `-VcBin`）** → 期望 `GATE: PASS (cells=12 runs=360 asan_reports=0)` 且打印 `[info] auto-detected ASan MSVC toolset bin`；**对照**（复现 84 号 §5 假 FAIL）：显式传错配 `-VcBin ...14.44...` → 期望 `GATE: FAIL / exit 1` + 明确诊断，且不再产生 0 字节 `.out`/`.err` 的 360 runs 误导性失败。
+8. 逐入口静态复核 83 号 §10.7 18 行表 + 本笔新增门：`rbio.c` flush 入口门与 `FlushThreadInLoop` 4 条清零路径、`rbdriver.c` 7 处 `RbUnloadAbort()`（漏一处即永久拒绝）、`rbctl.c:365`/`rbrebuild.c:444` 的 `Unloading \|\| 闩` 双门、`rbrebuild.c` B3 三个 `goto out_clear_gate` + 回读复核、B5 逐项 `Detached` 重挂、B6/B7 统计发布序、B9 锁外 destroy。
+9. 4K A/B 结构 diff 0：`git diff --stat -- src/core/cache.c src/core/read_plan.c` 为空；C7 统计逐字相等。
+10. 确认 `dist`/三锚点/签名产物/`README`/Setup/部署脚本/`$Tests` 列表未触碰；`git status` 仅 16 `M` + 1 新增脚本；**未 commit/push**（主理人统一提交）。
+
+---
+
+## 纪律声明（第三笔补充）
+
+第三笔严格未修改/删除任何已签名产物、三锚点、Setup、`README.txt`/`README.md`、部署脚本、运行态、注册表、服务、真机 D: 卷与 `D:\pagefile.sys`；未跑 `rbbench`/`bench-d.cmd`；未 UAC、未重启、**未 commit/push**。CI 仅按 B12 要求新增 Gate8 一步（不改既有 Gate 结构）。编译输出落在 `src/driver/x64/Release` 与 `src/core/build/`。所有改动为局部可修 + 补压测/门禁，非架构返工；不重构锁模型、不改 work item 模型、不合并工具链脚本、不抽公共重挂函数、`cache.c`/`read_plan.c` 零改动。

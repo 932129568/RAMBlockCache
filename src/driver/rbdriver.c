@@ -1097,6 +1097,19 @@ static NTSTATUS RbCreateControlDevice(VOID)
     return STATUS_SUCCESS;
 }
 
+/* [85 B2] 卸载中止统一收尾：清闩（先）→ 清 Unloading（后）→ return。
+ * 7 处中止分支（:1138/:1178/:1184/:1190/:1198/:1259/:1274）全部改走本 helper；
+ * 漏一处即「服务已恢复但闩恒 1 ⇒ 永久拒绝所有重建」。成功卸载路径(:1311)
+ * 不复位（驱动即将卸下）。职责单一铁律：rbrebuild.c :349/:401 无条件清
+ * Unloading（禁哑服役）不动、:417 维持原样、RbRebuildIsActive 判据不改、
+ * 10 处数据面闸门不动；不得把 work item 的 Unloading 清理改成「仅当闩为 0 才清」。 */
+static VOID RbUnloadAbort(VOID)
+{
+    RbUnloadCommitSet(0);                     /* 先清闩 */
+    InterlockedExchange(&g_Rb.Unloading, 0); /* 再清 Unloading（禁哑服役） */
+    return;
+}
+
 /* ---------------- DriverUnload：干净卸载（sc stop / 免重启完全开关） ----------------
  * 调用上下文：PASSIVE_LEVEL。sc stop 不触发 PnP，内置卷不会并发 REMOVE，故可串行
  * 拆除；RbVolumeRemove 幂等（RemoveDone），内含停流/等在途/分离/释放PDO/删设备。 */
@@ -1107,6 +1120,7 @@ VOID RbUnload(PDRIVER_OBJECT drv)
 
     RbDeregisterCrashHooks();                  /* [V10.1] 最早处注销崩溃回调，防野指针二次蓝屏 */
 
+    RbUnloadCommitSet(1);                     /* [85 B2] 先闩后 Unloading：封死 :417→:1142 窗口 */
     InterlockedExchange(&g_Rb.Unloading, 1);   /* [83] 原子发布序：重建/卸载窗口统一走此门 */
 
     /* [83 第二笔 2026-11-07] 卸载 ↔ 运行期几何重建 work item 互斥排空。
@@ -1135,11 +1149,28 @@ VOID RbUnload(PDRIVER_OBJECT drv)
         if (RbRebuildIsActive()) {
             RbLog(2, __LINE__, 0,
                   L"unload aborted: geometry rebuild work item in flight, service kept");
-            InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] 中止即恢复数据路径 */
+            RbUnloadAbort();                   /* [85 B2] 7 处之一：清闩 + 清 Unloading */
             return;
         }
     }
-    InterlockedExchange(&g_Rb.Unloading, 1);   /* 重新断言：在飞 work item 尾部曾清 0 */
+    InterlockedExchange(&g_Rb.Unloading, 1);   /* :1142 保留：重新断言 */
+    /* [85 B2 纵深] 复核一次：等待退出 → 重新断言之间若有 SET_CONFIG 借
+     * :417→:1142 的 Unloading=0 窗口抢主入队，此处会观测到在飞标志，
+     * 回 :1133 继续有界排空（闩=1 已封死新入队，不会反复开窗、无活锁）。
+     * 回等后 work item 尾部又把 Unloading 清 0，故须重新断言一次。 */
+    if (RbRebuildIsActive()) {
+        LARGE_INTEGER tick2; ULONG spin2 = 0;
+        tick2.QuadPart = -200000LL;
+        while (RbRebuildIsActive() && spin2++ < 3000)
+            KeDelayExecutionThread(KernelMode, FALSE, &tick2);
+        if (RbRebuildIsActive()) {
+            RbLog(2, __LINE__, 0,
+                  L"unload aborted: rebuild recheck exhausted, service kept");
+            RbUnloadAbort();
+            return;
+        }
+        InterlockedExchange(&g_Rb.Unloading, 1);
+    }
 
     /* 1) 先把全部脏数据落盘（工作线程停止前，回写通道完整） */
     RbFlushAllDirty();
@@ -1175,27 +1206,33 @@ VOID RbUnload(PDRIVER_OBJECT drv)
             else
                 RbLog(2, __LINE__, 0, L"flush thread restart FAILED - periodic writeback degraded");
         }
-        InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] 中止即恢复数据路径，禁哑服役 */
+        RbUnloadAbort();                       /* [85 B2] 中止即恢复数据路径，禁哑服役 */
         return;
     }
     if (!NT_SUCCESS(RbStopFlushers())) {
         RbLog(2, __LINE__, 0, L"unload aborted: flusher join timeout");
         RbRestartDeadFlushers();   /* [FIX S7-13] 重启已终止者：禁半死服役（回写退串行） */
-        InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] */
+        RbUnloadAbort();                       /* [85 B2] 清闩 + 清 Unloading */
         return;
     }
     if (!NT_SUCCESS(RbStopIoWorkers())) {
         RbLog(2, __LINE__, 0, L"unload aborted: io worker join timeout");
         RbRestartDeadIoWorkers();   /* [FIX S7-13] 重启已终止者：禁半死服役（I/O 退系统队列） */
-        InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] */
+        RbUnloadAbort();                       /* [85 B2] 清闩 + 清 Unloading */
         return;
     }
     /* [FIX C5] 特性层池 join 超时同样中止卸载（原 VOID 吞掉超时，
      * 驻留池线程将执行已卸载代码页） */
     if (!NT_SUCCESS(RbFeatShutdown())) {
         RbLog(2, __LINE__, 0, L"unload aborted: feature pool join timeout");
-        RbFeatRecover();          /* [FIX R2-W10] 特性层复活（解闩+重建 Rb2Tick），防僵尸态静默死亡 */
-        InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] */
+        /* [85 B15] 卸载中止分支专用完整复活：RbFeatShutdown 超时时
+         * rbpools.c:16 池闩已置 1，而原 RbFeatRecover() 只解 feat 层同名闩 +
+         * 重建 Rb2Tick、不碰池闩 → 服务已恢复但预取/淘汰/预热永久静默丢弃，
+         * :421 还谎报「recovered」。改用 RbFeatFullRecover()（解池闩 +
+         * feat 层复活 + L2/ETW 复核 + 返回值留痕 + 如实日志）。
+         * 成功卸载路径(:1311)不得调用。 */
+        (void)RbFeatFullRecover();
+        RbUnloadAbort();                       /* [85 B2] 清闩 + 清 Unloading */
         return;
     }
 
@@ -1256,7 +1293,7 @@ VOID RbUnload(PDRIVER_OBJECT drv)
              * 此刻释放它们=UAF/蓝屏。提前返回，保留引擎/池/控制设备/PDO
              * 不释放（宁可泄漏，不可崩溃）；等待下次卸载或重启回收。 */
             RbLog(2, __LINE__, 0, L"unload aborted: volumes in flight, engine/pool kept");
-            InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] */
+            RbUnloadAbort();                       /* [85 B2] 清闩 + 清 Unloading */
             return;
         }
     }
@@ -1271,7 +1308,7 @@ VOID RbUnload(PDRIVER_OBJECT drv)
             KeDelayExecutionThread(KernelMode, FALSE, &tick);
         if (g_Rb.FallbackInFlight) {
             RbLog(2, __LINE__, 0, L"unload aborted: fallback workitems in flight, ctx pool kept");
-            InterlockedExchange(&g_Rb.Unloading, 0);   /* [FIX R2-W5] */
+            RbUnloadAbort();                       /* [85 B2] 清闩 + 清 Unloading */
             return;
         }
     }

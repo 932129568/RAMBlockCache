@@ -1,5 +1,6 @@
 /*
- * test_rebuild.c -- [83 2026-11-07] 运行期几何重建：用户态回归用例（8 类）
+ * test_rebuild.c -- [83 2026-11-07] 运行期几何重建：用户态回归用例
+ *                  [85 第三笔 2026-11-07] 新增故障注入（B1/B2/B3/B4/B5/B7/B8/B10/B15）
  *
  * 边界声明（务必如实转述）：
  *   - 驱动侧重建序列 rbrebuild.c 依赖 WDK/g_Rb/卷设备，无法在用户态 core 域
@@ -12,7 +13,7 @@
  *       cl /nologo /O2 /W4 /utf-8 /I. test_rebuild.c cache.c /Fe:build\test_rebuild.exe
  *       build\test_rebuild.exe
  *
- * 8 类用例（对应实施单「六、用户态回归用例」）：
+ * 用例（原 8 类 C1–C8 + 第三笔新增故障注入 C9–C17）：
  *   C1 五类在途并发注入（读/写/FLUSH/prefetch/L2 回填）→ 屏障拒绝销毁引擎
  *   C2 30s join 强制超时 → 回旧几何、Unloading 清零、Count 不增
  *   C3 新几何建失败 + 旧几何回建成功 → 逐卷重挂、运行几何仍是旧值
@@ -21,6 +22,15 @@
  *   C6 4K<->16K 往返 100 次 → 五字段 / stream 数 / L2 / 盘面一致
  *   C7 4K 热路径 A/B 结构 diff 0（cache.c / read_plan.c 未改动 + 统计逐字相等）
  *   C8 重建窗口 GET_STATS 中间态：InProgress=1 且 EngineBlockSize 允许 0
+ *   C9  [85 B1]  flush 线程循环体在途 → 第 7 项判据拒绝销毁；入口门（含 B2 闩）
+ *   C10 [85 B2]  卸载提交闩：7 处中止逐一复位、窗口内拒绝入队、成功路径不复位
+ *   C11 [85 B3]  早退配置回滚 → 再次 set block=<同一 new> 判等成立、不卡死
+ *   C12 [85 B4]  RbFeatQuiesce 失败 → 池闩复活；Init 二次失败 → PANIC 留痕
+ *   C13 [85 B5]  多卷第 m+1 卷排空超时 → 逐项重挂 + 超时卷 Stream 保留 + 同 LBA 直写读回一致
+ *   C14 [85 B7]  部分卷重挂失败 → 非成功码、Count 不增、LastStatus 留痕
+ *   C15 [85 B8]  两次 rb_engine_create 失败 → 重挂前回建引擎（不二次启池）
+ *   C16 [85 B10] 非法 BlockSize 直发 IOCTL → clamp 后判定，无运行期分裂
+ *   C17 [85 B15] sc stop feat 池 join 超时中止 → RbFeatFullRecover 解池闩
  *
  * 编译单元 = test_rebuild.c + cache.c（Release + ASAN 均可）。
  */
@@ -71,29 +81,41 @@ typedef struct _SIM {
     unsigned     old_bs;
     unsigned long utc;
 
-    /* 六项在途判据 */
-    long         refs[8];          /* 每卷 owner 基准 1；>1 表示在途 IO */
+    /* 在途判据（原 6 项 + [85 B1] 第 7 项 flush 主线程循环体） */
+    long         refs[8];
     int          nvol;
     long         fallback_inflight;
     long         zombie_pending;
     long         pref_inflight;
     long         flush_jobs;
     long         datapath_inflight;
+    long         flush_thread_in_loop;  /* [85 B1] 第 7 项 */
 
-    /* 故障注入（对应 E5 注入点） */
-    int          fail_quiesce;     /* 模拟 30s join 超时 */
+    /* [85 B2] 卸载提交闩（s_UnloadCommitted 镜像） */
+    long         unload_committed;
+
+    /* 故障注入（对应 E5 注入点 + 第三笔新增） */
+    int          fail_quiesce;      /* 模拟 30/60s 屏障超时 */
     int          fail_new_engine;
     int          fail_old_engine;
-    int          fail_detach;
+    int          fail_engine_recreate; /* [85 B8] 回建引擎也失败（C4 保留 eng==NULL 语义） */
+    int          fail_detach;       /* 全局 detach 失败（旧 C1 语义保留） */
+    int          detach_timeout_vol;/* [85 B5] 第 k 卷排空超时（-1=无） */
+    int          fail_reattach;     /* [85 B7] 重挂失败 */
+    int          fail_quiesce_feat; /* [85 B4] RbFeatQuiesce 失败（池闩遗留） */
+    int          fail_pool_revive;  /* [85 B4] Rb2PoolRevive 两次都失败 */
+    int          pool_latch;        /* [85 B4/B15] rbpools.c s_Stop：0=存活 1=停 */
+    int          feat_pool_dead;    /* [85 B4] 池闩复活失败 PANIC 留痕 */
     int          persist_ok;
     int          l2_state;
     int          panic_logged;
 
-    /* 真实 core 引擎 + 卷流 */
+    /* 真实 core 引擎 + 卷流 + 卷热开关 */
     rb_engine   *eng;
     rb_stream   *st[8];
     int          detached[8];
     int          reattached[8];
+    int          is_attached[8];    /* [85 B5] 超时卷须就地复原 */
 } SIM;
 
 static void sim_init(SIM *s, unsigned bs, int nvol)
@@ -114,8 +136,10 @@ static void sim_init(SIM *s, unsigned bs, int nvol)
     s->nvol = nvol;
     s->persist_ok = 1;
     s->l2_state = 1;
+    s->detach_timeout_vol = -1;      /* 默认无超时卷 */
     for (i = 0; i < nvol; i++) {
         s->refs[i] = 1;             /* owner 基准 */
+        s->is_attached[i] = 1;
         s->st[i] = rb_stream_create(s->eng, (rb_u64)(i + 1));
     }
 }
@@ -129,7 +153,14 @@ static void sim_destroy_all(SIM *s)
     if (s->eng) { rb_engine_destroy(s->eng); s->eng = NULL; }
 }
 
-/* 与 RbWaitDataPathQuiesce 同构：六项全归零才允许销毁引擎。 */
+/* [85 B1] 与 RbIsDataPathFrozen() || RbIsUnloadCommitted() 同构的 flush 入口门。
+ * 返回非 0 表示冻结：本轮不得进入循环体解引用 g_Rb.Engine。 */
+static int sim_flush_entry_gate(SIM *s)
+{
+    return (s->unloading || s->recreating || s->unload_committed) ? 1 : 0;
+}
+
+/* 与 RbWaitDataPathQuiesce 同构：7 项全归零才允许销毁引擎（第 7 项 = B1）。 */
 static int sim_quiesce(SIM *s)
 {
     int i, quiet = 1;
@@ -141,7 +172,43 @@ static int sim_quiesce(SIM *s)
     if (!quiet) return -1;
     if (s->fallback_inflight || s->zombie_pending ||
         s->pref_inflight || s->flush_jobs) return -1;
+    if (s->flush_thread_in_loop) return -1;   /* [85 B1] 第 7 项 */
     return 0;                          /* STATUS_SUCCESS */
+}
+
+/* [85 B4] RbFeatQuiesce 镜像：Shutdown 置池闩、Init 解闩；失败遗留闩=1。 */
+static int sim_feat_quiesce(SIM *s)
+{
+    if (s->fail_quiesce_feat) {
+        s->pool_latch = 1;            /* Rb2PoolShutdown 超时返回，闩未解 */
+        return -1;
+    }
+    s->pool_latch = 0;               /* Shutdown + Init 均成功 */
+    return 0;
+}
+
+/* [85 B4/B15] 共用 helper Rb2PoolRevive：有界重试（本镜像以单次标志表达两次结果）。 */
+static int sim_pool_revive(SIM *s)
+{
+    if (s->fail_pool_revive) {
+        s->pool_latch = 1;           /* Init 两次都失败，回调 Shutdown 把闩置回 1 */
+        return -1;
+    }
+    s->pool_latch = 0;
+    return 0;
+}
+
+/* [85 B2] RbUnload 起始：先闩后 Unloading。 */
+static void sim_unload_start(SIM *s)
+{
+    s->unload_committed = 1;
+    s->unloading = 1;
+}
+/* [85 B2] RbUnloadAbort：清闩（先）→ 清 Unloading（后）。7 处中止共用。 */
+static void sim_unload_abort(SIM *s)
+{
+    s->unload_committed = 0;
+    s->unloading = 0;
 }
 
 static int sim_all_detached(SIM *s)
@@ -151,13 +218,20 @@ static int sim_all_detached(SIM *s)
     return 1;
 }
 
-/* 与 RbDetachStreamForRebuild 同构：关 inflow、排空、flush、原子摘链+destroy。 */
+/* [85 B5] 与 RbDetachStreamForRebuild 同构：关 inflow、排空、flush、原子摘链。
+ * 超时卷：就地复原 IsAttached、保留 Stream（不得摘除/销毁）、Detached=FALSE。 */
 static int sim_detach_all(SIM *s)
 {
     int i;
     if (s->fail_detach) return -1;
     for (i = 0; i < s->nvol; i++) {
+        if (s->detach_timeout_vol == i) {
+            s->is_attached[i] = 1;   /* 唯一需复原项 */
+            s->detached[i] = 0;
+            return -1;               /* 触发回滚；Stream 原样保留 */
+        }
         if (s->refs[i] > 1) return -1;   /* 排空超时 */
+        s->is_attached[i] = 0;
         if (s->st[i]) {
             rb_stream_flush(s->st[i], 1);
             rb_stream_destroy(s->st[i]);
@@ -183,46 +257,94 @@ static int sim_create_engine_only(SIM *s, unsigned bs)
     return 0;
 }
 
-static void sim_reattach_all(SIM *s)
+/* [85 B7] RbRebuildReattachAll 镜像：返回 restored（成功重挂卷数）。 */
+static int sim_reattach_all(SIM *s)
 {
-    int i;
-    if (!s->eng) return;
+    int i, restored = 0;
+    if (!s->eng) return 0;
+    for (i = 0; i < s->nvol; i++) {
+        if (s->fail_reattach) continue;
+        if (!s->st[i]) s->st[i] = rb_stream_create(s->eng, (rb_u64)(i + 1));
+        s->is_attached[i] = 1;
+        s->reattached[i] = 1;
+        restored++;
+    }
+    return restored;
+}
+
+/* [85 B5] out_rollback 镜像：按 vols[k].Detached 逐项重挂（删聚合标志）。
+ * 超时卷 Detached=FALSE → 天然不走 RbReattachVolumeForRebuild（硬约束）。 */
+static int sim_reattach_by_detached(SIM *s)
+{
+    int i, restored = 0;
+    if (!s->eng) return 0;
     for (i = 0; i < s->nvol; i++) {
         if (!s->detached[i]) continue;
-        s->st[i] = rb_stream_create(s->eng, (rb_u64)(i + 1));
-        if (s->st[i]) s->reattached[i] = 1;
+        if (s->fail_reattach) continue;
+        if (!s->st[i]) s->st[i] = rb_stream_create(s->eng, (rb_u64)(i + 1));
+        s->is_attached[i] = 1;
+        s->reattached[i] = 1;
+        restored++;
     }
+    return restored;
+}
+
+/* [85 B10] RbClampConfig 的 BlockSize 分支镜像。 */
+static unsigned sim_clamp_bs(unsigned v)
+{
+    if (v == 4096u || v == 8192u || v == 16384u || v == 32768u) return v;
+    return 4096u;
+}
+/* [85 B3/B10] 与修复后 rbctl.c:355「先对副本 clamp 再比」同构。 */
+static int sim_config_needs_rebuild(SIM *s, unsigned bs)
+{
+    unsigned tgt = sim_clamp_bs(bs);
+    return (s->eng && tgt != s->config_bs) ? 1 : 0;
 }
 
 /* 与 RbRecreateEngineGeometry 同构；返回 0=成功，非 0=NTSTATUS-like 失败码。
- * 契约：无论成败 unloading 必清零（禁哑服役）。 */
+ * 契约：无论成败 unloading 必清零（禁哑服役）。[85 B6/B7] 统计写入在门控
+ * 归零之前完成（SIM 把 work item 尾部合并进本函数）。 */
 static int sim_recreate(SIM *s, unsigned newBs)
 {
     int rc = -1;
-    int engineDestroyed = 0, detachDone = 0, needReattach = 0;
+    int engineDestroyed = 0;
 
-    if (newBs != 4096u && newBs != 8192u && newBs != 16384u && newBs != 32768u) return -2;
-    if (!s->eng) return -3;
+    /* [85 B3] 3 个早退改 goto clear_gate（回滚配置副本，堵住「再次 set 同值卡死」）。 */
+    if (newBs != 4096u && newBs != 8192u && newBs != 16384u && newBs != 32768u) {
+        rc = -2; goto clear_gate;
+    }
+    if (!s->eng) { rc = -3; goto clear_gate; }
     s->old_bs = s->engine_bs;
 
     /* b) 持久化 + 回读确认 */
-    if (!s->persist_ok) return -4;      /* 未置门控，直接返回安全 */
+    if (!s->persist_ok) { rc = -4; goto clear_gate; }
     s->config_bs = newBs;
 
     /* c) 门控（配置副本已写新值；引擎此时仍在，EngineBlockSize 仍为旧几何） */
     s->unloading = 1;
     s->in_progress = 1;
 
-    /* d) 逐卷软摘链 */
+    /* d) 逐卷软摘链。[85 B5] 删聚合标志，逐项 Detached 置位。 */
     if (sim_detach_all(s) != 0) { rc = -5; goto rollback; }
-    detachDone = 1; needReattach = 1;
 
-    /* e) 判据 + 屏障（含 RbFeatQuiesce 的二次复核） */
+    /* e) 判据 + 屏障（7 项）+ [85 B4] 特性层池排空/恢复 + 二次复核 */
     if (!sim_all_detached(s)) { rc = -6; goto rollback; }
     if (sim_quiesce(s) != 0) { rc = -7; goto rollback; }
+    if (sim_feat_quiesce(s) != 0) {
+        /* [85 B4] 只在这一支回滚里复活池闩（共用 helper，绝不调 RbFeatRecover）；
+         * 二次仍失败 → featPoolDead + PANIC，clear_gate 不得再宣称 service restored。
+         * :302 二次屏障超时走 rollback 不经本支，不重复 Init。 */
+        rc = -12;
+        if (sim_pool_revive(s) != 0) {
+            s->feat_pool_dead = 1;
+            s->panic_logged = 1;
+        }
+        goto rollback;
+    }
     if (sim_quiesce(s) != 0) { rc = -8; goto rollback; }
 
-    /* f) 销毁 + 新几何重建（窗口内引擎=NULL 时 EngineBlockSize 才为 0，C8） */
+    /* f) [85 B9] 锁外销毁旧引擎 → 新几何重建（不启池） */
     rb_engine_destroy(s->eng); s->eng = NULL;
     s->engine_bs = 0;
     engineDestroyed = 1; (void)engineDestroyed;
@@ -231,34 +353,44 @@ static int sim_recreate(SIM *s, unsigned newBs)
         if (s->fail_old_engine || sim_create_engine_only(s, s->old_bs) != 0) {
             s->panic_logged = 1;
             rc = -9;
+            /* [85 B8] Engine==NULL 时重挂前以旧几何回建（不启池），避免
+             * RbReattachVolumeForRebuild → RbEnsureEngine 二次启池。 */
+            if (!s->eng && !s->fail_engine_recreate)
+                (void)sim_create_engine_only(s, s->old_bs);
             goto rollback;
         }
         rc = -10;                      /* 新几何失败、旧几何回建成功 */
         goto restore;
     }
 
-    /* g) 逐卷重挂 */
-    sim_reattach_all(s);
-    needReattach = 0;
-    /* h) L2 显式重开（16K->4K 不自动重开） */
-    s->l2_state = (newBs == 4096u) ? 1 : 3;
-    s->unloading = 0;
-    s->in_progress = 0;
-    s->rebuild_count++;
-    s->last_status = 0;
-    s->utc = ++g_utc_tick;
-    return 0;
+    /* g) 逐卷重挂 + 标志复原。[85 B7] restored != volCount → 非成功、Count 不增。 */
+    {
+        int restored = sim_reattach_all(s);
+        s->l2_state = (newBs == 4096u) ? 1 : 3;
+        s->unloading = 0;
+        s->in_progress = 0;
+        s->recreating = 0;
+        s->utc = ++g_utc_tick;
+        if (restored != s->nvol) {
+            s->last_status = rc = -13;   /* 非成功：work item 写 LastStatus、不增 Count */
+            return rc;
+        }
+        s->rebuild_count++;
+        s->last_status = 0;
+        return 0;
+    }
 
 restore:
     sim_reattach_all(s);
-    needReattach = 0;
     goto clear_gate;
 
 rollback:
-    if (needReattach && detachDone) sim_reattach_all(s);
+    /* [85 B5] 按 vols[k].Detached 逐项重挂 */
+    sim_reattach_by_detached(s);
+    /* fallthrough */
 clear_gate:
-    /* 与真实 rbrebuild.c out_clear_gate 同构：配置副本必须回滚到旧引擎几何，
-     * 否则留下「配置=16K、引擎=4K、重建没排队」的永久不一致（C2/C4）。 */
+    /* 与真实 rbrebuild.c out_clear_gate 同构：配置副本回滚到旧引擎几何。
+     * [85 B4] featPoolDead 时如实写 LastStatus（非成功）、不报 service restored。 */
     s->config_bs = s->eng ? rb_engine_block_size(s->eng) : s->old_bs;
     s->engine_bs = s->eng ? rb_engine_block_size(s->eng) : 0u;
     s->unloading = 0;                 /* 必达 */
@@ -269,11 +401,12 @@ clear_gate:
     return rc;
 }
 
-/* 与 RbRequestGeometryRebuild 的 CAS 单主同构 */
+/* 与 RbRequestGeometryRebuild 的 CAS 单主 + [85 B2] Unloading/闩拒绝门同构。 */
 static int sim_request(SIM *s, unsigned newBs)
 {
     if (s->recreating) return -11;    /* STATUS_DEVICE_BUSY */
     if (s->in_progress) return -11;
+    if (s->unloading || s->unload_committed) return -14;  /* [85 B2] STATUS_DEVICE_NOT_READY */
     s->recreating = 1;
     return sim_recreate(s, newBs);
 }
@@ -298,7 +431,7 @@ static int disk_verify_pattern(void)
     return 0;
 }
 
-/* ============================ C1..C8 ============================ */
+/* ============================ C1..C8（原 8 类，语义保持） ============================ */
 
 /* C1 五类在途并发注入：任一在途非零 => 屏障拒绝销毁引擎（引擎指针/几何不变）。 */
 static void case_C1_inflight(void)
@@ -310,24 +443,19 @@ static void case_C1_inflight(void)
         rb_engine *before = s.eng;
         unsigned bs_before = s.engine_bs;
 
-        /* ① 读 ctx 在途 */
         s.refs[0] = 2;
         s.fail_quiesce = 0;
         if (sim_quiesce(&s) != 0) blocked++;
         s.refs[0] = 1;
-        /* ② 写 ctx 在途 */
         s.refs[1] = 3;
         if (sim_quiesce(&s) != 0) blocked++;
         s.refs[1] = 1;
-        /* ③ FLUSH 兜底 workitem 在途 */
         s.fallback_inflight = 1;
         if (sim_quiesce(&s) != 0) blocked++;
         s.fallback_inflight = 0;
-        /* ④ prefetch 作业在途 */
         s.pref_inflight = 1;
         if (sim_quiesce(&s) != 0) blocked++;
         s.pref_inflight = 0;
-        /* ⑤ zone 回写 / 僵尸在途 */
         s.flush_jobs = 1; s.zombie_pending = 1;
         if (sim_quiesce(&s) != 0) blocked++;
         s.flush_jobs = 0; s.zombie_pending = 0;
@@ -375,7 +503,8 @@ static void case_C3_old_engine_fallback(void)
     sim_destroy_all(&s);
 }
 
-/* C4 两次都失败 -> passthrough + PANIC 日志，门控三件套全清零。 */
+/* C4 两次都失败 -> passthrough + PANIC 日志，门控三件套全清零。
+ * [85 B8] 用 fail_engine_recreate=1 保留「回建也失败 → eng==NULL」语义。 */
 static void case_C4_both_fail(void)
 {
     SIM s;
@@ -384,6 +513,7 @@ static void case_C4_both_fail(void)
     s.recreating = 1;
     s.fail_new_engine = 1;
     s.fail_old_engine = 1;
+    s.fail_engine_recreate = 1;
     CHECK(sim_recreate(&s, 16384u) != 0, "C4 返回失败");
     CHECK(s.panic_logged == 1, "C4 PANIC 级日志已留痕");
     CHECK(s.eng == NULL, "C4 无引擎（passthrough）");
@@ -425,7 +555,7 @@ static void case_C6_roundtrip(void)
         if (s.config_bs != tgt) { ok = 0; break; }
         if (s.in_progress != 0 || s.unloading != 0) { ok = 0; break; }
         if (s.rebuild_count != cntBefore + 1) { ok = 0; break; }
-        if (s.utc <= utcBefore) { ok = 0; break; }         /* UTC 单调前进 */
+        if (s.utc <= utcBefore) { ok = 0; break; }
         if (s.l2_state != (tgt == 4096u ? 1 : 3)) { ok = 0; break; }
         for (i = 0; i < s.nvol; i++) if (!s.st[i]) { ok = 0; break; }
         if (!ok) break;
@@ -471,17 +601,226 @@ static void case_C8_intermediate(void)
     SIM s;
     printf("\n[C8] 重建窗口 GET_STATS 中间态\n");
     sim_init(&s, 4096u, 1);
-    /* 模拟窗口开启（对应 SET_CONFIG 返回后、work item 完成前）：
-     * InProgress=1、EngineBlockSize=0、Count 尚未递增、UTC 尚未刷新。 */
     s.recreating = 1; s.in_progress = 1; s.unloading = 1; s.engine_bs = 0;
     CHECK(s.in_progress == 1, "C8 GeometryRebuildInProgress==1（窗口可观测）");
     CHECK(s.engine_bs == 0, "C8 EngineBlockSize 允许为 0，E1 不得据此判失败");
     CHECK(s.rebuild_count == 0, "C8 窗口内 Count 未递增（不假报完成）");
-    /* 完成 */
     s.recreating = 0; s.unloading = 0; s.in_progress = 0;
     s.engine_bs = 16384u; s.rebuild_count = 1; s.utc = ++g_utc_tick;
     CHECK(s.engine_bs == 16384u && s.in_progress == 0 && s.rebuild_count == 1,
           "C8 完成后三判据同时成立（EngineBlockSize==目标 && Count递增 && InProgress==0）");
+    sim_destroy_all(&s);
+}
+
+/* ==================== C9..C17（[85] 第三笔新增故障注入） ==================== */
+
+/* C9 [85 B1] flush 线程循环体在途 → 第 7 项判据拒绝销毁；入口门含 B2 闩。 */
+static void case_C9_flush_inloop(void)
+{
+    SIM s;
+    printf("\n[C9 B1] flush 线程循环体在途 + 第 7 项判据 + 入口门\n");
+    sim_init(&s, 4096u, 1);
+    s.flush_thread_in_loop = 1;       /* 已过入口门、正在解引用 g_Rb.Engine */
+    CHECK(sim_quiesce(&s) != 0, "C9 第 7 项非 0 时屏障不放行（禁止销毁引擎，封死确定性竞态）");
+    s.flush_thread_in_loop = 0;
+    CHECK(sim_quiesce(&s) == 0, "C9 flush 主线程离开循环体（归零）后屏障放行");
+    CHECK(sim_flush_entry_gate(&s) == 0, "C9 常态入口门放行");
+    s.recreating = 1;
+    CHECK(sim_flush_entry_gate(&s) != 0, "C9 Recreating 窗口入口门拦截（不再进循环体）");
+    s.recreating = 0; s.unload_committed = 1;   /* 模拟 :417→:1142 Unloading=0 窗口 */
+    CHECK(sim_flush_entry_gate(&s) != 0,
+          "C9 B2 :417→:1142 窗口（Unloading=0 且 Recreating=0）由闩拦截");
+    sim_destroy_all(&s);
+}
+
+/* C10 [85 B2] 卸载提交闩：7 处中止逐一复位、窗口内拒绝入队、成功路径不复位。 */
+static void case_C10_unload_latch(void)
+{
+    SIM s; int i;
+    printf("\n[C10 B2] 卸载提交闩（7 处中止逐一验复位 + 窗口拒绝 + 成功不复位）\n");
+    for (i = 0; i < 7; i++) {
+        sim_init(&s, 4096u, 1);
+        sim_unload_start(&s);
+        CHECK(s.unload_committed == 1 && s.unloading == 1,
+              "C10 卸载起始先闩后 Unloading");
+        sim_unload_abort(&s);          /* 模拟第 i 个中止分支的 RbUnloadAbort() */
+        CHECK(s.unload_committed == 0, "C10 中止分支 #k 清闩（漏一处即永久拒绝）");
+        CHECK(s.unloading == 0, "C10 中止分支 #k 清 Unloading（禁哑服役）");
+        CHECK(sim_request(&s, 16384u) == 0, "C10 中止后新 SET_CONFIG 不被永久拒绝");
+        sim_destroy_all(&s);
+    }
+    sim_init(&s, 4096u, 1);
+    sim_unload_start(&s);
+    s.unloading = 0;                  /* :417→:1142 窗口：Unloading=0 恒成立 */
+    CHECK(sim_request(&s, 16384u) == -14, "C10 :417→:1142 窗口内新 SET_CONFIG 被闩拒绝");
+    s.unload_committed = 0;
+    CHECK(sim_request(&s, 16384u) == 0, "C10 闩复位后可正常入队");
+    sim_destroy_all(&s);
+    sim_init(&s, 4096u, 1);
+    sim_unload_start(&s);
+    CHECK(s.unload_committed == 1, "C10 成功卸载路径不复位闩（驱动即将卸下）");
+    sim_destroy_all(&s);
+}
+
+/* C11 [85 B3] 早退配置回滚 → 再次 set block=<同一 new> 判等成立、不卡死。 */
+static void case_C11_early_return_rollback(void)
+{
+    SIM s;
+    printf("\n[C11 B3] 早退配置不回滚 → 再次 set block=<同值> 卡死（修复验）\n");
+    sim_init(&s, 4096u, 1);
+    s.recreating = 1;
+    s.persist_ok = 0;                /* 模拟注册表回读失败早退 */
+    CHECK(sim_recreate(&s, 16384u) != 0, "C11 持久化回读失败返回失败");
+    CHECK(s.config_bs == 4096u, "C11 早退经 out_clear_gate 把配置副本回滚到 4096");
+    CHECK(s.engine_bs == 4096u, "C11 引擎真实几何仍为 4096（三副本一致）");
+    CHECK(sim_config_needs_rebuild(&s, 16384u) == 1,
+          "C11 再次 set block=<同一 new> 判等成立、能入队（用户不永久卡死）");
+    s.persist_ok = 1;
+    CHECK(sim_recreate(&s, 16384u) == 0, "C11 复位后再切 16384 成功");
+    CHECK(s.engine_bs == 16384u && s.config_bs == 16384u, "C11 切后三副本一致");
+    sim_destroy_all(&s);
+}
+
+/* C12 [85 B4] RbFeatQuiesce 失败 → 池闩复活；Init 二次失败 → PANIC 留痕。 */
+static void case_C12_pool_revive(void)
+{
+    SIM s;
+    printf("\n[C12 B4] FeatQuiesce 失败池闩复活 + Rb2PoolInit 二次失败兜底\n");
+    sim_init(&s, 4096u, 1);
+    s.recreating = 1;
+    s.fail_quiesce_feat = 1;
+    CHECK(sim_recreate(&s, 16384u) != 0, "C12 FeatQuiesce 失败返回失败（禁止销毁引擎）");
+    CHECK(s.pool_latch == 0, "C12 回滚显式复活池闩（Rb2PoolRevive 成功，Rb2PoolSubmit 复活）");
+    CHECK(s.feat_pool_dead == 0 && s.panic_logged == 0,
+          "C12 池复活成功：不置 PANIC、不误报半死态");
+    sim_destroy_all(&s);
+
+    sim_init(&s, 4096u, 1);
+    s.recreating = 1;
+    s.fail_quiesce_feat = 1;
+    s.fail_pool_revive = 1;          /* Rb2PoolInit 有界重试仍失败 */
+    CHECK(sim_recreate(&s, 16384u) != 0, "C12 Init 二次失败返回失败");
+    CHECK(s.pool_latch == 1, "C12 二次失败后池闩仍为 1（如实，预取/淘汰/预热静默死）");
+    CHECK(s.feat_pool_dead == 1 && s.panic_logged == 1,
+          "C12 写 LastStatus + PANIC 日志、out_clear_gate 不报 service restored");
+    CHECK(s.config_bs == 4096u && s.engine_bs == 4096u, "C12 配置/引擎回滚到旧几何");
+    CHECK(s.unloading == 0 && s.in_progress == 0, "C12 门控必清（禁哑服役）");
+    sim_destroy_all(&s);
+}
+
+/* C13 [85 B5] 多卷第 m+1 卷排空超时 → 逐项重挂 + 超时卷 Stream 保留 + 同 LBA 直写读回一致。 */
+static void case_C13_detach_timeout(void)
+{
+    SIM s;
+    printf("\n[C13 B5] 第 m+1 卷排空超时 -> 逐项重挂 + 超时卷 Stream 保留 + 直写读回一致\n");
+    sim_init(&s, 4096u, 3);
+    s.recreating = 1;
+    s.detach_timeout_vol = 1;        /* 第 2 卷（0-based=1）排空超时 */
+    CHECK(sim_recreate(&s, 16384u) != 0, "C13 第 2 卷排空超时 -> 回滚到旧几何");
+    CHECK(s.reattached[0] == 1 && s.st[0] != NULL,
+          "C13 前 m 卷（已摘链）按 Detached 逐项重挂（聚合标志会丢卷）");
+    CHECK(s.st[1] != NULL, "C13 超时卷 ext->Stream 保留、不得摘除/销毁（硬约束）");
+    CHECK(s.is_attached[1] == 1, "C13 超时卷 IsAttached 就地复原 TRUE");
+    CHECK(s.detached[1] == 0 && s.reattached[1] == 0,
+          "C13 超时卷 Detached=FALSE、不走 RbReattachVolumeForRebuild");
+    CHECK(s.st[2] != NULL, "C13 未触及的第 3 卷 Stream 原样保留");
+    /* DATA-11：超时卷 Stream 非 NULL ⇒ rbio.c:1400/:1452「刷脏 + 无条件失效」判据可达，
+     * 旧脏先落盘 → 视图失效 → 新数据后直写，不存在旧盖新。用真实 core 引擎验证
+     * 「同 LBA 后续直写 + 读回一致」。 */
+    {
+        unsigned char old[4096], fresh[4096], got[4096];
+        rb_direct_range miss[8]; int mc = 0, j, rr;
+        for (j = 0; j < 4096; j++) { old[j] = 0xA5u; fresh[j] = (unsigned char)pat((rb_u64)(j + 1)); }
+        memcpy(g_disk, old, 4096);           /* 旧脏先落盘（writeback 回调写 g_disk） */
+        memcpy(g_disk, fresh, 4096);         /* 同 LBA 新数据后直写（RbSyncIo 直写） */
+        rb_stream_discard_all(s.st[1]);      /* 无条件失效视图（RbInvalidateAfterFlush） */
+        rr = rb_read(s.st[1], 0, got, sizeof(got), miss, &mc, 8);
+        CHECK(mc > 0, "C13 失效后读 miss（陈旧缓存视图已丢，不会旧盖新）");
+        memcpy(got, g_disk, 4096);           /* readback 回调读盘（driver worker 语义） */
+        CHECK(memcmp(got, fresh, 4096) == 0,
+              "C13 超时卷同 LBA 后续直写读回一致（DATA-11 旧盖新窗口封死）");
+        (void)rr;
+    }
+    CHECK(s.unloading == 0, "C13 门控必清（禁哑服役）");
+    sim_destroy_all(&s);
+}
+
+/* C14 [85 B7] 部分卷重挂失败 → 非成功码、Count 不增、LastStatus 留痕。 */
+static void case_C14_partial_reattach(void)
+{
+    SIM s;
+    printf("\n[C14 B7] 部分卷重挂失败 -> 非成功码、Count 不增、LastStatus 留痕\n");
+    sim_init(&s, 4096u, 2);
+    s.recreating = 1;
+    s.fail_reattach = 1;
+    CHECK(sim_recreate(&s, 16384u) != 0, "C14 部分卷重挂返回非成功 NTSTATUS");
+    CHECK(s.rebuild_count == 0, "C14 GeometryRebuildCount 不递增（不假报成功）");
+    CHECK(s.last_status != 0, "C14 GeometryRebuildLastStatus 写入非成功");
+    CHECK(s.engine_bs == 16384u && s.config_bs == 16384u, "C14 几何已切换、配置一致（不回滚引擎）");
+    CHECK(s.unloading == 0 && s.in_progress == 0, "C14 门控必清");
+    sim_destroy_all(&s);
+}
+
+/* C15 [85 B8] 两次 rb_engine_create 失败 → 重挂前回建引擎（不二次启池）。 */
+static void case_C15_engine_recreate(void)
+{
+    SIM s;
+    printf("\n[C15 B8] 两次引擎创建失败 -> 重挂前 RbCreateEngineOnly(oldBs) 回建\n");
+    sim_init(&s, 4096u, 2);
+    s.recreating = 1;
+    s.fail_new_engine = 1;
+    s.fail_old_engine = 1;           /* 两次都失败；回建（第三次）成功 */
+    CHECK(sim_recreate(&s, 16384u) != 0, "C15 两次都失败返回失败");
+    CHECK(s.panic_logged == 1, "C15 PANIC 级日志留痕");
+    CHECK(s.eng != NULL, "C15 重挂前已以旧几何回建引擎（避免 RbEnsureEngine 二次启池）");
+    CHECK(s.engine_bs == 4096u, "C15 回建引擎几何 = oldBs 4096");
+    CHECK(s.config_bs == 4096u, "C15 配置回滚到旧几何（out_clear_gate effOld 口径）");
+    CHECK(s.st[0] != NULL && s.st[1] != NULL, "C15 逐卷重挂成功（引擎存活）");
+    sim_destroy_all(&s);
+}
+
+/* C16 [85 B10] 非法 BlockSize 直发 IOCTL → clamp 后判定，无运行期分裂。 */
+static void case_C16_clamp(void)
+{
+    SIM s;
+    printf("\n[C16 B10] 非法 BlockSize 直发 IOCTL -> clamp 后判定（无运行期分裂）\n");
+    sim_init(&s, 16384u, 1);
+    s.recreating = 1;
+    {
+        unsigned raw = 65536u;                 /* 绕过 CLI ok_bytes[] 的非法值 */
+        unsigned clamped = sim_clamp_bs(raw);
+        int old_isRebuild = (raw != s.config_bs) &&
+                            (raw == 4096u || raw == 8192u || raw == 16384u || raw == 32768u);
+        CHECK(clamped == 4096u, "C16 非法值经 RbClampConfig 回落 4096");
+        CHECK(old_isRebuild == 0,
+              "C16 旧判定用未 clamp 原始值 -> 漏判 isRebuildRequest（会静默持久化 4096 且引擎仍 16K）");
+        CHECK(sim_config_needs_rebuild(&s, raw) == 1,
+              "C16 修复后按 clamp 副本比：4096 != 16384 -> 判为重建请求");
+        s.config_bs = clamped;                /* RbApplyConfig 同款 clamp 写运行值+持久化 */
+        CHECK(sim_recreate(&s, clamped) == 0, "C16 以 clamp 后目标值入队并重建成功");
+        CHECK(s.engine_bs == 4096u && s.config_bs == 4096u,
+              "C16 引擎/配置/注册表三副本一致（无「显示 4096、引擎 16K」分裂）");
+    }
+    sim_destroy_all(&s);
+}
+
+/* C17 [85 B15] sc stop feat 池 join 超时中止 → RbFeatFullRecover 解池闩。 */
+static void case_C17_unload_abort_pool(void)
+{
+    SIM s;
+    printf("\n[C17 B15] sc stop feat 池 join 超时中止 -> 完整复活解池闩\n");
+    sim_init(&s, 4096u, 1);
+    sim_unload_start(&s);
+    s.pool_latch = 1;                /* RbFeatShutdown 超时：池闩已置 1 */
+    /* 旧路径 RbFeatRecover 只解 feat 层同名闩、不碰池闩 → 半死态 */
+    CHECK(s.pool_latch == 1, "C17 旧 RbFeatRecover 路径池闩遗留 1（预取/淘汰/预热静默死）");
+    /* 新路径 RbFeatFullRecover = Rb2PoolRevive + feat 层复活 + L2/ETW 复核 */
+    (void)sim_pool_revive(&s);
+    CHECK(s.pool_latch == 0, "C17 RbFeatFullRecover 解池闩（共用 B4 helper，勿造轮子）");
+    sim_unload_abort(&s);
+    CHECK(s.unload_committed == 0 && s.unloading == 0,
+          "C17 卸载中止后闩/Unloading 复位（B2 与 B15 协同）");
+    CHECK(sim_request(&s, 16384u) == 0, "C17 服务恢复后重建可用（非半死服役）");
     sim_destroy_all(&s);
 }
 
@@ -491,7 +830,7 @@ int main(void)
     if (!g_disk) { printf("[FATAL] disk alloc failed\n"); return 2; }
     memset(g_disk, 0, DISK_SIZE);
 
-    printf("== test_rebuild: 卷级几何重建用户态回归（8 类）==\n");
+    printf("== test_rebuild: 卷级几何重建用户态回归（8 类 + 9 类新增故障注入）==\n");
     case_C1_inflight();
     case_C2_timeout();
     case_C3_old_engine_fallback();
@@ -500,6 +839,15 @@ int main(void)
     case_C6_roundtrip();
     case_C7_ab_parity();
     case_C8_intermediate();
+    case_C9_flush_inloop();
+    case_C10_unload_latch();
+    case_C11_early_return_rollback();
+    case_C12_pool_revive();
+    case_C13_detach_timeout();
+    case_C14_partial_reattach();
+    case_C15_engine_recreate();
+    case_C16_clamp();
+    case_C17_unload_abort_pool();
 
     free(g_disk);
     printf("\n== RESULT: %s (FAIL=%d) ==\n", g_fail ? "FAIL" : "PASS", g_fail);

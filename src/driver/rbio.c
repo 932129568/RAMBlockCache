@@ -2073,10 +2073,25 @@ static VOID RbFlushThread(VOID *ctx)
                 objs[0] = &g_Rb.FlushStop;
                 objs[1] = &g_Rb.FlushWake;
                 wst = KeWaitForMultipleObjects(2, objs, WaitAny, Executive, KernelMode, FALSE, &timeout, NULL);
-                if (KeReadStateEvent(&g_Rb.FlushStop)) break;
+                if (KeReadStateEvent(&g_Rb.FlushStop)) {
+                    InterlockedExchange(&g_Rb.FlushThreadInLoop, 0);   /* [85 B1] 退出路径清零 */
+                    break;
+                }
                 /* 显式 FLUSH/自愈 kick（FlushWake）：无论节律立即执行一轮 */
                 if (wst == STATUS_WAIT_1) { KeClearEvent(&g_Rb.FlushWake); periodic = TRUE; }
             }
+            /* [85 B1] 入口门（与 RbWaitDataPathQuiesce 第 7 项判据并列，缺一不可）：
+             * 本线程原本全程不查 Unloading/Recreating（:2089/:2170/panic 段连判空
+             * 都无），是全库 7 个 PsCreateSystemThread 入口里唯一不受重建门控约束
+             * 的后台线程。重建/卸载窗口开启后本轮不得再进入循环体解引用
+             * g_Rb.Engine 裸指针。放在 1s 等待与 FlushWake 清理之后：等待本身阻塞
+             * 1s 免紧自旋，且 FlushWake 已清除、下一轮 wait 不会被残留信号立即
+             * 唤醒形成 100% CPU 忙循环。FlushStop 的 break 在本门之前（停机优先）。
+             * RbIsUnloadCommitted 覆盖 B2 的 :417→:1142 窗口（此时 Unloading=0、
+             * Recreating=0，RbIsDataPathFrozen 判 FALSE，唯闩仍为 1）。 */
+            if (RbIsDataPathFrozen() || RbIsUnloadCommitted())
+                continue;
+            InterlockedExchange(&g_Rb.FlushThreadInLoop, 1);   /* 第 7 项判据：进入循环体 */
             now = RbInterruptMs();
             {
                 /* need_flush 优先于节律：脏数据贴高水位时立即回写（不等周期）。
@@ -2098,6 +2113,7 @@ static VOID RbFlushThread(VOID *ctx)
                      * 现在：每次 1s 切片都刷新（内部是单个系统信息查询，微秒级），
                      * 应用内存增长 → 预算随之下降 → 缓存主动退让。 */
                     if (g_Rb.Engine) RbRefreshMemoryBudget();
+                    InterlockedExchange(&g_Rb.FlushThreadInLoop, 0);   /* [85 B1] 清零后回到等待 */
                     continue;                          /* 未到点：继续切片等待 */
                 }
                 next_due = now + (periodic ? ms : 30000);
@@ -2179,10 +2195,12 @@ static VOID RbFlushThread(VOID *ctx)
                  * 再以池实际 active 作为 nzones——配置热改即时生效且不丢作业。 */
                 ULONG want = RbFlushDesired();
                 ULONG active;
+                rb_engine *eng;           /* [85 B1] 局部快照，避免二次读裸全局指针 */
                 if (InterlockedCompareExchange(&g_Rb.FlushWorkerActive, 0, 0) == 0)
                     RbStartFlushers();      /* 纯旁观部署后首次回写：初始化池 */
                 active = RbEnsureFlushers(want);
-                RbEngineFlushZones(g_Rb.Engine, (int)active);
+                eng = g_Rb.Engine;
+                if (eng) RbEngineFlushZones(eng, (int)active);
             }
             /* FIX[N3]: 空闲回收此前从未被驱动调度 —— 开关形同虚设；按阈值执行 */
             if (g_Rb.Config.IdleReclaimEnabled) {
@@ -2197,7 +2215,9 @@ static VOID RbFlushThread(VOID *ctx)
             /* 动态内存：按"可用"内存收缩（P4 修复后此值才真实） */
             RbRefreshMemoryBudget();
         }
+        InterlockedExchange(&g_Rb.FlushThreadInLoop, 0);   /* [85 B1] 循环体末尾：回到等待前归零 */
     }
+    InterlockedExchange(&g_Rb.FlushThreadInLoop, 0);       /* [85 B1] 线程退出前归零 */
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 

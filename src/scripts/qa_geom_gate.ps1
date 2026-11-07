@@ -10,7 +10,7 @@
 param(
   [int]$Rounds = 30,
   [string]$CoreDir = '',
-  [string]$VcBin = 'C:\Program1\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64',
+  [string]$VcBin = '',   # [85 B13] empty = auto-detect MSVC toolset; explicit path still honored
   [string]$AsanStage = 'C:\Users\Public\rbc-geom-gate',
   [string]$Baseline4KNoArg = '',
   [string]$Baseline4K16 = '',
@@ -132,15 +132,85 @@ foreach ($p in @($relExe, $asanExe, $asanPdb)) {
   if (-not (Test-Path $p)) { Add-Fail "missing prerequisite: $p" }
 }
 if ($Rounds -lt 1) { Add-Fail 'Rounds must be >= 1' }
-if (-not (Test-Path $VcBin)) { Write-Output "[warn] MSVC bin missing: $VcBin (ASan runtime may not load)" }
-$symbolizer = Join-Path $VcBin 'llvm-symbolizer.exe'
-$env:PATH = "$VcBin;$env:SystemRoot\System32;$env:SystemRoot;$env:PATH"
-$env:ASAN_SYMBOLIZER_PATH = $symbolizer
+# [85 B13] Deterministic ASan toolset resolution (no hardcoded MSVC version).
+# Root cause (84 report, two independent rounds): asan_*.exe imports
+# clang_rt.asan_dynamic-x86_64.dll; each MSVC toolset ships a different build
+# (14.44 = 1,193,496 B, 14.51 = 1,881,912 B). Default -VcBin was hardcoded to
+# 14.44 while the staged exe was built with 14.51 -> loader fails with
+# 0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND and 0-byte .out/.err = FALSE FAIL.
+# Fix: when -VcBin is empty, enumerate installed MSVC toolset bins and pick the
+# one whose ASan runtime actually loads the staged exe (single-run probe);
+# an explicit -VcBin is still honored and verified the same way. The old
+# "[warn] MSVC bin missing" is upgraded to fail-closed: in ASan mode a missing
+# or mismatched bin now Add-Fail with a clear diagnostic instead of letting
+# 360 runs produce a misleading false FAIL.
 New-Item -ItemType Directory -Force -Path $evidence | Out-Null
 New-Item -ItemType Directory -Force -Path $AsanStage | Out-Null
 $asanStaged = Join-Path $AsanStage 'asan_test_flushpar.exe'
 Copy-Item $asanExe $asanStaged -Force
 Copy-Item $asanPdb (Join-Path $AsanStage 'asan_test_flushpar.pdb') -Force
+
+function Get-MsvcAsanBinCandidates {
+  $roots = @(
+    'C:\Program1\VC\Tools\MSVC',
+    'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC',
+    'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC',
+    'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC',
+    'C:\Program Files (x86)\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC',
+    'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC'
+  )
+  $found = New-Object System.Collections.ArrayList
+  foreach ($r in $roots) {
+    if (-not (Test-Path $r)) { continue }
+    foreach ($d in (Get-ChildItem -LiteralPath $r -Directory -ErrorAction SilentlyContinue)) {
+      $bin = Join-Path $d.FullName 'bin\Hostx64\x64'
+      if (Test-Path (Join-Path $bin 'clang_rt.asan_dynamic-x86_64.dll')) {
+        [void]$found.Add($bin)
+      }
+    }
+  }
+  return $found.ToArray()
+}
+
+function Test-AsanRuntime([string]$bin, [string]$exe) {
+  if (-not (Test-Path $bin)) { return $false }
+  $saved = $env:PATH
+  try {
+    $env:PATH = "$bin;$env:SystemRoot\System32;$env:SystemRoot;$saved"
+    $o = Join-Path $AsanStage 'vcprobe.out'
+    $e = Join-Path $AsanStage 'vcprobe.err'
+    $rc = Run-Native $exe @('4','6','20261106','8192') $o $e
+    $txt = Read-Both $o $e
+    Remove-Item $o,$e -Force -ErrorAction SilentlyContinue
+    if (($rc -eq 0) -and ($txt -match 'RESULT: PASS') -and ($txt.Length -gt 0)) { return $true }
+    return $false
+  } finally { $env:PATH = $saved }
+}
+
+$effectiveVcBin = ''
+if ($VcBin -ne '') {
+  $effectiveVcBin = $VcBin
+  if (-not (Test-Path $effectiveVcBin)) {
+    Add-Fail "MSVC -VcBin path missing: $effectiveVcBin (ASan runtime cannot load; pass the toolset that built asan_*.exe, or leave default for auto-detect)"
+  } elseif (-not (Test-AsanRuntime $effectiveVcBin $asanStaged)) {
+    Add-Fail "-VcBin $effectiveVcBin does NOT match the ASan runtime of $asanExe (0xC0000139 false-FAIL risk); pass the toolset that built asan_*.exe or leave default"
+  }
+} else {
+  $cands = @(Get-MsvcAsanBinCandidates)
+  foreach ($c in $cands) {
+    if (Test-AsanRuntime $c $asanStaged) { $effectiveVcBin = $c; break }
+  }
+  if ($effectiveVcBin -eq '') {
+    Add-Fail "auto-detect failed: no installed MSVC toolset matched $asanExe (probed $($cands.Count) candidate bin(s)); rebuild asan_*.exe with one toolset or pass -VcBin"
+  } else {
+    Write-Output "[info] auto-detected ASan MSVC toolset bin: $effectiveVcBin"
+  }
+}
+if ($effectiveVcBin -ne '') {
+  $symbolizer = Join-Path $effectiveVcBin 'llvm-symbolizer.exe'
+  $env:PATH = "$effectiveVcBin;$env:SystemRoot\System32;$env:SystemRoot;$env:PATH"
+  $env:ASAN_SYMBOLIZER_PATH = $symbolizer
+}
 
 if ($failReasons.Count -gt 0) {
   # still emit JSON so CI has a machine-readable failure record

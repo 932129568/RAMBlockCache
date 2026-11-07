@@ -345,24 +345,34 @@ static VOID RbMsgSetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
                   ? L"system volume opt-in ON by user (write-through still forced)"
                   : L"system volume opt-in OFF by user");
 
-    /* [83 补裁 A] 单主同源：与下方 :1008 的拒绝门共用 g_Rb.Recreating 这把锁。
-     * 抢主必须在 RbApplyConfig 之前：抢到者才放行并入队；抢不到（并发/窗口内
-     * 第二个 SET_CONFIG）直接 STATUS_DEVICE_BUSY，且**不应用配置、不回滚**——
-     * 旧实现「先 ApplyConfig 再 CAS、失败再回滚」有竞态：第二个 SET_CONFIG 会
-     * 用自己带来的旧几何把第一个刚持久化的新几何抹回。CAS 前置后无此窗口。
-     * 几何合法值由 RbClampConfig 保证（非法值回落 4096，不产生伪重建）。 */
-    newBs = msg->Data.Config.BlockSize;
-    if (g_Rb.Engine && newBs != g_Rb.Config.BlockSize &&
-        (newBs == 4096u || newBs == 8192u || newBs == 16384u || newBs == 32768u))
+    /* [85 B10] isRebuildRequest 判定改用 **clamp 后目标值**（先对副本
+     * RbClampConfig 再比）。原用未 clamp 的原始 msg->Data.Config.BlockSize：
+     * 绕过 CLI ok_bytes[] 直发 IOCTL 传 0/65536/非 2 幂等非法值时，白名单
+     * 判等失败 → isRebuildRequest=FALSE 不入队，但 RbApplyConfig 仍会 clamp
+     * 成 4096 并写运行值 + 持久化 → GET_CONFIG/注册表=4096、引擎仍 16K、
+     * *pst=SUCCESS，下次重启按 4096 建引擎 = 运行期分裂。改为副本 clamp 后，
+     * 非法值与合法值一样参与重建判定，config 副本与重建目标恒为同一 clamp
+     * 后值（RbApplyConfig 对同一输入做同款 clamp），分裂窗口被封死。
+     * 合法值经 clamp 不变，既有 CLI 行为零变化。 */
+    {
+        RB_CONFIG clamped = msg->Data.Config;
+        RbClampConfig(&clamped);
+        newBs = clamped.BlockSize;
+    }
+    if (g_Rb.Engine && newBs != g_Rb.Config.BlockSize)
         isRebuildRequest = TRUE;
 
     if (isRebuildRequest) {
-        /* [83 第二笔] 卸载窗口前置门：RbUnload 已置 Unloading=1 并正在排空在飞
-         * work item。此时直接拒绝，连配置都不动——否则 RbApplyConfig 会先把新
-         * BlockSize 写进注册表、再由入队失败回滚写回旧值，产生一次无意义的
-         * 注册表抖动。与 rbrebuild.c RbRequestGeometryRebuild 的 Unloading 门
-         * 双保险（那条兜住任何绕过本函数的入队路径）。 */
-        if (InterlockedCompareExchange(&g_Rb.Unloading, 0, 0) != 0) {
+        /* [83 第二笔 + 85 B2] 卸载窗口前置门：RbUnload 已置 Unloading=1 并正在
+         * 排空在飞 work item。此时直接拒绝，连配置都不动——否则 RbApplyConfig
+         * 会先把新 BlockSize 写进注册表、再由入队失败回滚写回旧值，产生一次
+         * 无意义的注册表抖动。与 rbrebuild.c RbRequestGeometryRebuild 的
+         * Unloading 门双保险（那条兜住任何绕过本函数的入队路径）。
+         * [85 B2] 追加 RbIsUnloadCommitted()：work item 尾部 :417 先清
+         * Unloading，:417→rbdriver.c:1142 之间 Unloading=0 恒成立，单靠
+         * Unloading 门挡不住该窗口内的新 SET_CONFIG；闩由 RbUnload 起始置 1、
+         * 7 处中止分支才清 0，成功卸载路径不复位。 */
+        if (InterlockedCompareExchange(&g_Rb.Unloading, 0, 0) != 0 || RbIsUnloadCommitted()) {
             if (pst) *pst = STATUS_DEVICE_NOT_READY;
             RbLog(1, __LINE__, 0, L"SET_CONFIG: unload in progress, rebuild request rejected");
             ExAcquireFastMutex(&g_Rb.CfgLock);

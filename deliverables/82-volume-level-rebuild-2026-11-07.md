@@ -92,6 +92,10 @@
 | P4 | pagefile 卷（D:）在 detach/reattach 过程中的系统稳定性；`CachePagingIo=0` 分页 IO 透传，但元数据 IO 走常规路径（80 号 Q5） |
 | P5 | **BLOCKER 2**（>4K 直写陈旧读）若复现成立，修复必须并入本批；否则切到 16K 就是切到一个有正确性缺陷的几何 |
 | P6 | 4K 热路径零回归、E1–E8 判据按卷级重建改写（E2 卷集合 diff=0 现在是真正的关键门） |
+| P7 | **[85 号第三笔系统审查补漏] 重建/卸载门控未覆盖 `RbFlushThread`（B1）**：本设计 §3.1/§4.5 的「六项在途判据」不含 flush 主线程，而该线程全程不查 `Unloading`/`Recreating`，无脏常态 `FlushJobs` 恒 0 ⇒ quiesce 立即放行销毁引擎 = 确定性 UAF。第三笔补「入口门 + `FlushThreadInLoop` 第 7 项判据」，缺一不可 |
+| P8 | **[85 号第三笔系统审查补漏] 卸载 ↔ 重建 work item 竞态（B2）**：本设计 §4.5/§10.3 的 `RbRebuildIsActive()` 三态排空在 work item 尾部 `:417` 清 `Unloading` → `:1142` 重新断言之间存在 `Unloading=0` 窗口，新 SET_CONFIG 可抢主入队与卸载销毁并发 = UAF。第三笔补 `s_UnloadCommitted` 闩 + `RbUnloadAbort()` 收敛 7 处中止 + 拒绝门 + `:1142` 后复核 |
+
+> P7/P8 是 82 号设计定稿后、85 号三方只读审查新发现的两个阻断级内核 UAF，原 §3.3/§4.5 未列举；均在第三笔（83 号 §11）定点修复。本表补齐供后续读者对照，不改变卷级重建主序列。
 
 ### 3.4 体验与代价重估
 

@@ -139,6 +139,28 @@ NTSTATUS Rb2PoolInit(VOID)
     }
     return STATUS_SUCCESS;
 }
+
+/* [85 B4/B15] 池闩复活：Rb2PoolRevive() 是重建回滚(B4)与卸载中止完整复活(B15)
+ * 唯一共用的 helper。Rb2PoolInit() 自身也可能失败——其 :117/:122/:135 三条
+ * 失败分支都回调 Rb2PoolShutdown() 把 rbpools.c:16 的 s_Stop 闩重新置回 1，
+ * 单次 Init 不足以解闩，故有界重试 1 次（共 2 次尝试）。返回最终 NTSTATUS：
+ * 非成功即「池闩仍为 1、Rb2PoolSubmit 永久 STATUS_SHUTDOWN_IN_PROGRESS」，
+ * 调用方必须据此写 LastStatus / PANIC 日志、禁止再宣称 service recovered。 */
+NTSTATUS Rb2PoolRevive(VOID)
+{
+    NTSTATUS st = Rb2PoolInit();
+    if (!NT_SUCCESS(st)) st = Rb2PoolInit();   /* 有界重试 1 次 */
+    if (!NT_SUCCESS(st))
+        RbLog(2, __LINE__, st, L"pool revive failed after bounded retry (latch still set)");
+    return st;
+}
+
+/* 只读池闩状态，供 RbFeatRecover/RbFeatFullRecover 日志如实化（不宣称 recovered）。 */
+LONG Rb2PoolLatch(VOID)
+{
+    return InterlockedCompareExchange(&s_Stop, 0, 0);
+}
+
 NTSTATUS RbFeatQuiesce(VOID)
 {
     NTSTATUS st;

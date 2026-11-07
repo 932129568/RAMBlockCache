@@ -94,6 +94,15 @@ jobs:
       - name: Gate7 check_geom_contract
         run: python src/scripts/check_geom_contract.py
 
+      # —— [85 B12] RB_STATS 统计五字段 ABI + TS/CLI 手工副本静态契约（Gate8）——
+      # check_proto_sync.py --strict 只管 C# 三副本，不含 web/ 的 TS 手工副本
+      # （types.ts / statsSchema / proto-decode.ts）与 CLI statval 键；本门防止
+      # 追加 RB_STATS 字段时漏改 TS 副本导致 66 号 TinyLFU@152 白屏同款事故。
+      # 断言五偏移 1280/1284/1288/1292/1296、sizeof=1304、decodeStats 分级长度
+      # 守卫（1280B 旧回包五字段填 0 不抛 RangeError）、四副本五字段齐备。
+      - name: Gate8 check_stats_contract
+        run: python src/scripts/check_stats_contract.py
+
       # —— Web 类型检查 + 生产构建（41 号 §11.5 阶段 2 接入）——
       # --loglevel=error 抑制 Node 27 alpha 上 npm 12.2.1 的已知 engines 假警告
       # （CI 侧同时抑制 Node 22 与 package.json engines 的 EBADENGINE 提示）。

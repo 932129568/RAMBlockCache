@@ -70,10 +70,20 @@ VOID     Rb2PortFillGen(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa, rb_
 NTSTATUS RbFeatInit(VOID);       /* DriverEntry/rbio 初始化尾部一次（幂等 CAS） */
 NTSTATUS RbFeatShutdown(VOID);   /* Unload 中、引擎停止之后；[FIX C5] 池 join 超时返回失败，调用方中止卸载 */
 VOID     RbFeatRecover(VOID);    /* [FIX R2-W10] 卸载中止后复活特性层（解闩+重建 Rb2Tick，幂等） */
+/* [85 B15] 卸载中止分支专用完整复活：Rb2PoolRevive() 解 rbpools.c 池闩 +
+ * 现有 feat 层复活 + L2/ETW 复位复核 + 返回值留痕 + 如实日志。
+ * **成功卸载路径不得调用**（驱动即将卸下，无需复活）。 */
+NTSTATUS RbFeatFullRecover(VOID);
 /* [83 2026-11-07] 重建窗口专用：只排空特性层 worker 池（Rb2PoolShutdown 的
  * 30s 有界 join），随后必须 Rb2PoolInit() 解闩恢复；**不得**调 RbFeatShutdown
  * （它会 RbL2Close()+RbEtwShutdown()，而 RbFeatRecover 只重建 Rb2Tick，
- * L2/ETW 永久关且不可恢复）。返回非成功时调用方必须回滚重建、禁止销毁引擎。 */
+ * L2/ETW 永久关且不可恢复）。返回非成功时调用方必须回滚重建、禁止销毁引擎，
+ * 且**回滚分支必须显式复活池闩**（Rb2PoolRevive()，见下）——RbFeatQuiesce
+ * 失败时 rbpools.c:16 的池闩可能仍为 1，否则 Rb2PoolSubmit 永久
+ * STATUS_SHUTDOWN_IN_PROGRESS、预取/淘汰/预热静默丢弃且日志谎报恢复。
+ * ⚠️ 回滚**绝不能**调 RbFeatRecover()：工程有两个同名 s_Stop
+ * （rbpools.c:16 池闩 vs rbfeat.c:27 feat 层闩），后者只解 feat 层闩 +
+ * 重建 Rb2Tick，不碰池闩（B4/B15）。 */
 NTSTATUS RbFeatQuiesce(VOID);
 VOID     RbFeatPanic(VOID);     /* RbSetPanic 内一行 */
 VOID     RbFeatPanicClear(VOID); /* [P0-1] 仅由 rbctl.c panic-clear 在自愈握手成功后调用 */
@@ -112,6 +122,11 @@ NTSTATUS Rb2GetDW(PCWSTR Sub, PCWSTR Name, ULONG Def, ULONG *Out);
 /* worker 池（rbpools.c） */
 NTSTATUS Rb2PoolInit(VOID);
 NTSTATUS Rb2PoolShutdown(VOID);  /* [FIX C5] join 超时返回 STATUS_TIMEOUT（leak-by-design 保留），调用方中止卸载 */
+/* [85 B4/B15] 池闩复活（两处共用的唯一 helper）：Rb2PoolInit() 有界重试 1 次
+ * （Init 的三条失败分支都回调 Rb2PoolShutdown 把闩置回 1），返回最终 NTSTATUS。
+ * 供重建回滚（B4）与卸载中止完整复活（B15）共用，勿重复造轮子。 */
+NTSTATUS Rb2PoolRevive(VOID);
+LONG     Rb2PoolLatch(VOID);     /* 只读池闩 s_Stop（日志如实化用，0=存活 1=停） */
 ULONG   Rb2PoolWorkerCount(VOID); /* [FIX S-telelemetry] 实际 worker 数（STATS2.Workers） */
 NTSTATUS Rb2PoolSubmit(VOID (*Fn)(PVOID), PVOID Ctx);
 /* W4 真实 Fn 白名单：仅改变链接可见性，函数体/调用方/导出表不变。 */

@@ -332,6 +332,11 @@ typedef struct _RB_GLOB {
     volatile LONG   GeometryRebuildInProgress;
     volatile LONG   GeometryRebuildOldBs;        /* 重建发起时旧引擎几何，供回滚 */
     LARGE_INTEGER   LastGeometryRebuildUtc;     /* KeQuerySystemTimePrecise FILETIME */
+    /* [85 B1] flush 主线程循环体在途判据（RbWaitDataPathQuiesce 第 7 项）：
+     * =1 表示 RbFlushThread 已过入口门、正在循环体内解引用 g_Rb.Engine；
+     * quiesce 必须等它归零才允许销毁引擎，否则 :306 销毁与 :2172/:2185/:2198
+     * 裸用并发 = heap UAF。rbio.c 置/清（PASSIVE 线程），rbrebuild.c 只读。 */
+    volatile LONG   FlushThreadInLoop;
 } RB_GLOB;
 
 extern RB_GLOB g_Rb;
@@ -534,6 +539,16 @@ ULONG    RbPrefInFlightCount(VOID);       /* 实现见 rbpref.c：导出静态�
  * 「已入队未执行」、「执行中」、「尾部统一清零之前」）。RbUnload 在停机序列
  * 最前据此有界等待，超时即中止卸载，绝不带着在飞 work item 销毁引擎。 */
 BOOLEAN  RbRebuildIsActive(VOID);
+
+/* ---- [85 第三笔 2026-11-07] 卸载提交闩 s_UnloadCommitted（B2）----
+ * 静态于 rbrebuild.c。RbUnload 起始与 Unloading=1 同处置 1（先闩后 Unloading）；
+ * 7 处卸载中止分支统一经 RbUnloadAbort() 清 0（漏一处即服务恢复后闩恒 1、
+ * 永久拒绝所有重建）；成功卸载路径不复位（驱动即将卸下）。
+ * 读点：rbio.c flush 入口门（B1，与 RbIsDataPathFrozen 并列）+
+ *       rbctl.c RbMsgSetConfig / rbrebuild.c RbRequestGeometryRebuild 拒绝门（B2）。
+ * 与 RbRebuildIsActive 正交：后者判「在飞 work item」，本闩判「卸载已提交」。 */
+BOOLEAN  RbIsUnloadCommitted(VOID);
+VOID     RbUnloadCommitSet(LONG v);
 
 /* ---- [V10.1] failsafe 接口（实现见 rbdriver.c / rbio.c） ---- */
 VOID    RbSetPanic(PCWSTR reason);                 /* 任意 IRQL：原子置位 + 唤醒 flush 线程 */

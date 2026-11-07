@@ -451,6 +451,15 @@ BOOLEAN RbDetachStreamForRebuild(PRB_DEV_EXT ext, LONG selfRefs)
     }
     if (InterlockedCompareExchange(&ext->Refs, 0, 0) > base) {
         RbLog(2, __LINE__, 0, L"rebuild: detach drain timeout, abort (engine kept)");
+        /* [85 B5] 超时卷就地复原 IsAttached（:445 置 FALSE 是本路径唯一被
+         * 改动的热开关状态），并显式发布屏障。此时尚未走到 :456 摘 Stream，
+         * 故 ext->Stream **必须保留、不得摘除/销毁**——rbio.c:1400/:1452 的
+         * 「刷脏 + 无条件失效」判据要求 Stream 非 NULL，摘掉会落到 :1469
+         * 纯 RbForward 无失效，反而重新打开 DATA-11 旧盖新窗口。该卷
+         * Detached=FALSE，回滚 out_rollback 按逐项判据不会对其走
+         * RbReattachVolumeForRebuild，硬约束自动满足。 */
+        ext->IsAttached = TRUE;
+        KeMemoryBarrier();
         return FALSE;
     }
     st = (rb_stream *)InterlockedExchangePointer((PVOID *)&ext->Stream, NULL);

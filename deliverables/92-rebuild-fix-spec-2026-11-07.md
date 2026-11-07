@@ -40,7 +40,15 @@
 1. **静态/编译域**：驱动 17 源完整编译链接 `BUILD OK`（`_build_manual.ps1` 已含 `rbrebuild.c`）；全套 Gate1–Gate11 + `check_ps_syntax` + `check_signature` PASS；`test_rebuild` C1–C17 `FAIL=0`；四模式直写矩阵 `post` 12/12 CLEAN；`qa_teeth` 3/3 KILLED。
 2. **用户态故障注入**：新增用例覆盖「稳态 `Refs` 恒 >4（含模拟历史泄漏/常驻引用）时重建仍成功」与「窗口前在途 IO 未完成时重建必须等待/超时回滚」的**正负双向**；不得只测成功路径。
 3. **真机 S4**（重启后）：4K→8K→16K→32K→回 4K，每档必须 `GET_CONFIG.BlockSize == GET_STATS.EngineBlockSize == 目标`、`GeometryRebuildCount` 递增、`InProgress=0`、`LastStatus=0`；canary SHA256 逐字节一致；卷集合 C/E/F=0、D=1；bootcfg 不变；新开机段零 ` ERROR ` / 无 `[rebuild] ... failed` / 无 `cfg: BlockSize deferred`；`DirtyBytes` 恒 0（直写）。
-4. **发布链**：重编 → 重签 sys（Valid）→ `sync_anchors.ps1` 三锚点同步 → gate5 → `build_setup.ps1` 重打 Setup → 签 Setup（四重哈希断言）→ ledger append FATAL → **不写 marker**（本次不重跑全链 wrapper；用轻量 UAC 链）→ 用户双击一次 → 重启一次 → `verify_final_reboot.ps1` `FAIL=0` → S4。
+4. **发布链（勘误：必须 `deploy.ps1`，见 §3.1）**：重编 → 重签 sys（Valid）→ `sync_anchors.ps1` 三锚点同步 → gate5 → `build_setup.ps1` 重打 Setup → 签 Setup（四重哈希断言）→ **`deploy.ps1` 把新 sys 部署到 `System32\drivers` 并重新武装看门** → post-deploy gate5 → ledger append FATAL → **不写 marker、不 `verifier /reset`** → 用户重启一次 → `verify_final_reboot.ps1` `FAIL=0` → S4。
+
+### 3.1 勘误记录（主理人自查发现，已通知实施方）
+初稿 §3 第 4 条写过「轻量 UAC 链……**不 `deploy.ps1`**」，这是**错误的**。`deploy.ps1:70,416` 的职责是把 `dist\RAMBlockCache.sys` 拷到 `System32\drivers\RAMBlockCache.sys`（文件锁时 `MoveFileEx` 排队下次启动替换）。实测当前 dist 与 System32 两份哈希都是 `10fb7009…`；若只签 dist 而不部署，重启后内核加载的仍是**旧 sys**，修复不生效，等于白做一次签名与重启。⇒ **必须跑 `deploy.ps1`**，它是幂等 + verify-before-change + 完整回滚的既有链，且**不写 marker**（marker 由全链 wrapper 写，本批不重跑全链）。X2 判据仍成立：marker `08:30:48.509Z` 不变，重启后 boot 必然更新且仍 > marker。
+- `deploy.ps1` 会重写看门基线（`DeploySeq+1` / `Armed=1` / `Healthy=0` / `BootFails=0`）、重注册两个看门任务、`Features\Flags=0`（当前已是 0）。重启并交互登录后 `logon_disarm` 解除武装 → 结构不变式 `Seq==Ack / Armed=0 / Healthy=1 / BootFails=0` 仍可验收。
+- `deploy.ps1` 不碰 bootcfg（`AutoAttach/ResumeOnBoot/ResumeLetters` 走独立 ABI），bootcfg 维持 `AA=0/RB=1/Letters=D`。
+- `verifier /reset` 本次无需（Verifier 已清，`VerifyDrivers=[]`）。
+- 顺序约束：`deploy.ps1` 必须在 **dist sys 已签名 + 三锚点已同步 + sidecar 已写** 之后，因为它的 pre-flight gate 读 sidecar/锚点做 fail-closed 校验。
+
 5. **口径**：内核运行时后果仍需 WDK/Verifier/双机 WinDbg；本机无 WDK、Verifier 已清，**不得宣称「内核已修」**。
 
 ## 4. 交付物与状态

@@ -13,8 +13,10 @@
 #   [92 3.1 ERRATA] deploy.ps1 is MANDATORY: it is the only step that copies
 #   dist\RAMBlockCache.sys into System32\drivers. Signing dist without
 #   deploying means the rebooted kernel still loads the OLD sys and the
-#   whole fix is a no-op. NO marker write, NO test-flag reset,
-#   NO reboot, NO SET_CONFIG.
+#   whole fix is a no-op. NO test-flag reset, NO reboot, NO SET_CONFIG.
+#   [94 5.2 / 96 review] the reboot marker IS written - but ONLY LAST,
+#   after every check passed (step 11), so X2 boot>marker genuinely proves
+#   this UAC rebooted.
 #
 # Derived from finalize_setup_only.ps1 / finalize_geom_rebuild.ps1.
 # Every hard discipline is kept:
@@ -23,8 +25,8 @@
 #     IMMEDIATELY AFTER every native / child invocation.
 #   * HashOf / SigOf / CopyChecked; independent log; Write-Host is display-only.
 #   * gate5 is a CHILD process judged by BOTH exit code and 'result: PASS' text.
-#   * marker discipline: finalize-utc.txt is READ ONLY and byte-compared at the
-#     end (writing it would break boot_utc > finalize_utc in the reboot check).
+#   * marker discipline: finalize-utc.txt is byte-compared at step 10, then
+#     written ONLY at step 11 (LAST, post-verification; 94 5.2).
 #   * scope double-read: sys / sidecar / three anchors / marker at start and end.
 #
 # Sequence:
@@ -35,13 +37,14 @@
 #   4) gate5 again (CHILD, exit code + result text)
 #   5) build_setup.ps1 (CHILD) -> fresh unsigned Setup
 #   6) payload assertions (CLI pair, both zips, bridge decoder, cwd-independent
-#      bridge index.ts, four-size SPA, new sys in payload)
+#      bridge index.ts, five-size SPA, new sys in payload)
 #   7) sign Setup: four hash assertions
 #   8) deploy.ps1 (CHILD, -999 sentinel + explicit ExitCode) -> post-deploy
 #      gate5 (CHILD, exit code + 'result: PASS' text double judgement)
 #   9) FATAL ledger append FINAL_SETUP_SHA256 + own read-back
 #  10) final scope double-read
-#  11) ALL OK + NEXT hint
+#  11) reboot marker written LAST (94 5.2)
+#  12) ALL OK + NEXT hint
 #
 # DO NOT DEPLOY: 31cf870 / 76aacfc / 931ed53 are AUDIT RECORDS ONLY
 # (93 SPEC NO-GO, see the fail-closed gate below and the 93 report).

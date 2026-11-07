@@ -121,7 +121,7 @@ jobs:
       # 防「Web 下拉只给 4K、驱动白名单却已放开 4 档」这类 UI 档位 ↔ 驱动白名单
       # 漂移：静态只读断言 SettingsPage.tsx BLOCK_SIZES、rbctl.c rb_legal_bs[]、
       # rbrebuild.c 重建目标白名单三者恰为 {4096,8192,16384,32768,65536} 且顺序一致，
-      # 三者均不含 64K/128K（76 号 NO-GO 封禁），且桥接 configSchema 未用
+      # 三者均不含 128K（76 号 NO-GO 封禁；64K 已于 2026-11-08 解禁），且桥接 configSchema 未用
       # z.enum / z.literal / refine 把 BlockSize 重新锁死。CI 持续调用本脚本。
       - name: Gate10 check_blocksize_contract
         run: python src/scripts/check_blocksize_contract.py

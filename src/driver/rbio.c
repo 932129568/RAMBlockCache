@@ -905,6 +905,8 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
             RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
         }
         RbForward(ext->FilterDevice, irp);
+        if (NT_SUCCESS(irp->IoStatus.Status))
+            rb_engine_note_direct_write(g_Rb.Engine, len);   /* [100 §1] 直写记账 */
         RbIoCompleteMark();  /* [96 §2] C3：透传写完成出口 */
         RbCtxFree(ctx);      /* [FIX M10] 先还 ctx 后减引用 */
         RbDerefExt(ext);
@@ -934,6 +936,8 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
         }
         s = RbSyncIo(ext, TRUE, &o, tgt, len, NULL);
         info = NT_SUCCESS(s) ? len : 0;
+        if (NT_SUCCESS(s))
+            rb_engine_note_direct_write(g_Rb.Engine, len);   /* [100 §1] 直写记账 */
         goto done;
     }
 
@@ -1125,6 +1129,8 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
             RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
         }
         s = RbSyncIo(ext, TRUE, &o, tgt, len, NULL);
+        if (NT_SUCCESS(s))
+            rb_engine_note_direct_write(g_Rb.Engine, len);   /* [100 §1] 直写记账（仪表「总写」口径修复） */
         if (NT_SUCCESS(s) && ext->Stream)
             /* [FIX 2026-11-06] 直写后回填同样门控：世代在直写（含上面的失效）
              * 之后捕获——期间若有并发丢视图操作（别的线程的元数据操作），

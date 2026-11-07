@@ -2687,6 +2687,13 @@ void rb_stream_release_io(rb_stream *s)
 { if(s)InterlockedDecrement(&s->io_users); }
 /* Called after an externally-driven (zone-parallel) flush completes:
  * clear the need-flush flag only if no dirty data remains. */
+/* [100 §1] 直写路径漏计修复：见 cache.h 声明。仅统计面。 */
+void rb_engine_note_direct_write(rb_engine *eng, rb_u64 len)
+{
+    if(!eng || !len) return;
+    RB_AADD64(&eng->stats.write_req,1);
+    RB_AADD64(&eng->stats.write_bytes,len);
+}
 void rb_engine_note_flush_done(rb_engine *eng)
 { if(eng && RB_ALOAD64(&eng->total_dirty)==0)RB_ASTORE32(&eng->need_flush,0); }
 /* ---- user-mode pthread parallel flush (tests only) lives on the test side:

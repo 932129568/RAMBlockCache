@@ -59,7 +59,7 @@
  * rb_stream_flush_zoned(s, zone_sel, nzones, ws) 按 zone_of % nzones 动态
  * 分片，因此本改造【零改动 core 数据路径】。旧固定 4 路保留为 DEF 常量。 */
 #define RB_IO_WORKERS_MAX  32      /* I/O worker 池上限（按逻辑 CPU 数截断，含超线程） */
-#define RB_FLUSH_WORKERS   16      /* zone 回写 worker 池硬上限 */
+#define RB_FLUSH_WORKERS   32      /* zone 回写 worker 池硬上限（[100 §2] 16→32：能力供给；90 号五路 A/B 证据=收益受盘限，直写态不消费此池） */
 #define RB_FLUSH_WORKERS_DEF 4     /* 历史固定路数（ParallelFlush>=2 的旧行为） */
 #define RB_FLUSH_SNAP_MAX  64      /* 单轮快照流上限 */
 

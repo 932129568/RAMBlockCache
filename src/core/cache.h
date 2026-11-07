@@ -251,6 +251,10 @@ void rb_stream_release_io(rb_stream *s);
  * 被 rb_write_ex 吸收的脏写（应用 IRP 已收到 SUCCESS）会随缓存视图一起被
  * discard——丢数只计入 lost_dirty_bytes，不可恢复。 */
 void rb_stream_drain_writeback(rb_stream *s);
+/* [100 §1] 直写路径漏计修复：write-through/passthru/admit 直落盘的写不经
+ * rb_write_ex，write_req/write_bytes 原先恒不计 → 仪表「总写」直写态恒 0。
+ * 成功交付后由驱动调用本 API 记账（仅统计，无数据面行为）。 */
+void rb_engine_note_direct_write(rb_engine *eng, rb_u64 len);
 void rb_engine_note_flush_done(rb_engine *eng);
 void rb_engine_set_max_bytes(rb_engine *eng, rb_u64 max_bytes);
 void rb_engine_reclaim(rb_engine *eng);

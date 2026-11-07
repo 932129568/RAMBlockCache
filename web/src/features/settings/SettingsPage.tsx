@@ -267,16 +267,21 @@ export default function SettingsPage() {
                 {...form.register('IdleReclaimSec', { valueAsNumber: true, min: 0, max: 86400 })}
               />
               <Select
-                label="回写并行度 ParallelFlush（1–16 路 · 运行期生效）"
+                label="回写落盘并行度 ParallelFlush（1–32 路 · 仅回写脏数据消费 · 运行期生效）"
                 options={[
                   { value: 1, text: '串行（1 路 · 默认）' },
                   { value: 2, text: '并行 2 路' },
                   { value: 4, text: '并行 4 路（历史档）' },
                   { value: 8, text: '并行 8 路' },
-                  { value: 16, text: '并行 16 路（上限）' },
+                  { value: 16, text: '并行 16 路' },
+                  { value: 20, text: '并行 20 路' },
+                  { value: 32, text: '并行 32 路（上限）' },
                 ]}
                 {...form.register('ParallelFlush', { valueAsNumber: true })}
               />
+              <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
+                此路数只作用于【回写脏数据落盘】的 zone 并行（直写模式下不产生脏数据，本项近似无感）。真机 90 号五路 A/B：吞吐无稳定区分度（收益受盘限，非线程限）。读没有「路数」开关：读并行由每核 I/O worker 池（≤32 绑核 worker + 工作窃取）按负载自动承担。
+              </p>
               <Select
                 label="TinyLFU 频率准入（防顺序扫描冲掉热集 · 默认关）"
                 options={[

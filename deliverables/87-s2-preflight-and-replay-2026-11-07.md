@@ -343,3 +343,52 @@ UAC 后十道门禁全绿；四个提交 `70a38f8` / `c20c732` / `ec7714e` / `b8
 
 - 已证明：新签名驱动**已加载并稳定运行**、五字段 ABI 可读、看门全周期闭环、Verifier 已清、D: 自动恢复、分发包与文档一致。
 - **仍未证明**：B1/B2 两个内核 UAF 的运行时后果、`sc stop` 与免重启切档真机实效、缓存数据面 >4K 正确性、回写正确性、峰值性能、H8。S4/S5 才是这些结论的取证窗口；单轮 16K、单卷 D:、直写、单次会话不构成全几何/全模式验证，吞吐绝对值不作峰值宣称。
+
+---
+
+## 15. BlockSize 四档修复落地与「分发包缺口」（16:45–17:0x）
+
+### 15.1 工程师交付 + 主理人独立复核
+
+`impl-blocksize` 交付 commit **`4ad883b`**（`fix(web): 开放 BlockSize 四档下拉并新增 Gate10 白名单漂移契约`），3 个文件、193 insertions / 4 deletions：
+
+| 文件 | 改动 |
+|---|---|
+| `web/src/features/settings/SettingsPage.tsx` | `:15` `BLOCK_SIZES = [4096, 8192, 16384, 32768]`；`:10-14` 注释改述 79/83 号免重启重建已落地、S2 验收 FAIL=0、64K/128K 依 76 号仍 NO-GO；`:200-202` 下拉下新增说明（引擎重建无需重启整机、干净块丢弃命中率短时归零、直写 WriteBack=0 无脏数据不丢、重建窗口 I/O 回落至磁盘建议避开高负载、列出四档），沿用本页既有说明风格、未新增组件、未动布局骨架 |
+| `src/scripts/check_blocksize_contract.py`（新增） | Gate10：断言 UI `BLOCK_SIZES` 字面量 == `rbctl.c:172` `rb_legal_bs[]` == `rbrebuild.c:294-295` 白名单、三者均无 65536/131072、`http-transport.ts` 的 `configSchema` 未加 `z.enum/z.literal/.refine`、`ci.yml` 持续注册；只读无 subprocess、CI 安全 |
+| `.github/workflows/ci.yml` | `:115-122` 注册 `Gate10 check_blocksize_contract`，位于 Gate9 之后、Web typecheck 之前 |
+
+工程师自验：Python 7 项 + PowerShell 2 项全 PASS（含 `refcount_model` 5/5 场景 17/17 断言）、`check_ps_syntax` 67 文件 0 失败、`check_signature` Valid + 三锚点一致；Node27 v27.0.0-alpha + npm 12.2.1 `npm run build` exit 0（2233 modules / 1.40s）、vitest 2 files / 7 tests 全绿；全局一致性 `IS_PASS: YES`。
+
+**主理人独立复跑（作者≠验证者）**：十道门禁全部 `exit=0`（含新增 Gate10 `PASS (0 fail, 0 warn)`）；`cache.c` 仍 `8340f9ff…`、`dist sys` 仍 `10fb7009…`、三锚点 `distinct=1` 且等于 `10fb7009…` —— **红线零改动**。
+
+### 15.2 本机已生效（无需重启 / 无需再 UAC）
+
+本机桥接 keeper 从仓库 `web/` 直跑、服务 `web/dist`（无正规 `webconsole\` 安装）。实测：
+
+- `web/dist/assets/SettingsPage-CGJZ6Bdb.js`（08:54:49Z，48,889 B）内含 `4 KB` / `8 KB` / `16 KB` / `32 KB`、`4096,8192,16384,32768`、「命中率」提示；下拉 options 由该数组 map 生成。
+- 桥接 `GET /` → HTTP 200（544 B）。
+- ⇒ **用户刷新 Web 设置页即可看到 4/8/16/32 KB 四档**。S2 之后不需要第二次重启、不需要再双击全链 wrapper。
+
+### 15.3 分发包一致性缺口（待一次轻量 UAC）
+
+实测：`src/ui/installer/RAMBlockCache.Setup/Assets/payload/webconsole.zip` 仍是 `08:30:31Z` 的旧包，内部只有 `dist/assets/SettingsPage-B5cxqUq9.js`（单档）；`dist\RAMBlockCache-Setup.exe` 仍是 `db7006d7…` / 272,868,696 B / Valid / `08:30:39Z`。**别人安装当前 Setup 依然只能选 4 KB**。
+
+处置：已派 `impl-blocksize` 写**只重打 Setup**的轻量提权链 `src/scripts/finalize_setup_only.ps1` + `RB-repack-setup.cmd`。硬约束：
+
+- 只跑 `build_setup.ps1` → 签 Setup → ledger append（fatal + read-back）；
+- **不重编驱动、不签 sys、不同步三锚点、不部署、不 `verifier /reset`、不写 marker**（marker `08:30:48.509Z` 必须保持，否则 X2 的 `boot_utc > finalize_utc` 变假）、不重启；
+- 前后各回读一次 sys 哈希与三锚点，断言完全一致；
+- 新增断言：用 `tar.exe` 从 `webconsole.zip` 读出 `dist/assets/SettingsPage-*.js`，确认含 `8/16/32 KB` 与四档数组（本次重打包的目的）；
+- 用户双击一次后，由主理人跑 `sync_setup_hash.ps1 -RequireSetupChanged` 回填 README.md / 67 号的 Setup 行（sys 行不变）。
+
+### 15.4 推送与 CI（如实记录）
+
+`4ad883b` 本地提交完成，但连续撞本地代理 `Empty reply from server` / `CONNECT tunnel failed, 502`，`main` 暂 `ahead 1`；此前 `70a38f8` / `c20c732` / `ec7714e` / `b8bc1fa` / `6b00927` 均已推送且 CI run 24–27 全 `success`。代理恢复后由主理人补推并确认 Gate10 在 hosted runner 上不误报。
+
+### 15.5 下一步
+
+1. 用户**刷新页面**即可选四档（本机功能已闭环）。
+2. 等 `impl-blocksize` 交付轻量重打包脚本 → 用户双击一次 `RB-repack-setup.cmd` → 主理人回填文档 → 分发包一致。
+3. 等 `software-qa-engineer` 的 S4 判据（已三次催办）→ 执行 4K → 16K → 4K 免重启切档真机验收（E1/E3/E8、canary、STOP-ON-FAIL）。
+4. S4/S5 全程 **0 次重启**；重启后严禁再运行任何 finalize 全链 wrapper。

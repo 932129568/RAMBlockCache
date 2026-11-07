@@ -193,6 +193,14 @@ typedef struct _RB_FLUSHER {
     PETHREAD        Thread;      /* join 用：卸载时等待线程真正退出 */
 } RB_FLUSHER, *PRB_FLUSHER;
 
+/* [96 §2] per-CPU 配对计数槽：64B 独占一行，防相邻槽伪共享（多核 plain 写
+ * 互踢 cache line = 变相乒乓，正是本设计要避免的）。C_ASSERT 钉死布局。 */
+typedef struct _RB_IOCNT_SLOT {
+    volatile LONG64 Cnt;
+    UCHAR           Pad[56];
+} RB_IOCNT_SLOT;
+C_ASSERT(sizeof(RB_IOCNT_SLOT) == 64);
+
 /* 全局状态 */
 typedef struct _RB_GLOB {
     PDRIVER_OBJECT   DriverObject;
@@ -337,6 +345,28 @@ typedef struct _RB_GLOB {
      * quiesce 必须等它归零才允许销毁引擎，否则 :306 销毁与 :2172/:2185/:2198
      * 裸用并发 = heap UAF。rbio.c 置/清（PASSIVE 线程），rbrebuild.c 只读。 */
     volatile LONG   FlushThreadInLoop;
+    /* ---- [96 §2 2026-11-07] 严格配对 IO 计数（94 号 §2.1/§2.2；per-CPU 变体）----
+     * 94 号原案为 RB_GLOB 两个全局 volatile LONG + 每 IO InterlockedIncrement；
+     * R10 红线（4K 常态零新增原子写）不许：全局原子序号在多核读热下每 IO 一次
+     * 跨核乒乓（rbio.c ReadLatSeqCpu [OPT-STATS R26] 已有同款教训与迁移先例）。
+     * 本变体按 94 号 §6 自己给出的豁免路径实现：
+     *   · 每 CPU 一个 64B 独占槽（防伪共享），单写者（仅本 CPU 的执行流写本槽），
+     *     plain volatile 自增（MSVC 编译为单条 inc [mem] 指令，同核指令级原子；
+     *     跨核不可见只造成「读旧值」= 判据偏保守，永不假绿——可 见 96 号报告 §3
+     *     可见性论证）。热路径零 LOCK 前缀、零跨核写。
+     *   · IoIssued 在 2 个 dispatch 入口无条件自增（rbio.c RbDispatchReadWrite /
+     *     RbDispatchFlush 的 ext->Refs 自增点），自 DriverEntry 起即计数 ⇒ 窗口
+     *     前置入 IO 必已被计入（这正是 fail-open 缺陷 A 要求覆盖的盲区）。
+     *   · IoCompleted 在全部 10 个完成出口自增（96 号报告配对审计表 E1–E10），
+     *     每处都紧邻一个 LOCK 类操作（RbDerefExt / RbNoteIoResult / 锁），发布及时。
+     *   · 组外 / >64 逻辑 CPU（第 0 组 Number>=64 或 Group!=0）回退全局原子对
+     *     IoIssuedG/IoCompletedG（Interlocked；本机及客户端不存在该拓扑，纯
+     *     fail-closed 兜底，防 128 路服务器上丢更新造成永久超时）。
+     * 非协议面：不进 RB_CONFIG / RB_STATS / RB_MSG / ProtocolVersion。 */
+    RB_IOCNT_SLOT    IoIssuedSlots[64];  /* per-CPU issued（64B 独占槽，单写者 plain ++） */
+    RB_IOCNT_SLOT    IoCompletedSlots[64];
+    volatile LONG    IoIssuedG;          /* 组外回退（Interlocked） */
+    volatile LONG    IoCompletedG;
 } RB_GLOB;
 
 extern RB_GLOB g_Rb;
@@ -488,20 +518,32 @@ NTSTATUS RbReattachVolumeForRebuild(WCHAR letter);
  * RbStartIoWorkers/RbStartFlushers/RbStartFlushThread 二次启动正在服役的池。
  * 参数 newBs 已 clamp 到白名单；失败返回 STATUS_INSUFFICIENT_RESOURCES。 */
 NTSTATUS RbCreateEngineOnly(ULONG newBs);
-/* [92 A/C 2026-11-07] 重建排空的相对基线稳定判据（两处共用，勿改单侧）。
- * ext->Refs 是生命周期计数（owner + find + 在途 IO + 历史泄漏/常驻引用），
- * 真机稳态恒 >4；要求回落到绝对基准 1/2 结构性不可能满足（见 91/92 号）。
- * 改为：关 inflow 时记录该卷/各卷 Refs 基线，等待「不再下降且连续稳定
- * N 次 20ms 采样」，并与 6 项在途计数全 0 AND。历史泄漏属于稳定基线。
- * 严禁删除排空循环或 7 项判据（B1/B2 的 UAF 安全网）。 */
-#define RB_REBUILD_REFS_STABLE_SAMPLES 4
+/* [96 §2 2026-11-07] 安全热重建排空判据（94 号 §2.1/§2.2，取代 92 号 A/C 的
+ * 「Refs 相对基线稳定」判据——后者经 93 号独立复核判为 fail-open UAF，已冻结）。
+ * 新判据 = 严格配对 IO 计数（RB_GLOB 末尾 IoIssuedSlots/IoCompletedSlots）：
+ *   quiesce ⟺ IoCompleted >= issued_at_open（开窗前发出的 IO 全部完成）
+ *          && (IoIssued - IoCompleted)==0 连续 RB_QUIESCE_ZERO_SAMPLES 次
+ *             20ms 采样读零（防 inc/dec 之间瞬时读 0）
+ *          && 7 项在途判据逐项全 0（DataPathInFlight / FallbackInFlight /
+ *             ZombiePending / PrefInFlight / FlushJobs / FlushThreadInLoop /
+ *             IoInFlight——第 7 项 B1 UAF 防护绝不可删，逐项枚举见 96 号报告）。
+ * ext->Refs 从此只作负判据/诊断（r > 开窗基线 ⇒ 契约违例 ⇒ WARN 日志），
+ * 绝不参与 return STATUS_SUCCESS 的 AND 链（94 号 §2.3）。 */
+#define RB_QUIESCE_ZERO_SAMPLES 4
 
-/* [83 2026-11-07] 软摘链原语：置 IsAttached=FALSE、等窗口前置入 IO 完成
- * （Refs 相对基线连续稳定 RB_REBUILD_REFS_STABLE_SAMPLES 次采样）、flush+discard、
- * 原子摘除并销毁 stream；不删设备、不清 Magic、不摘 DevList、不置 Removed。
- * selfRefs = 调用方额外持有的引用数（RbFindExtByLetter 返回带引用 = 1），
- * 属于捕获到的稳态基线的一部分，参与诊断但不再作为绝对阈值。
- * 返回 FALSE 表示排空超时或脏数据未落盘，调用方必须回滚重建（禁止销毁引擎）。 */
+/* [96 §2 2026-11-07] 软摘链原语（重建专用，第一阶段）：
+ * 置 IsAttached=FALSE + KeMemoryBarrier 关 inflow → flush → 排空在途回写 →
+ * 再 flush（R6-D3 三步范式，封「drain 前吸收、drain 后落盘」尾窗）→
+ * 残留脏非 0 即返回 FALSE（坏盘，fail-closed 回滚；绝不带着脏销毁流）。
+ * **不再等待 ext->Refs 稳定**（fail-open 判据已废）；Stream 保持挂链且非 NULL，
+ * 摘链与销毁由 RbRebuildDestroyAllStreams 在 RbWaitDataPathQuiesce 通过后执行
+ * ——per-IO 路径不持 io_users（cache.c 只在 snapshot/flush 路径自增），在途
+ * IRP 直接解引用 ext->Stream，故销毁必须晚于「全部窗口前 IRP 已完成」的证明
+ * （94 号 §2.2 允许的顺序调整，论证见 96 号报告 §4）。迟到的已入队 IRP 由
+ * worker 重校验（rbio.c）路由到透传，不触缓存路径。
+ * 不删设备、不清 Magic、不摘 DevList、不置 Removed。
+ * selfRefs 形参保留（调用契约；诊断用，不再参与任何判据）。
+ * 返回 FALSE 表示脏数据未能落盘，调用方必须回滚重建（禁止销毁引擎）。 */
 BOOLEAN  RbDetachStreamForRebuild(PRB_DEV_EXT ext, LONG selfRefs);
 /* [83 2026-11-07] 快照当前 Attached 卷的 read/write/wm 标志，重挂后复原。
  * 供 rbrebuild.c 调用（内部持 DevListLock 快照，PASSIVE）。 */
@@ -529,18 +571,25 @@ NTSTATUS RbAttachVolumeRuntime(WCHAR letter);
 static __inline BOOLEAN RbTestModeEnabled(VOID)   /* 热路径内联版：一次 volatile 读 */
 { return (BOOLEAN)g_Rb.TestMode; }
 
-/* ---- [83 2026-11-07] 运行期几何重建（实现见 rbrebuild.c） ----
+/* ---- [83 2026-11-07 / 96 §2 修订] 运行期几何重建（实现见 rbrebuild.c） ----
  * RbRequestGeometryRebuild：SET_CONFIG 命中 BlockSize 变化时调用；PASSIVE，
  *   只做「校验 + 入队 + 立即返回」，30s 级 join / 引擎销毁必须在 work item 内
  *   （RbApplyConfig 持 CfgLock=FastMutex 会抬到 APC_LEVEL）。
  * RbRecreateEngineGeometry：work item 内 PASSIVE 执行的完整重建序列（含回滚）。
- * RbWaitDataPathQuiesce：有界等待 6 项在途计数全 0 + Refs 相对基线连续稳定；
- *   超时禁止销毁引擎（7 项判据一条不删）。
+ * RbWaitDataPathQuiesce：有界等待新排空判据（配对计数 epoch + 连续读零 +
+ *   7 项逐项全 0）；超时禁止销毁引擎（fail-closed 回滚）。
+ * RbIoIssueMark / RbIoCompleteMark（rbio.c 实现）：dispatch 入口/完成出口的
+ *   per-CPU 配对计数自增（热路径零 LOCK 前缀；组外回退 Interlocked）。
+ * RbIoCountSnapshot（rbio.c 实现）：屏障后求和两计数（重建线程独占调用，
+ *   PASSIVE），issued_at_open 快照与 quiesce 轮询共用。
  * RbDetachStreamForRebuild / RbReattachVolumesForRebuild：软摘链/重挂原语
  *   （不删设备、不清 Magic、不摘 DevList；与 RbVolumeRemove 的完整拆除区分）。 */
 NTSTATUS RbRequestGeometryRebuild(ULONG newBlockSize);
 NTSTATUS RbRecreateEngineGeometry(ULONG newBlockSize);
-NTSTATUS RbWaitDataPathQuiesce(ULONG timeoutMs);
+NTSTATUS RbWaitDataPathQuiesce(ULONG timeoutMs, ULONG64 issuedAtOpen);
+VOID     RbIoIssueMark(VOID);
+VOID     RbIoCompleteMark(VOID);
+VOID     RbIoCountSnapshot(PULONG64 pIssued, PULONG64 pCompleted);
 BOOLEAN  RbIsDataPathFrozen(VOID);        /* 入口一次 volatile 读：Unloading||Recreating */
 ULONG    RbPrefInFlightCount(VOID);       /* 实现见 rbpref.c：导出静态计数快照 */
 /* ---- [83 第二笔 2026-11-07] 卸载 ↔ 重建 work item 互斥排空判据 ----

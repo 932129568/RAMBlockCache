@@ -112,9 +112,10 @@ static PVOID RbMapIrpBuffer(PIRP irp)
  * RbCtxAlloc/RbCtxFree 严格配对）。与 R10「4K 热路径零新增原子写」调和：
  * 用 Recreating 门控——4K 常态 Recreating=0 时只做一次 volatile 读分支，
  * 零 InterlockedIncrement；只有重建窗口内分配的 ctx 才计数并打标记。
- * 窗口前置入的 ctx 不计入 DataPathInFlight，但 RbWaitDataPathQuiesce 的
- * 「每卷 ext->Refs 回基准」判据兜底（ext->Refs 由 dispatch 入口 :1420 无条件
- * 递增，覆盖窗口前置入 ctx。双判据：DataPathInFlight==0 && refsQuiet）。
+ * [96 §2 修订] 窗口前置入 ctx 的排空证明不再依赖 ext->Refs（fail-open 判据，
+ * 93 号冻结），改由严格配对 IO 计数承担：IoIssued 在 I1/I2 dispatch 入口
+ * 无条件自增（含窗口前置入 IRP），RbWaitDataPathQuiesce 以
+ * completed>=issued_at_open && diff==0 判「全部完成」。
  * Rsvd[0] 显式赋值（lookaside 复用不清零）。
  * RbFlushSubmit 用既有 FlushJobs 计数，不并入 DataPathInFlight，避免双重计数。 */
 PVOID RbCtxAlloc(VOID)
@@ -152,6 +153,78 @@ BOOLEAN RbIsDataPathFrozen(VOID)
     if (InterlockedCompareExchange(&g_Rb.Unloading, 0, 0) != 0) return TRUE;
     if (InterlockedCompareExchange(&g_Rb.Recreating, 0, 0) != 0) return TRUE;
     return FALSE;
+}
+
+/* ===== [96 §2 2026-11-07] 严格配对 IO 计数（94 号 §2.1/§2.2 的 per-CPU 变体）=====
+ *
+ * 为什么不是 94 号原案（RB_GLOB 两个全局 LONG + InterlockedIncrement）：
+ * R10「4K 常态零新增原子写」红线——900K IOPS 下全局原子序号 = 每 IO 两次
+ * 跨核乒乓 LOCK RMW（ReadLatSeqCpu [OPT-STATS R26] 已有同款教训）。按 94 号
+ * §6 自己给出的豁免路径改为 per-CPU 累加：
+ *
+ *  · 单写者：只有本 CPU 的执行流写本槽（KeGetCurrentProcessorNumberEx 定位）。
+ *    同一 CPU 任意时刻只有一个线程在执行（HT 兄弟核 = 不同 CPU 号 = 不同槽），
+ *    「preempted 线程与后续线程并发写同槽」不存在；MSVC 对 volatile LONG64 ++
+ *    生成单条 inc [mem]（指令级原子，中断/抢占只发生在指令边界），故无需 LOCK。
+ *  · 跨核可见性只朝保守方向偏：x86-TSO 单调计数器，读方拿到旧值 ⇒ completed
+ *    偏小 / issued 偏小 ⇒ 判据更难满足 ⇒ 最多多等几拍，永不假绿（论证见
+ *    96 号报告 §3）。issued 侧的及时可见性由两道既有 LOCK 类操作保证：
+ *    入队必经 RbSubmitIo 的 KeAcquireSpinLock（LOCK 指令清空本核 store buffer，
+ *    发布此前的 issued 自增）；内联完成路径必经 RbDerefExt/RbNoteIoResult 的
+ *    Interlocked 操作。completed 自增点全部紧邻 LOCK 类操作（同款发布）。
+ *  · 唯一无 LOCK 兜底的窗口 = 分发线程在 issued 自增之后、任何 LOCK 类操作
+ *    之前被抢占——该 IO 尚未入队、未读 ext->Stream 存指针，恢复后由 worker
+ *    重校验（RbReadWorker/RbWriteWorker 入口）路由到透传，绝不触缓存路径。
+ *  · 组外（Group!=0 或 Number>=64）回退全局 Interlocked 对——本机与客户端
+ *    不存在该拓扑，纯 fail-closed 兜底。
+ *
+ * 906K IOPS 热路径实测口径见 96 号报告 §7（A/B 结构 diff：0 新增 LOCK 前缀）。 */
+static __inline ULONG RbIoCpuIndex(VOID)
+{
+    PROCESSOR_NUMBER pn;
+    KeGetCurrentProcessorNumberEx(&pn);
+    if (pn.Group == 0 && pn.Number < 64) return pn.Number;
+    return 0xFFFFFFFFu;    /* 组外：走全局原子回退 */
+}
+
+VOID RbIoIssueMark(VOID)
+{
+    ULONG c = RbIoCpuIndex();
+    if (c < 64) {
+        g_Rb.IoIssuedSlots[c].Cnt++;        /* 单写者 plain ++（单条 inc 指令） */
+    } else {
+        InterlockedIncrement(&g_Rb.IoIssuedG);
+    }
+}
+
+VOID RbIoCompleteMark(VOID)
+{
+    ULONG c = RbIoCpuIndex();
+    if (c < 64) {
+        g_Rb.IoCompletedSlots[c].Cnt++;     /* 单写者 plain ++（单条 inc 指令） */
+    } else {
+        InterlockedIncrement(&g_Rb.IoCompletedG);
+    }
+}
+
+/* 屏障后求和（重建线程 PASSIVE 独占调用；单调计数，撕裂不可能——8 字节
+ * 对齐 LOAD 原子）。屏障保证：本核此前的读不再重排；对端单调值只会更旧
+ * （保守方向）。求和期间新 IO 到来 = 判据自然不满足，下轮重读。 */
+VOID RbIoCountSnapshot(PULONG64 pIssued, PULONG64 pCompleted)
+{
+    ULONG64 si = 0, sc = 0;
+    ULONG i;
+    if (!pIssued || !pCompleted) return;
+    KeMemoryBarrier();
+    for (i = 0; i < 64; i++) {
+        si += (ULONG64)g_Rb.IoIssuedSlots[i].Cnt;
+        sc += (ULONG64)g_Rb.IoCompletedSlots[i].Cnt;
+    }
+    si += (ULONG64)InterlockedCompareExchange(&g_Rb.IoIssuedG, 0, 0);
+    sc += (ULONG64)InterlockedCompareExchange(&g_Rb.IoCompletedG, 0, 0);
+    KeMemoryBarrier();
+    *pIssued = si;
+    *pCompleted = sc;
 }
 
 /* [STAGE-1] miss staging 复用：每 worker 独占一块，按需求涨，不逐 IO 分配释放 */
@@ -665,6 +738,30 @@ static VOID RbReadWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
         goto done;
     }
 
+    /* [96 §2] 迟到 IO 重校验（worker 出队后）：分发时已过热开关门，但入队后
+     * 可能进入重建窗口（Unloading/Recreating 置位）、卷被软摘链（IsAttached=
+     * FALSE）、摘流（ext->Stream=NULL）或移除（Removed）。per-IO 路径不持
+     * io_users（cache.c 仅 snapshot/flush 自增），在途 IRP 直接解引用
+     * ext->Stream——重建把「摘流+销毁流」排在 quiesce 通过之后之后，本检查
+     * 封住最后一段竞态：任何在执行/刚出队的 IRP 绝不触已被销毁的流，一律降级
+     * 直读（读不触缓存、无回填，语义与透传读一致；DATA-9 read-your-writes
+     * 同款刷脏前置，纪律与 RbDispatchPassthrough 逐字对齐）。纯 volatile 读，
+     * 零 LOCK，R10 合规。issued 自增后、入队前被抢占的 IO 的唯一安全出路。 */
+    if (!ext->IsAttached || ext->Stream == NULL || ext->Removed ||
+        g_Rb.Unloading || g_Rb.Recreating) {
+        if (!tgt) {
+            RbNoteBypass(ext, RB_BYPASS_RESOURCE);
+            s = STATUS_INSUFFICIENT_RESOURCES;
+        } else {
+            if (ext->Stream && !g_Rb.Unloading &&
+                KeGetCurrentIrql() == PASSIVE_LEVEL &&
+                rb_stream_has_dirty_range(ext->Stream, cur, remaining))
+                rb_stream_flush(ext->Stream, 1);
+            RbReadDirectFallback(ext, tgt, len, (LONGLONG)cur, &s, &info);
+        }
+        goto done;
+    }
+
     /* 原 IRP 只判定一次预取/准入；分片不放大特性钩子次数。 */
     RbFeatOnRead(ext, (ULONG64)cur, len);
     if (!RbFeatAdmit(ext)) {
@@ -717,6 +814,7 @@ done:
     IoCompleteRequest(irp, IO_DISK_INCREMENT);
     RbNoteIoResult(ext, s);
     RbCtxFree(ctx);
+    RbIoCompleteMark();  /* [96 §2] C6：读 worker 完成出口 */
     RbDerefExt(ext);
 }
 
@@ -762,14 +860,19 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
     NTSTATUS    s   = STATUS_SUCCESS;
     ULONG_PTR   info= 0;
     BOOLEAN     wb;
+    /* [96 §2] 迟到 IO 重校验（与 RbReadWorker 同款；写降级走既有透传分支：
+     * flush-first + 无条件失效 + 直写下盘，DATA-2 R1 / P0-1 纪律原样生效） */
+    BOOLEAN reroute = (BOOLEAN)(!ext->IsAttached || ext->Stream == NULL ||
+                                ext->Removed || g_Rb.Unloading || g_Rb.Recreating);
 
     /* [P0-1] 透传写：dispatch 已判定缓存旁路（panic/写缓存关/几何无效等），
      * 但缓存中可能还留着同区间旧副本（含未回写脏块）。先失效再前转：
      * 应用本次写入已由 RbForward 直落盘，旧副本自此过期；若留存，后续
      * 自愈/周期回写会把旧内容落盘覆盖新数据（静默数据丢失）。
      * invalidate 持 ERESOURCE（IRQL≤APC），故在本 PASSIVE worker 内执行。
-     * 被丢弃的旧脏块，其数据已被本次直写取代，无 acknowledged 数据丢失。 */
-    if (ctx->Passthru) {
+     * 被丢弃的旧脏块，其数据已被本次直写取代，无 acknowledged 数据丢失。
+     * [96 §2] reroute=TRUE 的迟到 IO 走同一分支（重校验见函数头）。 */
+    if (ctx->Passthru || reroute) {
         if (ext->Stream) {
             /* [FIX DATA-2 R1 2026-11-03] 原序=先 invalidate(superseded=1) 后直写：
              * 直写失败时区间内"仅存于缓存"的已 ack 脏数据被静默丢弃且零记账。
@@ -782,6 +885,7 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
             RbInvalidateAfterFlush(ext->Stream, (rb_u64)off, (rb_u64)len);
         }
         RbForward(ext->FilterDevice, irp);
+        RbIoCompleteMark();  /* [96 §2] C3：透传写完成出口 */
         RbCtxFree(ctx);      /* [FIX M10] 先还 ctx 后减引用 */
         RbDerefExt(ext);
         return;
@@ -1016,6 +1120,7 @@ done:
     IoCompleteRequest(irp, IO_DISK_INCREMENT);
     RbNoteIoResult(ext, s);
     RbCtxFree(ctx);          /* [FIX M10] 先还 ctx 后减引用 */
+    RbIoCompleteMark();      /* [96 §2] C7：写 worker 完成出口 */
     RbDerefExt(ext);
 }
 
@@ -1337,7 +1442,10 @@ static VOID RbFlushIrpWorker(PRB_IOCTX ctx)
 {
     PRB_DEV_EXT ext = ctx->Ext;
     BOOLEAN persisted = TRUE;
-    if (ext->Stream) {
+    /* [96 §2] 迟到 FLUSH 重校验：重建/卸载窗口内不触碰缓存流（M5 纪律——
+     * 窗口内流可能正被软摘链/待销毁；持久化由重建自身的 flush×2 或卸载
+     * 序列保证），降级为直接前转。常态（两门皆 0）行为逐字不变。 */
+    if (ext->Stream && !g_Rb.Unloading && !g_Rb.Recreating) {
         /* [P0-2] IRP_MJ_FLUSH_BUFFERS 语义=持久化：必须整净回写（force）
          * 并以残留脏量为成败判据。旧代码 flush(s,0) 只写到低水位且忽略
          * 结果、随后仍以成功态转发——下层盘故障导致回写失败时，文件系统
@@ -1358,6 +1466,7 @@ static VOID RbFlushIrpWorker(PRB_IOCTX ctx)
         RbLog(2, __LINE__, 0, L"FLUSH IRP failed: dirty writeback incomplete");
     }
     RbCtxFree(ctx);          /* [FIX M10] 先还 ctx 后减引用 */
+    RbIoCompleteMark();      /* [96 §2] C10：FLUSH worker 完成出口 */
     RbDerefExt(ext);
 }
 
@@ -1419,6 +1528,7 @@ static NTSTATUS RbDispatchPassthrough(PRB_DEV_EXT ext, PDEVICE_OBJECT dev, PIRP 
                                    (rb_u64)sp->Parameters.Read.ByteOffset.QuadPart,
                                    (rb_u64)sp->Parameters.Read.Length);
             fst = RbForward(ext->FilterDevice, irp);
+            RbIoCompleteMark();   /* [96 §2] C1：透传写内联完成出口（!IsAttached+PASSIVE） */
             RbDerefExt(ext);
             return fst;
         }
@@ -1466,7 +1576,9 @@ static NTSTATUS RbDispatchPassthrough(PRB_DEV_EXT ext, PDEVICE_OBJECT dev, PIRP 
     }
     /* [FIX D6-01] 先转发后归还引用：RbForward 内部解引用 ext->LowerDevice，
      * 原顺序（先 deref）在这是最后一笔引用时构成 UAF 窗口（卸载竞态）。 */
-    { NTSTATUS fst = RbForward(dev, irp); RbDerefExt(ext); return fst; }
+    { NTSTATUS fst = RbForward(dev, irp);
+      RbIoCompleteMark();   /* [96 §2] C2：透传内联完成总出口（读直转/ctx 耗尽写/非 PASSIVE） */
+      RbDerefExt(ext); return fst; }
 }
 
 NTSTATUS RbDispatchReadWrite(PDEVICE_OBJECT dev, PIRP irp)
@@ -1488,7 +1600,12 @@ NTSTATUS RbDispatchReadWrite(PDEVICE_OBJECT dev, PIRP irp)
     /* C3: 先引用后校验（覆盖整个窗口），与 REMOVE 排空无竞态。
      * 该引用覆盖"校验→转投 worker→worker 完成"全程：防 REMOVE 在窗口内
      * 拆除 ext 后 worker 仍解引用（UAF）；由透传/worker 完成路径的
-     * RbDerefExt 配对释放（本函数每个出口都有）。 */
+     * RbDerefExt 配对释放（本函数每个出口都有）。
+     * [96 §2] I1：issued 配对计数点（READ/WRITE 唯一入口）。无条件自增，
+     * 自 DriverEntry 起即计数 ⇒ 重建开窗前已进入的 IRP 必被计入（覆盖
+     * fail-open 缺陷 A 的盲区）。紧随其后的 Refs LOCK 自增保证本自增在
+     * 入队（KeAcquireSpinLock）前全局可见。 */
+    RbIoIssueMark();
     InterlockedIncrement(&ext->Refs);
 
     /* [V10.1] 哨兵/熔断/几何/热开关：任一不满足即透传。
@@ -1565,7 +1682,14 @@ NTSTATUS RbDispatchReadWrite(PDEVICE_OBJECT dev, PIRP irp)
                 irp->IoStatus.Status = STATUS_SUCCESS;
                 irp->IoStatus.Information = len;
                 IoCompleteRequest(irp, IO_DISK_INCREMENT);
+                RbIoCompleteMark();   /* [96 §2] C4：内联写吸收完成出口 */
                 RbNoteIoResult(ext, STATUS_SUCCESS);
+                /* [96 §2 配对审计修复] 本出口原先漏 RbDerefExt：:1492 的 IO 式
+                 * 引用被永久泄漏——回写模式下每次内联吸收写 ext->Refs +1 且
+                 * 永不归还。这正是 90 号 §4「稳态超额引用来源未定位」(O-2) 的
+                 * 真实来源之一（回写卷稳态 Refs 恒涨）。本机直写态该路径不可达，
+                 * 但 ReadMode 同款缺陷（下方 C5）在直写读热路径必现。 */
+                RbDerefExt(ext);
                 return STATUS_SUCCESS;
             }
             /* 吸收失败/有 direct 区间 → worker 路径（完整 DseqBuf 记账+失效处理）。
@@ -1594,7 +1718,15 @@ NTSTATUS RbDispatchReadWrite(PDEVICE_OBJECT dev, PIRP irp)
             irp->IoStatus.Status = STATUS_SUCCESS;
             irp->IoStatus.Information = len;
             IoCompleteRequest(irp, IO_DISK_INCREMENT);
+            RbIoCompleteMark();   /* [96 §2] C5：内联全命中读完成出口 */
             RbNoteIoResult(ext, STATUS_SUCCESS);
+            /* [96 §2 配对审计修复] 本出口原先漏 RbDerefExt（[OPT F8] 引入时
+             * 遗漏）：每次全命中读 ext->Refs +1 永不归还——直写读热路径（本机
+             * 姿态）每 IO 泄漏一笔，累计百万级。这就是 90/91 号「真机稳态
+             * Refs 恒 >4」与 O-2「稳态超额引用来源未定位」的根因：不是未知
+             * 常驻引用，是本出口的配对缺失。修复后 Refs 恢复严格配对，94 号
+             * §2.3 的「r > 基线 ⇒ 契约违例」负判据才有意义。 */
+            RbDerefExt(ext);
             return STATUS_SUCCESS;
         }
         /* 回退：tgt 映射无害保留（MmGetSystemAddressForMdlSafe 不需解除），
@@ -1636,11 +1768,14 @@ NTSTATUS RbDispatchFlush(PDEVICE_OBJECT dev, PIRP irp)
         return STATUS_INVALID_DEVICE_REQUEST;
     }
     ext = (PRB_DEV_EXT)dev->DeviceExtension;
-    /* C3b: 先引用后校验，与读写路径一致 */
+    /* C3b: 先引用后校验，与读写路径一致。
+     * [96 §2] I2：issued 配对计数点（FLUSH 唯一入口），纪律同 I1。 */
+    RbIoIssueMark();
     InterlockedIncrement(&ext->Refs);
     if (!ext->IsAttached || !ext->Stream || ext->Removed || g_Rb.Unloading) {
         /* [FIX D6-01] 同读写路径：先转发后归还引用（RbForward 读 ext->LowerDevice） */
         NTSTATUS fst = RbForward(dev, irp);
+        RbIoCompleteMark();   /* [96 §2] C8：FLUSH 直转完成出口 */
         RbDerefExt(ext);
         return fst;
     }
@@ -1649,6 +1784,7 @@ NTSTATUS RbDispatchFlush(PDEVICE_OBJECT dev, PIRP irp)
         if (!ctx) {
             /* [FIX M5] 旁视池耗尽绝不静默透传：FLUSH 语义=持久化，直接下发
              * 下层会让 FS 误判 RAM 脏块已落盘（掉电丢数据且无痕迹）。如实失败。 */
+            RbIoCompleteMark();   /* [96 §2] C9：FLUSH ctx 耗尽失败完成出口 */
             RbDerefExt(ext);
             irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
             irp->IoStatus.Information = 0;

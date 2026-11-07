@@ -424,79 +424,61 @@ VOID RbRestoreVolumeFlags(WCHAR letter, LONG rd, LONG wr, LONG wm)
     ExReleaseFastMutex(&g_Rb.DevListLock);
 }
 
-/* [83 2026-11-07] 软摘链原语（重建专用）。
+/* [96 §2 2026-11-07] 软摘链原语（重建专用，第一阶段）。
  * 与 RbVolumeRemove 的完整拆除不同：保留 FilterDevice/PDO/DevList/Magic/
- * Removed/RemoveDone 原样，只摘并销毁缓存流，使 RbReattachVolumeForRebuild
- * 能通过 RbFindExtByLetter 找回同一 ext 并 rb_stream_create 重建流。
- * 顺序照 RbVolumeRemove :681-750：先关 inflow、再等窗口前置入 IO 完成、
- * 再 flush、最后原子摘链 + rb_stream_destroy。超时返回 FALSE（禁止销毁引擎）。
+ * Removed/RemoveDone/Stream 原样，只关 inflow 并保证脏数据落盘。
  *
- * [92 A 2026-11-07] 旧判据 base = 1 + selfRefs = 2，要求 ext->Refs <= 2。
- * 但 Refs 是生命周期计数（owner + find + 在途 IO + 历史泄漏），同文件
- * :1273-1290 自承真机稳态恒 >4 ⇒ 60s 恒超时（ERROR [453]，确定性缺陷）。
- * 新判据：关 inflow 后记录该卷 Refs 基线；每 20ms 采样，要求
- *   ① Refs 不高于基线（关 inflow 后不应新增引用）；
- *   ② Refs 连续 RB_REBUILD_REFS_STABLE_SAMPLES 次不再下降（稳定）；
- * 历史泄漏/常驻引用落在基线内，不再被误判为在途 IO。
- * 6 项在途计数全 0 由后续 RbWaitDataPathQuiesce 的 7 项判据与本判据 AND；
- * 排空循环本身绝不删除（B1/B2 持旧 stream 裸指针的 UAF 安全网）。
- * 已知边界：若窗口前置入 IO 永久卡住且 6 项计数皆 0，其引用会混入基线而
- * 判稳；该运行时后果需 WDK/Verifier/双机 WinDbg 复核（本机不得宣称内核已修）。 */
+ * [92 A → 93 号冻结 → 94 号重设计] 三代演进：
+ *   v1（83 号）：base = 1 + selfRefs，要求 ext->Refs <= 2 —— 真机稳态恒 >4，
+ *     60s 恒超时（ERROR [453]，确定性缺陷，91 号三次判别试验实锤）。
+ *   v2（92 A/C，31cf870）：关 inflow 后取 Refs 相对基线，连续稳定 4×20ms 即
+ *     drained —— 被 93 号独立复核判为 **fail-open**：开窗前已进入、剩余寿命
+ *     >80ms 的 IO 被烤进基线 → 假绿 → rbrebuild.c 销毁引擎 → UAF/静默数据
+ *     损坏。已冻结（DO NOT DEPLOY），本实现不得复用其任何判据。
+ *   v3（本版，94 号 §2.2）：**不等待任何生命周期计数**。关 inflow + 刷脏两趟
+ *     即返回；「全部窗口前 IRP 已完成」由 RbWaitDataPathQuiesce 的严格配对
+ *     IO 计数（IoIssued/IoCompleted + epoch）证明，摘流+销毁流被移到该证明
+ *     之后（rbrebuild.c RbRebuildDestroyAllStreams）。顺序调整的论证：per-IO
+ *     路径不持 io_users（cache.c 仅 snapshot/flush 路径自增），在途 IRP 直接
+ *     解引用 ext->Stream —— 94 号 §2.2 明文允许此顺序调整
+ *     （「若工程师认为 detach 必须先等 IO 排空才能摘流，须给出论证并相应
+ *     调整顺序」），完整论证见 96 号报告 §4。
+ * 返回 FALSE 仅表示脏数据未能落盘（坏盘，fail-closed）：就地复原 IsAttached、
+ * 保留 Stream（rbio.c:1400/:1452 透传写「刷脏+失效」判据要求非 NULL，
+ * DATA-11），调用方回滚。 */
 BOOLEAN RbDetachStreamForRebuild(PRB_DEV_EXT ext, LONG selfRefs)
 {
-    LARGE_INTEGER tick;
-    ULONG i;
     rb_stream *st;
-    LONG baseline, last;
-    ULONG stable = 0;
-    BOOLEAN drained = FALSE;
     PAGED_CODE();
     if (!ext) return TRUE;
-
-    /* selfRefs（调用方 RbFindExtByLetter 的 1 引用）在关 inflow 时已计入
-     * 稳态基线；保留形参以维持调用契约，并用于超时诊断。 */
+    /* selfRefs 形参保留调用契约（调用方 RbFindExtByLetter 的 1 引用）；
+     * v3 判据不消费它，仅用于将来诊断扩展。 */
     (void)selfRefs;
+
+    /* 1) 关 inflow + 发布屏障：此后新 IRP 一律透传（dispatch 热开关门）；
+     *    已过门、在队列/在执行中的 IRP 由 worker 重校验（rbio.c
+     *    RbReadWorker/RbWriteWorker/RbFlushIrpWorker）降级透传，不触缓存路径。 */
     ext->IsAttached = FALSE;
     KeMemoryBarrier();
-    baseline = InterlockedCompareExchange(&ext->Refs, 0, 0);
-    last = baseline;
-    tick.QuadPart = -200000LL;                 /* 20ms/步 */
-    for (i = 0; i < 3000; i++) {               /* 60s 上限，排空循环保留 */
-        LONG r = InterlockedCompareExchange(&ext->Refs, 0, 0);
-        if (r > baseline) {
-            stable = 0;                       /* 关 inflow 后新增引用：契约违例 */
-            last = r;
-        } else if (r == last && r <= baseline) {
-            if (++stable >= RB_REBUILD_REFS_STABLE_SAMPLES) { drained = TRUE; break; }
-        } else {
-            stable = 0;                       /* 又回落：窗口前置入 IO 刚完成 */
-            last = r;
-        }
-        KeDelayExecutionThread(KernelMode, FALSE, &tick);
-    }
-    if (!drained) {
-        RbLog(2, __LINE__, baseline, L"rebuild: detach drain timeout (refs relative baseline), abort (engine kept)");
-        /* [85 B5] 超时卷就地复原 IsAttached（:445 置 FALSE 是本路径唯一被
-         * 改动的热开关状态），并显式发布屏障。此时尚未走到 :456 摘 Stream，
-         * 故 ext->Stream **必须保留、不得摘除/销毁**——rbio.c:1400/:1452 的
-         * 「刷脏 + 无条件失效」判据要求 Stream 非 NULL，摘掉会落到 :1469
-         * 纯 RbForward 无失效，反而重新打开 DATA-11 旧盖新窗口。该卷
-         * Detached=FALSE，回滚 out_rollback 按逐项判据不会对其走
-         * RbReattachVolumeForRebuild，硬约束自动满足。 */
+
+    /* 2) 刷脏两趟（R6-D3 范式：flush → 排空在途回写 → flush）：
+     *    封「drain 前吸收、drain 后落盘」尾窗。本线程是唯一 flush 执行者
+     *    （flush 主线程被 Recreating 门冻结，RbIsDataPathFrozen 早退），
+     *    passthrough 写只直写+失效不新增脏 ⇒ 本序列收敛。 */
+    st = (rb_stream *)InterlockedCompareExchangePointer((PVOID *)&ext->Stream, NULL, NULL);
+    if (!st) return TRUE;                    /* 无流（快照时序异常）：视为已就绪 */
+    rb_stream_flush(st, 1);
+    rb_stream_drain_writeback(st);
+    rb_stream_flush(st, 1);
+
+    /* 3) 残留脏非 0 = 回写失败（坏盘）。fail-closed：绝不带着脏摘流/销毁流
+     *    （销毁带脏流 = 已 ack 数据唯一副本丢失），就地复原热开关并回滚。 */
+    if (rb_stream_dirty_bytes(st) != 0) {
+        RbLog(2, __LINE__, 0,
+              L"rebuild: dirty data could not be flushed before detach, abort (engine kept)");
         ext->IsAttached = TRUE;
         KeMemoryBarrier();
         return FALSE;
-    }
-    st = (rb_stream *)InterlockedExchangePointer((PVOID *)&ext->Stream, NULL);
-    if (st) {
-        /* 排空已完成、无并发访问：先保证脏数据落盘（E4），再销毁流。
-         * rb_stream_destroy 内部先摘 eng->streams 表，之后 rb_engine_destroy
-         * 不会再遍历到它，无双重释放。刷脏失败如实留痕（回滚时旧引擎仍在，
-         * 但本卷流已丢弃——回滚路径会逐卷重挂建新流，缓存冷一轮）。 */
-        rb_stream_flush(st, 1);
-        if (rb_stream_dirty_bytes(st) != 0)
-            RbLog(2, __LINE__, 0, L"rebuild: dirty data could not be flushed before detach");
-        rb_stream_destroy(st);
     }
     return TRUE;
 }

@@ -33,6 +33,12 @@ if (-not (Test-Path -LiteralPath $link)) { throw "link.exe not found: $link" }
 $out = Join-Path $root "src\driver\x64\Release"
 $obj = Join-Path $out "obj"
 New-Item -ItemType Directory -Force -Path $obj | Out-Null
+# [88 H-9 2026-11-07 / 92 修正] link consumes $obj\*.obj: a source removed since
+# the last build would otherwise leave a stale .obj linked into the new sys.
+# The purge MUST happen BEFORE the compile loop (clearing afterwards deletes the
+# objects just built -> LNK4001 "no object files specified" + LNK2019/LNK1120).
+Get-ChildItem -LiteralPath $obj -Filter '*.obj' -File -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction Stop
 
 $inc = @(
     "/I$kit\shared",
@@ -66,10 +72,6 @@ try {
     }
     if ($fail -gt 0) { throw "$fail source(s) failed to compile" }
 
-    # [88 H-9 2026-11-07] link consumes $obj\*.obj; a source removed since
-    # the last build would otherwise leave a stale .obj linked into the new sys.
-    Get-ChildItem -LiteralPath $obj -Filter '*.obj' -File -ErrorAction SilentlyContinue |
-        Remove-Item -Force -ErrorAction Stop
     Write-Host "[2/2] linking RAMBlockCache.sys ..."
     & $link @(
         "/nologo","/DRIVER","/NODEFAULTLIB","/MANIFEST:NO","/SUBSYSTEM:NATIVE",

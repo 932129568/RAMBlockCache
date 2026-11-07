@@ -428,29 +428,54 @@ VOID RbRestoreVolumeFlags(WCHAR letter, LONG rd, LONG wr, LONG wm)
  * 与 RbVolumeRemove 的完整拆除不同：保留 FilterDevice/PDO/DevList/Magic/
  * Removed/RemoveDone 原样，只摘并销毁缓存流，使 RbReattachVolumeForRebuild
  * 能通过 RbFindExtByLetter 找回同一 ext 并 rb_stream_create 重建流。
- * 顺序照 RbVolumeRemove :681-750：先关 inflow、再等 Refs 排空、再 flush、
- * 最后原子摘链 + rb_stream_destroy。排空超时返回 FALSE（禁止销毁引擎）。 */
+ * 顺序照 RbVolumeRemove :681-750：先关 inflow、再等窗口前置入 IO 完成、
+ * 再 flush、最后原子摘链 + rb_stream_destroy。超时返回 FALSE（禁止销毁引擎）。
+ *
+ * [92 A 2026-11-07] 旧判据 base = 1 + selfRefs = 2，要求 ext->Refs <= 2。
+ * 但 Refs 是生命周期计数（owner + find + 在途 IO + 历史泄漏），同文件
+ * :1273-1290 自承真机稳态恒 >4 ⇒ 60s 恒超时（ERROR [453]，确定性缺陷）。
+ * 新判据：关 inflow 后记录该卷 Refs 基线；每 20ms 采样，要求
+ *   ① Refs 不高于基线（关 inflow 后不应新增引用）；
+ *   ② Refs 连续 RB_REBUILD_REFS_STABLE_SAMPLES 次不再下降（稳定）；
+ * 历史泄漏/常驻引用落在基线内，不再被误判为在途 IO。
+ * 6 项在途计数全 0 由后续 RbWaitDataPathQuiesce 的 7 项判据与本判据 AND；
+ * 排空循环本身绝不删除（B1/B2 持旧 stream 裸指针的 UAF 安全网）。
+ * 已知边界：若窗口前置入 IO 永久卡住且 6 项计数皆 0，其引用会混入基线而
+ * 判稳；该运行时后果需 WDK/Verifier/双机 WinDbg 复核（本机不得宣称内核已修）。 */
 BOOLEAN RbDetachStreamForRebuild(PRB_DEV_EXT ext, LONG selfRefs)
 {
     LARGE_INTEGER tick;
     ULONG i;
     rb_stream *st;
-    LONG base;
+    LONG baseline, last;
+    ULONG stable = 0;
+    BOOLEAN drained = FALSE;
     PAGED_CODE();
     if (!ext) return TRUE;
 
-    /* owner 基准 1 + 调用方额外引用（RbFindExtByLetter 带 1 引用）。
-     * 窗口内 Unloading=1 已挡新 IO、旁路作业早退，Refs 只会下降不会新增。 */
-    base = 1 + selfRefs;
+    /* selfRefs（调用方 RbFindExtByLetter 的 1 引用）在关 inflow 时已计入
+     * 稳态基线；保留形参以维持调用契约，并用于超时诊断。 */
+    (void)selfRefs;
     ext->IsAttached = FALSE;
     KeMemoryBarrier();
+    baseline = InterlockedCompareExchange(&ext->Refs, 0, 0);
+    last = baseline;
     tick.QuadPart = -200000LL;                 /* 20ms/步 */
-    for (i = 0; i < 3000; i++) {               /* 60s 上限 */
-        if (InterlockedCompareExchange(&ext->Refs, 0, 0) <= base) break;
+    for (i = 0; i < 3000; i++) {               /* 60s 上限，排空循环保留 */
+        LONG r = InterlockedCompareExchange(&ext->Refs, 0, 0);
+        if (r > baseline) {
+            stable = 0;                       /* 关 inflow 后新增引用：契约违例 */
+            last = r;
+        } else if (r == last && r <= baseline) {
+            if (++stable >= RB_REBUILD_REFS_STABLE_SAMPLES) { drained = TRUE; break; }
+        } else {
+            stable = 0;                       /* 又回落：窗口前置入 IO 刚完成 */
+            last = r;
+        }
         KeDelayExecutionThread(KernelMode, FALSE, &tick);
     }
-    if (InterlockedCompareExchange(&ext->Refs, 0, 0) > base) {
-        RbLog(2, __LINE__, 0, L"rebuild: detach drain timeout, abort (engine kept)");
+    if (!drained) {
+        RbLog(2, __LINE__, baseline, L"rebuild: detach drain timeout (refs relative baseline), abort (engine kept)");
         /* [85 B5] 超时卷就地复原 IsAttached（:445 置 FALSE 是本路径唯一被
          * 改动的热开关状态），并显式发布屏障。此时尚未走到 :456 摘 Stream，
          * 故 ext->Stream **必须保留、不得摘除/销毁**——rbio.c:1400/:1452 的

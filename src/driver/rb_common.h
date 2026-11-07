@@ -488,10 +488,19 @@ NTSTATUS RbReattachVolumeForRebuild(WCHAR letter);
  * RbStartIoWorkers/RbStartFlushers/RbStartFlushThread 二次启动正在服役的池。
  * 参数 newBs 已 clamp 到白名单；失败返回 STATUS_INSUFFICIENT_RESOURCES。 */
 NTSTATUS RbCreateEngineOnly(ULONG newBs);
-/* [83 2026-11-07] 软摘链原语：置 IsAttached=FALSE、等 Refs 回基准、flush+discard、
+/* [92 A/C 2026-11-07] 重建排空的相对基线稳定判据（两处共用，勿改单侧）。
+ * ext->Refs 是生命周期计数（owner + find + 在途 IO + 历史泄漏/常驻引用），
+ * 真机稳态恒 >4；要求回落到绝对基准 1/2 结构性不可能满足（见 91/92 号）。
+ * 改为：关 inflow 时记录该卷/各卷 Refs 基线，等待「不再下降且连续稳定
+ * N 次 20ms 采样」，并与 6 项在途计数全 0 AND。历史泄漏属于稳定基线。
+ * 严禁删除排空循环或 7 项判据（B1/B2 的 UAF 安全网）。 */
+#define RB_REBUILD_REFS_STABLE_SAMPLES 4
+
+/* [83 2026-11-07] 软摘链原语：置 IsAttached=FALSE、等窗口前置入 IO 完成
+ * （Refs 相对基线连续稳定 RB_REBUILD_REFS_STABLE_SAMPLES 次采样）、flush+discard、
  * 原子摘除并销毁 stream；不删设备、不清 Magic、不摘 DevList、不置 Removed。
- * selfRefs = 调用方额外持有的引用数（RbFindExtByLetter 返回带引用 = 1）；
- * 排空判据为 Refs <= 1(owner) + selfRefs，与 RbVolumeRemove 同款纪律。
+ * selfRefs = 调用方额外持有的引用数（RbFindExtByLetter 返回带引用 = 1），
+ * 属于捕获到的稳态基线的一部分，参与诊断但不再作为绝对阈值。
  * 返回 FALSE 表示排空超时或脏数据未落盘，调用方必须回滚重建（禁止销毁引擎）。 */
 BOOLEAN  RbDetachStreamForRebuild(PRB_DEV_EXT ext, LONG selfRefs);
 /* [83 2026-11-07] 快照当前 Attached 卷的 read/write/wm 标志，重挂后复原。
@@ -525,7 +534,8 @@ static __inline BOOLEAN RbTestModeEnabled(VOID)   /* 热路径内联版：一次
  *   只做「校验 + 入队 + 立即返回」，30s 级 join / 引擎销毁必须在 work item 内
  *   （RbApplyConfig 持 CfgLock=FastMutex 会抬到 APC_LEVEL）。
  * RbRecreateEngineGeometry：work item 内 PASSIVE 执行的完整重建序列（含回滚）。
- * RbWaitDataPathQuiesce：有界等待 6 项在途判据全归零；超时禁止销毁引擎。
+ * RbWaitDataPathQuiesce：有界等待 6 项在途计数全 0 + Refs 相对基线连续稳定；
+ *   超时禁止销毁引擎（7 项判据一条不删）。
  * RbDetachStreamForRebuild / RbReattachVolumesForRebuild：软摘链/重挂原语
  *   （不删设备、不清 Magic、不摘 DevList；与 RbVolumeRemove 的完整拆除区分）。 */
 NTSTATUS RbRequestGeometryRebuild(ULONG newBlockSize);

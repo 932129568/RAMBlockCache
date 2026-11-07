@@ -33,6 +33,11 @@
  *   C15 [85 B8]  两次 rb_engine_create 失败 → 重挂前回建引擎（不二次启池）
  *   C16 [85 B10] 非法 BlockSize 直发 IOCTL → clamp 后判定，无运行期分裂
  *   C17 [85 B15] sc stop feat 池 join 超时中止 → RbFeatFullRecover 解池闩
+ *   C18 [92 A/C 正例] 稳态 Refs 恒 >4（历史泄漏/常驻引用）→ 相对基线放行、重建成功；
+ *       同一场景以 refs_model=0 复现修复前绝对基准判据 → 必然超时回滚
+ *   C19 [92 负例1] 6 项在途计数未归零 / 窗口前置入 IO 未完成 → 新判据仍超时回滚
+ *   C20 [92 负例2] detach 失败 → Stream 保留 + IsAttached 就地复原（DATA-11/13）
+ *   C21 [92 负例3] 软分离卷不再触发全表判据；引擎 stream 表判据仍 abort
  *
  * 编译单元 = test_rebuild.c + cache.c（Release + ASAN 均可）。
  */
@@ -43,6 +48,8 @@
 
 #define DISK_SIZE   (8u * 1024u * 1024u)
 #define WORK_BYTES  (1u * 1024u * 1024u)
+/* [92 A/C] 与 rb_common.h RB_REBUILD_REFS_STABLE_SAMPLES 同值（20ms × N） */
+#define SIM_STABLE_SAMPLES 4
 #define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", (msg)); g_fail++; } \
                               else { printf("  [ok]   %s\n", (msg)); } } while (0)
 
@@ -85,6 +92,14 @@ typedef struct _SIM {
 
     /* 在途判据（原 6 项 + [85 B1] 第 7 项 flush 主线程循环体） */
     long         refs[8];
+    /* [92 A/B/C] 相对基线稳定判据镜像 + 修复前/对照开关 */
+    int          refs_model;        /* 0 = 旧绝对基准（修复前对照）, 1 = 新相对基线 */
+    long         refs_baseline[8]; /* 窗口起点的稳态基线（owner + 历史泄漏） */
+    int          refs_stable[8];   /* 连续稳定采样次数 */
+    int          prewindow_pending[8]; /* 窗口前置入 IO 未完成数 */
+    int          in_snapshot[8];   /* 本轮快照收录（IsAttached && Stream） */
+    int          snap_count;
+    int          engine_stream_table_nonempty; /* 引擎表残留（防 UAF 判据） */
     int          nvol;
     long         fallback_inflight;
     long         zombie_pending;
@@ -139,8 +154,13 @@ static void sim_init(SIM *s, unsigned bs, int nvol)
     s->persist_ok = 1;
     s->l2_state = 1;
     s->detach_timeout_vol = -1;      /* 默认无超时卷 */
+    s->refs_model = 1;              /* 默认 = 修复后判据 */
+    s->snap_count = nvol;
     for (i = 0; i < nvol; i++) {
         s->refs[i] = 1;             /* owner 基准 */
+        s->refs_baseline[i] = 1;
+        s->refs_stable[i] = SIM_STABLE_SAMPLES;  /* 初始即稳态 */
+        s->in_snapshot[i] = 1;
         s->is_attached[i] = 1;
         s->st[i] = rb_stream_create(s->eng, (rb_u64)(i + 1));
     }
@@ -162,17 +182,50 @@ static int sim_flush_entry_gate(SIM *s)
     return (s->unloading || s->recreating || s->unload_committed) ? 1 : 0;
 }
 
-/* 与 RbWaitDataPathQuiesce 同构：7 项全归零才允许销毁引擎（第 7 项 = B1）。 */
+/* [92 A/C] 一次 20ms 采样：窗口前置入 IO 逐个完成会让 Refs 回落并打断稳定；
+ * 稳态（含历史泄漏/常驻引用）下 Refs 不高于基线且稳定计数累加。 */
+static void sim_refs_advance(SIM *s)
+{
+    int i;
+    for (i = 0; i < s->nvol; i++) {
+        long r = s->refs[i];
+        if (s->prewindow_pending[i] > 0 && r > s->refs_baseline[i]) {
+            s->prewindow_pending[i]--;
+            s->refs[i]--;
+            s->refs_stable[i] = 0;
+        } else if (r > s->refs_baseline[i]) {
+            s->refs_stable[i] = 0;      /* 高于基线且不再回落 = 未稳定 */
+        } else if (s->refs_stable[i] < SIM_STABLE_SAMPLES) {
+            s->refs_stable[i]++;
+        }
+    }
+}
+static void sim_refs_drain(SIM *s, int steps)
+{
+    int k;
+    for (k = 0; k < steps; k++) sim_refs_advance(s);
+}
+
+/* 与 RbWaitDataPathQuiesce 同构：7 项全归零才允许销毁引擎（第 7 项 = B1）。
+ * [92 C] refs_model=0 复现修复前的绝对基准判据（Refs<=1）；=1 为新的
+ * 相对基线 + 连续稳定判据，6 项在途计数仍逐项 AND，一条不删。 */
 static int sim_quiesce(SIM *s)
 {
     int i, quiet = 1;
-    long inflight = 0;
     if (s->fail_quiesce) return -1;   /* STATUS_TIMEOUT */
-    for (i = 0; i < s->nvol; i++)
-        if (s->refs[i] > 1) { quiet = 0; inflight += (s->refs[i] - 1); }
-    s->datapath_inflight = inflight;
+    if (s->refs_model == 0) {
+        long inflight = 0;
+        for (i = 0; i < s->nvol; i++)
+            if (s->refs[i] > 1) { quiet = 0; inflight += (s->refs[i] - 1); }
+        s->datapath_inflight = inflight;
+    } else {
+        for (i = 0; i < s->nvol; i++) {
+            if (s->refs[i] > s->refs_baseline[i] ||
+                s->refs_stable[i] < SIM_STABLE_SAMPLES) quiet = 0;
+        }
+    }
     if (!quiet) return -1;
-    if (s->fallback_inflight || s->zombie_pending ||
+    if (s->datapath_inflight || s->fallback_inflight || s->zombie_pending ||
         s->pref_inflight || s->flush_jobs) return -1;
     if (s->flush_thread_in_loop) return -1;   /* [85 B1] 第 7 项 */
     return 0;                          /* STATUS_SUCCESS */
@@ -213,10 +266,19 @@ static void sim_unload_abort(SIM *s)
     s->unloading = 0;
 }
 
+/* [92 B] 只检查本轮快照内、Detached=TRUE 的卷；引擎 stream 表判据保留。
+ * refs_model=0 时退回旧「全表 Stream==NULL」判据，用于修复前后对照。 */
 static int sim_all_detached(SIM *s)
 {
     int i;
-    for (i = 0; i < s->nvol; i++) if (s->st[i]) return 0;
+    for (i = 0; i < s->nvol; i++) {
+        if (s->refs_model == 0) {
+            if (s->st[i]) return 0;
+        } else if (s->in_snapshot[i] && s->detached[i] && s->st[i]) {
+            return 0;
+        }
+    }
+    if (s->engine_stream_table_nonempty) return 0;   /* 防 UAF/双释放，绝不删 */
     return 1;
 }
 
@@ -227,12 +289,18 @@ static int sim_detach_all(SIM *s)
     int i;
     if (s->fail_detach) return -1;
     for (i = 0; i < s->nvol; i++) {
+        if (!s->in_snapshot[i]) continue;   /* [92 B] 软分离卷不在本轮快照 */
         if (s->detach_timeout_vol == i) {
             s->is_attached[i] = 1;   /* 唯一需复原项 */
             s->detached[i] = 0;
             return -1;               /* 触发回滚；Stream 原样保留 */
         }
-        if (s->refs[i] > 1) return -1;   /* 排空超时 */
+        if (s->refs_model == 0) {
+            if (s->refs[i] > 2) return -1;              /* 旧 A: base = 1 + selfRefs = 2 */
+        } else if (s->refs[i] > s->refs_baseline[i] ||
+                   s->refs_stable[i] < SIM_STABLE_SAMPLES) {
+            return -1;                                  /* 新 A: 相对基线未稳定 */
+        }
         s->is_attached[i] = 0;
         if (s->st[i]) {
             rb_stream_flush(s->st[i], 1);
@@ -265,6 +333,7 @@ static int sim_reattach_all(SIM *s)
     int i, restored = 0;
     if (!s->eng) return 0;
     for (i = 0; i < s->nvol; i++) {
+        if (!s->in_snapshot[i]) continue;              /* 软分离卷不在本轮 */
         if (s->fail_reattach) continue;
         if (!s->st[i]) s->st[i] = rb_stream_create(s->eng, (rb_u64)(i + 1));
         s->is_attached[i] = 1;
@@ -326,6 +395,15 @@ static int sim_recreate(SIM *s, unsigned newBs)
     /* c) 门控（配置副本已写新值；引擎此时仍在，EngineBlockSize 仍为旧几何） */
     s->unloading = 1;
     s->in_progress = 1;
+    /* [92 B] 快照只收 IsAttached && Stream 的卷；软分离卷不进本轮 */
+    {
+        int i;
+        s->snap_count = 0;
+        for (i = 0; i < s->nvol; i++) {
+            s->in_snapshot[i] = (s->is_attached[i] && s->st[i] != NULL) ? 1 : 0;
+            if (s->in_snapshot[i]) s->snap_count++;
+        }
+    }
 
     /* d) 逐卷软摘链。[85 B5] 删聚合标志，逐项 Detached 置位。 */
     if (sim_detach_all(s) != 0) { rc = -5; goto rollback; }
@@ -373,7 +451,7 @@ static int sim_recreate(SIM *s, unsigned newBs)
         s->in_progress = 0;
         s->recreating = 0;
         s->utc = ++g_utc_tick;
-        if (restored != s->nvol) {
+        if (restored != s->snap_count) {
             s->last_status = rc = -13;   /* 非成功：work item 写 LastStatus、不增 Count */
             return rc;
         }
@@ -826,13 +904,169 @@ static void case_C17_unload_abort_pool(void)
     sim_destroy_all(&s);
 }
 
+
+/* ==================== C18..C21（92 号 A/B/C 正反双向） ==================== */
+
+/* 把「稳态 Refs 恒 >4」灌进 SIM：owner 1 + find 1 + 历史泄漏 5 = 7，恒定不回落。 */
+static void sim_steady_leak(SIM *s, long steady_refs)
+{
+    int i;
+    for (i = 0; i < s->nvol; i++) {
+        s->refs[i] = steady_refs;
+        s->refs_baseline[i] = steady_refs;
+        s->refs_stable[i] = SIM_STABLE_SAMPLES;
+    }
+}
+
+/* C18 [92 A/C 正例] 稳态 Refs>4 时重建仍判定 quiesce 通过并成功；
+ * 同一场景用 refs_model=0 复现修复前绝对基准判据（必然超时回滚）。 */
+static void case_C18_steady_refs_leak(void)
+{
+    SIM s;
+    int rcOld, rcNew;
+    printf("\n[C18 92 A/C 正例] 稳态 Refs=7（历史泄漏/常驻引用）-> 相对基线判据放行\n");
+    sim_init(&s, 4096u, 2);
+    sim_steady_leak(&s, 7L);
+    s.recreating = 1;
+    s.refs_model = 0;                        /* 修复前：Refs<=2 / <=1 */
+    rcOld = sim_recreate(&s, 8192u);
+    CHECK(rcOld != 0, "C18 修复前：绝对基准判据超时回滚（复现 ERROR [453]/[268]）");
+    CHECK(s.engine_bs == 4096u && s.config_bs == 4096u,
+          "C18 修复前：引擎/配置保持旧几何 4096");
+    CHECK(s.rebuild_count == 0, "C18 修复前：成功计数不增");
+    sim_destroy_all(&s);
+
+    sim_init(&s, 4096u, 2);
+    sim_steady_leak(&s, 7L);
+    s.recreating = 1;
+    sim_refs_drain(&s, SIM_STABLE_SAMPLES);   /* 连续 N 次 20ms 稳定采样 */
+    rcNew = sim_recreate(&s, 8192u);
+    CHECK(rcNew == 0, "C18 修复后：稳态 Refs=7 仍判定 quiesce 通过并重建成功");
+    CHECK(s.engine_bs == 8192u && s.config_bs == 8192u,
+          "C18 修复后：引擎/配置切到 8192（A/C 同批修才不挪卡点）");
+    CHECK(s.rebuild_count == 1, "C18 修复后：GeometryRebuildCount 递增 1");
+    CHECK(s.unloading == 0 && s.in_progress == 0, "C18 门控必清（禁哑服役）");
+    sim_destroy_all(&s);
+}
+
+/* C19 [92 负例1] 在途计数 / 窗口前置入 IO 未完成 -> 新判据必须仍超时回滚。
+ * 证明没有放宽成「立即通过」的空判据；并给出 IO 完成后放行的正向对照。 */
+static void case_C19_inflight_still_blocks(void)
+{
+    SIM s;
+    int i, rc;
+    printf("\n[C19 92 负例1] 6 项在途未归零 / 窗口前置入 IO 未完成 -> 仍超时回滚\n");
+
+    /* 1a：稳态泄露 + B1 第 7 项 flush 主线程循环体在途 */
+    sim_init(&s, 4096u, 2);
+    sim_steady_leak(&s, 7L);
+    s.recreating = 1;
+    s.flush_thread_in_loop = 1;
+    rc = sim_recreate(&s, 8192u);
+    CHECK(rc != 0, "C19a 第 7 项在途非零 -> 仍超时回滚（7 项判据一条未删）");
+    CHECK(s.engine_bs == 4096u && s.rebuild_count == 0,
+          "C19a 引擎保留旧几何 / Count 不增");
+    sim_destroy_all(&s);
+
+    /* 1b：窗口前置入 IO 持续完成，Refs 回落中（未稳定） */
+    sim_init(&s, 4096u, 2);
+    for (i = 0; i < s.nvol; i++) {
+        s.refs[i] = 7L + 8L;                 /* 稳态基线 7 + 8 个前置入 IO */
+        s.refs_baseline[i] = 7L;
+        s.refs_stable[i] = 0;
+        s.prewindow_pending[i] = 8;
+    }
+    s.recreating = 1;
+    sim_refs_drain(&s, 2);                   /* 只推进 2 步，仍有前置入 IO 在途 */
+    rc = sim_recreate(&s, 8192u);
+    CHECK(rc != 0, "C19b 窗口前置入 IO 未全部完成 -> 仍超时回滚（相对基线非立即通过）");
+    CHECK(s.engine_bs == 4096u && s.rebuild_count == 0,
+          "C19b 引擎保留旧几何 / Count 不增");
+    sim_destroy_all(&s);
+
+    /* 1c 正向对照：前置入 IO 全部完成 + N 次稳定采样后放行（证明不是永久拒绝） */
+    sim_init(&s, 4096u, 2);
+    for (i = 0; i < s.nvol; i++) {
+        s.refs[i] = 7L + 8L;
+        s.refs_baseline[i] = 7L;
+        s.refs_stable[i] = 0;
+        s.prewindow_pending[i] = 8;
+    }
+    s.recreating = 1;
+    sim_refs_drain(&s, 8 + SIM_STABLE_SAMPLES);
+    rc = sim_recreate(&s, 8192u);
+    CHECK(rc == 0, "C19c 前置入 IO 全部完成并稳定 N 次后放行（非永久拒绝）");
+    CHECK(s.engine_bs == 8192u && s.rebuild_count == 1, "C19c 几何切换成功 / Count 递增");
+    sim_destroy_all(&s);
+}
+
+/* C20 [92 负例2] detach 失败 -> Stream 保留 + IsAttached 就地复原 + 引擎保留。 */
+static void case_C20_detach_fail_state(void)
+{
+    SIM s;
+    printf("\n[C20 92 负例2] detach 失败 -> Stream 保留 / IsAttached 复原（DATA-11/13）\n");
+    sim_init(&s, 4096u, 3);
+    s.recreating = 1;
+    s.detach_timeout_vol = 1;
+    CHECK(sim_recreate(&s, 16384u) != 0, "C20 detach 失败返回失败并走 out_rollback");
+    CHECK(s.st[1] != NULL, "C20 超时卷 Stream 保留（未摘除/销毁，rbio.c 失效判据仍需它）");
+    CHECK(s.is_attached[1] == 1, "C20 超时卷 IsAttached 就地复原 TRUE + 屏障");
+    CHECK(s.detached[1] == 0, "C20 超时卷 Detached=FALSE（回滚按逐项判定不重挂该卷）");
+    CHECK(s.eng != NULL && s.engine_bs == 4096u, "C20 引擎保留旧几何（禁止销毁）");
+    CHECK(s.config_bs == 4096u, "C20 配置副本回滚到旧几何");
+    CHECK(s.unloading == 0 && s.in_progress == 0, "C20 门控必清（禁哑服役）");
+    sim_destroy_all(&s);
+}
+
+/* C21 [92 负例3] 软分离卷（不在快照、Stream 保留）不再触发全表判据；
+ * 且 rb_engine_snapshot_streams==0 的引擎表判据仍生效（防 UAF/双释放）。 */
+static void case_C21_soft_detached(void)
+{
+    SIM s;
+    int rc;
+    printf("\n[C21 92 负例3] 软分离卷不再阻断 DevList 判据，引擎表判据仍 abort\n");
+    sim_init(&s, 4096u, 2);
+    s.is_attached[1] = 0;                   /* 软分离：热开关关、Stream 保留 */
+    rb_stream_destroy(s.st[0]); s.st[0] = NULL;
+    s.detached[0] = 1;                      /* 本轮快照内唯一摘链卷 */
+    s.in_snapshot[0] = 1; s.in_snapshot[1] = 0;
+
+    s.refs_model = 0;
+    CHECK(sim_all_detached(&s) == 0,
+          "C21 修复前：全表 Stream==NULL 被软分离卷挡住（复现 ERROR [334]）");
+    s.refs_model = 1;
+    CHECK(sim_all_detached(&s) == 1,
+          "C21 修复后：判据收窄到本轮 Detached 卷，软分离卷不再阻断");
+    s.engine_stream_table_nonempty = 1;
+    CHECK(sim_all_detached(&s) == 0,
+          "C21 引擎 stream 表非空仍 abort（防 UAF/双释放判据保留）");
+    sim_destroy_all(&s);
+
+    /* 端到端：软分离卷的流仍挂在 eng->streams 时，防 UAF/双释放判据必须仍
+     * abort（92 §2.2「明确保留现状 + 日志告警」）。B 修的是「全表 DevList
+     * 判据」这个假阻断，不是要绕过引擎表判据去静默销毁带残留流的引擎。 */
+    sim_init(&s, 4096u, 2);
+    s.is_attached[1] = 0;                   /* 软分离：Stream 保留 */
+    s.engine_stream_table_nonempty = 1;     /* 真实语义：该流仍在引擎表 */
+    sim_refs_drain(&s, SIM_STABLE_SAMPLES);
+    s.recreating = 1;
+    rc = sim_recreate(&s, 8192u);
+    CHECK(rc != 0, "C21 软分离卷的流仍在引擎表 -> 防 UAF 判据仍 abort（不静默放行）");
+    CHECK(s.eng != NULL && s.engine_bs == 4096u,
+          "C21 引擎保留旧几何（禁止带残留流销毁，防双重释放）");
+    CHECK(s.rebuild_count == 0, "C21 Count 不增");
+    CHECK(s.unloading == 0 && s.in_progress == 0, "C21 门控必清");
+    sim_destroy_all(&s);
+}
+
 int main(void)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* 崩溃时也能定位到最后一个用例 */
     g_disk = (unsigned char *)malloc(DISK_SIZE);
     if (!g_disk) { printf("[FATAL] disk alloc failed\n"); return 2; }
     memset(g_disk, 0, DISK_SIZE);
 
-    printf("== test_rebuild: 卷级几何重建用户态回归（8 类 + 9 类新增故障注入）==\n");
+    printf("== test_rebuild: 卷级几何重建用户态回归（8 类 + 9 类 + 4 类 92 号正反用例）==\n");
     case_C1_inflight();
     case_C2_timeout();
     case_C3_old_engine_fallback();
@@ -850,6 +1084,10 @@ int main(void)
     case_C15_engine_recreate();
     case_C16_clamp();
     case_C17_unload_abort_pool();
+    case_C18_steady_refs_leak();
+    case_C19_inflight_still_blocks();
+    case_C20_detach_fail_state();
+    case_C21_soft_detached();
 
     free(g_disk);
     printf("\n== RESULT: %s (FAIL=%d) ==\n", g_fail ? "FAIL" : "PASS", g_fail);

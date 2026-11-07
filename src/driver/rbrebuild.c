@@ -18,9 +18,11 @@
  *   2. RbSaveConfig 写新 BlockSize + RbRegQueryValue 回读确认（防 void 写假成功）
  *   3. InterlockedExchange(Unloading,1) 挡新 IO（既有 10 处入口闸门）
  *   4. 快照 Attached 卷集合 + 各卷 read/write/wm 标志（DevListLock 短锁后释放）
- *   5. 逐卷 RbDetachStreamForRebuild（关 inflow → 等 Refs 回基准 → flush →
- *      原子摘链 + rb_stream_destroy）——旁路回调的安全屏障来源
- *   6. RbWaitDataPathQuiesce（6 项有界等待）+ RbFeatQuiesce（池排空后配对 Init）
+ *   5. 逐卷 RbDetachStreamForRebuild（关 inflow → 等窗口前置入 IO 完成，即 Refs
+ *      相对基线连续稳定 → flush → 原子摘链 + rb_stream_destroy）
+ *   6. RbWaitDataPathQuiesce（7 项有界等待 + Refs 相对基线稳定）+ RbFeatQuiesce
+ *      [92 A/C] 不再用「Refs 回落绝对基准」这类生命周期计数判据；[92 B]
+ *      RbRebuildAllStreamsDetached 收窄到本轮快照卷，引擎表判据保留
  *   7. rb_engine_destroy → Engine=NULL → Config.BlockSize=new → RbCreateEngineOnly
  *   8. 逐卷 RbReattachVolumeForRebuild（绕过 Recreating 门）+ 复原标志
  *   9. RbL2LazyOpen + 复核 RbL2State（16K→4K 回退不会自动重开）
@@ -135,16 +137,26 @@ static ULONG RbRebuildSnapshotVolumes(RB_REBUILD_VOL *out, ULONG cap)
     return n;
 }
 
-/* ---- 工具：全部卷 Stream 已摘链 + 引擎 stream 表为空（销毁前双硬判据） ----
+/* ---- 工具：本轮快照卷 Stream 已摘链 + 引擎 stream 表为空（销毁前双硬判据）----
  * [83 收窄#4] cache.c:1125-1146 rb_stream_destroy 有 60s 超时 leak-by-design
  * 路径：超时后 stream 已从 ext 摘下但仍挂在 eng->streams 链表上。若此时销毁
- * 引擎，rb_engine_destroy 会二次遍历该表 → UAF/双重释放。故必须同时验证
- * ① 每卷 ext->Stream==NULL ② rb_engine_snapshot_streams(eng,...) 返回 0。
- * snapshot 会给每个流加 io_users 引用，必须逐个 rb_stream_release_io 归还。 */
-static BOOLEAN RbRebuildAllStreamsDetached(VOID)
+ * 引擎，rb_engine_destroy 会二次遍历该表 → UAF/双重释放。故引擎表判据
+ * rb_engine_snapshot_streams(eng,...)==0 **必须保留**；snapshot 会给每个流
+ * 加 io_users 引用，必须逐个 rb_stream_release_io 归还。
+ *
+ * [92 B 2026-11-07] 旧实现遍历整个 DevList 要求所有卷 Stream==NULL。但软分离
+ * rbattach.c:1273-1305 设计上保留 Stream，而 RbRebuildSnapshotVolumes 只收
+ * IsAttached && Stream 的卷 ⇒ 软分离卷不在本轮快照、却被全表判据挡住
+ * （ERROR [334] / 0x80000011，91 号判别试验 3）。现把 DevList 判据收窄到
+ * 本轮 vols[] 中 Detached=TRUE 的卷：只有确需摘链且已摘链的卷才要求 NULL。
+ * 软分离卷（不在快照、Stream 保留）不再触发本判据；若引擎表仍有它的流，
+ * 下方的引擎表判据仍会 abort，并额外打一条可归因 WARN（保留现状 + 明示，
+ * 不静默放过：92 §2.2）。绝不为了放行而删引擎表判据（防 UAF/双释放）。 */
+static BOOLEAN RbRebuildAllStreamsDetached(const RB_REBUILD_VOL *vols, ULONG count)
 {
     PLIST_ENTRY link;
-    BOOLEAN ok = TRUE;
+    BOOLEAN ok = TRUE, softKept = FALSE;
+    WCHAR softLetter = L'?';
     rb_engine *eng;
     rb_stream *snap[RB_FLUSH_SNAP_MAX];
     int n, k;
@@ -152,10 +164,26 @@ static BOOLEAN RbRebuildAllStreamsDetached(VOID)
     ExAcquireFastMutex(&g_Rb.DevListLock);
     for (link = g_Rb.DevList.Flink; link != &g_Rb.DevList; link = link->Flink) {
         PRB_DEV_EXT e = CONTAINING_RECORD(link, RB_DEV_EXT, ListEntry);
-        if (e->Stream != NULL) { ok = FALSE; break; }
+        ULONG j;
+        BOOLEAN inScope = FALSE;
+        for (j = 0; j < count; j++) {
+            if (vols[j].Detached && vols[j].Letter == e->Letter) { inScope = TRUE; break; }
+        }
+        if (inScope) {
+            if (e->Stream != NULL) { ok = FALSE; break; }
+        } else if (e->Stream != NULL && !e->IsAttached) {
+            softKept = TRUE; softLetter = e->Letter;   /* 锁内只记标志，锁外再打日志 */
+        }
     }
     ExReleaseFastMutex(&g_Rb.DevListLock);
-    if (!ok) return FALSE;
+    if (softKept) {
+        RbLog(1, __LINE__, (LONG)softLetter,
+              L"rebuild: soft-detached volume keeps its stream (not in snapshot); engine-table check still authoritative");
+    }
+    if (!ok) {
+        RbLog(2, __LINE__, 0, L"rebuild: snapshot volume still has a stream, abort");
+        return FALSE;
+    }
 
     eng = (rb_engine *)InterlockedCompareExchangePointer((PVOID *)&g_Rb.Engine, NULL, NULL);
     if (!eng) return TRUE;                  /* 引擎已销毁：无表可查 */
@@ -218,11 +246,15 @@ static ULONG RbRebuildReattachAll(RB_REBUILD_VOL *vols, ULONG count, ULONG *pFai
 
 /* ---- 屏障：7 项在途判据全部归零（30/60s 有界） ----
  * [83 收窄#1] DataPathInFlight 是 RbCtxAlloc/RbCtxFree 严格配对的**真实计数**
- * （只统计重建窗口内分配的 ctx）。窗口前置入的 ctx 由「每卷 ext->Refs
- * 回基准」判据兜底。故此处**只读不写** DataPathInFlight，判据 =
- *   DataPathInFlight==0 && refsQuiet && FallbackInFlight==0 &&
+ * （只统计重建窗口内分配的 ctx）。窗口前置入的 ctx 不计入该项，由下面的
+ * 「Refs 相对基线连续稳定」判据兜底。故此处**只读不写** DataPathInFlight。
+ * [92 C 2026-11-07] 旧 refsQuiet 要求每卷 Refs<=1，比缺陷 A 更严；只修 A
+ * 会把卡点从 [453] 挪到 [268] datapath quiesce timeout。现改为：首次采样
+ * 记录各卷 Refs 基线，要求 ①不高于基线 ②连续 N 次 20ms 不再下降（稳定）。
+ * 历史泄漏/常驻引用属于稳定基线，不再被误判为在途 IO。
+ * 判据 = DataPathInFlight==0 && refsQuiet && FallbackInFlight==0 &&
  *   ZombiePending==0 && s_PrefInFlight==0 && FlushJobs==0 &&
- *   FlushThreadInLoop==0（7 项）。
+ *   FlushThreadInLoop==0（7 项，一条不删）。
  * 旁路作业由 M5 各入口 RbIsDataPathFrozen 早退，不新增计数。
  * [85 B1] 第 7 项 FlushThreadInLoop：RbFlushThread 的入口门只在循环入口判一次，
  * 已进循环体的那一轮仍会解引用 g_Rb.Engine；必须等它离开循环体（归零）才允许
@@ -234,24 +266,43 @@ static ULONG RbRebuildReattachAll(RB_REBUILD_VOL *vols, ULONG count, ULONG *pFai
 NTSTATUS RbWaitDataPathQuiesce(ULONG timeoutMs)
 {
     LARGE_INTEGER tick;
-    ULONG spins, maxSpins;
+    ULONG spins, maxSpins, idx, seen = 0;
+    LONG base[RB_MAX_VOLUMES], last[RB_MAX_VOLUMES];
+    ULONG stable[RB_MAX_VOLUMES];
+    BOOLEAN captured = FALSE;
     PAGED_CODE();
     tick.QuadPart = -200000LL;                 /* 20ms/步 */
     maxSpins = (timeoutMs / 20u) + 1u;
     if (maxSpins < 50u) maxSpins = 50u;        /* 至少 1s */
+    RtlZeroMemory(base, sizeof(base));
+    RtlZeroMemory(last, sizeof(last));
+    RtlZeroMemory(stable, sizeof(stable));
 
     for (spins = 0; spins < maxSpins; spins++) {
         PLIST_ENTRY link;
         BOOLEAN refsQuiet = TRUE;
+        idx = 0;
 
         ExAcquireFastMutex(&g_Rb.DevListLock);
         for (link = g_Rb.DevList.Flink; link != &g_Rb.DevList; link = link->Flink) {
             PRB_DEV_EXT e = CONTAINING_RECORD(link, RB_DEV_EXT, ListEntry);
             LONG r = InterlockedCompareExchange(&e->Refs, 0, 0);
-            /* owner 基准 1；重建期间已关 inflow 且旁路早退，Refs 不会新增。 */
-            if (r > 1) { refsQuiet = FALSE; break; }
+            if (idx >= RB_MAX_VOLUMES) break;
+            if (!captured || idx >= seen) {
+                base[idx] = r; last[idx] = r; stable[idx] = 0;   /* 窗口起点基线 */
+            }
+            if (r > base[idx]) {
+                stable[idx] = 0; last[idx] = r;                   /* 新增引用 */
+            } else if (r == last[idx] && r <= base[idx]) {
+                if (stable[idx] < RB_REBUILD_REFS_STABLE_SAMPLES) stable[idx]++;
+            } else {
+                stable[idx] = 0; last[idx] = r;                   /* 前置入 IO 完成 */
+            }
+            if (stable[idx] < RB_REBUILD_REFS_STABLE_SAMPLES) refsQuiet = FALSE;
+            idx++;
         }
         ExReleaseFastMutex(&g_Rb.DevListLock);
+        if (!captured || idx > seen) { seen = idx; captured = TRUE; }
 
         if (InterlockedCompareExchange(&g_Rb.DataPathInFlight, 0, 0) == 0 &&
             refsQuiet &&
@@ -265,7 +316,7 @@ NTSTATUS RbWaitDataPathQuiesce(ULONG timeoutMs)
         KeDelayExecutionThread(KernelMode, FALSE, &tick);
     }
     RbLog(2, __LINE__, (LONG)InterlockedCompareExchange(&g_Rb.FlushThreadInLoop, 0, 0),
-          L"rebuild: datapath quiesce timeout (7 criteria) - engine kept, rolling back");
+          L"rebuild: datapath quiesce timeout (7 criteria + refs relative baseline) - engine kept, rolling back");
     return STATUS_TIMEOUT;                     /* 超时：绝不销毁引擎（R2） */
 }
 
@@ -330,7 +381,7 @@ NTSTATUS RbRecreateEngineGeometry(ULONG newBlockSize)
     }
 
     /* e) 判据复核 + 屏障 + 特性层池排空/恢复 */
-    if (!RbRebuildAllStreamsDetached()) {
+    if (!RbRebuildAllStreamsDetached(vols, volCount)) {
         RbLog(2, __LINE__, 0, L"rebuild: stream(s) still attached, abort");
         st = STATUS_DEVICE_BUSY;
         goto out_rollback;

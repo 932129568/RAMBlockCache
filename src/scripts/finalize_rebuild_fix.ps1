@@ -43,6 +43,9 @@
 #  10) final scope double-read
 #  11) ALL OK + NEXT hint
 #
+# DO NOT DEPLOY: 31cf870 / 76aacfc / 931ed53 are AUDIT RECORDS ONLY
+# (93 SPEC NO-GO, see the fail-closed gate below and the 93 report).
+#
 # NEXT (plain session, by the lead): sync_setup_hash.ps1 -RequireSetupChanged,
 # then ONE reboot AND AN INTERACTIVE LOGON (logon_disarm must run to clear
 # FilterArmed, otherwise verify_final_reboot.ps1 gives a deterministic false
@@ -105,6 +108,30 @@ $statvalKeys  = @('engine_bs','rebuild_count','rebuild_status','rebuild_in_progr
 $blockLabels  = @('4 KB','8 KB','16 KB','32 KB')
 $rxBlockArray = [regex]'\[\s*4096\s*,\s*8192\s*,\s*16384\s*,\s*32768\s*\]'
 $rxChunk      = [regex]'SettingsPage-[A-Za-z0-9_-]+\.js$'
+
+# ---- [93 SPEC NO-GO] FAIL-CLOSED FREEZE GATE -----------------------------
+# DO NOT DEPLOY: commits 31cf870 / 76aacfc / 931ed53 are AUDIT RECORDS ONLY.
+# Independent second-layer review deliverables/93-spec-nogo-freeze-2026-11-07.md
+# proved the "Refs relative baseline + 4 x 20ms stable" drain criterion is
+# FAIL-OPEN: a pre-window IO whose +1 is baked into the baseline and that lives
+# >80ms is judged "drained" -> engine destroyed -> UAF / silent data corruption
+# on a BOOT_START volume filter. PE can rescue boot, NOT user data.
+# NO automatic / date-based / environment-variable bypass. The lift file below
+# must be created MANUALLY by the lead only after route A is re-designed AND
+# independently reviewed SPEC OK.
+# This gate runs after the variable area and BEFORE the first write operation
+# (log init / Copy-Item / Set-Content / Invoke-Step), so a frozen chain cannot
+# sign, deploy or reboot anything.
+$nogoLift = 'C:\ProgramData\rb-deploy\93-NOGO-LIFTED.ok'
+if (-not (Test-Path -LiteralPath $nogoLift)) {
+    Write-Host '[X] FROZEN: 93 SPEC NO-GO - DO NOT DEPLOY (31cf870 / 76aacfc / 931ed53)'
+    Write-Host '    Reason: fail-open UAF / silent data corruption (Refs-baseline drain criterion).'
+    Write-Host '    See   : deliverables/93-spec-nogo-freeze-2026-11-07.md'
+    Write-Host '    No signing, no deploy.ps1, no reboot. This chain must NOT run.'
+    Write-Host ('    Manual lift file required (lead only): ' + $nogoLift)
+    exit 1
+}
+Write-Host ('[i] 93 NO-GO lift present: ' + $nogoLift + ' - continuing (route A must be SPEC OK)')
 
 function L([string]$m) {
     Add-Content -LiteralPath $log -Value ("[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m)

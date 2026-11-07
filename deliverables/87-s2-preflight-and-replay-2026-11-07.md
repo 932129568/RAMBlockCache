@@ -264,3 +264,32 @@ ramboostctl.new.exe : fatal error LNK1120: 3 个无法解析的外部命令
 - 唯一未闭环是**外部网络**：本地提交 `70a38f8` 因本地代理 `CONNECT tunnel failed, 502` 未推送，`ahead 1`；不阻断 UAC，恢复后补推并确认 CI。
 
 用户操作仍是**双击一次 `RB-finalize-geom-rebuild.cmd` → 回话 → 由主理人执行回填 → 重启一次 → 只读验收 + S3 专项**。重启后严禁再双击任何 finalize wrapper（§7 / KNOWN_ISSUES G5）。
+
+---
+
+## 13. S2 UAC 全链执行结果（2026-11-07 16:29:38 – 16:30:48，70 秒）
+
+用户双击 `RB-finalize-geom-rebuild.cmd` 完成 UAC。**以日志为准**（`C:\ProgramData\rb-deploy\finalize-geom-rebuild.log`，43,796 B），零 `ABORT`、零 `FAILED`，收尾 `ALL OK`。
+
+| 步 | 结果 |
+|---|---|
+| 1 | 全部前置断言 PASS：cache.c pin `8340f9ff…`、CLI 双件新鲜 + 5 statval 键（`b24f0a23…`）、TS 解码器 5 字段、`_build_manual.ps1` 含 `rbrebuild.c`、动态基线 `63ad0fa8…` / 禁用集含 `0269fb50…`、anti-reboot `boot 15:29Z > marker 15:22Z` |
+| 2 | 17 源全部 `[ok]`，`=== BUILD OK ===`，未签名 sys `8353ccdf…` / 170,496 B |
+| 3 | signtool 成功，签名 sys **`10fb700903caab564c028817474db3c9e1f9c7914bfbf1237e72958ddffaa981`**（172,768 B），sidecar 回读一致 |
+| 4 | `sync_anchors.ps1` 三处 `63ad0fa8… → 10fb7009…`，`README.txt` 仅哈希行变动，回读断言 PASS |
+| 5 | gate5 `result: PASS (0 fail, 0 warn)`，链 Valid |
+| 6 | `build_setup.ps1` exit 0（Node27 + npm 12.2.1、SPA 2233 modules、controller 自包含发布、单文件 Setup `1c878378…` 未签名）；新增断言全部落地：`Setup payload CLI matches fresh src CLI b24f0a23…` / `payload rbfeatctl.exe + both zips refreshed OK` / **`webconsole.zip decoder carries all 5 RB_STATS fields (8117 chars probed)`**（QA WARN-1 在真机上被证伪并闭环） |
+| 7 | Setup 四重哈希断言 PASS，签名后 **`db7006d71c117a15fe2f535f6034076627732487601eb2039e322b88580fd3f1`** / 272,868,696 B / Valid |
+| 8 | `verifier /reset` **exit 0** + registry cleared；`deploy.ps1` 预检门（SHA + `signtool /pa` 双验）通过 → System32 拷贝 `10fb7009…` 且回验一致；`UpperFilters=[volsnap, RAMBlockCache]`；武装 `DeploySeq=12 / Ack=11 / Armed=1 / Healthy=0 / BootFails=0`；`Features\Flags=0`；两个看门任务注册；部署后 gate5 再 PASS |
+| 9 | ledger append **fatal 路径成功** + read-back OK（`FINAL_SETUP_SHA256=db7006d7…` / `FINAL_SYS_SHA256=10fb7009…` 为最后两条）；marker `2026-11-07T08:30:48.509Z` |
+
+**UAC 后处置（主理人）**：
+
+- `sync_setup_hash.ps1 -RequireSetupChanged` → **`UPDATED / exit 0`**，5 行全部回填：README.md:16/17 → `db7006d7…` / `10fb7009…`；67:12/13 → `db7006d7…` / `272,868,696 B`、`10fb7009…` / `172,768 B`；67:130 改「已重编重签」。幂等复跑 `ALREADY IN SYNC / exit 0`。
+- UAC 后十道门禁 **全绿**（`check_repo` / `check_proto_sync --strict` / `refcount` / `xaml` / `check_ps_syntax` 67 文件 0 失败 / `check_signature` Valid + 三锚点指向新 sys / node / geom / Gate8 / Gate9）。
+- 提交推送：`70a38f8`、`c20c732`、`ec7714e`（UAC 产物 7 文件）全部推送成功，本地 = `origin/main`，工作区干净。此前的代理 `schannel / 502` 已自行恢复。
+- **重启前预演** `verify_final_reboot.ps1`：`RESULT: FAIL=2 WARN=0 / SCRIPT_EXIT=1`，两项**全部是「还没重启」的预期项** —— ① `reboot after finalize`（`boot_utc=2026-11-06T15:29:00.501Z` < `finalize_utc=2026-11-07T08:30:48.509Z`）；② `watchdog`（`Seq=12 Ack=11 Armed=1 Healthy=0`）。其余 **17 项 PASS**：Verifier off、System32 sys 新哈希 Valid、service Running/Boot、bootcfg AA=0/RB=1/Letters=D、X4 文本匹配 `resume list loaded` / `volume attached` 均命中（segment 24 行、零 ERROR）、bridge health pid=8376 / node v27、D: Attached=1、C/E/F 0、GET_CONFIG 24 字段含 TinyLFU=0、看门 RPC 前后不变、Setup signed、README Setup hash in sync。⇒ 重启后只要这 2 项转绿即 `FAIL=0 / VERDICT: PASS`。
+
+**重启后仍须额外确认（不在 `verify_final_reboot.ps1` 内）**：预演里 bridge pid 仍是 `8376`（11-06 23:30 启动的旧解码器，`GET_STATS` 仍是 45 字段）。keeper 由 SYSTEM/ONSTART 约 30 s 重起后须先查 pid 已变 + `GET_STATS` 字段数 = **50** 且五键存在，再跑验收与 S3 专项（§11.4 / §8）。
+
+**口径**：以上只证明**新签名驱动已部署到 System32、服务/注册态已武装、分发包与文档一致**；内核内存镜像仍是旧驱动，**不构成 B1/B2 运行时后果、免重启切档实效、缓存数据面正确性或回写性能的真机验证**。Verifier `/reset` 的内核侧落实也须重启后复核。

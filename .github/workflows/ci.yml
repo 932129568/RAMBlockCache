@@ -112,6 +112,15 @@ jobs:
       - name: Gate9 check_ctl_freshness
         run: python src/scripts/check_ctl_freshness.py
 
+      # —— [2026-11-07] UI 档位 ↔ 驱动白名单漂移守卫（Gate10）——
+      # 防「Web 下拉只给 4K、驱动白名单却已放开 4 档」这类 UI 档位 ↔ 驱动白名单
+      # 漂移：静态只读断言 SettingsPage.tsx BLOCK_SIZES、rbctl.c rb_legal_bs[]、
+      # rbrebuild.c 重建目标白名单三者恰为 {4096,8192,16384,32768} 且顺序一致，
+      # 三者均不含 64K/128K（76 号 NO-GO 封禁），且桥接 configSchema 未用
+      # z.enum / z.literal / refine 把 BlockSize 重新锁死。CI 持续调用本脚本。
+      - name: Gate10 check_blocksize_contract
+        run: python src/scripts/check_blocksize_contract.py
+
       # —— Web 类型检查 + 生产构建（41 号 §11.5 阶段 2 接入）——
       # --loglevel=error 抑制 Node 27 alpha 上 npm 12.2.1 的已知 engines 假警告
       # （CI 侧同时抑制 Node 22 与 package.json engines 的 EBADENGINE 提示）。

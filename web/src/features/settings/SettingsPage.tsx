@@ -7,10 +7,12 @@ import { confirmDialog } from '@state/confirm-store';
 import { toast } from '@state/toast-store';
 import { Badge, PageHeader, Toggle } from '@components/ui';
 
-/** 合法缓存块大小（rb_proto.h RB_BLOCK_SIZE + CLI set 同款白名单） */
-// [F1 2026-11-06] 驱动白名单 {4K,8K,16K,32K}（64K/128K 因 11-03 事故未归因而
-// 封禁，59-64k-audit F1）；UI 只提供 4K。
-const BLOCK_SIZES = [4096];
+/** 合法缓存块大小（驱动 rbctl.c rb_legal_bs[] / rbrebuild.c 四档白名单同款） */
+// [2026-11-07 BugFix] 79/83 号卷级免重启几何重建已落地：切档由驱动在卷级重建
+// 引擎，无需整机重启；S2 全链重放真机验收 FAIL=0 / WARN=0。UI 恢复开放
+// {4K,8K,16K,32K} 四档，与 WPF MemoryView.xaml.cs:20 及驱动白名单对齐。
+// 64K/128K 依 76 号（11-03/11-04 蓝屏未归因）仍 NO-GO 封禁，不出现在任何 UI。
+const BLOCK_SIZES = [4096, 8192, 16384, 32768];
 
 /**
  * 设置页（§11.5 迁移顺序第 5 页，六页收尾）。
@@ -195,6 +197,9 @@ export default function SettingsPage() {
                 options={[...(BLOCK_SIZES.includes(cfg.BlockSize) ? [] : [{ value: cfg.BlockSize, text: `${cfg.BlockSize / 1024} KB（当前值）` }]), ...BLOCK_SIZES.map((b) => ({ value: b, text: `${b / 1024} KB` }))]}
                 {...form.register('BlockSize', { valueAsNumber: true })}
               />
+              <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
+                切换块大小会触发驱动内部引擎重建（无需重启整机）：重建期间缓存中的干净块会被丢弃，命中率短时归零；默认直写（WriteBack=0）下无脏数据、不丢数据。重建窗口内 I/O 回落至磁盘、性能会短暂下降，建议避开高负载时段切换。开放档位：4 KB / 8 KB / 16 KB / 32 KB。
+              </p>
             </Group>
 
             <Group title="回写与回收">

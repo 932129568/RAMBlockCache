@@ -1,380 +1,193 @@
+﻿================================================================
+ RAMBlockCache V10.5.0  Build 19  瀹屾暣寮€鍙戝寘
 ================================================================
- RAMBlockCache V10.5.0  Build 19  完整开发包
-================================================================
-打包时间 : 2026-11-07
-版本     : 10.4.1.19  (Protocol 9)
+鎵撳寘鏃堕棿 : 2026-11-07
+鐗堟湰     : 10.4.1.19  (Protocol 9)
 ----------------------------------------------------------------
-版本标识说明（两轨并存，非笔误）
+鐗堟湰鏍囪瘑璇存槑锛堜袱杞ㄥ苟瀛橈紝闈炵瑪璇級
 ----------------------------------------------------------------
-  机器版本串 : 10.4.1.19   —— 唯一事实源 src\common\version.h，
-               被工具链(gen_version.ps1)、门禁(check_repo.py)、
-               驱动 INF(DriverVer) 与 GET_VERSION 上报共同引用。
-  发布名     : V10.5.0 Build 19 —— 对外称呼，用于 README/UI 标题。
-               （由 version.h 的 RB_RELEASE_* 宏显式定义，与机器版本解耦）
-  两者对应关系：Build 号一致(19)；改版本请只改 version.h，
-  并同步 DriverService.cs 的 ExpectedDriverVer。
+  鏈哄櫒鐗堟湰涓?: 10.4.1.19   鈥斺€?鍞竴浜嬪疄婧?src\common\version.h锛?               琚伐鍏烽摼(gen_version.ps1)銆侀棬绂?check_repo.py)銆?               椹卞姩 INF(DriverVer) 涓?GET_VERSION 涓婃姤鍏卞悓寮曠敤銆?  鍙戝竷鍚?    : V10.5.0 Build 19 鈥斺€?瀵瑰绉板懠锛岀敤浜?README/UI 鏍囬銆?               锛堢敱 version.h 鐨?RB_RELEASE_* 瀹忔樉寮忓畾涔夛紝涓庢満鍣ㄧ増鏈В鑰︼級
+  涓よ€呭搴斿叧绯伙細Build 鍙蜂竴鑷?19)锛涙敼鐗堟湰璇峰彧鏀?version.h锛?  骞跺悓姝?DriverService.cs 鐨?ExpectedDriverVer銆?----------------------------------------------------------------
+閮ㄧ讲闂ㄧ鍝堝笇閿氱偣锛堥噸瑕侊級
 ----------------------------------------------------------------
-部署门禁哈希锚点（重要）
+  scripts\deploy.ps1 / verify_deploy_signature.ps1 鍐呯疆
+  DefaultExpectedSha256 = c0b03c67d9eeda100f84479b11ba68ac1a77182e904876ba89d242a02ceb950b
+  璇ュ€煎搴旀湰鍖?dist\RAMBlockCache.sys锛?026-11-07 鍗风骇鍏嶉噸鍚嚑浣曢噸寤烘壒锛?  79/83 鍙峰嵎绾ч噸寤?+ 85 鍙峰璁′慨澶嶏紝S2 鍏ㄩ摼閲嶆斁鐪熸満楠屾敹 FAIL=0 / WARN=0锛?  172,768 瀛楄妭锛夈€傦紙2026-10-21 鏇存锛氬師鏂囧瓧璇啓 115,424锛涘搱甯屾墠鏄敮涓€鏉冨▉鏍囪瘑锛屽瓧鑺傛暟浠呬緵浜哄伐鏍稿锛?  浠讳綍婧愮爜鏀瑰姩鍚庡繀椤婚噸鏂扮紪璇?+ 閲嶆柊绛惧悕锛?  鏂颁簩杩涘埗鍝堝笇浼氬彉鍖?鈥斺€?鑻ユ湭鍚屾鏇存柊璇ラ敋鐐癸紝閮ㄧ讲浼?澶辫触鍏抽棴"锛堟嫆缁濋儴缃诧級锛?  杩欐槸鍒绘剰璁捐锛屼笉瑕佷负浜嗙粫杩囪€屽垹鎺夋牎楠屻€?  鍙︼細src\scripts\check_signature.ps1锛堟彁浜ゅ墠闂ㄧ绗簲浠跺锛変細鑷姩鏂█
+  鏈敋鐐逛笌涓夊閮ㄧ讲鑴氭湰涓€鑷达紝绛惧悕鏃犳晥鍗?FAIL銆?----------------------------------------------------------------
+鐩綍缁撴瀯
 ----------------------------------------------------------------
-  scripts\deploy.ps1 / verify_deploy_signature.ps1 内置
-  DefaultExpectedSha256 = 544ba6d9a22325339294807140bcb7689cea3b88a9db1a06a3f4b6d247ed17d4
-  该值对应本包 dist\RAMBlockCache.sys（2026-11-07 卷级免重启几何重建批：
-  79/83 号卷级重建 + 85 号审计修复，S2 全链重放真机验收 FAIL=0 / WARN=0，
-  172,768 字节）。（2026-10-21 更正：原文字误写 115,424；哈希才是唯一权威标识，字节数仅供人工核对）
-  任何源码改动后必须重新编译 + 重新签名，
-  新二进制哈希会变化 —— 若未同步更新该锚点，部署会"失败关闭"（拒绝部署），
-  这是刻意设计，不要为了绕过而删掉校验。
-  另：src\scripts\check_signature.ps1（提交前门禁第五件套）会自动断言
-  本锚点与三处部署脚本一致，签名无效即 FAIL。
-----------------------------------------------------------------
-目录结构
-----------------------------------------------------------------
-  src\        完整源码（已排除 obj/bin/x64/build 编译中间产物）
-    driver\   Windows 内核块缓存过滤驱动（C, WDK）
-              rbattach.c / rbio.c / rbdriver.c / rbctl.c / rb_common.h ...
+  src\        瀹屾暣婧愮爜锛堝凡鎺掗櫎 obj/bin/x64/build 缂栬瘧涓棿浜х墿锛?    driver\   Windows 鍐呮牳鍧楃紦瀛樿繃婊ら┍鍔紙C, WDK锛?              rbattach.c / rbio.c / rbdriver.c / rbctl.c / rb_common.h ...
               RAMBlockCache.inf / RAMBlockCache.vcxproj / _build_drv.cmd
-    core\     用户态缓存引擎 + 全部自测（cache.c + test_*.c + edge/stress）
-              build_all.bat（Release+ASan）/ run_rel.bat
-    ctl\      用户态控制台 ramboostctl
-    common\   version.h、协议头
-    ui\controller\RAMBlockCache.Controller\   WPF 5 页 Fluent 深色 UI
-    scripts\  部署/回滚脚本
-    docs\     设计文档
+    core\     鐢ㄦ埛鎬佺紦瀛樺紩鎿?+ 鍏ㄩ儴鑷祴锛坈ache.c + test_*.c + edge/stress锛?              build_all.bat锛圧elease+ASan锛? run_rel.bat
+    ctl\      鐢ㄦ埛鎬佹帶鍒跺彴 ramboostctl
+    common\   version.h銆佸崗璁ご
+    ui\controller\RAMBlockCache.Controller\   WPF 5 椤?Fluent 娣辫壊 UI
+    scripts\  閮ㄧ讲/鍥炴粴鑴氭湰
+    docs\     璁捐鏂囨。
   dist\
-    RAMBlockCache.sys            已签名驱动（CN=RAMBoostFS Root，verify 通过）
-    wpf\RAMBlockCache.Controller.exe   WPF 控制台（self-contained，无需目标机安装 .NET）
-  report\
-    RAMBlockCache_V10.4.3_build19_专业审计.txt   本轮专业审计
+    RAMBlockCache.sys            宸茬鍚嶉┍鍔紙CN=RAMBoostFS Root锛寁erify 閫氳繃锛?    wpf\RAMBlockCache.Controller.exe   WPF 鎺у埗鍙帮紙self-contained锛屾棤闇€鐩爣鏈哄畨瑁?.NET锛?  report\
+    RAMBlockCache_V10.4.3_build19_涓撲笟瀹¤.txt   鏈疆涓撲笟瀹¤
 
 ----------------------------------------------------------------
-本轮改了什么（相对 Build 18）
+鏈疆鏀逛簡浠€涔堬紙鐩稿 Build 18锛?----------------------------------------------------------------
+  1. 淇 0xA (IRQL_NOT_LESS_OR_EQUAL) 涓夊锛?     - RbEnsureSystemVolumeInfo 鐨?PAGED_CODE() 鎻愬墠鍒颁换浣?return 涔嬪墠
+     - RbPnpRemoveComplete 鍦?DISPATCH_LEVEL 鐩存帴鎷嗚澶?鈫?鎺掗槦 PASSIVE 宸ヤ綔椤?     - RbVolumeRemove 鍏堟瘉娴佸啀绛?worker 鈫?鍏堟帓绌哄啀姣佹祦锛堜慨 UAF锛?     - DevCount-- 浠呭湪鑺傜偣纭疄閾惧叆琛ㄦ椂鎵ц锛堜慨璐熸紓绉伙級
+  2. version.h Build 18 鈫?19
+  3. UI 鍗曢〉 鈫?渚ц竟瀵艰埅 5 椤碉紙鎬昏/纾佺洏/缂撳瓨/鏃ュ織/璁剧疆锛?
 ----------------------------------------------------------------
-  1. 修复 0xA (IRQL_NOT_LESS_OR_EQUAL) 三处：
-     - RbEnsureSystemVolumeInfo 的 PAGED_CODE() 提前到任何 return 之前
-     - RbPnpRemoveComplete 在 DISPATCH_LEVEL 直接拆设备 → 排队 PASSIVE 工作项
-     - RbVolumeRemove 先毁流再等 worker → 先排空再毁流（修 UAF）
-     - DevCount-- 仅在节点确实链入表时执行（修负漂移）
-  2. version.h Build 18 → 19
-  3. UI 单页 → 侧边导航 5 页（总览/磁盘/缓存/日志/设置）
-
+瀹夎锛堟櫘閫氱敤鎴凤細鍙屽嚮鍗曟枃浠跺畨瑁呭櫒锛?----------------------------------------------------------------
+锛堝叆鍙ｅ彛寰?2026-10-21 缁熶竴 [FIX N-b]锛氭櫘閫氱敤鎴?鏈〉 GUI 瀹夎鍣紱寮€鍙戣€?鑴氭湰=
+ src\scripts\deploy.ps1锛沬nstall.ps1 / ramboostsetup.ps1=legacy 澶囬€夈€傦級
+  dist\RAMBlockCache-Setup.exe锛?72,872,792 B锛孷10.5.0 璧凤級
+  路 鍙屽嚮鍗宠繍琛岋紙鑷姩 UAC 鎻愭潈锛涘畨瑁呭櫒涓庢帶鍒跺彴鍧?self-contained锛屾棤闇€鐩爣鏈哄畨瑁?.NET锛夈€?  路 鎺у埗鍣ㄤ笌 CLI 闇€绠＄悊鍛橈細鎺у埗璁惧 \\.\RAMBlockCache 鐨?SDDL 浠?SYSTEM/
+    绠＄悊鍛樺彲璁块棶锛屾爣鍑嗙敤鎴疯处鎴蜂笅鎺у埗鍣ㄤ笌 CLI 涓嶅彲鐢紙瀹夎鍣ㄦ湰韬細鑷姩 UAC锛夈€?  路 浜旈〉鍚戝锛氭杩?鈫?璁稿彲鍗忚 鈫?瀹夎浣嶇疆涓庨€夐」锛堣嚜瀹氫箟鐩綍/蹇嵎鏂瑰紡锛夆啋
+    杩涘害锛堟彁鍙?鈫?椹卞姩绛惧悕鏍￠獙 鈫?娉ㄥ唽鏈嶅姟 鈫?鍐欏叆閰嶇疆锛夆啋 瀹屾垚锛堢珛鍗?绋嶅悗閲嶅惎锛夈€?  路 椹卞姩鏈綋鍥哄畾瑁?System32\drivers锛堝唴鏍歌姹傦級锛涙帶鍒跺彴/CLI/INF/README 钀藉湪
+    浣犻€夌殑鐩綍锛涖€屽簲鐢ㄤ笌鍔熻兘銆嶈嚜鍔ㄧ櫥璁板嵏杞藉叆鍙ｏ紙鎴栧畨瑁呭櫒鍔?/Uninstall锛夈€?  路 瑁呭悗闇€閲嶅惎涓€娆★紙BOOT_START 鍗疯繃婊ら┍鍔ㄧ殑鍝佺被鍥烘湁鎴愭湰锛屼笌 PrimoCache 涓€鑷达級锛?    閲嶅惎鍚庢暟鎹嵎鑷姩杩涘叆缂撳瓨锛堢郴缁熺洏榛樿涓嶅姞閫燂級锛屽啓妯″紡榛樿鐩村啓銆?  路 鍐呯疆杞借嵎锛氱鍚嶇増椹卞姩 + 闈欓粯寮曟搸锛圵inVerifyTrust fail-closed 棰勬鍦ㄥ紩鎿庡唴锛?    鏈鍚?楠岀澶辫触 = 闆剁郴缁熷彉鏇达紝鏈哄櫒淇濇寔鍘熺姸锛夈€?  寮€鍙戣€呴噸寤猴細src\scripts\build_setup.ps1锛堝彂甯冩帶鍒跺彴鈫掑埛鏂拌浇鑽封啋鍗曟枃浠跺彂甯冿級銆?
 ----------------------------------------------------------------
-安装（普通用户：双击单文件安装器）
+濡備綍缂栬瘧
 ----------------------------------------------------------------
-（入口口径 2026-10-21 统一 [FIX N-b]：普通用户=本页 GUI 安装器；开发者/脚本=
- src\scripts\deploy.ps1；install.ps1 / ramboostsetup.ps1=legacy 备选。）
-  dist\RAMBlockCache-Setup.exe（272,872,792 B，V10.5.0 起）
-  · 双击即运行（自动 UAC 提权；安装器与控制台均 self-contained，无需目标机安装 .NET）。
-  · 控制器与 CLI 需管理员：控制设备 \\.\RAMBlockCache 的 SDDL 仅 SYSTEM/
-    管理员可访问，标准用户账户下控制器与 CLI 不可用（安装器本身会自动 UAC）。
-  · 五页向导：欢迎 → 许可协议 → 安装位置与选项（自定义目录/快捷方式）→
-    进度（提取 → 驱动签名校验 → 注册服务 → 写入配置）→ 完成（立即/稍后重启）。
-  · 驱动本体固定装 System32\drivers（内核要求）；控制台/CLI/INF/README 落在
-    你选的目录；「应用与功能」自动登记卸载入口（或安装器加 /Uninstall）。
-  · 装后需重启一次（BOOT_START 卷过滤驱动的品类固有成本，与 PrimoCache 一致）；
-    重启后数据卷自动进入缓存（系统盘默认不加速），写模式默认直写。
-  · 内置载荷：签名版驱动 + 静默引擎（WinVerifyTrust fail-closed 预检在引擎内，
-    未签名/验签失败 = 零系统变更，机器保持原状）。
-  开发者重建：src\scripts\build_setup.ps1（发布控制台→刷新载荷→单文件发布）。
-
-----------------------------------------------------------------
-如何编译
-----------------------------------------------------------------
-  驱动 : 管理员 cmd → src\driver\_build_drv.cmd
-         （依赖 vcvars64 + WDK 26100；产物 driver\x64\Release\RAMBlockCache.sys）
-  WPF  : set DOTNET_ROOT=C:\Program Files\...\dotnet
+  椹卞姩 : 绠＄悊鍛?cmd 鈫?src\driver\_build_drv.cmd
+         锛堜緷璧?vcvars64 + WDK 26100锛涗骇鐗?driver\x64\Release\RAMBlockCache.sys锛?  WPF  : set DOTNET_ROOT=C:\Program Files\...\dotnet
          dotnet build src\ui\controller\RAMBlockCache.Controller\ -c Release
-  core : cmd → src\core\build_all.bat 然后 run_rel.bat
+  core : cmd 鈫?src\core\build_all.bat 鐒跺悗 run_rel.bat
 
 ----------------------------------------------------------------
-签名（需管理员）
+绛惧悕锛堥渶绠＄悊鍛橈級
 ----------------------------------------------------------------
   signtool sign /sm /s My /sha1 DF1A0ADA2F2CD6E5778EA937C079CB0A035BA431 /fd SHA256 <sys>
 
 ----------------------------------------------------------------
-注册表配置（HKLM\SYSTEM\CurrentControlSet\Services\RAMBlockCache\Parameters）
+娉ㄥ唽琛ㄩ厤缃紙HKLM\SYSTEM\CurrentControlSet\Services\RAMBlockCache\Parameters锛?----------------------------------------------------------------
+  浠ヤ笅椤逛笌 AutoAttach / TestMode / ReadaheadEnabled 鍚岄敭鍚屾棌锛?  浠?DriverEntry 璇诲彇涓€娆★紝杩愯鏈熸敼鍔ㄩ渶閲嶅惎椹卞姩鐢熸晥锛坰c stop/start锛夈€?  瀹夎鍣ㄤ笉鍐欒繖浜涢」锛堢己鐪佸嵆涓嬭堪榛樿锛屽畨瑁呴潰闆舵敼鍔級銆?
+  MaxCacheIoKB 鈥斺€?鍗曞潡 IO 缂撳瓨闂紙REG_DWORD锛屽崟浣?KB锛?    榛樿   : 65536锛?4MB锛?    鑼冨洿   : 8192-131072锛?MB-128MB锛?    浣滅敤   : 鍗曞潡 READ/WRITE 闀垮害瓒呰繃闂ㄥ€?鈫?鐩存帴閫忎紶锛堜笉杩涚紦瀛?鍥炲啓璺緞锛夛紱
+              闂ㄥ唴锛堝惈 8MB 浠ヤ笂澶у潡椤哄簭 IO锛夌殑璇诲啓杩涘叆缂撳瓨璺緞銆俉1.5 鍓嶆亽涓?              8MB锛?192锛夛紱AS SSD Seq 16MB 鍧楃瓑澶у潡椤哄簭 IO 鐢辨杩涘叆鍔犻€熼潰銆?    閽充綅   : 闈炴硶鍊间笉鍥為粯璁わ細鍐?0 鎴栦换浣?<8192 鈫?8192锛?131072 鈫?131072銆?    鍥炴粴   : 鏀?8192 淇濆瓨鍚庨噸鍚┍鍔紝澶у潡 IO 绔嬪嵆鍥炲埌鏃ц涓猴紙鏃犻渶閲嶇紪锛夈€?    鐣欒瘉   : 椹卞姩鍔犺浇鏃ュ織 "MaxCacheIoKB effective KB"锛坮amboostctl log 鍙锛夛紝
+             QA 鎹纭閽充綅鍚庣殑鐢熸晥鍊笺€?    鍗忚闈?: 闆跺奖鍝嶏紙涓嶈繘 RB_CONFIG/RB_STATS锛孶I 涓嶆毚闇诧級銆?
+  IoWorkerByCpu 鈥斺€?褰撳墠澶勭悊鍣ㄤ翰鍜屾淳鍙戣〃锛堥┍鍔ㄥ唴閮ㄥ彧璇昏〃锛屾棤娉ㄥ唽琛ㄩ」锛?    榛樿   : 鏃犳敞鍐岃〃寮€鍏炽€傞┍鍔ㄥ姞杞芥椂鐢?RbStartIoWorkers 鎸夊悇 worker 鐨?              缁戞牳缁撴灉锛圓uxValid 缁勪翰鍜?/ CpuIndex 鍙屾潵婧愶級涓€娆℃€ф瀯寤猴細
+              CPU 鍙?鈫?worker 涓嬫爣+1锛? = 璇?CPU 鏃犲搴?worker銆?    浣滅敤   : RbSubmitIo 娲惧彂鏃朵紭鍏堟姇閫掑埌銆愮粦鍦ㄥ綋鍓嶉€昏緫 CPU銆戠殑 worker
+              锛堝悓鏍镐氦鎺?~1-2碌s锛屾秷闄?QD1 鍗曠嚎绋?IO 鐨勮法鏍稿敜閱?+ 娣?C-state
+              鍞ら啋浠ｄ环锛夛紱鏌ヨ〃澶辫触锛?64 閫昏緫 CPU 缁勫 / 鐩爣 worker 宸叉 /
+              琛ㄩ」涓?0锛夆啋 鍥為€€鏃㈡湁杞锛圛oRR锛夛紝琛屼负涓庢湰涓撻」鍓嶉€愬瓧涓€鑷淬€?    鍥炴粴   : 婧愮爜绾?revert rbio.c 鐨?RbSubmitIo 浜插拰鍒嗘敮鍗冲洖鍒拌疆璇?              锛坮b_common.h 瀛楁鍙暀锛屾棤瀹筹級锛涙棤闇€娉ㄥ唽琛ㄩ」銆?    鐣欒瘉   : 椹卞姩鍔犺浇鏃ュ織 "io worker dispatch: current-cpu affinity"
+              锛坮amboostctl log 鍙锛夛紝QA 鎹纭浜插拰娲惧彂宸茬敓鏁堛€?    鍗忚闈?: 闆跺奖鍝嶏紙RB_GLOB 鏈熬绾拷鍔犲瓧娈碉紝涓嶈繘 RB_CONFIG/RB_STATS锛?              UI 涓嶆毚闇诧級銆?
 ----------------------------------------------------------------
-  以下项与 AutoAttach / TestMode / ReadaheadEnabled 同键同族：
-  仅 DriverEntry 读取一次，运行期改动需重启驱动生效（sc stop/start）。
-  安装器不写这些项（缺省即下述默认，安装面零改动）。
-
-  MaxCacheIoKB —— 单块 IO 缓存门（REG_DWORD，单位 KB）
-    默认   : 65536（64MB）
-    范围   : 8192-131072（8MB-128MB）
-    作用   : 单块 READ/WRITE 长度超过门值 → 直接透传（不进缓存/回写路径）；
-              门内（含 8MB 以上大块顺序 IO）的读写进入缓存路径。W1.5 前恒为
-              8MB（8192）；AS SSD Seq 16MB 块等大块顺序 IO 由此进入加速面。
-    钳位   : 非法值不回默认：写 0 或任何 <8192 → 8192；>131072 → 131072。
-    回滚   : 改 8192 保存后重启驱动，大块 IO 立即回到旧行为（无需重编）。
-    留证   : 驱动加载日志 "MaxCacheIoKB effective KB"（ramboostctl log 可见），
-             QA 据此确认钳位后的生效值。
-    协议面 : 零影响（不进 RB_CONFIG/RB_STATS，UI 不暴露）。
-
-  IoWorkerByCpu —— 当前处理器亲和派发表（驱动内部只读表，无注册表项）
-    默认   : 无注册表开关。驱动加载时由 RbStartIoWorkers 按各 worker 的
-              绑核结果（AuxValid 组亲和 / CpuIndex 双来源）一次性构建：
-              CPU 号 → worker 下标+1；0 = 该 CPU 无对应 worker。
-    作用   : RbSubmitIo 派发时优先投递到【绑在当前逻辑 CPU】的 worker
-              （同核交接 ~1-2µs，消除 QD1 单线程 IO 的跨核唤醒 + 深 C-state
-              唤醒代价）；查表失败（>64 逻辑 CPU 组外 / 目标 worker 已死 /
-              表项为 0）→ 回退既有轮询（IoRR），行为与本专项前逐字一致。
-    回滚   : 源码级 revert rbio.c 的 RbSubmitIo 亲和分支即回到轮询
-              （rb_common.h 字段可留，无害）；无需注册表项。
-    留证   : 驱动加载日志 "io worker dispatch: current-cpu affinity"
-              （ramboostctl log 可见），QA 据此确认亲和派发已生效。
-    协议面 : 零影响（RB_GLOB 末尾纯追加字段，不进 RB_CONFIG/RB_STATS，
-              UI 不暴露）。
-
+娉ㄦ剰
 ----------------------------------------------------------------
-注意
+  路 褰撳墠绯荤粺 UpperFilters=volsnap锛堝畨鍏ㄦ€侊紝涓嶄細 0x7B锛夈€?  路 dist\RAMBlockCache.sys 宸蹭簬 2026-10-17 瀹屾垚 CN=RAMBoostFS Root 绛惧悕
+    锛?x7B 浜嬫晠鏁存敼 A1锛夛紝灏氭湭閮ㄧ讲锛涢儴缃插墠闂ㄧ鈶?check_signature.ps1 蹇呴』 PASS銆?  路 瀹夎鍣?ramboostsetup.exe 鍐呯疆 WinVerifyTrust 绛惧悕棰勬锛堟暣鏀?A2锛夛細
+    鏈鍚嶉┍鍔ㄥ湪澶嶅埗/寤烘湇鍔?鍐?UpperFilters 涔嬪墠鍗宠鎷掔粷銆?  路 鐪熸満楠岃瘉椤硅瀹¤ report\ 绗?7 绔犮€?----------------------------------------------------------------
+寮€鏈?0x7B锛圛NACCESSIBLE_BOOT_DEVICE锛夎嚜鏁戝崱
 ----------------------------------------------------------------
-  · 当前系统 UpperFilters=volsnap（安全态，不会 0x7B）。
-  · dist\RAMBlockCache.sys 已于 2026-10-17 完成 CN=RAMBoostFS Root 签名
-    （0x7B 事故整改 A1），尚未部署；部署前门禁⑤ check_signature.ps1 必须 PASS。
-  · 安装器 ramboostsetup.exe 内置 WinVerifyTrust 签名预检（整改 A2）：
-    未签名驱动在复制/建服务/写 UpperFilters 之前即被拒绝。
-  · 真机验证项见审计 report\ 第 7 章。
-----------------------------------------------------------------
-开机 0x7B（INACCESSIBLE_BOOT_DEVICE）自救卡
-----------------------------------------------------------------
-  症状：部署本驱动后重启进不了系统，0x7B 循环。
-  根因：BOOT_START + 卷类 UpperFilters 中的驱动被 CI 拒载（未签名 /
-  签名链无效 / testsigning 关闭），引导卷栈初始化失败。
-  手动自救（进 PE / WinRE 命令提示符）：
-    1) reg load HKLM\RB_OFFLINE C:\Windows\System32\config\SYSTEM
+  鐥囩姸锛氶儴缃叉湰椹卞姩鍚庨噸鍚繘涓嶄簡绯荤粺锛?x7B 寰幆銆?  鏍瑰洜锛欱OOT_START + 鍗风被 UpperFilters 涓殑椹卞姩琚?CI 鎷掕浇锛堟湭绛惧悕 /
+  绛惧悕閾炬棤鏁?/ testsigning 鍏抽棴锛夛紝寮曞鍗锋爤鍒濆鍖栧け璐ャ€?  鎵嬪姩鑷晳锛堣繘 PE / WinRE 鍛戒护鎻愮ず绗︼級锛?    1) reg load HKLM\RB_OFFLINE C:\Windows\System32\config\SYSTEM
     2) reg delete "HKLM\RB_OFFLINE\ControlSet001\Services\RAMBlockCache" /f
-       （ControlSet001 以实际当前集为准；删除服务即解除 BOOT_START 挂载）
-    3) reg delete "HKLM\RB_OFFLINE\ControlSet001\Control\Class\
+       锛圕ontrolSet001 浠ュ疄闄呭綋鍓嶉泦涓哄噯锛涘垹闄ゆ湇鍔″嵆瑙ｉ櫎 BOOT_START 鎸傝浇锛?    3) reg delete "HKLM\RB_OFFLINE\ControlSet001\Control\Class\
        {71a27cdd-812a-11d0-bec7-08002be2092f}" /v UpperFilters /f
-       然后重新写入：volsnap
-       （或仅从 MULTI_SZ 中摘除 RAMBlockCache，保留第三方过滤器）
+       鐒跺悗閲嶆柊鍐欏叆锛歷olsnap
+       锛堟垨浠呬粠 MULTI_SZ 涓憳闄?RAMBlockCache锛屼繚鐣欑涓夋柟杩囨护鍣級
     4) reg unload HKLM\RB_OFFLINE
-    5) 重启
-  一键版：offline_rollback.cmd 已随包安装在产品目录（与 README.txt 同目录）。
-    在 WinRE 命令提示符下进入该盘符目录运行它
-    （自动完成上述 1-4，保留第三方过滤器，摘空回落 volsnap）。
-    注意 WinRE 下系统盘符常不是 C:，先用 diskpart/bcdedit 确认实际盘符。
-  预防：部署前跑门禁⑤ check_signature.ps1（必须 PASS）+
-    提权窗 bcdedit /enum {current} 确认 testsigning Yes。
-----------------------------------------------------------------
-三重回滚网（P1.5，2026-11-06）
-----------------------------------------------------------------
-  ① 引擎 WinVerifyTrust 预检：未签名/签名链无效的驱动在复制/建服务/写
-    UpperFilters 之前即被拒绝安装（零系统变更，机器保持原状）。
-  ② boot_guard 双计划任务（随安装器自动注册）：
-    - AtStartup（RAMBoostBootGuard）：仅在 FilterArmed=1 且 BootFailCount>=1
-      （确认引导失败）时把 RAMBlockCache 从卷类 UpperFilters 摘除，
-      其余情况零动作；
-    - AtLogOn（RAMBoostLogonDisarm）：健康到达桌面即写 LastBootHealthy=1、
-      DeployAck=DeploySeq 并解除武装（FilterArmed=0）。
-  ③ WinRE 兜底：offline_rollback.cmd（见上方一键版）。
-  注：若安全软件（如 360）拦截 schtasks 导致看门武装失败，安装器自动降级
-    为两层网（签名预检 + offline_rollback.cmd）并打印提示，安装不中止。
-
-桥接开机自启（P3.15，2026-11-06）
-----------------------------------------------------------------
-  安装器自动注册计划任务 RAMBlockCacheBridge（SYSTEM / ONSTART / HIGHEST），
-  动作 = 便携 node 运行 <安装目录>\webconsole\bridge\server\index.ts（Web 控制台
-  桥接，仅监听 127.0.0.1:5199，本机回环不可远程访问）。安装完成即启动一次，
-  之后每次开机自启；「应用与功能」卸载时自动摘除任务并结束桥接进程。
-  信任边界：桥接持有驱动控制面（挂载/配置），等价于本机管理员操作——
-  单用户桌面环境默认形态；多用户共用机器请自行评估后用
-  schtasks /Delete /TN RAMBlockCacheBridge /F 移除。手动起停：
-  schtasks /Run|/End /TN RAMBlockCacheBridge（管理员）。
-================================================================
-W1.5 读写路径性能专项 · 真机验证手册（2026-10-20）
-================================================================
-  本轮改动：大块 IO 缓存门 8MB→64MB（MaxCacheIoKB 可配）、RB_SYNCCTX 池化、
-  读 miss 32MB 分片 + >1MB 全覆盖直读快路径、回写 8MB 分块。core cache.c 与
-  协议三副本零改动；Flags=0（预取默认关）、逐卷回写、直写默认不动。
-  以下矩阵与 PRD §6.2/§6.3 判据逐条对应。跑分由人执行（AS SSD 无 CLI 静默
-  模式）；计数器抓取/中位/CSV 由 src\scripts\bench_proto.ps1 固化。
-
-一、统一基准条件
-  · AS SSD Benchmark 2.0.7316；1GB 测试文件；D: Crucial MX500 1TB SATA SSD。
-  · 关后台程序；测前空闲 60s；每场景 3 轮取中位；任一轮 Verifier 新告警即
-    该轮作废重跑。
-  · 卷挂载（attach）；写模式按场景显式设置：ramboostctl volset D wm=1 回写 /
-    wm=0 直写（默认直写；回写须逐卷显式，红线不改全局默认）。
-  · 二遍读协议：同文件冷/热两轮。热轮达标 + 冷轮无回归 = 门+缓存面生效；
-    只有冷轮变化 = 预取/直读路径疑点（停下来报告，不放宽判据）。
-
-二、AS SSD 复测矩阵（PRD §6.2 通过判据）
-  场景                     冷缓存(首遍)          热缓存(二遍)          通过判据
-  Seq 读                   >=504.92 无回归      >=2000 MB/s          热档达标+冷档无回归
-  Seq 写(回写开)           >=900 MB/s           >=900 MB/s           vs 409.58 基线 >2x
-  4K 读 QD1                >=61.55 向 65-75     >=3000 MB/s          冷档不劣化+热档内存级
-                           收敛
-  4K 写 QD1(回写开)        >=300 MB/s           >=300 MB/s           vs 41.50 基线 >7x
-  4K-64Thrd 读             >=3132.89            >=3132.89            保持内存级，无回归
-  4K-64Thrd 写(回写开)     >=91.91 且明显改善   同左                  无回归+改善
-  Acc.time 读/写及其他     不明显劣化           同左                  无回归
-
-三、判别式对账（怎么算"明显加速"）
-  1. 计数器对账：复测期间 ramboostctl status 的 ReadReq / ReadHit(派生) /
-     命中率曲线与分数变化同向——证明加速来自缓存命中而非工具假象。
-     >8MB 的 IO 应出现在 ReadReq 增量中（Seq 16MB 块进缓存面 = 门生效的
-     直接证据）。
-  2. 二遍读协议：见"一"。
-  3. detached 裸盘基线一轮（B）：detach 后同矩阵跑一轮，把 4K 写改善拆成
-     "消除负优化（池化）" vs "回写吸收"两部分归因。
-  4. 3 轮取中位抗噪。
-  脚本化（提权窗）：
-    powershell -NoProfile -ExecutionPolicy Bypass -File src\scripts\bench_proto.ps1 -Letter D
-    负责轮次提示/计数器抓取/中位/CSV（字段见脚本头；-DryRun -Auto 可无驱动干跑）。
-
-四、数据安全回归点（PRD §6.3；回写开启后既有纪律不破坏）
-  · 60s 周期落盘节奏：stats 的 WbFlush/WbBytes 时间序列保持 ~60s 脉动，
-    不被分块/分片改动打乱（bench_proto CSV 的 WbFlushDelta/WbBytesDelta
-    序列人工核对）。
-  · 卸载/关机/句柄关闭全量回写：fix-report-2026-10-17 既有验收项复跑不劣化；
-    detach 后 DirtyBytes=0（bench_proto.ps1 Phase 2 自动校验）。
-  · 分块失败回滚语义：以代码审查为主（真机难注入盘错）+ 既有 test_regress/edge
-    用户态回归（core 未动，语义不变）。
-  · 异常退出（Kill 驱动）掉电窗口语义：UI 明示 + 安全模式兜底不被削弱
-    （SafeMode 路径未碰；下次非干净启动强制直写）。
-  · Driver Verifier（Special Pool + IRQL + Deadlock）全负载零新告警；
-    池化对象（SyncCtxLa/IoCtxLa）为专项观察项。
-
-五、回滚指引
-  · 大块 IO 门：注册表 MaxCacheIoKB 改 8192 保存后重启驱动 = 大块 IO 立即
-    回到 8MB 旧行为（无需重编；范围 8192-131072，非法值钳位不回默认；
-    生效值见驱动日志 "MaxCacheIoKB effective KB"）。
-  · 其余改动：revert 源码 diff 后重编（分块/分片/池化均为自包含改动）。
-  · 三锚点/签名/部署流程本轮未触碰，回滚不涉及锚点；后续部署照旧：
-    改动→重编→哈希变→sync_anchors.ps1→重签名→部署（fail-closed 不绕过）。
-
-六、注册表面（本专项唯一新增项）
-  · MaxCacheIoKB（REG_DWORD，单位 KB）：键位/缺省 65536/范围/钳位/回滚见
-    上方"注册表配置"表；仅 DriverEntry 读取一次，运行期改动需重启驱动生效
-    （与 AutoAttach/TestMode 一致）；安装器不写该项（缺省即 64MB）。
-
-七、已知问题（Known Issues，不阻塞放行，后续单列）
-  · p21 测试牙囗：回退 core 下 0 失败/10 轮（顺序单写语义不构造"旧脏
-    版本"前置条件），测试无法区分修复/回退 core；-2 路径闭合为设计级
-    论证（wb_drain 挂点 + 复检 + 升代组合覆盖）。后续以"覆盖式重写"
-    （同区间二次写）构造旧脏版本，使 p21 获得区分度。
-  · miss-fill 世代校验 API（闭合"读者盘读→建块 vs 镜像→失效"微窗）与
-    直写屏障 API（闭合失败路径单块"镜像→invalidate"窗口）：均为 core
-    新 API、扩大协议面，后续单列（architect 仲裁）；驱动不依赖其存在。
-  · BIG 变体（1MB 写）未定位机制：损坏字节恒为 0、最后写者为 FLUSH、
-    驱动不可达（dcnt 难自然 >160）；官方 bigwrite/p21big 模式全过——
-    随 BLOCKER-2 改判一并关闭证据链，不再单独立项。
-  · 真机 CDM 内存级矩阵（二遍读协议）必须用户侧执行；本环境仅静态+
-    测试验证，不得宣称任何性能数字为已实测。
-================================================================
-「全指标内存级速度」专项 · 真机验证手册（2026-10-20；判据表已按设计 §七 填数）
-================================================================
-  本轮改动（D1-D5）：写路径锁合并（rb_write_ex 零窗口写前快照）、chain 16 路
-  分片锁（消除并发写互锁）、当前处理器亲和派发（IoWorkerByCpu）、回写足迹
-  （ents 预扩容移出 RLOCK）。协议三副本、core 公开 API 只增不改、≤8MB 读写
-  行为等价、部署/安装器零改动；Flags=0/逐卷回写/直写默认不动。
-
-一、统一基准条件
-  · CDM（CrystalDiskMark）9.0.1；1GiB 测试文件；Crucial MX500 1TB SATA SSD。
-  · 关后台程序；测前空闲 60s；每场景 3 轮取中位；任一轮 Driver Verifier
-    新告警即该轮作废重跑。
-  · 卷挂载（attach）+ 回写模式（ramboostctl volset D wm=1）；QD1 判据轮
-    必须先热一轮（二遍读协议），第二遍为内存级判据轮。
-  · 部署链照旧：改动→重编→哈希变→sync_anchors.ps1→重签名→deploy_w15.ps1
-    + 重启（本专项不碰安装器/Setup；fail-closed 不绕过）。
-
-二、CDM 复测矩阵（判据表：设计 §七 真机矩阵原文；3 轮取中位，跑分前先热一轮）
-  场景                     竞品     现状(旧驱动)   本专项判据
-  SEQ1M Q8T1 读           19734    37517          不回归（≥30000）
-  SEQ1M Q8T1 写           23983    1718           ≥ Q1T1 写（消除倒退），向 9000+ 收敛
-  SEQ1M Q1T1 读           15565    5875           ≥15000
-  SEQ1M Q1T1 写           18674    4841           ≥15000
-  RND4K Q32T1 读          893      808            ≥3000（R1/R2 主效，本专项 D3 助攻）
-  RND4K Q32T1 写          815      361            ≥2000
-  RND4K Q1T1 读           745      45.95          热轮 ≥500（冷轮=盘物理下限，非判据）
-  RND4K Q1T1 写           670      23.13          热轮 ≥500，且 > 裸盘 63.27（负优化必须消除）
-  口径：CDM 9.0.1 / 1GiB / MX500 / 挂载+回写（ramboostctl volset D wm=1）；
-  QD1 判据轮必须先热一轮（二遍读），第二遍为内存级判据轮；单位 MB/s。
-  数据抓取：src\scripts\bench_proto.ps1（Phase 1b 矩阵，逐轮计数器增量含
-  LostDirtyDelta；3 轮中位 + CSV 落盘备查）。
-
-三、判别式对账（怎么算"真的内存级"）
-  1. 二遍读协议：同文件冷/热两轮——热轮达标 + 冷轮无回归 = 缓存面生效；
-     只有冷轮变化 = 疑点（停下来报告，不放宽判据）。
-  2. 计数器对账：bench_proto.ps1 抓取 ReadReq/ReadHit(派生)/WriteReq/
-     WbFlush/WbBytes/lost_dirty（C7 记账），分数变化与命中曲线同向
-     （证明加速来自缓存命中而非工具假象）；detached 基线轮 ReadReq 增量
-     应为 0（驱动不可见）。
-  3. D2 主判据（脚本自动打印）：SEQ 写 Q8T1 ≥ Q1T1（消除并发写互锁倒退）。
-  4. D3 判据：4K QD1 读/写热轮 ≥500 MB/s（≈8µs/IO）且写 > 裸盘 63.27；
-     生效留证：驱动日志 "io worker dispatch: current-cpu affinity" +
-     "io worker affinity table filled (current-cpu dispatch)"。
-  5. detached 裸盘基线一轮（B）：把 QD1 改善拆成"消除负优化（亲和派发）"
-     vs "回写吸收"两部分归因。
-  6. 3 轮取中位抗噪；任一轮 Verifier 新告警即该轮作废（人工判据）。
-
-四、数据安全回归点（既有纪律不破坏）
-  · 60s 周期落盘节奏：stats 的 WbFlush/WbBytes 时间序列保持 ~60s 脉动，
-    不被锁合并/分片/预扩容打乱（bench_proto CSV 的增量序列人工核对）。
-  · 卸载/关机 DirtyBytes=0：detach 后 bench_proto Phase 2 自动校验；
-    脚本同时校验 LostDirtyBytes=0（C7 记账干净）。
-  · C7 记账：失败路径代码审查为主 + test_write_ex/test_wsconc 用户态断言
-    （零窗口快照"只紧不松"：test_write_ex 以旧两调用序列为对照组逐场景
-    断言相等或更保守）。
-  · 分片链表：test_wsconc 10 轮（8 写者+8 读者+4 zoned flusher+小 max_bytes
-    强制驱逐）磁盘镜像逐字节一致、lost_dirty_bytes==0、chunk_count 归零，
-    ASAN 构建零报告。
-  · [WS-RACE 整改] 直写成功后失效同区间缓存旧副本（P0-1 纪律补齐：core
-    direct 区间=未吸收，但洞期间并发读回填可在缓存留下写前副本——先镜像
-    后失效，superseded=1 不记账）；RMW 洞期间块被回收重建时改吸收不回退
-    直写（cache.c pass2，注释 WS-RACE）。
-  · [WS-RACE-2 整改·QA BLOCKER-1] 在途回写与"整段镜像+整段失效"交错的数据
-    损坏（gen 校验只保护 clean、保护不了已发出的磁盘写）：core 落盘前 gen
-    复检弃写 + 失效路径升 dseq + 失效/直写前排空在途回写（wb_active）；
-    驱动逐区间直写成功后补失效。P2-1（-2 溢出整块直写）路径同构覆盖
-    （rb_write_ex 出口统一排空，dcount>0 含 -2 的 161；test_wsconc p21/
-    bigwrite 模式确定性执行）。QA Round 2 的 BLOCKER-2 复现器经裁定其
-    口径超出驱动行为（覆盖率计数器证明 -2/P2-1 路径从未执行，wrc_neg=0、
-    dc_gt160=0），竞态类真实、修复为结构性闭合（排空+复检+升代，7 条
-    全镜像路径审计表见交付报告 §九）；QA 两轮 BLOCKER 证据均建于超驱动
-    行为的测试模式，已认账。Round 3 全镜像路径审计表（7 条路径逐条排空/
-    复检保护证据）见 deliverables/wsrace-fix-report-2026-10-21.md §九。
-  · [WS-RACE-2 整改·finding-2 闭环] 驱动"失败后后续块"路径（不调用
-    rb_write_ex、无出口排空）：前序块回滚 invalidate 已从块循环之后移至
-    首个失败探测点（任何后续块镜像之前）——入口 wb_drain 排空在途回写、
-    清脏升 dseq；叠加每块 invalidate 入口 drain（先于下一块镜像），
-    所有后续块镜像之前均有排空（同一收口点，无新 API）；回滚区间与
-    记账语义（pre=NULL 保守）与旧实现逐字一致；末块失败有 post-loop
-    兜底（rolled_back 闸）。
-  · [WS-RACE-2 整改·残余微窗披露（不在本专项闭合，后续单列）]
-    ① 读者"盘读→建块"与写者"镜像→失效"的驱动层微窗：读者 miss 填充
-       （盘读+commit）非原子 wrt 直写镜像时，可能缓存镜像前旧值；彻底
-       闭合需 core 新增 miss-fill 世代校验 API（扩大协议面），test_wsconc
-       侧已以"只回填请求交集内的完整子块"闭合测试入口。
-    ② 调用方镜像"全吸收区间"（dc=0 也镜像+失效）时无 core 排空保护
-       （wb_drain 只挂 direct 路径）：驱动不产生该序列（全路径审计见
-       交付报告 §9.2），属调用契约约束。
-    ③ 驱动"失败后后续块"路径（rbio.c else 分支，finding-2 整改后收窄
-       至此）：该路径不调用 rb_write_ex、无出口排空；块间镜像已全部有
-       前置排空（回滚 invalidate 与每块 invalidate 的入口 drain），但
-       单块自身"镜像→invalidate"之间，在途回写（stage 时捕获的旧数据）
-       仍可能落于镜像之后——盘面回到此前已 ack 的有效状态（IRP 已失败、
-       无 ack 数据丢失；superseded=0 有 pre=NULL 保守记账兜底）；需盘写
-       失败后触发，窄且方向安全；彻底闭合需直写屏障 API（同①，后续
-       单列，architect 仲裁）。
-  · SafeMode / 熔断 / P0-1 / P2-2 路径未碰；Driver Verifier（Special Pool +
-    IRQL + Deadlock）全负载零新告警。
-
-五、回滚指引
-  · D1（写路径锁合并）：revert cache.c 的 rb_write_ex/pass1 diff + rbio.c
-    的 RbWriteWorker 单调用 diff（自包含）；rb_stream_dirty_mask 公开 API
-    本就可直调，回滚后驱动改回两调用序列即可。
-  · D2（chain 分片）+ D5（ents 预扩容）：revert cache.c 对应 diff（单文件
-    自包含）。
-  · D3（亲和派发）：revert rbio.c 的 RbSubmitIo 亲和分支即回到 IoRR 轮询
-    （rb_common.h 的 IoWorkerByCpu 字段可留，无害）。
-  · WS-RACE / WS-RACE-2 整改（rbio.c 直写后失效 / cache.c RMW 吸收 /
-    复检+排空+升代）：随 D1/D2 一并 revert（同为自包含 diff；回滚后
-    BLOCKER-1 竞态复存，仅供紧急回退，见上述交付报告 §六/§九）。
-  · WS-RACE-2 finding-2 整改（rbio.c 失败路径回滚前移）：revert 方式——
-    把 else 分支首行的前序块回滚 invalidate（rolled_back 闸整段）移回
-    块循环之后即回到旧实现（回滚区间/记账语义不变；回滚后"回滚晚于
-    后续块镜像"的残余复存，仅供紧急回退）。
-  · 从 build_all.bat 摘除 test_write_ex/test_wsconc 后重编重签名部署
-    （deploy_w15.ps1 + 重启）；三锚点/协议/部署流程不动。
-================================================================
+    5) 閲嶅惎
+  涓€閿増锛歰ffline_rollback.cmd 宸查殢鍖呭畨瑁呭湪浜у搧鐩綍锛堜笌 README.txt 鍚岀洰褰曪級銆?    鍦?WinRE 鍛戒护鎻愮ず绗︿笅杩涘叆璇ョ洏绗︾洰褰曡繍琛屽畠
+    锛堣嚜鍔ㄥ畬鎴愪笂杩?1-4锛屼繚鐣欑涓夋柟杩囨护鍣紝鎽樼┖鍥炶惤 volsnap锛夈€?    娉ㄦ剰 WinRE 涓嬬郴缁熺洏绗﹀父涓嶆槸 C:锛屽厛鐢?diskpart/bcdedit 纭瀹為檯鐩樼銆?  棰勯槻锛氶儴缃插墠璺戦棬绂佲懁 check_signature.ps1锛堝繀椤?PASS锛?
+    鎻愭潈绐?bcdedit /enum {current} 纭 testsigning Yes銆?----------------------------------------------------------------
+涓夐噸鍥炴粴缃戯紙P1.5锛?026-11-06锛?----------------------------------------------------------------
+  鈶?寮曟搸 WinVerifyTrust 棰勬锛氭湭绛惧悕/绛惧悕閾炬棤鏁堢殑椹卞姩鍦ㄥ鍒?寤烘湇鍔?鍐?    UpperFilters 涔嬪墠鍗宠鎷掔粷瀹夎锛堥浂绯荤粺鍙樻洿锛屾満鍣ㄤ繚鎸佸師鐘讹級銆?  鈶?boot_guard 鍙岃鍒掍换鍔★紙闅忓畨瑁呭櫒鑷姩娉ㄥ唽锛夛細
+    - AtStartup锛圧AMBoostBootGuard锛夛細浠呭湪 FilterArmed=1 涓?BootFailCount>=1
+      锛堢‘璁ゅ紩瀵煎け璐ワ級鏃舵妸 RAMBlockCache 浠庡嵎绫?UpperFilters 鎽橀櫎锛?      鍏朵綑鎯呭喌闆跺姩浣滐紱
+    - AtLogOn锛圧AMBoostLogonDisarm锛夛細鍋ュ悍鍒拌揪妗岄潰鍗冲啓 LastBootHealthy=1銆?      DeployAck=DeploySeq 骞惰В闄ゆ瑁咃紙FilterArmed=0锛夈€?  鈶?WinRE 鍏滃簳锛歰ffline_rollback.cmd锛堣涓婃柟涓€閿増锛夈€?  娉細鑻ュ畨鍏ㄨ蒋浠讹紙濡?360锛夋嫤鎴?schtasks 瀵艰嚧鐪嬮棬姝﹁澶辫触锛屽畨瑁呭櫒鑷姩闄嶇骇
+    涓轰袱灞傜綉锛堢鍚嶉妫€ + offline_rollback.cmd锛夊苟鎵撳嵃鎻愮ず锛屽畨瑁呬笉涓銆?
+妗ユ帴寮€鏈鸿嚜鍚紙P3.15锛?026-11-06锛?----------------------------------------------------------------
+  瀹夎鍣ㄨ嚜鍔ㄦ敞鍐岃鍒掍换鍔?RAMBlockCacheBridge锛圫YSTEM / ONSTART / HIGHEST锛夛紝
+  鍔ㄤ綔 = 渚挎惡 node 杩愯 <瀹夎鐩綍>\webconsole\bridge\server\index.ts锛圵eb 鎺у埗鍙?  妗ユ帴锛屼粎鐩戝惉 127.0.0.1:5199锛屾湰鏈哄洖鐜笉鍙繙绋嬭闂級銆傚畨瑁呭畬鎴愬嵆鍚姩涓€娆★紝
+  涔嬪悗姣忔寮€鏈鸿嚜鍚紱銆屽簲鐢ㄤ笌鍔熻兘銆嶅嵏杞芥椂鑷姩鎽橀櫎浠诲姟骞剁粨鏉熸ˉ鎺ヨ繘绋嬨€?  淇′换杈圭晫锛氭ˉ鎺ユ寔鏈夐┍鍔ㄦ帶鍒堕潰锛堟寕杞?閰嶇疆锛夛紝绛変环浜庢湰鏈虹鐞嗗憳鎿嶄綔鈥斺€?  鍗曠敤鎴锋闈㈢幆澧冮粯璁ゅ舰鎬侊紱澶氱敤鎴峰叡鐢ㄦ満鍣ㄨ鑷璇勪及鍚庣敤
+  schtasks /Delete /TN RAMBlockCacheBridge /F 绉婚櫎銆傛墜鍔ㄨ捣鍋滐細
+  schtasks /Run|/End /TN RAMBlockCacheBridge锛堢鐞嗗憳锛夈€?================================================================
+W1.5 璇诲啓璺緞鎬ц兘涓撻」 路 鐪熸満楠岃瘉鎵嬪唽锛?026-10-20锛?================================================================
+  鏈疆鏀瑰姩锛氬ぇ鍧?IO 缂撳瓨闂?8MB鈫?4MB锛圡axCacheIoKB 鍙厤锛夈€丷B_SYNCCTX 姹犲寲銆?  璇?miss 32MB 鍒嗙墖 + >1MB 鍏ㄨ鐩栫洿璇诲揩璺緞銆佸洖鍐?8MB 鍒嗗潡銆俢ore cache.c 涓?  鍗忚涓夊壇鏈浂鏀瑰姩锛汧lags=0锛堥鍙栭粯璁ゅ叧锛夈€侀€愬嵎鍥炲啓銆佺洿鍐欓粯璁や笉鍔ㄣ€?  浠ヤ笅鐭╅樀涓?PRD 搂6.2/搂6.3 鍒ゆ嵁閫愭潯瀵瑰簲銆傝窇鍒嗙敱浜烘墽琛岋紙AS SSD 鏃?CLI 闈欓粯
+  妯″紡锛夛紱璁℃暟鍣ㄦ姄鍙?涓綅/CSV 鐢?src\scripts\bench_proto.ps1 鍥哄寲銆?
+涓€銆佺粺涓€鍩哄噯鏉′欢
+  路 AS SSD Benchmark 2.0.7316锛?GB 娴嬭瘯鏂囦欢锛汥: Crucial MX500 1TB SATA SSD銆?  路 鍏冲悗鍙扮▼搴忥紱娴嬪墠绌洪棽 60s锛涙瘡鍦烘櫙 3 杞彇涓綅锛涗换涓€杞?Verifier 鏂板憡璀﹀嵆
+    璇ヨ疆浣滃簾閲嶈窇銆?  路 鍗锋寕杞斤紙attach锛夛紱鍐欐ā寮忔寜鍦烘櫙鏄惧紡璁剧疆锛歳amboostctl volset D wm=1 鍥炲啓 /
+    wm=0 鐩村啓锛堥粯璁ょ洿鍐欙紱鍥炲啓椤婚€愬嵎鏄惧紡锛岀孩绾夸笉鏀瑰叏灞€榛樿锛夈€?  路 浜岄亶璇诲崗璁細鍚屾枃浠跺喎/鐑袱杞€傜儹杞揪鏍?+ 鍐疯疆鏃犲洖褰?= 闂?缂撳瓨闈㈢敓鏁堬紱
+    鍙湁鍐疯疆鍙樺寲 = 棰勫彇/鐩磋璺緞鐤戠偣锛堝仠涓嬫潵鎶ュ憡锛屼笉鏀惧鍒ゆ嵁锛夈€?
+浜屻€丄S SSD 澶嶆祴鐭╅樀锛圥RD 搂6.2 閫氳繃鍒ゆ嵁锛?  鍦烘櫙                     鍐风紦瀛?棣栭亶)          鐑紦瀛?浜岄亶)          閫氳繃鍒ゆ嵁
+  Seq 璇?                  >=504.92 鏃犲洖褰?     >=2000 MB/s          鐑。杈炬爣+鍐锋。鏃犲洖褰?  Seq 鍐?鍥炲啓寮€)           >=900 MB/s           >=900 MB/s           vs 409.58 鍩虹嚎 >2x
+  4K 璇?QD1                >=61.55 鍚?65-75     >=3000 MB/s          鍐锋。涓嶅姡鍖?鐑。鍐呭瓨绾?                           鏀舵暃
+  4K 鍐?QD1(鍥炲啓寮€)        >=300 MB/s           >=300 MB/s           vs 41.50 鍩虹嚎 >7x
+  4K-64Thrd 璇?            >=3132.89            >=3132.89            淇濇寔鍐呭瓨绾э紝鏃犲洖褰?  4K-64Thrd 鍐?鍥炲啓寮€)     >=91.91 涓旀槑鏄炬敼鍠?  鍚屽乏                  鏃犲洖褰?鏀瑰杽
+  Acc.time 璇?鍐欏強鍏朵粬     涓嶆槑鏄惧姡鍖?          鍚屽乏                  鏃犲洖褰?
+涓夈€佸垽鍒紡瀵硅处锛堟€庝箞绠?鏄庢樉鍔犻€?锛?  1. 璁℃暟鍣ㄥ璐︼細澶嶆祴鏈熼棿 ramboostctl status 鐨?ReadReq / ReadHit(娲剧敓) /
+     鍛戒腑鐜囨洸绾夸笌鍒嗘暟鍙樺寲鍚屽悜鈥斺€旇瘉鏄庡姞閫熸潵鑷紦瀛樺懡涓€岄潪宸ュ叿鍋囪薄銆?     >8MB 鐨?IO 搴斿嚭鐜板湪 ReadReq 澧為噺涓紙Seq 16MB 鍧楄繘缂撳瓨闈?= 闂ㄧ敓鏁堢殑
+     鐩存帴璇佹嵁锛夈€?  2. 浜岄亶璇诲崗璁細瑙?涓€"銆?  3. detached 瑁哥洏鍩虹嚎涓€杞紙B锛夛細detach 鍚庡悓鐭╅樀璺戜竴杞紝鎶?4K 鍐欐敼鍠勬媶鎴?     "娑堥櫎璐熶紭鍖栵紙姹犲寲锛? vs "鍥炲啓鍚告敹"涓ら儴鍒嗗綊鍥犮€?  4. 3 杞彇涓綅鎶楀櫔銆?  鑴氭湰鍖栵紙鎻愭潈绐楋級锛?    powershell -NoProfile -ExecutionPolicy Bypass -File src\scripts\bench_proto.ps1 -Letter D
+    璐熻矗杞鎻愮ず/璁℃暟鍣ㄦ姄鍙?涓綅/CSV锛堝瓧娈佃鑴氭湰澶达紱-DryRun -Auto 鍙棤椹卞姩骞茶窇锛夈€?
+鍥涖€佹暟鎹畨鍏ㄥ洖褰掔偣锛圥RD 搂6.3锛涘洖鍐欏紑鍚悗鏃㈡湁绾緥涓嶇牬鍧忥級
+  路 60s 鍛ㄦ湡钀界洏鑺傚锛歴tats 鐨?WbFlush/WbBytes 鏃堕棿搴忓垪淇濇寔 ~60s 鑴夊姩锛?    涓嶈鍒嗗潡/鍒嗙墖鏀瑰姩鎵撲贡锛坆ench_proto CSV 鐨?WbFlushDelta/WbBytesDelta
+    搴忓垪浜哄伐鏍稿锛夈€?  路 鍗歌浇/鍏虫満/鍙ユ焺鍏抽棴鍏ㄩ噺鍥炲啓锛歠ix-report-2026-10-17 鏃㈡湁楠屾敹椤瑰璺戜笉鍔ｅ寲锛?    detach 鍚?DirtyBytes=0锛坆ench_proto.ps1 Phase 2 鑷姩鏍￠獙锛夈€?  路 鍒嗗潡澶辫触鍥炴粴璇箟锛氫互浠ｇ爜瀹℃煡涓轰富锛堢湡鏈洪毦娉ㄥ叆鐩橀敊锛? 鏃㈡湁 test_regress/edge
+    鐢ㄦ埛鎬佸洖褰掞紙core 鏈姩锛岃涔変笉鍙橈級銆?  路 寮傚父閫€鍑猴紙Kill 椹卞姩锛夋帀鐢电獥鍙ｈ涔夛細UI 鏄庣ず + 瀹夊叏妯″紡鍏滃簳涓嶈鍓婂急
+    锛圫afeMode 璺緞鏈锛涗笅娆￠潪骞插噣鍚姩寮哄埗鐩村啓锛夈€?  路 Driver Verifier锛圫pecial Pool + IRQL + Deadlock锛夊叏璐熻浇闆舵柊鍛婅锛?    姹犲寲瀵硅薄锛圫yncCtxLa/IoCtxLa锛変负涓撻」瑙傚療椤广€?
+浜斻€佸洖婊氭寚寮?  路 澶у潡 IO 闂細娉ㄥ唽琛?MaxCacheIoKB 鏀?8192 淇濆瓨鍚庨噸鍚┍鍔?= 澶у潡 IO 绔嬪嵆
+    鍥炲埌 8MB 鏃ц涓猴紙鏃犻渶閲嶇紪锛涜寖鍥?8192-131072锛岄潪娉曞€奸挸浣嶄笉鍥為粯璁わ紱
+    鐢熸晥鍊艰椹卞姩鏃ュ織 "MaxCacheIoKB effective KB"锛夈€?  路 鍏朵綑鏀瑰姩锛歳evert 婧愮爜 diff 鍚庨噸缂栵紙鍒嗗潡/鍒嗙墖/姹犲寲鍧囦负鑷寘鍚敼鍔級銆?  路 涓夐敋鐐?绛惧悕/閮ㄧ讲娴佺▼鏈疆鏈Е纰帮紝鍥炴粴涓嶆秹鍙婇敋鐐癸紱鍚庣画閮ㄧ讲鐓ф棫锛?    鏀瑰姩鈫掗噸缂栤啋鍝堝笇鍙樷啋sync_anchors.ps1鈫掗噸绛惧悕鈫掗儴缃诧紙fail-closed 涓嶇粫杩囷級銆?
+鍏€佹敞鍐岃〃闈紙鏈笓椤瑰敮涓€鏂板椤癸級
+  路 MaxCacheIoKB锛圧EG_DWORD锛屽崟浣?KB锛夛細閿綅/缂虹渷 65536/鑼冨洿/閽充綅/鍥炴粴瑙?    涓婃柟"娉ㄥ唽琛ㄩ厤缃?琛紱浠?DriverEntry 璇诲彇涓€娆★紝杩愯鏈熸敼鍔ㄩ渶閲嶅惎椹卞姩鐢熸晥
+    锛堜笌 AutoAttach/TestMode 涓€鑷达級锛涘畨瑁呭櫒涓嶅啓璇ラ」锛堢己鐪佸嵆 64MB锛夈€?
+涓冦€佸凡鐭ラ棶棰橈紙Known Issues锛屼笉闃诲鏀捐锛屽悗缁崟鍒楋級
+  路 p21 娴嬭瘯鐗欏洍锛氬洖閫€ core 涓?0 澶辫触/10 杞紙椤哄簭鍗曞啓璇箟涓嶆瀯閫?鏃ц剰
+    鐗堟湰"鍓嶇疆鏉′欢锛夛紝娴嬭瘯鏃犳硶鍖哄垎淇/鍥為€€ core锛?2 璺緞闂悎涓鸿璁＄骇
+    璁鸿瘉锛坵b_drain 鎸傜偣 + 澶嶆 + 鍗囦唬缁勫悎瑕嗙洊锛夈€傚悗缁互"瑕嗙洊寮忛噸鍐?
+    锛堝悓鍖洪棿浜屾鍐欙級鏋勯€犳棫鑴忕増鏈紝浣?p21 鑾峰緱鍖哄垎搴︺€?  路 miss-fill 涓栦唬鏍￠獙 API锛堥棴鍚?璇昏€呯洏璇烩啋寤哄潡 vs 闀滃儚鈫掑け鏁?寰獥锛変笌
+    鐩村啓灞忛殰 API锛堥棴鍚堝け璐ヨ矾寰勫崟鍧?闀滃儚鈫抜nvalidate"绐楀彛锛夛細鍧囦负 core
+    鏂?API銆佹墿澶у崗璁潰锛屽悗缁崟鍒楋紙architect 浠茶锛夛紱椹卞姩涓嶄緷璧栧叾瀛樺湪銆?  路 BIG 鍙樹綋锛?MB 鍐欙級鏈畾浣嶆満鍒讹細鎹熷潖瀛楄妭鎭掍负 0銆佹渶鍚庡啓鑰呬负 FLUSH銆?    椹卞姩涓嶅彲杈撅紙dcnt 闅捐嚜鐒?>160锛夛紱瀹樻柟 bigwrite/p21big 妯″紡鍏ㄨ繃鈥斺€?    闅?BLOCKER-2 鏀瑰垽涓€骞跺叧闂瘉鎹摼锛屼笉鍐嶅崟鐙珛椤广€?  路 鐪熸満 CDM 鍐呭瓨绾х煩闃碉紙浜岄亶璇诲崗璁級蹇呴』鐢ㄦ埛渚ф墽琛岋紱鏈幆澧冧粎闈欐€?
+    娴嬭瘯楠岃瘉锛屼笉寰楀绉颁换浣曟€ц兘鏁板瓧涓哄凡瀹炴祴銆?================================================================
+銆屽叏鎸囨爣鍐呭瓨绾ч€熷害銆嶄笓椤?路 鐪熸満楠岃瘉鎵嬪唽锛?026-10-20锛涘垽鎹〃宸叉寜璁捐 搂涓?濉暟锛?================================================================
+  鏈疆鏀瑰姩锛圖1-D5锛夛細鍐欒矾寰勯攣鍚堝苟锛坮b_write_ex 闆剁獥鍙ｅ啓鍓嶅揩鐓э級銆乧hain 16 璺?  鍒嗙墖閿侊紙娑堥櫎骞跺彂鍐欎簰閿侊級銆佸綋鍓嶅鐞嗗櫒浜插拰娲惧彂锛圛oWorkerByCpu锛夈€佸洖鍐欒冻杩?  锛坋nts 棰勬墿瀹圭Щ鍑?RLOCK锛夈€傚崗璁笁鍓湰銆乧ore 鍏紑 API 鍙涓嶆敼銆佲墹8MB 璇诲啓
+  琛屼负绛変环銆侀儴缃?瀹夎鍣ㄩ浂鏀瑰姩锛汧lags=0/閫愬嵎鍥炲啓/鐩村啓榛樿涓嶅姩銆?
+涓€銆佺粺涓€鍩哄噯鏉′欢
+  路 CDM锛圕rystalDiskMark锛?.0.1锛?GiB 娴嬭瘯鏂囦欢锛汣rucial MX500 1TB SATA SSD銆?  路 鍏冲悗鍙扮▼搴忥紱娴嬪墠绌洪棽 60s锛涙瘡鍦烘櫙 3 杞彇涓綅锛涗换涓€杞?Driver Verifier
+    鏂板憡璀﹀嵆璇ヨ疆浣滃簾閲嶈窇銆?  路 鍗锋寕杞斤紙attach锛? 鍥炲啓妯″紡锛坮amboostctl volset D wm=1锛夛紱QD1 鍒ゆ嵁杞?    蹇呴』鍏堢儹涓€杞紙浜岄亶璇诲崗璁級锛岀浜岄亶涓哄唴瀛樼骇鍒ゆ嵁杞€?  路 閮ㄧ讲閾剧収鏃э細鏀瑰姩鈫掗噸缂栤啋鍝堝笇鍙樷啋sync_anchors.ps1鈫掗噸绛惧悕鈫抎eploy_w15.ps1
+    + 閲嶅惎锛堟湰涓撻」涓嶇瀹夎鍣?Setup锛沠ail-closed 涓嶇粫杩囷級銆?
+浜屻€丆DM 澶嶆祴鐭╅樀锛堝垽鎹〃锛氳璁?搂涓?鐪熸満鐭╅樀鍘熸枃锛? 杞彇涓綅锛岃窇鍒嗗墠鍏堢儹涓€杞級
+  鍦烘櫙                     绔炲搧     鐜扮姸(鏃ч┍鍔?   鏈笓椤瑰垽鎹?  SEQ1M Q8T1 璇?          19734    37517          涓嶅洖褰掞紙鈮?0000锛?  SEQ1M Q8T1 鍐?          23983    1718           鈮?Q1T1 鍐欙紙娑堥櫎鍊掗€€锛夛紝鍚?9000+ 鏀舵暃
+  SEQ1M Q1T1 璇?          15565    5875           鈮?5000
+  SEQ1M Q1T1 鍐?          18674    4841           鈮?5000
+  RND4K Q32T1 璇?         893      808            鈮?000锛圧1/R2 涓绘晥锛屾湰涓撻」 D3 鍔╂敾锛?  RND4K Q32T1 鍐?         815      361            鈮?000
+  RND4K Q1T1 璇?          745      45.95          鐑疆 鈮?00锛堝喎杞?鐩樼墿鐞嗕笅闄愶紝闈炲垽鎹級
+  RND4K Q1T1 鍐?          670      23.13          鐑疆 鈮?00锛屼笖 > 瑁哥洏 63.27锛堣礋浼樺寲蹇呴』娑堥櫎锛?  鍙ｅ緞锛欳DM 9.0.1 / 1GiB / MX500 / 鎸傝浇+鍥炲啓锛坮amboostctl volset D wm=1锛夛紱
+  QD1 鍒ゆ嵁杞繀椤诲厛鐑竴杞紙浜岄亶璇伙級锛岀浜岄亶涓哄唴瀛樼骇鍒ゆ嵁杞紱鍗曚綅 MB/s銆?  鏁版嵁鎶撳彇锛歴rc\scripts\bench_proto.ps1锛圥hase 1b 鐭╅樀锛岄€愯疆璁℃暟鍣ㄥ閲忓惈
+  LostDirtyDelta锛? 杞腑浣?+ CSV 钀界洏澶囨煡锛夈€?
+涓夈€佸垽鍒紡瀵硅处锛堟€庝箞绠?鐪熺殑鍐呭瓨绾?锛?  1. 浜岄亶璇诲崗璁細鍚屾枃浠跺喎/鐑袱杞€斺€旂儹杞揪鏍?+ 鍐疯疆鏃犲洖褰?= 缂撳瓨闈㈢敓鏁堬紱
+     鍙湁鍐疯疆鍙樺寲 = 鐤戠偣锛堝仠涓嬫潵鎶ュ憡锛屼笉鏀惧鍒ゆ嵁锛夈€?  2. 璁℃暟鍣ㄥ璐︼細bench_proto.ps1 鎶撳彇 ReadReq/ReadHit(娲剧敓)/WriteReq/
+     WbFlush/WbBytes/lost_dirty锛圕7 璁拌处锛夛紝鍒嗘暟鍙樺寲涓庡懡涓洸绾垮悓鍚?     锛堣瘉鏄庡姞閫熸潵鑷紦瀛樺懡涓€岄潪宸ュ叿鍋囪薄锛夛紱detached 鍩虹嚎杞?ReadReq 澧為噺
+     搴斾负 0锛堥┍鍔ㄤ笉鍙锛夈€?  3. D2 涓诲垽鎹紙鑴氭湰鑷姩鎵撳嵃锛夛細SEQ 鍐?Q8T1 鈮?Q1T1锛堟秷闄ゅ苟鍙戝啓浜掗攣鍊掗€€锛夈€?  4. D3 鍒ゆ嵁锛?K QD1 璇?鍐欑儹杞?鈮?00 MB/s锛堚増8碌s/IO锛変笖鍐?> 瑁哥洏 63.27锛?     鐢熸晥鐣欒瘉锛氶┍鍔ㄦ棩蹇?"io worker dispatch: current-cpu affinity" +
+     "io worker affinity table filled (current-cpu dispatch)"銆?  5. detached 瑁哥洏鍩虹嚎涓€杞紙B锛夛細鎶?QD1 鏀瑰杽鎷嗘垚"娑堥櫎璐熶紭鍖栵紙浜插拰娲惧彂锛?
+     vs "鍥炲啓鍚告敹"涓ら儴鍒嗗綊鍥犮€?  6. 3 杞彇涓綅鎶楀櫔锛涗换涓€杞?Verifier 鏂板憡璀﹀嵆璇ヨ疆浣滃簾锛堜汉宸ュ垽鎹級銆?
+鍥涖€佹暟鎹畨鍏ㄥ洖褰掔偣锛堟棦鏈夌邯寰嬩笉鐮村潖锛?  路 60s 鍛ㄦ湡钀界洏鑺傚锛歴tats 鐨?WbFlush/WbBytes 鏃堕棿搴忓垪淇濇寔 ~60s 鑴夊姩锛?    涓嶈閿佸悎骞?鍒嗙墖/棰勬墿瀹规墦涔憋紙bench_proto CSV 鐨勫閲忓簭鍒椾汉宸ユ牳瀵癸級銆?  路 鍗歌浇/鍏虫満 DirtyBytes=0锛歞etach 鍚?bench_proto Phase 2 鑷姩鏍￠獙锛?    鑴氭湰鍚屾椂鏍￠獙 LostDirtyBytes=0锛圕7 璁拌处骞插噣锛夈€?  路 C7 璁拌处锛氬け璐ヨ矾寰勪唬鐮佸鏌ヤ负涓?+ test_write_ex/test_wsconc 鐢ㄦ埛鎬佹柇瑷€
+    锛堥浂绐楀彛蹇収"鍙揣涓嶆澗"锛歵est_write_ex 浠ユ棫涓よ皟鐢ㄥ簭鍒椾负瀵圭収缁勯€愬満鏅?    鏂█鐩哥瓑鎴栨洿淇濆畧锛夈€?  路 鍒嗙墖閾捐〃锛歵est_wsconc 10 杞紙8 鍐欒€?8 璇昏€?4 zoned flusher+灏?max_bytes
+    寮哄埗椹遍€愶級纾佺洏闀滃儚閫愬瓧鑺備竴鑷淬€乴ost_dirty_bytes==0銆乧hunk_count 褰掗浂锛?    ASAN 鏋勫缓闆舵姤鍛娿€?  路 [WS-RACE 鏁存敼] 鐩村啓鎴愬姛鍚庡け鏁堝悓鍖洪棿缂撳瓨鏃у壇鏈紙P0-1 绾緥琛ラ綈锛歝ore
+    direct 鍖洪棿=鏈惛鏀讹紝浣嗘礊鏈熼棿骞跺彂璇诲洖濉彲鍦ㄧ紦瀛樼暀涓嬪啓鍓嶅壇鏈€斺€斿厛闀滃儚
+    鍚庡け鏁堬紝superseded=1 涓嶈璐︼級锛汻MW 娲炴湡闂村潡琚洖鏀堕噸寤烘椂鏀瑰惛鏀朵笉鍥為€€
+    鐩村啓锛坈ache.c pass2锛屾敞閲?WS-RACE锛夈€?  路 [WS-RACE-2 鏁存敼路QA BLOCKER-1] 鍦ㄩ€斿洖鍐欎笌"鏁存闀滃儚+鏁存澶辨晥"浜ら敊鐨勬暟鎹?    鎹熷潖锛坓en 鏍￠獙鍙繚鎶?clean銆佷繚鎶や笉浜嗗凡鍙戝嚭鐨勭鐩樺啓锛夛細core 钀界洏鍓?gen
+    澶嶆寮冨啓 + 澶辨晥璺緞鍗?dseq + 澶辨晥/鐩村啓鍓嶆帓绌哄湪閫斿洖鍐欙紙wb_active锛夛紱
+    椹卞姩閫愬尯闂寸洿鍐欐垚鍔熷悗琛ュけ鏁堛€侾2-1锛?2 婧㈠嚭鏁村潡鐩村啓锛夎矾寰勫悓鏋勮鐩?    锛坮b_write_ex 鍑哄彛缁熶竴鎺掔┖锛宒count>0 鍚?-2 鐨?161锛泃est_wsconc p21/
+    bigwrite 妯″紡纭畾鎬ф墽琛岋級銆俀A Round 2 鐨?BLOCKER-2 澶嶇幇鍣ㄧ粡瑁佸畾鍏?    鍙ｅ緞瓒呭嚭椹卞姩琛屼负锛堣鐩栫巼璁℃暟鍣ㄨ瘉鏄?-2/P2-1 璺緞浠庢湭鎵ц锛寃rc_neg=0銆?    dc_gt160=0锛夛紝绔炴€佺被鐪熷疄銆佷慨澶嶄负缁撴瀯鎬ч棴鍚堬紙鎺掔┖+澶嶆+鍗囦唬锛? 鏉?    鍏ㄩ暅鍍忚矾寰勫璁¤〃瑙佷氦浠樻姤鍛?搂涔濓級锛決A 涓よ疆 BLOCKER 璇佹嵁鍧囧缓浜庤秴椹卞姩
+    琛屼负鐨勬祴璇曟ā寮忥紝宸茶璐︺€俁ound 3 鍏ㄩ暅鍍忚矾寰勫璁¤〃锛? 鏉¤矾寰勯€愭潯鎺掔┖/
+    澶嶆淇濇姢璇佹嵁锛夎 deliverables/wsrace-fix-report-2026-10-21.md 搂涔濄€?  路 [WS-RACE-2 鏁存敼路finding-2 闂幆] 椹卞姩"澶辫触鍚庡悗缁潡"璺緞锛堜笉璋冪敤
+    rb_write_ex銆佹棤鍑哄彛鎺掔┖锛夛細鍓嶅簭鍧楀洖婊?invalidate 宸蹭粠鍧楀惊鐜箣鍚庣Щ鑷?    棣栦釜澶辫触鎺㈡祴鐐癸紙浠讳綍鍚庣画鍧楅暅鍍忎箣鍓嶏級鈥斺€斿叆鍙?wb_drain 鎺掔┖鍦ㄩ€斿洖鍐欍€?    娓呰剰鍗?dseq锛涘彔鍔犳瘡鍧?invalidate 鍏ュ彛 drain锛堝厛浜庝笅涓€鍧楅暅鍍忥級锛?    鎵€鏈夊悗缁潡闀滃儚涔嬪墠鍧囨湁鎺掔┖锛堝悓涓€鏀跺彛鐐癸紝鏃犳柊 API锛夛紱鍥炴粴鍖洪棿涓?    璁拌处璇箟锛坧re=NULL 淇濆畧锛変笌鏃у疄鐜伴€愬瓧涓€鑷达紱鏈潡澶辫触鏈?post-loop
+    鍏滃簳锛坮olled_back 闂革級銆?  路 [WS-RACE-2 鏁存敼路娈嬩綑寰獥鎶湶锛堜笉鍦ㄦ湰涓撻」闂悎锛屽悗缁崟鍒楋級]
+    鈶?璇昏€?鐩樿鈫掑缓鍧?涓庡啓鑰?闀滃儚鈫掑け鏁?鐨勯┍鍔ㄥ眰寰獥锛氳鑰?miss 濉厖
+       锛堢洏璇?commit锛夐潪鍘熷瓙 wrt 鐩村啓闀滃儚鏃讹紝鍙兘缂撳瓨闀滃儚鍓嶆棫鍊硷紱褰诲簳
+       闂悎闇€ core 鏂板 miss-fill 涓栦唬鏍￠獙 API锛堟墿澶у崗璁潰锛夛紝test_wsconc
+       渚у凡浠?鍙洖濉姹備氦闆嗗唴鐨勫畬鏁村瓙鍧?闂悎娴嬭瘯鍏ュ彛銆?    鈶?璋冪敤鏂归暅鍍?鍏ㄥ惛鏀跺尯闂?锛坉c=0 涔熼暅鍍?澶辨晥锛夋椂鏃?core 鎺掔┖淇濇姢
+       锛坵b_drain 鍙寕 direct 璺緞锛夛細椹卞姩涓嶄骇鐢熻搴忓垪锛堝叏璺緞瀹¤瑙?       浜や粯鎶ュ憡 搂9.2锛夛紝灞炶皟鐢ㄥ绾︾害鏉熴€?    鈶?椹卞姩"澶辫触鍚庡悗缁潡"璺緞锛坮bio.c else 鍒嗘敮锛宖inding-2 鏁存敼鍚庢敹绐?       鑷虫锛夛細璇ヨ矾寰勪笉璋冪敤 rb_write_ex銆佹棤鍑哄彛鎺掔┖锛涘潡闂撮暅鍍忓凡鍏ㄩ儴鏈?       鍓嶇疆鎺掔┖锛堝洖婊?invalidate 涓庢瘡鍧?invalidate 鐨勫叆鍙?drain锛夛紝浣?       鍗曞潡鑷韩"闀滃儚鈫抜nvalidate"涔嬮棿锛屽湪閫斿洖鍐欙紙stage 鏃舵崟鑾风殑鏃ф暟鎹級
+       浠嶅彲鑳借惤浜庨暅鍍忎箣鍚庘€斺€旂洏闈㈠洖鍒版鍓嶅凡 ack 鐨勬湁鏁堢姸鎬侊紙IRP 宸插け璐ャ€?       鏃?ack 鏁版嵁涓㈠け锛泂uperseded=0 鏈?pre=NULL 淇濆畧璁拌处鍏滃簳锛夛紱闇€鐩樺啓
+       澶辫触鍚庤Е鍙戯紝绐勪笖鏂瑰悜瀹夊叏锛涘交搴曢棴鍚堥渶鐩村啓灞忛殰 API锛堝悓鈶狅紝鍚庣画
+       鍗曞垪锛宎rchitect 浠茶锛夈€?  路 SafeMode / 鐔旀柇 / P0-1 / P2-2 璺緞鏈锛汥river Verifier锛圫pecial Pool +
+    IRQL + Deadlock锛夊叏璐熻浇闆舵柊鍛婅銆?
+浜斻€佸洖婊氭寚寮?  路 D1锛堝啓璺緞閿佸悎骞讹級锛歳evert cache.c 鐨?rb_write_ex/pass1 diff + rbio.c
+    鐨?RbWriteWorker 鍗曡皟鐢?diff锛堣嚜鍖呭惈锛夛紱rb_stream_dirty_mask 鍏紑 API
+    鏈氨鍙洿璋冿紝鍥炴粴鍚庨┍鍔ㄦ敼鍥炰袱璋冪敤搴忓垪鍗冲彲銆?  路 D2锛坈hain 鍒嗙墖锛? D5锛坋nts 棰勬墿瀹癸級锛歳evert cache.c 瀵瑰簲 diff锛堝崟鏂囦欢
+    鑷寘鍚級銆?  路 D3锛堜翰鍜屾淳鍙戯級锛歳evert rbio.c 鐨?RbSubmitIo 浜插拰鍒嗘敮鍗冲洖鍒?IoRR 杞
+    锛坮b_common.h 鐨?IoWorkerByCpu 瀛楁鍙暀锛屾棤瀹筹級銆?  路 WS-RACE / WS-RACE-2 鏁存敼锛坮bio.c 鐩村啓鍚庡け鏁?/ cache.c RMW 鍚告敹 /
+    澶嶆+鎺掔┖+鍗囦唬锛夛細闅?D1/D2 涓€骞?revert锛堝悓涓鸿嚜鍖呭惈 diff锛涘洖婊氬悗
+    BLOCKER-1 绔炴€佸瀛橈紝浠呬緵绱ф€ュ洖閫€锛岃涓婅堪浜や粯鎶ュ憡 搂鍏?搂涔濓級銆?  路 WS-RACE-2 finding-2 鏁存敼锛坮bio.c 澶辫触璺緞鍥炴粴鍓嶇Щ锛夛細revert 鏂瑰紡鈥斺€?    鎶?else 鍒嗘敮棣栬鐨勫墠搴忓潡鍥炴粴 invalidate锛坮olled_back 闂告暣娈碉級绉诲洖
+    鍧楀惊鐜箣鍚庡嵆鍥炲埌鏃у疄鐜帮紙鍥炴粴鍖洪棿/璁拌处璇箟涓嶅彉锛涘洖婊氬悗"鍥炴粴鏅氫簬
+    鍚庣画鍧楅暅鍍?鐨勬畫浣欏瀛橈紝浠呬緵绱ф€ュ洖閫€锛夈€?  路 浠?build_all.bat 鎽橀櫎 test_write_ex/test_wsconc 鍚庨噸缂栭噸绛惧悕閮ㄧ讲
+    锛坉eploy_w15.ps1 + 閲嶅惎锛夛紱涓夐敋鐐?鍗忚/閮ㄧ讲娴佺▼涓嶅姩銆?================================================================

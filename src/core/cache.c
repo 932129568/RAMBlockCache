@@ -381,7 +381,6 @@ struct rb_stream {
  * for a push/pop (no I/O, no memset). Alignment: the batch base is rounded up
  * to 64KiB, so every block is >=4KiB aligned -- strictly better than the
  * previous per-block 4KiB guarantee. */
-#define RB_SLAB_BATCH     16u     /* 单批块数上限: 16 x chunk_size（[F5] 起按几何自适应收缩，见 slab_get） */
 /* [F4 2026-11-06] free-stack 块数上限 = min(RB_SLAB_FREE_MAX, RB_SLAB_RETAIN_BYTES/chunk_size)：
  * 原纯块数上限 2048 在大几何档把非分页滞留按 chunk 倍数放大（32K 档 chunk=512KB
  * → 2048×512KB=1GB；64K 档 2GB、128K 档 4GB——59-64k-audit F4：chunk_destroy→
@@ -391,10 +390,20 @@ struct rb_stream {
  *   8K 档 chunk=128KB → 2048 → 2048（不变）
  *  16K 档 chunk=256KB → 1024
  *  32K 档 chunk=512KB →  512
- * free_stack 数组物理维度保持 RB_SLAB_FREE_MAX=2048（只改接纳判据，不动内存
- * 布局）；满栈=直接丢弃该块（batch 链在引擎销毁时统一释放，不泄漏，仅损失复用）。 */
+ * free_stack 数组物理维度保持 RB_SLAB_FREE_MAX=2048（只改接纳判据，不动内存布局）。
+ * [FIX O9-SLAB 2026-11-09] 缺陷（真机 200GB 测试灌入复现+活体观测）：原"批次切片"
+ * 设计（slab_get 栈空即整批 CORE_MALLOC_NP、批次内存只在引擎销毁统一释放）下，
+ * free_stack 满栈后 slab_put 对块不做任何事——该块仍被批次持有：不可复用、不归还
+ * OS、滞留到引擎销毁。净效果 = slab 足迹随【历史分配总量】单调增长，与 live/预算
+ * 彻底脱钩（本机 200GB churn → 非分页池 50GB 滞留；引擎账面 PeakBytes 仅 21.3GB，
+ * 且系统可用 0.5GB 的极端压力下池纹丝不动）。修复 = 纯单块制：
+ *   slab_get 栈空直接 CORE_MALLOC_NP(单块)——内核 RBKAllocAligned 页对齐且 raw
+ *   指针自存于 [-1] 槽，可独立 RBKFreeAligned；slab_put 满栈即 CORE_FREE 归还 OS。
+ * 滞留上限 = free_stack 容量（4K 几何 2048x64KB=128MB，恰为 F4 预算），
+ * 与缓存容量/历史 churn 彻底解耦。热循环（淘汰→再分配同一批块）仍走栈复用，
+ * 零额外池流量。批次数组结构 RB_SLAB_BATCH/rb_slab_batch 随批次制一并移除。 */
 #define RB_SLAB_RETAIN_BYTES (256u*1024u*1024u)   /* free-stack 字节预算（0x10000000） */
-#define RB_SLAB_FREE_MAX  2048u   /* free-stack 物理维度; overflow just loses reuse */
+#define RB_SLAB_FREE_MAX  2048u   /* free-stack 物理维度 */
 /* [F4] 块数上限接纳判据（slab_get/slab_put 共用，保证两端一致）。
  * chunk_size 一律取引擎 create 期派生的实际值（调用方传入），绝不按
  * block_size×16 重算。除零防御：chunk_size==0（几何未派生，不可达）→ 物理
@@ -408,73 +417,43 @@ static rb_u32 slab_free_cap(rb_u32 chunk_size)
     if(n<1u) n=1u;
     return (rb_u32)n;
 }
-struct rb_slab_batch { struct rb_slab_batch *next; rb_u32 nblocks; };
 struct rb_slab {
     rb_mutex lock;
-    struct rb_slab_batch *batches;
     void   *free_stack[RB_SLAB_FREE_MAX];
     rb_u32  nfree;
-    rb_u32  grows;                /* diagnostics: batch allocations */
 };
-/* one contiguous grow, sliced into n blocks (n = F5 自适应批); returns one block.
+/* [FIX O9-SLAB] 取块：栈复用优先；栈空=单块直分配（独立可释放）。
  * NULL => caller degrades to direct I/O (same as any chunk_create failure). */
 static void *slab_get(struct rb_slab *sl, rb_u32 block_size)
 {
     void *p=NULL;
-    rb_u32 cap=slab_free_cap(block_size);   /* [F4] 接纳判据（与 slab_put 同式） */
     if(!block_size) return NULL;            /* 防御：几何未派生（不可达） */
     RB_M_LOCK(&sl->lock);
     if(sl->nfree) p=sl->free_stack[--sl->nfree];
     RB_M_UNLOCK(&sl->lock);
-    if(p)return p;
-    {
-        /* [F5 2026-11-06] 单批块数自适应：batch = min(16, max(1, (4MB-64KB)/chunk_size))
-         * （0x400000-0x10000 为"4MB 批预算 - 64KiB 对齐 slack"，整除向下取整）。
-         * 原固定 16 在大几何档把单次非分页分配大额化（4K 档 ≈1.06MB → 32K 档
-         * ≈8.4MB、64K 档 ≈16.07MB），失败→NULL→chunk_create NULL→direct 兜底
-         * （安全）但反复失败 = 静默性能悬崖（59-64k-audit F5）。各档结果：
-         *   4K 档 chunk= 64KB → (4MB-64KB)/ 64KB=63 → 16（不变）
-         *  16K 档 chunk=256KB → 15
-         *  32K 档 chunk=512KB → 7
-         *   8K 档 chunk=128KB → 31 → 16（不变）
-         * 失败路径零改动：CORE_MALLOC_NP 失败 → NULL → 既有 direct 兜底。 */
-        rb_u32 fit=(rb_u32)((0x400000u-0x10000u)/block_size);
-        rb_u32 n=RB_SLAB_BATCH;
-        if(fit<1u) fit=1u;                  /* 极小 chunk 防御（不可达，白名单下 fit≥63） */
-        if(fit<n) n=fit;
-        size_t head=(sizeof(struct rb_slab_batch)+63u)&~(size_t)63u;
-        size_t need=head+(size_t)n*block_size+65536u;   /* slack for 64KiB align */
-        unsigned char *raw=(unsigned char *)CORE_MALLOC_NP(need);
-        unsigned char *base; rb_u32 i;
-        struct rb_slab_batch *b;
-        if(!raw)return NULL;
-        base=(unsigned char *)(((uintptr_t)(raw+head)+65535u)&~(uintptr_t)65535u);
-        b=(struct rb_slab_batch *)raw; b->nblocks=n;
-        RB_M_LOCK(&sl->lock);
-        b->next=sl->batches; sl->batches=b; sl->grows++;
-        for(i=n;i>1;i--)
-            if(sl->nfree<cap) sl->free_stack[sl->nfree++]=base+(size_t)(i-1)*block_size;
-        RB_M_UNLOCK(&sl->lock);
-        return base;
-    }
+    if(p) return p;
+    return CORE_MALLOC_NP((size_t)block_size);
 }
-/* return a block; a full stack simply drops it (batch is freed with the engine).
- * [F4 2026-11-06] 满栈判据从物理维度改为 slab_free_cap(chunk_size)（字节预算）；
- * chunk_size 由调用方传引擎几何（chunk_free/chunk_unref 两处调用点均持有 eng）。 */
+/* 还块：栈未满入栈复用；满栈即归还 OS（[FIX O9-SLAB]，原批次制满栈=批次持有
+ * 滞留到引擎销毁。满栈判据维持 [F4 2026-11-06] slab_free_cap(chunk_size)
+ * 字节预算；chunk_size 由调用方传引擎几何（chunk_free/chunk_unref 两处调用点
+ * 均持有 eng）。CORE_FREE 移到锁外：内核 RBKFreeAligned 走 ExFreePool，
+ * 不在引擎锁内做池归还。 */
 static void slab_put(struct rb_slab *sl, void *p, rb_u32 chunk_size)
 {
     rb_u32 cap;
-    if(!sl||!p)return;
+    if(!p)return;
+    if(!sl){ CORE_FREE(p); return; }        /* 无引擎上下文：直接归还（原为滞留） */
     cap=slab_free_cap(chunk_size);
     RB_M_LOCK(&sl->lock);
-    if(sl->nfree<cap) sl->free_stack[sl->nfree++]=p;
+    if(sl->nfree<cap){ sl->free_stack[sl->nfree++]=p; p=NULL; }
     RB_M_UNLOCK(&sl->lock);
+    if(p) CORE_FREE(p);
 }
 static void slab_release_all(struct rb_slab *sl)
 {
-    struct rb_slab_batch *b=sl->batches;
-    while(b){ struct rb_slab_batch *n=b->next; CORE_FREE(b); b=n; }
-    sl->batches=NULL; sl->nfree=0;
+    /* [FIX O9-SLAB] 纯单块制：栈内块各自独立分配，逐块归还 */
+    while(sl->nfree) CORE_FREE(sl->free_stack[--sl->nfree]);
 }
 struct rb_engine {
     rb_config cfg;

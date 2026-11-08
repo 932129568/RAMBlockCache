@@ -92,7 +92,7 @@ export default function EmergencyPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="应急"
-        desc="这些按钮直接改变驱动数据面行为。确认框是最后一道人为闸门，驱动侧闸门（panic 世代追平、BootLoopGuard）不因前端绕过。"
+        desc="紧急操作：立即回写落盘、安全模式（强制直写）、熔断（全局旁路）"
         actions={
           <>
             {panicking && <Badge tone="warn">熔断中</Badge>}

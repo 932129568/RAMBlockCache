@@ -149,16 +149,12 @@ export default function SettingsPage() {
   }
 
   const cfg = configQuery.data;
-  /* [UI-FIX 2026-11-05] 缓存上限标签联动：真正决定"动态/固定"的是 AutoMemory
-   * 开关，而非 CacheSizeMB 是否为 0。原标签"（0=动态自动）"会让用户以为
-   * 填 4096 就是动态模式——实际 AutoMemory=1 时该值仅作兜底。 */
-  const autoMem = form.watch('AutoMemory');
 
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="设置"
-        desc="SET_CONFIG 全量回写：未放开的字段按当前驱动值原样写回；危险字段只读"
+        desc="缓存引擎全局设置"
         actions={
           <Badge tone="neutral">
             {configQuery.isFetching ? '查询中…' : '每 5s 查询'}
@@ -193,10 +189,10 @@ export default function SettingsPage() {
                 )} />
               </Row>
               <Select
-                label="全局写模式 WriteBack（D2 红线：默认直写）"
+                label="全局写模式 WriteBack"
                 options={[
-                  { value: 0, text: '直写（默认，安全）' },
-                  { value: 1, text: '回写（性能，需知情）' },
+                  { value: 0, text: '直写（写入即落盘）' },
+                  { value: 1, text: '回写（写延迟更低）' },
                 ]}
                 {...form.register('WriteBack', { valueAsNumber: true })}
               />
@@ -204,7 +200,7 @@ export default function SettingsPage() {
 
             <Group title="容量与内存预算">
               <Num
-                label={autoMem === 1 ? '缓存上限 CacheSizeMB（当前为动态，此值仅兜底）' : '缓存上限 CacheSizeMB（固定上限，MB）'}
+                label="缓存上限 CacheSizeMB (MB)"
                 min={0}
                 max={1048576}
                 {...form.register('CacheSizeMB', { valueAsNumber: true, min: 0, max: 1048576 })}
@@ -215,13 +211,13 @@ export default function SettingsPage() {
                 )} />
               </Row>
               <Num
-                label="保留内存 MemReserveMB（0=自动按物理内存容量适配；手动 ≤65536）"
+                label="保留内存 MemReserveMB (MB)"
                 min={0}
                 max={65536}
                 {...form.register('MemReserveMB', { valueAsNumber: true, min: 0, max: 65536 })}
               />
               <Num
-                label="可用内存占用上限 AutoUsePct %（10-95）"
+                label="可用内存占用上限 AutoUsePct %"
                 min={10}
                 max={95}
                 {...form.register('AutoUsePct', { valueAsNumber: true, min: 10, max: 95 })}
@@ -232,25 +228,25 @@ export default function SettingsPage() {
                 {...form.register('BlockSize', { valueAsNumber: true })}
               />
               <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
-                切换块大小会触发驱动内部引擎重建（无需重启整机）：重建期间缓存中的干净块会被丢弃，命中率短时归零；默认直写（WriteBack=0）下无脏数据、不丢数据。重建窗口内 I/O 回落至磁盘、性能会短暂下降，建议避开高负载时段切换。开放档位：4 KB / 8 KB / 16 KB / 32 KB / 64 KB（64K 档经 59 号前置审计+测试包后解禁，大块顺序场景 per-chunk 开销最低，小随机场景建议 4K）。
+                缓存引擎的数据块粒度：小块利于随机读写，大块利于顺序读写，切换免重启。
               </p>
             </Group>
 
             <Group title="回写与回收">
               <Num
-                label="回写间隔 FlushIntervalMs（0=关闭周期回写）"
+                label="回写落盘间隔 FlushIntervalMs（毫秒，0=关闭）"
                 min={0}
                 max={600000}
                 {...form.register('FlushIntervalMs', { valueAsNumber: true, min: 0, max: 600000 })}
               />
               <Num
-                label="脏水位高 DirtyHighPct %（15-99）"
+                label="脏水位高 DirtyHighPct %"
                 min={15}
                 max={99}
                 {...form.register('DirtyHighPct', { valueAsNumber: true, min: 15, max: 99 })}
               />
               <Num
-                label="脏水位低 DirtyLowPct %（5-89，须低于高水位）"
+                label="脏水位低 DirtyLowPct %"
                 min={5}
                 max={89}
                 {...form.register('DirtyLowPct', { valueAsNumber: true, min: 5, max: 89 })}
@@ -267,32 +263,35 @@ export default function SettingsPage() {
                 {...form.register('IdleReclaimSec', { valueAsNumber: true, min: 0, max: 86400 })}
               />
               <Select
-                label="回写落盘并行度 ParallelFlush（1–32 路 · 仅回写脏数据消费 · 运行期生效）"
+                label="回写落盘并行度 ParallelFlush"
                 options={[
-                  { value: 1, text: '串行（1 路 · 默认）' },
-                  { value: 2, text: '并行 2 路' },
-                  { value: 4, text: '并行 4 路（历史档）' },
-                  { value: 8, text: '并行 8 路' },
-                  { value: 16, text: '并行 16 路' },
-                  { value: 20, text: '并行 20 路' },
-                  { value: 32, text: '并行 32 路（上限）' },
+                  { value: 1, text: '1 路' },
+                  { value: 2, text: '2 路' },
+                  { value: 4, text: '4 路' },
+                  { value: 8, text: '8 路' },
+                  { value: 16, text: '16 路' },
+                  { value: 20, text: '20 路' },
+                  { value: 32, text: '32 路' },
                 ]}
                 {...form.register('ParallelFlush', { valueAsNumber: true })}
               />
               <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
-                此路数只作用于【回写脏数据落盘】的 zone 并行（直写模式下不产生脏数据，本项近似无感）。真机 90 号五路 A/B：吞吐无稳定区分度（收益受盘限，非线程限）。读没有「路数」开关：读并行由每核 I/O worker 池（≤32 绑核 worker + 工作窃取）按负载自动承担。
+                回写脏数据并发落盘的路数：并行越高，回写吞吐越高。
               </p>
               <Select
-                label="TinyLFU 频率准入（防顺序扫描冲掉热集 · 默认关）"
+                label="TinyLFU 频率准入"
                 options={[
-                  { value: 0, text: '关闭（默认，行为与旧版一致）' },
-                  { value: 1, text: '开启（内存压力态按访问频率准入）' },
+                  { value: 0, text: '关闭' },
+                  { value: 1, text: '开启' },
                 ]}
                 {...form.register('TinyLFU', { valueAsNumber: true })}
               />
+              <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
+                按访问频率决定数据是否进缓存：顺序扫描不再冲掉热数据。
+              </p>
             </Group>
 
-            <Group title="开机行为（默认：不自动加速 · 恢复上次选择）">
+            <Group title="开机行为">
               <Row label="开机自动加速所有数据卷 AutoAttach">
                 <Toggle
                   checked={bootCfgQuery.data?.AutoAttach === 1}
@@ -301,9 +300,6 @@ export default function SettingsPage() {
                   disabled={bootBusy}
                 />
               </Row>
-              <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
-                关闭时（默认）开机不加速任何卷，全部手动开启。系统卷始终只在手动操作下加速。
-              </p>
               <Row label="开机恢复上次加速的卷 ResumeOnBoot">
                 <Toggle
                   checked={bootCfgQuery.data?.ResumeOnBoot === 1}
@@ -319,9 +315,9 @@ export default function SettingsPage() {
               </p>
             </Group>
 
-            <Group title="预取与分页（真实生效开关）">
+            <Group title="预取与分页">
               <label className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
-                <span>分页 IO 进缓存 CachePagingIo（运行期即时生效）</span>
+                <span>分页 IO 进缓存 CachePagingIo</span>
                 <Toggle
                   checked={!!form.watch('CachePagingIo')}
                   onChange={(b) => form.setValue('CachePagingIo', b ? 1 : 0, { shouldDirty: true })}
@@ -329,10 +325,10 @@ export default function SettingsPage() {
                 />
               </label>
               <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
-                驱动自 2026-11-06 起逐 IO 消费此开关（映射节读写/加载器读 DLL 走此门）；默认 0 = 分页 IO 直读盘不进缓存（11-06 微信 DLL 事故加固）。开启可提高映射文件读命中率，但分页流进入缓存爆炸半径。
+                映射文件读写（如加载 DLL）进入缓存：提高映射文件读取命中率。
               </p>
               <label className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
-                <span>预取引擎 ReadaheadEnabled（创建期冻结）</span>
+                <span>预取引擎 ReadaheadEnabled</span>
                 <Toggle
                   checked={!!form.watch('ReadaheadEnabled')}
                   onChange={(b) => form.setValue('ReadaheadEnabled', b ? 1 : 0, { shouldDirty: true })}
@@ -340,30 +336,29 @@ export default function SettingsPage() {
                 />
               </label>
               <Num
-                label="预取窗口 ReadaheadWindowKB（64–4096）"
+                label="预取窗口 ReadaheadWindowKB (KB)"
                 min={64}
                 max={4096}
                 {...form.register('ReadaheadWindowKB', { valueAsNumber: true })}
               />
               <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
-                core 无运行期 setter：两项在下次几何重建/卷重挂（引擎重建）后生效，与 BlockSize 同纪律；保存即持久化。
+                提前读入即将访问的数据：提升连续读速度。
               </p>
             </Group>
 
-            <Group title="只读字段（高级/驱动侧语义，不在 Web 表单放开）">
-              <ReadOnly label="SystemVolumeCached" value={cfg.SystemVolumeCached} note="系统卷已可在「卷加速」页手动开启（含回写，风险自负）" />
+            <Group title="只读字段">
+              <ReadOnly label="SystemVolumeCached" value={cfg.SystemVolumeCached} />
               <ReadOnly label="Frozen" value={cfg.Frozen} />
               <ReadOnly label="IdleFlush" value={cfg.IdleFlush} />
               <ReadOnly label="WriteRelease" value={cfg.WriteRelease} />
               <ReadOnly
                 label="VolumeFilter"
                 value={JSON.stringify(cfg.VolumeFilter)}
-                note="驱动明确忽略（逐卷策略走 ATTACH_VOLUME）"
               />
             </Group>
 
-            <Group title="特性开关（RB2 · Features\Flags · 热生效）">
-              {([['PREFETCH', '预取（读 miss 窗口回填）'], ['HOT', '热区预热（Prewarm/衰减）'], ['THERMAL', '温度护栏（过热暂停预取）'], ['ETW', 'ETW 遥测'], ['WBCOAL', '回写合写节奏（写合并/限速 · 已接线 · 默认关）']] as const).map(([k, label]) => (
+            <Group title="特性开关">
+              {([['PREFETCH', '预取（提升连续读）'], ['HOT', '热区预热（冷启动更快命中）'], ['THERMAL', '温度护栏（过热暂停预取）'], ['ETW', 'ETW 遥测'], ['WBCOAL', '回写合写（平滑写延迟）']] as const).map(([k, label]) => (
                 <label key={k} className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
                   <span>{label} · {k}</span>
                   <Toggle
@@ -374,9 +369,6 @@ export default function SettingsPage() {
                   />
                 </label>
               ))}
-              <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
-                WBCOAL 与 L2 互斥（红线：两者不可同为 1）——CLI 与本页都强制；切换冲突时 CLI 返回 [blocked] 并如实显示。
-              </p>
               <L2Manager rbfeat={rbfeat} reload={loadRbfeat} />
               <ExclManager rbfeat={rbfeat} reload={loadRbfeat} />
               {rbfeat?.exe !== 'found' && (
@@ -535,7 +527,7 @@ function L2Manager({ rbfeat, reload }: { rbfeat: RbfeatState; reload: () => void
                 onClick={() => call('disable')}>停用</button>
       </div>
       <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
-        容器 = 卷上文件（RAMBoostL2.idx/.dat，非破坏性创建）。约束：仅 4K 块几何可用（记录粒度 64KB）；单加速卷；与 WBCOAL 互斥（CLI 强制）。
+        L2 二级读缓存：淘汰的热数据存入卷上容器文件，重复读取直接命中，提升二次读速度。
       </p>
     </>
   );
@@ -569,7 +561,7 @@ function ExclManager({ rbfeat, reload }: { rbfeat: RbfeatState; reload: () => vo
                 onClick={() => { call('add'); setName(''); }}>加入</button>
       </div>
       <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
-        当前自定义排除：{entries.length ? entries.join('、') : '（空）'}——命中进程的读写直落盘不进缓存（AdmitRejects 可在诊断页观测）。
+        当前自定义排除：{entries.length ? entries.join('、') : '（空）'}——命中进程的读写不进缓存。
       </p>
     </>
   );

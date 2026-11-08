@@ -273,6 +273,17 @@ int main(int argc, char **argv)
     } else if (!strcmp(argv[1], "l2") && argc > 2 && !strcmp(argv[2], "disable")) {
         /* l2 disable：清 Flags L2 位 + REFRESH（驱动收尾容器并保存索引） */
         FlagsReg(0, 4);
+        {   /* [FIX O9-L2RES 2026-11-09] 清残值：L2Letter 残留会让驱动
+             * RbFeatRefuseLetter 持续拒绝该卷的自动挂载（该判定不看 L2 flag
+             * 是否在开），卷从此静默无法 resume——真机 F: 两晚失联实锤 */
+            HKEY k2;
+            if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\RAMBlockCache\\Features",
+                                0, NULL, 0, KEY_SET_VALUE, NULL, &k2, NULL) == ERROR_SUCCESS) {
+                RegDeleteValueA(k2, "L2Letter");
+                RegDeleteValueA(k2, "L2SizeGB");
+                RegCloseKey(k2);
+            }
+        }
         Xfer(d, RB2_IOCTL_REFRESH, NULL, 0, NULL, 0, NULL);
         printf("refresh sent\n");
     } else if (!strcmp(argv[1], "l2") && argc > 3 &&

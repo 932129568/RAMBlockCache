@@ -73,7 +73,7 @@ export default function VolumesPage() {
     if (mode === v.WriteMode) return;
     const okGo = await confirmDialog({
       title: `确认将卷 ${v.Letter}: 的写模式切换为「${WRITEMODE_TEXT[mode] ?? mode}」？`,
-      body: '回写模式：写缓存标脏即完成，后台落盘；异常退出存在丢脏窗口（默认红线为直写）。',
+      body: '回写模式：写入先进缓存，后台合并落盘，写延迟更低。',
       danger: mode === RB_WRITEMODE.BACK,
     });
     if (!okGo) return;
@@ -93,7 +93,7 @@ export default function VolumesPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="卷加速"
-        desc="热开关（ATTACH）与逐卷写模式；系统卷可手动开启（开机自动挂载仍跳过），回写需逐卷知情开启"
+        desc="卷加速开关与逐卷写模式"
         actions={
           <>
             <Badge tone="neutral">枚举 {count} 卷 · 5s 轮询</Badge>
@@ -125,7 +125,7 @@ export default function VolumesPage() {
         <EmptyState
           icon={<Icons.disk size={26} />}
           title="驱动未枚举到卷"
-          body="引擎惰性创建：首次挂载后才枚举。热开关在驱动侧闸门（BootLoopGuard / 系统卷 opt-in / 几何校验）全过时才生效。"
+          body="尚未枚举到卷：打开任一卷的加速开关后再试。"
           action={
             <Button tone="secondary" icon={<Icons.refresh size={14} />} onClick={() => void queryClient.invalidateQueries({ queryKey: ['rb', 'volumes'] })}>
               重新枚举
@@ -152,7 +152,7 @@ export default function VolumesPage() {
         </p>
       )}
       <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)' }}>
-        红线：系统卷不进开机自动挂载（仅手动开启，掉电丢脏窗口自负）；全局默认直写，回写需逐卷显式开启。
+        每个卷可独立开关加速；回写模式下写延迟更低。
       </p>
     </div>
   );

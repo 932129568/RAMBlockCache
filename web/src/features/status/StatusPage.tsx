@@ -90,7 +90,7 @@ export default function StatusPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="运行状态"
-        desc="驱动数据面与控制面的实时健康面（1s 采样）"
+        desc="缓存实时状态与健康监控"
         actions={
           <Badge tone={panicking ? 'warn' : stats.Enabled === 1 ? 'ok' : 'neutral'}>
             {panicking ? '全局直通' : stats.Enabled === 1 ? '缓存生效中' : '旁路待命'}

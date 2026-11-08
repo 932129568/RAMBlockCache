@@ -1,0 +1,6 @@
+﻿MSTART 2026-11-08T22:30:48.3225440+08:00
+BASE pool=5.356GB cur=4GB trim=0
+RD1 [done] 20480 MiB across 1 file(s), 327680 blocks, 189625 ms (108 MB/s) | pool=27.996GB cur=14.84GB trim=150144
+RD1 [done] 16000 MiB across 1 file(s), 256000 blocks, 151657 ms (106 MB/s) | pool=41.253GB cur=4.66GB trim=572928
+RD1 [done] 4900 MiB across 1 file(s), 78400 blocks, 45516 ms (108 MB/s) | pool=44.674GB cur=2.65GB trim=684160
+RD2 [done] 20480 MiB across 1 file(s), 327680 blocks, 183360 ms (112 MB/s) | pool=48.508GB cur=0.57GB trim=1046016

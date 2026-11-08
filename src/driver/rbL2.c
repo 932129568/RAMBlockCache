@@ -558,13 +558,30 @@ cleanup:
 VOID RbL2Store(PVOID Extp, ULONG64 lba, ULONG len, PVOID src)
 {
     PRB2_L2HDR rec; ULONG i; ULONG64 blk; PRB2_L2E idx;
+    /* [O9-DIAG 2026-11-09] 存储链路诊断：每 4096 次同因拒绝记一行（洪泛不刷屏），
+     * IO 失败必记。l2m 有计数而 l2s 恒 0 的现场用此定位断点。 */
     if ((g_Rb2Flags & RB2F_L2) == 0) return;
     if (RbPanicActive()) return;
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) return;
-    if (!s_Idx || !s_Slots || !src) return;        /* 仅指针读（不解引用）：安全快路径 */
-    if (len != RB2_L2BLK) return;                  /* 只收整块：杜绝 v1 越界读/零填充污染 */
+    if (!s_Idx || !s_Slots || !src) {              /* 仅指针读（不解引用）：安全快路径 */
+        static volatile LONG s_RejIdx = 0;
+        if ((InterlockedIncrement(&s_RejIdx) & 0xFFF) == 1)
+            RbLog(1, __LINE__, 0, L"l2: store rejected (no idx/slots/src) [diag O9]");
+        return;
+    }
+    if (len != RB2_L2BLK) {                        /* 只收整块：杜绝 v1 越界读/零填充污染 */
+        static volatile LONG s_RejLen = 0;
+        if ((InterlockedIncrement(&s_RejLen) & 0xFFF) == 1)
+            RbLog(1, __LINE__, 0, L"l2: store rejected (len!=64KB) [diag O9]");
+        return;
+    }
     /* [FIX R6-01] 存储的卷身份闸（同探测）：非本容器的卷不写（防覆写他卷记录） */
-    if (Extp && ((PRB_DEV_EXT)Extp)->VolId != InterlockedOr64(&s_VolId, 0)) return;
+    if (Extp && ((PRB_DEV_EXT)Extp)->VolId != InterlockedOr64(&s_VolId, 0)) {
+        static volatile LONG s_RejVol = 0;
+        if ((InterlockedIncrement(&s_RejVol) & 0xFFF) == 1)
+            RbLog(1, __LINE__, 0, L"l2: store rejected (vol identity) [diag O9]");
+        return;
+    }
 
     /* [F1] 在飞计数 + 单一出口 cleanup（配对规则同 RbL2ProbeFill） */
     InterlockedIncrement(&s_Ops);
@@ -575,7 +592,12 @@ VOID RbL2Store(PVOID Extp, ULONG64 lba, ULONG len, PVOID src)
     if (!s_File) goto cleanup;
 
     blk = lba / RB2_L2BLK;
-    if (blk >= s_Slots) goto cleanup;              /* [F4] 超容量 LBA：拒绝写出名义长度（重启即全废） */
+    if (blk >= s_Slots) {                          /* [F4] 超容量 LBA：拒绝写出名义长度（重启即全废） */
+        static volatile LONG s_RejOow = 0;
+        if ((InterlockedIncrement(&s_RejOow) & 0xFFF) == 1)
+            RbLog(1, __LINE__, 0, L"l2: store rejected (out of window) [diag O9]");
+        goto cleanup;
+    }
     rec = (PRB2_L2HDR)Rb2Alloc(RB2_L2REC);
     if (!rec) goto cleanup;
     rec->Lba = blk << 16; rec->Stamp = ++s_Stamp;
@@ -583,15 +605,20 @@ VOID RbL2Store(PVOID Extp, ULONG64 lba, ULONG len, PVOID src)
     RtlCopyMemory((PCHAR)(rec + 1), src, RB2_L2BLK);
     rec->Crc = RbCrc32((PCHAR)(rec + 1), RB2_L2BLK);
 
-    if (NT_SUCCESS(RbL2Io(s_File, TRUE, 4096 + blk * RB2_L2REC, rec, RB2_L2REC))) {
-        /* [F1] 索引守卫（双保险）：持计数期间 Close 无法回收，正常不可达；
-         * 万一将来计数契约被破坏，此处保证不写野指针而非静默损坏。 */
-        if (s_Idx && s_Slots) {
-            i = RbL2Hash(blk); idx = L2Idx();
-            idx[i].Lba = blk << 16; idx[i].Stamp = rec->Stamp; idx[i].Use = 1;
+    {
+        NTSTATUS stw = RbL2Io(s_File, TRUE, 4096 + blk * RB2_L2REC, rec, RB2_L2REC);
+        if (NT_SUCCESS(stw)) {
+            /* [F1] 索引守卫（双保险）：持计数期间 Close 无法回收，正常不可达；
+             * 万一将来计数契约被破坏，此处保证不写野指针而非静默损坏。 */
+            if (s_Idx && s_Slots) {
+                i = RbL2Hash(blk); idx = L2Idx();
+                idx[i].Lba = blk << 16; idx[i].Stamp = rec->Stamp; idx[i].Use = 1;
+            }
+            Rb2Count(8, 1);
+            InterlockedExchange(&s_IdxDirty, 1);
+        } else {
+            RbLog(1, __LINE__, stw, L"l2: store io failed [diag O9]");
         }
-        Rb2Count(8, 1);
-        InterlockedExchange(&s_IdxDirty, 1);
     }
 cleanup:
     if (rec) Rb2Free(rec);

@@ -1148,11 +1148,15 @@ static NTSTATUS RbAttachVolumeByLetterImpl(WCHAR letter, BOOLEAN forRebuild)
          * opt-in 取代"默认放行"：默认拒绝、知情开启、留证（SET_CONFIG 日志）。 */
         /* [USER-REQ 2026-11-05] 系统卷允许手动加速（解除 B-10 硬拒绝）。
          * 用户明确要求"C 盘可手动打开"。安全边界仍在驱动侧兜底：
-         *   · RbIsWriteBack 对 IsSystem 恒返回 FALSE → 系统卷**强制直写**
-         *     （写立即落盘，缓存只做只读加速，不存在丢脏/回写覆盖风险）；
          *   · 开机自动挂载的巡检（RbAutoAttachSweep）仍跳过系统卷，
          *     只有用户显式 attach 才会缓存 C:。
-         * 因此放开手动 attach 不引入数据风险，只增加"只读加速 C 盘"能力。 */
+         *   · [USER-REQ 2026-11-05]（rbio.c RbIsWriteBack 现行为）系统卷不再
+         *     强制直写——改为配置双闸（全局 WriteBack + 逐卷 WriteMode，默认
+         *     全直写）+ SafeMode 兜底；系统卷回写需用户在知情下显式逐卷开启。
+         *     本处注释按 rbio.c:337-343 现行语义同步（2026-11-09 O-9 批勘误，
+         *     原文"恒强制直写"已与实现漂移）。 */
+        /* [契约 B-10]（2026-11-05 前）opt-in 后仍强制直写的旧语义已被
+         * [USER-REQ 2026-11-05] 取代，见上。 */
         if (ext->IsSystem) {
             RbLog(0, __LINE__, 0,
                   L"attach: system volume manual opt-in (forced write-through, read-cache only)");

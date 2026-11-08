@@ -1460,14 +1460,19 @@ static NTSTATUS RbDispatchPassthrough(PRB_DEV_EXT ext, PDEVICE_OBJECT dev, PIRP 
      * （该组合下读透传本就罕见，且无撕裂风险——仅陈旧窗口）。 */
     if (sp->MajorFunction == IRP_MJ_READ &&
         ext->Magic == RB_EXT_MAGIC && ext->Stream && !ext->Removed &&
-        !g_Rb.Unloading && KeGetCurrentIrql() == PASSIVE_LEVEL &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL &&
         rb_stream_has_dirty_range(ext->Stream,
                                   (rb_u64)sp->Parameters.Read.ByteOffset.QuadPart,
                                   (size_t)sp->Parameters.Read.Length)) {
+        /* [FIX O9-PTREAD 2026-11-09] 解除 96 号登记的 :1394 Unloading 门（O-9
+         * 授权项）：卸载窗不再关闭 read-your-writes 刷脏——回写卷透传读的
+         * 毫秒级陈旧读小窗就此闭合。rb_stream_flush 为 PASSIVE 同步路径、
+         * 不依赖本驱动 worker 池；卸载晚期刷写通道若已关闭，flush 最多无效
+         * 返回，读仅保留既有陈旧窗口，不引入新失败模式。 */
         rb_stream_flush(ext->Stream, 1);
     }
     if (sp->MajorFunction == IRP_MJ_WRITE &&
-        ext->Magic == RB_EXT_MAGIC && ext->Stream && !ext->Removed && !g_Rb.Unloading) {
+        ext->Magic == RB_EXT_MAGIC && ext->Stream && !ext->Removed) {
         /* [FIX S7-03] 热开关已关（detach/拆除进行中）且当前 PASSIVE：内联失效+
          * 前转，不再转 worker。原实现无条件转 worker——每个透传写把 ext->Refs
          * 抬在整个 worker 处理期（ms~s），持续写负载下 detach/REMOVE 的排空
@@ -1501,7 +1506,12 @@ static NTSTATUS RbDispatchPassthrough(PRB_DEV_EXT ext, PDEVICE_OBJECT dev, PIRP 
             ctx->Offset   = sp->Parameters.Read.ByteOffset;
             ctx->Length   = sp->Parameters.Read.Length;
             IoMarkIrpPending(irp);
-            if (g_Rb.IoWorkerCount) {
+            /* [FIX O9-PTWRITE 2026-11-09] 卸载窗（Unloading=1）不再整体跳过本分支
+             * （96 号 :1452 登记项，O-9 授权）：原样直落"最终前转"= 卸载窗
+             * DISPATCH 透传写零失效（P0-1 旧盖新窗）。改走系统 WorkItem 兜底
+             * （RbRwWorker 在 PASSIVE 执行完整 flush-first+失效纪律）；
+             * FallbackInFlight 排空机制本就覆盖"已入队未启动"窗口。 */
+            if (g_Rb.IoWorkerCount && !g_Rb.Unloading) {
                 RbSubmitIo(ctx);                  /* 专用 per-CPU worker 池 */
             } else {
                 /* [FIX R2-M1] 入队即计数（见 RbSubmitIo 同款注释） */

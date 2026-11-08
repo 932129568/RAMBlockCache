@@ -736,6 +736,10 @@ NTSTATUS RbFeatDispatch(PIRP Irp)
 BOOLEAN RbFeatRefuseLetter(WCHAR Letter)
 {
     ULONG v = 0;
+    /* [FIX O9-L2REF 2026-11-09] L2 未启用时该判定一律放行：残值 L2Letter 曾把
+     * 对应卷挡在开机 resume sweep 外（判定不看 L2 flag，卷静默两晚无法恢复）。
+     * L2 在开时维持原语义：容器所在卷不进自动挂载。 */
+    if ((g_Rb2Flags & RB2F_L2) == 0) return FALSE;
     Rb2GetDW(L"Features", L"L2Letter", 0, &v);
     return ((WCHAR)v == Letter);
 }
@@ -774,8 +778,14 @@ VOID RbEvictJob(PVOID Ctx)
          * （拒绝 0→1 复活，同 RbGetExt 纪律），用完在此归还。 */
         /* [83 2026-11-07 M5] 重建窗口早退：跳过 RbL2Store（它可能触碰已销毁
          * 引擎/L2 容器），但引用/内存必须按既有纪律成对归还。 */
-        if (!RbIsDataPathFrozen())
+        if (!RbIsDataPathFrozen()) {
             RbL2Store(j->Ext, j->Lba, j->Len, j->Buf);   /* PASSIVE：内部同步拷贝入容器 */
+        } else {
+            /* [O9-DIAG 2026-11-09] 存储链路诊断：冻结跳过计数可见化 */
+            static volatile LONG s_SkipFrozen = 0;
+            if ((InterlockedIncrement(&s_SkipFrozen) & 0xFFF) == 1)
+                RbLog(1, __LINE__, 0, L"l2: evict job skipped (data path frozen) [diag O9]");
+        }
         RbDerefExt((PRB_DEV_EXT)j->Ext);
         Rb2Free(j->Buf);
         Rb2Free(j);
@@ -794,11 +804,23 @@ VOID RbFeatOnEvict(PVOID Ext, ULONG64 Lba, ULONG Len, PVOID Src, ULONG64 Hits)
      * （rbL2.c RbL2Store 入口 len!=RB2_L2BLK return）。预检拦截，消除
      * 64K 几何下每块淘汰 1MB 白拷。 */
     if ((g_Rb2Flags & RB2F_L2) == 0)        return;
-    if (RbL2State() != 1)                   return;
+    if (RbL2State() != 1) {
+        /* [O9-DIAG 2026-11-09] L2 位开而容器未开：预检拦截可见化（洪泛 1/4096） */
+        static volatile LONG s_RejState = 0;
+        if ((InterlockedIncrement(&s_RejState) & 0xFFF) == 1)
+            RbLog(1, __LINE__, 0, L"l2: evict rejected (state!=opened) [diag O9]");
+        return;
+    }
     if (RbPanicActive())                    return;
     if (RbIsDataPathFrozen())               return;   /* [83 M5] 重建窗口不再提交淘汰作业 */
     if (Ext == NULL || Src == NULL || Len == 0) return;
-    if (Hits < 2)                           return;   /* 冷块不进 L2 */
+    if (Hits < 2) {
+        /* [O9-DIAG 2026-11-09] 冷块过滤可见化（Hits>=2 契约的现场观测点） */
+        static volatile LONG s_RejCold = 0;
+        if ((InterlockedIncrement(&s_RejCold) & 0xFFF) == 1)
+            RbLog(1, __LINE__, 0, L"l2: evict rejected (cold, hits<2) [diag O9]");
+        return;
+    }
     /* [FIX S7-04] PASSIVE 也一律走池异步：原 PASSIVE 分支内联同步 RbL2Store
      * （一次 ZwWriteFile 64KB+24B）——该回调处于 stream_reclaim 的
      * reclaim_active 临界区内，L2 盘慢/挂死会把发起回收的 I/O worker 楔住

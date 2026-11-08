@@ -218,13 +218,12 @@ public sealed class SetupEngine
         foreach (var (zipName, destSub) in new[] { ("controller.zip", ""), ("webconsole.zip", "webconsole") })
         {
             var zipPath = Path.Combine(opts.InstallDir, zipName);
-            /* 旧 zip 可能被上次运行残留句柄占用：先尽力删掉再写新的 */
-            if (File.Exists(zipPath))
-            {
-                try { File.Delete(zipPath); }
-                catch { /* 仍被占用：ExtractTo 覆盖写会抛出更明确的错误 */ }
-            }
-            if (!File.Exists(zipPath)) { line.Report($"      [!] {zipName} 缺失（旧载荷包），跳过解压"); continue; }
+            /* [105] BUGFIX: 原实现先 File.Delete(zipPath) 再断言 File.Exists ——
+             * 刚由 Payload.ExtractAllTo 释放出来的 zip 被自己删掉，随后必然走进
+             * "缺失（旧载荷包），跳过解压" 分支：controller/webconsole 从不落地，
+             * 桥接与 Web 控制台全缺失（安装"成功"但功能半残，只在查目录时可见）。
+             * 正确顺序：先确认存在（ExtractAllTo 已写入），再解压，最后才删。 */
+            if (!File.Exists(zipPath)) { line.Report($"      [!] {zipName} 提取失败（应对齐 Payload.AppFiles），跳过解压"); continue; }
             var destDir = string.IsNullOrEmpty(destSub) ? opts.InstallDir : Path.Combine(opts.InstallDir, destSub);
             Directory.CreateDirectory(destDir);
             int entryCount;

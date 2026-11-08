@@ -82,6 +82,27 @@ foreach ($shim in @('npm.cmd','npm.ps1','npm','npx.cmd','npx.ps1','npx')) {
     $s = Join-Path $tool.Dir $shim
     if (Test-Path -LiteralPath $s) { Copy-Item -LiteralPath $s -Destination $wcStage -Force }
 }
+# [105 BUGFIX] bridge runtime deps: bridge/server/index.ts imports hono /
+# @hono/node-server / pino / zod — resolved at runtime by walking UP to
+# <repo>/web/node_modules (the standalone webconsole layout has no parent node_modules)
+# node_modules, so the zip must CARRY the full production closure. Compute it
+# with the same walker Node uses (recursive package.json dependencies from the
+# 4 roots), copy each package dir into wcStage/node_modules. Never hardcode
+# the list (it drifts); missing packages abort the build (fail-closed).
+Push-Location $webRoot
+$bridgeClosure = (& $tool.Node -e "const fs=require('fs'),path=require('path');const roots=['hono','@hono/node-server','pino','zod'];const seen=new Set();const q=[...roots];while(q.length){const n=q.shift();if(seen.has(n))continue;seen.add(n);const pj=path.join('node_modules',n,'package.json');if(!fs.existsSync(pj)){console.error('MISSING '+n);process.exit(3);}const j=JSON.parse(fs.readFileSync(pj,'utf8'));for(const d of Object.keys(j.dependencies||{}))if(!seen.has(d))q.push(d);}console.log(Array.from(seen).sort().join(String.fromCharCode(10)));")
+Pop-Location
+if ($LASTEXITCODE -ne 0 -or -not $bridgeClosure) { throw "bridge dep closure walk failed (exit=$LASTEXITCODE)" }
+$copied = 0
+foreach ($name in ($bridgeClosure -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+    $srcPkg = Join-Path $webRoot ("node_modules" + [IO.Path]::DirectorySeparatorChar + $name.Replace('/', [IO.Path]::DirectorySeparatorChar))
+    $dstPkg = Join-Path $wcStage ("node_modules" + [IO.Path]::DirectorySeparatorChar + $name.Replace('/', [IO.Path]::DirectorySeparatorChar))
+    if (-not (Test-Path -LiteralPath $srcPkg)) { throw "bridge dep missing on disk: $name" }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dstPkg) | Out-Null
+    Copy-Item -LiteralPath $srcPkg -Destination $dstPkg -Recurse -Force
+    $copied++
+}
+Write-Host ("  payload: bridge runtime deps copied ({0} packages: hono/@hono/pino/zod closure)" -f $copied)
 # [NODE27] strip dev-only artifacts from the staged bridge (~100MB of Rust
 # target/ + .mimosa logs). Runtime needs only native/build/Release/*.node.
 Get-ChildItem -LiteralPath (Join-Path $wcStage 'bridge') -Recurse -Directory -Force -ErrorAction SilentlyContinue |

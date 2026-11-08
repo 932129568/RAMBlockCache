@@ -166,6 +166,41 @@ static LONG RegMultiSzRemove(LPCWSTR sub, LPCWSTR val, LPCWSTR entry)
 /* [88 H-2 2026-11-07] 原实现吞掉 ControlService / DeleteService / 超时，
  * 并无条件打印 [ok] old service removed：覆盖升级时旧驱动仍加载、映像被覆盖，
  * 失败被静默忽略。现在所有返回值都判，失败一律 FALSE 让调用方 return 1。 */
+/* [104] 覆盖安装：驱动在跑时先运行期摘卷再停服。
+ * 调安装目录下 ramboostctl detach（逐盘符，不存在/未挂载的卷报错无害）。
+ * 失败不致命——调用方会降级为"重启时替换"。 */
+static BOOL g_RebootReplaceNeeded = FALSE;
+static void DetachAllVolumesForReplace(void)
+{
+    WCHAR exe[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    WCHAR *p;
+    int c;
+    if (n == 0 || n >= MAX_PATH) return;
+    p = wcsrchr(exe, (WCHAR)0x5C);
+    if (!p) return;
+    *p = 0;                                  /* exe 目录 = 安装目录 */
+    for (c = 2; c <= 25; c++) {              /* C: .. Z: */
+        WCHAR cmd[MAX_PATH + 64];
+        WCHAR cli[MAX_PATH];
+        STARTUPINFOW si; PROCESS_INFORMATION pi;
+        _snwprintf_s(cli, MAX_PATH, _TRUNCATE, L"%s\\ramboostctl.exe", exe);
+        if (GetFileAttributesW(cli) == INVALID_FILE_ATTRIBUTES) {
+            Ok(L"detach: ramboostctl.exe not found in install dir (skip)");
+            return;
+        }
+        _snwprintf_s(cmd, MAX_PATH + 64, _TRUNCATE, L"\"%s\" detach %c:", cli, (wchar_t)(L'A' + c));
+        ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+        if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, 5000);
+            CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        }
+    }
+    Ok(L"detach: attempted runtime detach of all volumes");
+}
+
+
 static BOOL DeleteServiceIfExists(void)
 {
     SC_HANDLE m = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
@@ -190,6 +225,30 @@ static BOOL DeleteServiceIfExists(void)
             if (e == ERROR_SERVICE_NOT_ACTIVE || e == ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
                 Ok(L"old service already stopped (STOP control not needed)");
                 stopped = TRUE;
+            } else if (e == ERROR_INVALID_SERVICE_CONTROL) {
+                /* [104] 1052: BOOT_START 卷过滤驱动未注册 SERVICE_ACCEPT_STOP，
+                 * 运行期必然拒绝 STOP——不是故障而是设计。旧实现当致命错误，
+                 * 导致"驱动已在运行"的机器无法覆盖安装（首装不触发，故长期潜伏）。
+                 * 处置：先运行期摘卷，再重试 STOP；仍不行则标记"重启时替换"，
+                 * 绝不硬覆盖运行中的映像（那才是 0x7B 风险）。 */
+                Ok(L"driver refuses runtime stop (BOOT_START filter, err=1052) - trying volume detach");
+                DetachAllVolumesForReplace();
+                ZeroMemory(&st, sizeof(st));
+                if (ControlService(s, SERVICE_CONTROL_STOP, &st)) {
+                    Ok(L"stop accepted after volume detach");
+                } else {
+                    DWORD e2 = GetLastError();
+                    if (e2 == ERROR_SERVICE_NOT_ACTIVE || e2 == ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
+                        stopped = TRUE;
+                    } else {
+                        wsprintfW(b, L"still cannot stop after detach (err=%lu) - scheduling reboot replace", e2);
+                        Ok(b);
+                        g_RebootReplaceNeeded = TRUE;
+                        CloseServiceHandle(s);
+                        CloseServiceHandle(m);
+                        return TRUE;   /* 服务保留，仅驱动文件延迟替换 */
+                    }
+                }
             } else {
                 wsprintfW(b, L"ControlService(STOP) failed err=%lu - refusing to overwrite a live driver", e);
                 Fail(b);
@@ -391,24 +450,29 @@ static BOOL CopyDriverFile(void)
 {
     WCHAR src[MAX_PATH], dst[MAX_PATH];
     int retry;
-    /* [88 H-2] Overwriting a still-loaded image is unsafe. If a previous
-     * cleanup somehow left a RUNNING service, say so loudly and stop. */
+    /* [88 H-2] Overwriting a still-loaded image is unsafe.
+     * [104] 但 BOOT_START 卷过滤驱动【无法运行期停止】(err=1052)，若此处一律
+     * 拒绝，"驱动已在跑"的机器永远装不上——这正是本机实测到的死锁。
+     * 正确做法：服务仍在 RUNNING 时不再硬拷，改走 MoveFileEx 延迟替换
+     * （重启时由内核在加载前完成替换，绝不覆盖运行中的映像段）。
+     * 只有在"既停不下来、又无法排队替换"时才失败。 */
+    BOOLEAN runningLive = FALSE;
     {
         SC_HANDLE sm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
         if (sm) {
             SC_HANDLE ss = OpenServiceW(sm, SVC_NAME, SERVICE_QUERY_STATUS);
             if (ss) {
                 SERVICE_STATUS sst;
-                if (QueryServiceStatus(ss, &sst) && sst.dwCurrentState == SERVICE_RUNNING) {
-                    Fail(L"old RAMBlockCache service is STILL RUNNING - refusing to overwrite its image; run 'sc stop RAMBlockCache' and re-run");
-                    CloseServiceHandle(ss);
-                    CloseServiceHandle(sm);
-                    return FALSE;
-                }
+                if (QueryServiceStatus(ss, &sst) && sst.dwCurrentState == SERVICE_RUNNING)
+                    runningLive = TRUE;
                 CloseServiceHandle(ss);
             }
             CloseServiceHandle(sm);
         }
+    }
+    if (runningLive) {
+        Ok(L"driver image is live and cannot stop (BOOT_START) - queuing replace-on-reboot instead of overwriting");
+        g_RebootReplaceNeeded = TRUE;
     }
     GetModuleFileNameW(NULL, src, MAX_PATH);
     WCHAR *sl = wcsrchr(src, L'\\'); if (sl) *sl = 0;
@@ -419,6 +483,23 @@ static BOOL CopyDriverFile(void)
     /* [FIX err=32 2026-10-24] 刚停服的旧驱动映像段释放有延迟（卸载异步），
      * 立刻覆盖拷贝会撞 ERROR_SHARING_VIOLATION。占用重试（上限 ~10s），
      * 超限才报错——重装不再要求用户手动等待。 */
+    if (g_RebootReplaceNeeded) {
+        /* [104] 运行中映像不可覆盖：拷到同目录暂存名，再排队
+         * MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT | MOVEFILE_REPLACE_EXISTING)，
+         * 由内核在下次加载驱动前完成替换。 */
+        WCHAR stage[MAX_PATH];
+        _snwprintf_s(stage, MAX_PATH, _TRUNCATE, L"%s.new", dst);
+        if (!CopyFileW(src, stage, FALSE)) {
+            Fail(L"stage driver for reboot replace");
+            return FALSE;
+        }
+        if (!MoveFileExW(stage, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_DELAY_UNTIL_REBOOT)) {
+            Fail(L"queue driver replace on reboot (MoveFileEx)");
+            return FALSE;
+        }
+        Ok(L"driver replacement queued for next reboot (live image untouched)");
+        return TRUE;
+    }
     for (retry = 0; ; retry++) {
         if (CopyFileW(src, dst, FALSE)) break;
         if (GetLastError() != ERROR_SHARING_VIOLATION || retry >= 20) {

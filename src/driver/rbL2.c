@@ -121,7 +121,20 @@ static NTSTATUS RbL2Io(HANDLE file, BOOLEAN wr, ULONG64 off, PVOID buf, ULONG le
         }
         st = ib.Status;
     }
-    return (NT_SUCCESS(st) && ib.Information == len) ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
+    if (NT_SUCCESS(st) && ib.Information == len) return STATUS_SUCCESS;
+    /* [O9-DIAG 2026-11-09] 原样暴露真实失败态：原折算 IO_DEVICE_ERROR 掩盖根因
+     * （3425 次存储失败全被折叠）。短写把 Information 塞进状态位打印。 */
+    if (NT_SUCCESS(st)) {
+        static volatile LONG s_ShortCnt = 0;
+        if ((InterlockedIncrement(&s_ShortCnt) & 0x3F) == 1)
+            RbLog(1, __LINE__, (NTSTATUS)(ULONG_PTR)ib.Information,
+                  L"l2 io short (Information in status slot) [diag O9]");
+    } else {
+        static volatile LONG s_RawCnt = 0;
+        if ((InterlockedIncrement(&s_RawCnt) & 0x3F) == 1)
+            RbLog(1, __LINE__, st, L"l2 io raw fail [diag O9]");
+    }
+    return STATUS_IO_DEVICE_ERROR;
 }
 
 static VOID RbL2Path(WCHAR *path, PCWSTR name)

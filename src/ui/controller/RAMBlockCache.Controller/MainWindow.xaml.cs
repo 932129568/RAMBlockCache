@@ -16,6 +16,7 @@ namespace RAMBlockCache.Controller;
  * 设计取舍：
  *   - 原生 WPF 六页已归档 docs/legacy-wpf-ui/（两套 UI 永远不同步的教训）；
  *   - node 进程由本窗口拥有：窗口真退出时结束桥接（避免孤儿进程占 5199）；
+ *   - [SHELL-REUSE 2026-11-08] 桥接已在跑（ONSTART 计划任务）时只复用不重复拉起；
  *   - 开发期源码树运行（webconsole 目录不存在）→ 显示明确错误引导用构建包。
  */
 public partial class MainWindow : Window
@@ -67,6 +68,16 @@ public partial class MainWindow : Window
         LoadBar.Visibility = Visibility.Visible;
         LoadingText.Text = "正在启动控制台服务…";
 
+        // [SHELL-REUSE 2026-11-08] 先探 health：Setup 已注册 ONSTART 计划任务
+        // （RAMBlockCacheBridge），桥接多半早已在跑。此时只复用、不重复 spawn，
+        // 避免第二实例绑定 5199 失败滞留成孤儿 node 进程。
+        if (await IsBridgeAliveAsync(3, 300))
+        {
+            _nodeProc = null;   // 桥接归外部所有：本窗口退出时不杀
+            await NavigateConsoleAsync();
+            return;
+        }
+
         var wc = FindWebConsoleDir();
         if (wc is null)
         {
@@ -110,28 +121,36 @@ public partial class MainWindow : Window
 
         // 轮询 health（上限 ~20s）
         LoadingText.Text = "等待控制通道就绪…";
-        var ready = false;
-        using (var http = new System.Net.Http.HttpClient())
-        {
-            for (int i = 0; i < 20; i++)
-            {
-                await Task.Delay(500);
-                try
-                {
-                    using var resp = await http.GetAsync($"http://127.0.0.1:{_bridgePort}/health");
-                    if (resp.IsSuccessStatusCode) { ready = true; break; }
-                }
-                catch { }
-            }
-        }
-        if (!ready)
+        if (!await IsBridgeAliveAsync(40, 500))
         {
             ShowError("桥接服务未在 20 秒内就绪（node 可能被安全软件拦截）。\n" +
                       "可关闭安全软件后点重试，或直接用浏览器打开 http://127.0.0.1:5199/");
             return;
         }
 
-        // WebView2 初始化 + 导航
+        await NavigateConsoleAsync();
+    }
+
+    /// <summary>[SHELL-REUSE 2026-11-08] 探测桥接 health 是否就绪（总时长 ≈ tries×delayMs）。</summary>
+    private async Task<bool> IsBridgeAliveAsync(int tries, int delayMs)
+    {
+        using var http = new System.Net.Http.HttpClient();
+        for (int i = 0; i < tries; i++)
+        {
+            try
+            {
+                using var resp = await http.GetAsync($"http://127.0.0.1:{_bridgePort}/health");
+                if (resp.IsSuccessStatusCode) return true;
+            }
+            catch { }
+            await Task.Delay(delayMs);
+        }
+        return false;
+    }
+
+    /// <summary>WebView2 初始化并导航到控制台首页。</summary>
+    private async Task NavigateConsoleAsync()
+    {
         LoadingText.Text = "加载控制台界面…";
         try
         {

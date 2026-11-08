@@ -260,7 +260,11 @@ int main(int argc, char **argv)
         printf("will create %lc:\\RAMBoostL2.bin (%lu GB) ... deleting cache = deleting that file\n",
                (wint_t)L, (unsigned long)gb);
         RegCreateKeyExA(HKEY_LOCAL_MACHINE, fk, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL);
-        RegSetValueExA(k, "L2Letter", 0, REG_DWORD, (BYTE *)&L, sizeof(L));
+        {   /* [FIX O9-L2LTR 2026-11-08] REG_DWORD 须 4 字节：原 sizeof(WCHAR)==2 半长写入，
+             * 驱动 Rb2GetDW 的 sz>=4 校验恒失败 -> letter 门永远 refused（L2 从未可启用） */
+            ULONG Lv = (ULONG)L;
+            RegSetValueExA(k, "L2Letter", 0, REG_DWORD, (BYTE *)&Lv, sizeof(Lv));
+        }
         RegSetValueExA(k, "L2SizeGB", 0, REG_DWORD, (BYTE *)&gb, sizeof(gb));
         RegCloseKey(k);
         FlagsReg(4, 0);
@@ -283,7 +287,11 @@ int main(int argc, char **argv)
         printf("will create %lc:\\RAMBoostL2.bin (%lu GB) ... deleting cache = deleting that file\n",
                (wint_t)L, (unsigned long)gb);
         RegCreateKeyExA(HKEY_LOCAL_MACHINE, fk, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL);
-        RegSetValueExA(k, "L2Letter", 0, REG_DWORD, (BYTE *)&L, sizeof(L));
+        {   /* [FIX O9-L2LTR 2026-11-08] REG_DWORD 须 4 字节：原 sizeof(WCHAR)==2 半长写入，
+             * 驱动 Rb2GetDW 的 sz>=4 校验恒失败 -> letter 门永远 refused（L2 从未可启用） */
+            ULONG Lv = (ULONG)L;
+            RegSetValueExA(k, "L2Letter", 0, REG_DWORD, (BYTE *)&Lv, sizeof(Lv));
+        }
         RegSetValueExA(k, "L2SizeGB", 0, REG_DWORD, (BYTE *)&gb, sizeof(gb));
         RegCloseKey(k);
         FlagsReg(4, 0);

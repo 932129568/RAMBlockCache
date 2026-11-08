@@ -445,6 +445,12 @@ VOID RbDevListUnlink(PRB_DEV_EXT ext)
 VOID RbZombieQueueExt(PRB_DEV_EXT ext)
 {
     KIRQL irql;
+    /* [FIX O9-ZOM 2026-11-09] 去重闸：已在队（InZombie=1）直接跳过。
+     * detach 超时路径无 RemoveDone CAS，同一 ext 双入队（多路 REMOVE/detach
+     * 竞态）会二次收割 → IoDeleteDevice 双删 = 池腐坏 → 0xC0000096 野指令
+     * （10-24 双 0x7E 转储 Failure.Bucket=RAMBlockCache!RbZombieReap 实锤，
+     * 10-25 Verifier 0xC4_31 OldIrql 花栈同族）。 */
+    if (InterlockedExchange(&ext->InZombie, 1) == 1) return;
     /* [FIX C1] 入队前先离表（条件摘除）。DevListLock 为 FastMutex 仅 IRQL<=APC_LEVEL
      * 可取：DISPATCH 级调用方（PnP completion 兜底）推迟到 RbZombieReap（PASSIVE）
      * 销毁前摘除，殊途同归且全程不重入。 */
@@ -478,6 +484,10 @@ VOID RbZombieReap(VOID)     /* PASSIVE 调用（flush 线程 / RbUnload） */
         InterlockedDecrement(&g_Rb.ZombiePending);
 
         ext = CONTAINING_RECORD(le, RB_DEV_EXT, ZombieEntry);
+        /* [FIX O9-ZOM] 哨兵卫兵：Magic 失活（已收割/已拆除）的条目绝不再触碰。
+         * 正常路径 InZombie 去重已防双入队，此为纵深防御（防内存踩踏后
+         * ZombieList 残留幽灵节点 → 二次 IoDeleteDevice）。 */
+        if (ext->Magic != RB_EXT_MAGIC) continue;
         if (InterlockedCompareExchange(&ext->Refs, 1, 1) > 1) {
             /* 仍在途：放回队尾，本轮不再检查（有界，只重排一次）。
              * 持 ZombieLock 完成"摘→插尾"的原子重排，防 reaper 与并发
@@ -502,6 +512,7 @@ VOID RbZombieReap(VOID)     /* PASSIVE 调用（flush 线程 / RbUnload） */
             }
         }
         ext->Magic = 0;                                    /* 哨兵失活 */
+        InterlockedExchange(&ext->InZombie, 0);            /* [FIX O9-ZOM] 队闸归零 */
         if (ext->LowerDevice) { IoDetachDevice(ext->LowerDevice); ext->LowerDevice = NULL; }
         if (ext->Pdo)         { ObDereferenceObject(ext->Pdo);     ext->Pdo = NULL; }
         IoDeleteDevice(ext->FilterDevice);

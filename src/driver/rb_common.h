@@ -119,6 +119,9 @@ typedef struct _RB_DEV_EXT {
     ULONG          Magic;          /* 内存踩踏哨兵：dispatch 入口一次比较（RB_EXT_MAGIC） */
     volatile LONG  IoFailRun;      /* 盘 I/O 连续失败计数（成功清零；>=32 熔断） */
     LIST_ENTRY     ZombieEntry;    /* REMOVE 超时后挂入延迟删除队列 */
+    volatile LONG  InZombie;       /* [FIX O9-ZOM 2026-11-09] 僵尸队列去重闸：1=已在队
+                                    * （防双入队→二次收割→IoDeleteDevice 双删=池腐坏/
+                                    * 0xC0000096 野指令，10-24 双 0x7E 实锤） */
     /* [BUG4] 盘符缓存刷新节流（100ns 单位）：RbTryResolveLetter 非强制路径
      * 距上次成功解析 <10s 沿用缓存（GET_VOLUMES 秒级轮询不能每次重解 PnP）；
      * attach 路径（RbFindExtByLetter）强制刷新，修「首次解析后永久缓存、

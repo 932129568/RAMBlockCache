@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System;
 using System.Collections.ObjectModel;
 using System.IO;
@@ -76,10 +76,6 @@ public sealed class InstallerViewModel : ObservableObject
     private bool _launchController = true;
     /// <summary>安装完成后启动控制台（默认开）。</summary>
     public bool LaunchController { get => _launchController; set => Set(ref _launchController, value); }
-
-    private bool _testMode;
-    /// <summary>测试模式（U0-1 安装面）：DEMAND_START + 运行时挂栈，默认关。</summary>
-    public bool TestMode { get => _testMode; set => Set(ref _testMode, value); }
 
     /* [COVERAGE 2026-11-05] 已安装检测 + 清洁安装选项 */
     private bool _existingDetected;
@@ -335,10 +331,9 @@ public sealed class InstallerViewModel : ObservableObject
                 return;
             }
         }
-        Log.Add(TestMode ? "开始安装（测试模式：DEMAND_START + 运行时挂载，免重启）…"
-                         : "开始安装（生产模式：DEMAND_START + 卷过滤器随包，装后重启一次生效；[FIX 2026-11-06] 原 BOOT_START 文案过时——首装一律 DEMAND_START 防 0x7B）…");
+        Log.Add("开始安装（生产模式：DEMAND_START 首装防 0x7B，卷过滤器随包，装后重启一次生效）…");
         var progress = new Progress<string>(l => Log.Add(l));
-        var opts = new InstallOptions(_installDir.Trim(), DesktopShortcut, StartMenuShortcut, LaunchController, TestMode,
+        var opts = new InstallOptions(_installDir.Trim(), DesktopShortcut, StartMenuShortcut, LaunchController, false,
                                    (ExistingDetected && CleanInstall) ? InstallMode.Clean : InstallMode.Auto);
         if (opts.Mode == InstallMode.Clean) Log.Add("安装模式：清洁安装（将清除旧配置）");
         else if (ExistingDetected) Log.Add("安装模式：覆盖安装（保留现有配置）");
@@ -370,23 +365,16 @@ public sealed class InstallerViewModel : ObservableObject
         if (rc == 0)
         {
             Succeeded = true;
-            StatusTitle = TestMode ? "安装完成（测试模式，无需重启）" : "安装完成";
-            if (TestMode)
-            {
-                FixSteps = "接下来：sc start RAMBlockCache，然后 ramboostctl attach <X:>。";
-            }
-            else
-            {
-                FixSteps = $"已安装到 {opts.InstallDir}。\n\n" +
-                           "【重要】测试模式已自动开启（桌面右下角出现“测试模式”水印属正常）。\n" +
-                           "系统卷（C:）现在也可手动加速（含回写），但默认不在开机自动列表内。\n\n" +
-                           "接下来：\n" +
-                           "  1) 点击下方「立即重启」（必须重启，过滤器才会进入卷栈）\n" +
-                           "  2) 重启后双击桌面「RAMBlockCache」打开控制台\n" +
-                           "  3) 在「卷加速」页手动开启要加速的盘（开机默认不加速任何卷）\n" +
-                           "  4) 开启后自动记住，下次开机只恢复这些盘（可在设置页关闭）\n\n" +
-                           "卸载：「应用与功能」→ RAMBlockCache，或再次运行本安装器加 /Uninstall。";
-            }
+            StatusTitle = "安装完成";
+            FixSteps = $"已安装到 {opts.InstallDir}。\n\n" +
+                       "【重要】测试模式已由安装器自动开启（桌面右下角出现“测试模式”水印属正常，是自签驱动的必要条件）。\n" +
+                       "系统卷（C:）现在也可手动加速（含回写），但默认不在开机自动列表内。\n\n" +
+                       "接下来：\n" +
+                       "  1) 点击下方「立即重启」（必须重启，过滤器才会进入卷栈）\n" +
+                       "  2) 重启后双击桌面「RAMBlockCache」打开控制台\n" +
+                       "  3) 在「卷加速」页手动开启要加速的盘（开机默认不加速任何卷）\n" +
+                       "  4) 开启后自动记住，下次开机只恢复这些盘（可在设置页关闭）\n\n" +
+                       "卸载：「应用与功能」→ RAMBlockCache，或再次运行本安装器加 /Uninstall。";
             if (opts.LaunchController)
             {
                 TryLaunchController(opts.InstallDir);

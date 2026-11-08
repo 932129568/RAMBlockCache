@@ -123,7 +123,11 @@ $watchOk = ($null -ne $p -and
             [int]$p.DeploySeq -eq [int]$p.DeployAck -and
             $p.FilterArmed -eq 0 -and $p.LastBootHealthy -eq 1 -and $p.BootFailCount -eq 0)
 G 'watchdog' $watchOk ("Seq=" + $p.DeploySeq + " Ack=" + $p.DeployAck + " Armed=" + $p.FilterArmed + " Healthy=" + $p.LastBootHealthy + " BootFails=" + $p.BootFailCount)
-G 'bootcfg reg' ($null -ne $p -and $p.AutoAttach -eq 0 -and $p.ResumeOnBoot -eq 1 -and $p.ResumeLetters -eq 'D') ("AA=" + $p.AutoAttach + " RB=" + $p.ResumeOnBoot + " Letters=" + $p.ResumeLetters)
+# [101] 不再硬编码 Letters='D'：用户可自行在其它卷开启加速，开机恢复列表是其
+# 配置权（红线：本脚本只读，不改）。判据 = AutoAttach=0 且 ResumeOnBoot=1 且
+# 列表非空且【包含 D】——D: 是引导验收基线卷，其余卷由用户配置，如实打印。
+$lettersOk = ($null -ne $p -and "$($p.ResumeLetters)" -match 'D' -and "$($p.ResumeLetters)".Length -gt 0)
+G 'bootcfg reg' ($null -ne $p -and $p.AutoAttach -eq 0 -and $p.ResumeOnBoot -eq 1 -and $lettersOk) ("AA=" + $p.AutoAttach + " RB=" + $p.ResumeOnBoot + " Letters=" + $p.ResumeLetters + " (user config: any subset containing D)")
 $seqBefore = [string]$p.DeploySeq
 $ackBefore = [string]$p.DeployAck
 $armedBefore = [string]$p.FilterArmed
@@ -177,9 +181,19 @@ try {
     W 'bridge fallback' 'keeper may be down; check the SYSTEM RAMBlockCacheBridge task, then re-run this script'
 }
 if ($bridgeOk) {
+    # [101] 卷集合基线：用户可自行开启任意卷加速（其配置权）。本条只断言
+    # 「验收过程本身不得改变卷集合」——保留 66 #7.3 的挂载泄漏保护语义，
+    # 去掉与用户配置冲突的「只允许 D:」硬编码。
+    $script:AttachBaseline = @()
+    try {
+        $r7b = Invoke-RestMethod -Method Post -Uri ($base + '/rb/rpc') -ContentType 'application/json' -Body '{"method":7}' -TimeoutSec 8
+        $script:AttachBaseline = @($r7b.data.Items | Where-Object { [int]$_.Attached -ne 0 } | ForEach-Object { [string]$_.Letter })
+        G 'attached volume baseline captured' ($true) ("attached=[" + ($script:AttachBaseline -join ',') + "]")
+    } catch { G 'attached volume baseline captured' $false $_.Exception.Message }
     try {
         $bc = Invoke-RestMethod -Uri ($base + '/rb/bootcfg') -TimeoutSec 5
-        G 'GET /rb/bootcfg' ($bc.ResumeOnBoot -eq 1 -and $bc.ResumeLetters -eq 'D') ("AA=" + $bc.AutoAttach + " RB=" + $bc.ResumeOnBoot + " Letters=" + $bc.ResumeLetters)
+        $bcLettersOk = ("$($bc.ResumeLetters)" -match 'D' -and "$($bc.ResumeLetters)".Length -gt 0)
+        G 'GET /rb/bootcfg' ($bc.ResumeOnBoot -eq 1 -and $bcLettersOk) ("AA=" + $bc.AutoAttach + " RB=" + $bc.ResumeOnBoot + " Letters=" + $bc.ResumeLetters)
     } catch { G 'GET /rb/bootcfg' $false $_.Exception.Message }
     try {
         # GET_VOLUMES decodes to { Count, Items:[{ Letter, Attached, ... }] }.
@@ -189,9 +203,13 @@ if ($bridgeOk) {
         $d = @($items | Where-Object { [string]$_.Letter -eq 'D' }) | Select-Object -First 1
         $att = if ($null -ne $d) { [int]$d.Attached } else { -1 }
         G 'POST /rb/rpc method=7 (D: attached)' ($null -ne $d -and $att -eq 1) ("status=" + $r7.status + " count=" + $r7.data.Count + " D.Attached=" + $att)
-        # 64 #7.3: C/E/F must stay 0.
-        $others = @($items | Where-Object { [string]$_.Letter -ne 'D' -and [int]$_.Attached -ne 0 })
-        G 'other volumes still detached' ($others.Count -eq 0) ("non-D attached=" + $others.Count)
+        # [101] 基线对齐：用户可自行开启任意卷的加速（配置权）。本条判据改为
+        # 「RPC 前后卷集合零漂移」——回归保护等价（66 号 #7.3 的原意=检测挂载泄漏），
+        # 但不再与用户配置冲突。基线 = 本条 RPC 之前的 Attached 集合。
+        $attNow = @($items | Where-Object { [int]$_.Attached -ne 0 } | ForEach-Object { [string]$_.Letter } | Sort-Object)
+        $attBase = @($script:AttachBaseline | Sort-Object)
+        $drift = @(Compare-Object -ReferenceObject $attBase -DifferenceObject $attNow)
+        G 'attached volume set unchanged by verification' ($drift.Count -eq 0) ("baseline=[" + ($attBase -join ',') + "] now=[" + ($attNow -join ',') + "]")
     } catch { G 'POST /rb/rpc method=7' $false $_.Exception.Message }
     try {
         $r4 = Invoke-RestMethod -Method Post -Uri ($base + '/rb/rpc') -ContentType 'application/json' -Body '{"method":4}' -TimeoutSec 8

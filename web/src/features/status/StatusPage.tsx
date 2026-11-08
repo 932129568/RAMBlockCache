@@ -218,7 +218,7 @@ export default function StatusPage() {
             </div>
             {d.us === 0 && (
               <div className="mt-1 text-xs" style={{ color: 'var(--rbc-text-tertiary)' }}>
-                EWMA 无样本，不画假条
+                尚未采到样本：延迟按 1/64 抽样（每 64 笔读采 1 笔），多读写一些即出数；不画假条
               </div>
             )}
             {/* [U1 2026-11-06] 分位数明细（log2 桶近似；0=尚无样本不画假值） */}

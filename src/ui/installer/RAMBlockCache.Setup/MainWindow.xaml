@@ -1,4 +1,4 @@
-<Window x:Class="RAMBlockCache.Setup.MainWindow"
+﻿<Window x:Class="RAMBlockCache.Setup.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="RAMBlockCache 安装" Height="520" Width="640"
@@ -81,11 +81,13 @@
                           Content="创建开始菜单快捷方式" IsChecked="{Binding StartMenuShortcut, Mode=TwoWay}"/>
                 <CheckBox Margin="0,8,0,0" FontSize="13" Foreground="{StaticResource RbcTextPrimary}"
                           Content="安装完成后启动控制台" IsChecked="{Binding LaunchController, Mode=TwoWay}"/>
-                <!-- [FIX 高-2 续] TestMode 落点：目录页 = 引擎启动前最后选择点 -->
-                <CheckBox Margin="0,14,0,0" FontSize="12" Foreground="{StaticResource RbcTextSecondary}"
-                          Content="测试模式（开发者：DEMAND_START + 运行时挂载，装后免重启）"
-                          IsChecked="{Binding TestMode, Mode=TwoWay}"
-                          IsEnabled="{Binding Busy, Converter={StaticResource NotB}}"/>
+                <!-- [102] 测试模式（DEMAND_START + 运行时挂栈）是开发者调试路径，对用户
+                     只会扩大风险面（运行期挂栈卷走完整拆除路径）且与生产 BOOT_START 冲突。
+                     已从安装界面移除：安装一律走生产模式（BOOT_START，装后重启一次生效）。
+                     引擎能力保留（/TestMode 参数仍在），仅供开发/QA 手工调用。 -->
+                <TextBlock Margin="0,14,0,0" FontSize="12" TextWrapping="Wrap"
+                           Foreground="{StaticResource RbcTextSecondary}"
+                           Text="安装方式：生产模式（驱动随系统引导加载，装完重启一次即生效）。"/>
 
                 <!-- [COVERAGE 2026-11-05] 已安装检测与清洁安装选项 -->
                 <Border Margin="0,16,0,0" Padding="10" CornerRadius="6"

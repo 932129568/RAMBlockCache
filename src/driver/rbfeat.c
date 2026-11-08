@@ -20,6 +20,8 @@
 
 /* 裁剪 WDK 头可能未导出该原型，ntoskrnl 有导出，显式声明 */
 CHAR *PsGetProcessImageFileName(PEPROCESS Process);
+/* [103] 进程镜像全路径查询（ntoskrnl 导出；裁剪 WDK 头缺原型，显式声明） */
+NTSYSAPI NTSTATUS NTAPI ZwQueryInformationProcess(HANDLE, ULONG, PVOID, ULONG, PULONG);
 
 #define RB2_SVC  L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\RAMBlockCache"
 
@@ -168,6 +170,135 @@ static const CHAR *s_DefExcl[] = {
     "DEFRAG.EXE", "DFRGUI.EXE", "WBENGINE.EXE", "VSSADMIN.EXE", "MSMPENG.EXE"
 };
 #define RB2_DEFEXCL_N (sizeof(s_DefExcl)/sizeof(s_DefExcl[0]))
+/* ---- [103] 安装目录排除（按进程可执行文件全路径前缀匹配） ----
+ * 需求：软件自己的安装目录不应被自己缓存。WDM 卷过滤驱动在块层拿不到文件名
+ * （文件系统层概念），但能拿到【进程镜像全路径】——判定「该进程的可执行体
+ * 是否位于受保护目录下」，语义上等价于「排除该文件夹」，且与文件增删/碎片
+ * 无关（不像 LBA 区间会漂移）。
+ *
+ * 配置：Features\ExcludeDirs（REG_MULTI_SZ，目录全路径，如 D:\加速）。
+ * 前缀语义：路径 + '' 前缀匹配（避免 D:\Acc 误伤 D:\Acc2）；目录自身也匹配。
+ *
+ * 性能：热路径每 IO 一次 PID 比对（缓存命中），未命中才查进程路径；
+ * 路径查询结果按 PID 缓存（进程退出后 PID 复用会误判——用 CreateTime 无关
+ * 的保守策略：缓存只增不删，条数上限 64，超限整体清空重建）。
+ * 未配置 ExcludeDirs 时本特性零开销（n==0 早退）。 */
+#define RB2_EXDIR_MAX    8      /* 最多 8 个目录 */
+#define RB2_EXDIR_LEN    260    /* 目录全路径上限（wchar） */
+#define RB2_EXPIID_MAX   64     /* PID 判定缓存条数 */
+static WCHAR  s_ExDir[RB2_EXDIR_MAX][RB2_EXDIR_LEN];
+static ULONG  s_ExDirN;
+static struct { ULONG Pid; BOOLEAN Excluded; } s_ExPid[RB2_EXPIID_MAX];
+static ULONG  s_ExPidN;
+
+static VOID Rb2LoadExcludeDirs(VOID)
+{
+    PVOID d = NULL; ULONG sz = 0, ty = 0, i, n;
+    PWCHAR w;
+    s_ExDirN = 0;
+    s_ExPidN = 0;
+    if (!NT_SUCCESS(Rb2Query(L"Features", L"ExcludeDirs", &d, &sz, &ty))) return;
+    if (ty == REG_MULTI_SZ) {
+        w = (PWCHAR)d; n = sz / sizeof(WCHAR);
+        i = 0;
+        while (i < n && s_ExDirN < RB2_EXDIR_MAX) {
+            ULONG olen = 0, j;
+            while (i + olen < n && w[i + olen]) olen++;
+            if (olen == 0) break;                    /* 双 NUL：名单结束 */
+            if (olen < RB2_EXDIR_LEN) {
+                for (j = 0; j < olen; j++) {
+                    WCHAR c = w[i + j];
+                    if (c == L'/') c = (WCHAR)0x5C;
+                    if (c >= L'a' && c <= L'z') c = (WCHAR)(c - 32);   /* 路径大写归一 */
+                    s_ExDir[s_ExDirN][j] = c;
+                }
+                /* 去尾部反斜杠（统一为 "D:\DIR" 形式，匹配时补反斜杠） */
+                while (olen > 0 && s_ExDir[s_ExDirN][olen - 1] == (WCHAR)0x5C) olen--;
+                s_ExDir[s_ExDirN][olen] = 0;
+                if (olen > 0) s_ExDirN++;
+            }
+            i += olen + 1;
+            /* olen 已被上面的去尾逻辑改写，改用原始长度步进 */
+            { ULONG olen2 = 0; while (i - 1 + olen2 < n && w[i - 1 + olen2]) olen2++; i = i - 1 + olen2 + 1; }
+        }
+    }
+    if (d) ExFreePoolWithTag(d, RB_POOL_TAG);
+}
+
+/* 取当前进程镜像全路径（NT 路径 \Device\HarddiskVolumeN\... 或 \??\C:\...），
+ * 归一化为大写、反斜杠、去 \??\ / \Device\HarddiskVolumeN 前缀 → "C:\..." 形式。
+ * 失败返回 FALSE（调用方按"不排除"处理，方向保守）。 */
+static BOOLEAN Rb2CurrentImagePath(WCHAR *out, ULONG cap)
+{
+    PEPROCESS proc = PsGetCurrentProcess();
+    WCHAR buf[RB2_EXDIR_LEN * 2];
+    UNICODE_STRING *us = (UNICODE_STRING *)buf;
+    ULONG need = sizeof(buf), j, k;
+    NTSTATUS st;
+    ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+
+    UNREFERENCED_PARAMETER(proc);
+    /* 缓冲区布局：[UNICODE_STRING 头][路径字符] */
+    us = (UNICODE_STRING *)buf;
+    us->Buffer = (PWCH)(buf + 8);
+    us->MaximumLength = (USHORT)(sizeof(buf) - 8);
+    us->Length = 0;
+    st = ZwQueryInformationProcess(PsGetCurrentProcess(), (PROCESSINFOCLASS)27 /* ProcessImageFileName */,
+                                   buf, need, &need);
+    if (!NT_SUCCESS(st) || us->Length == 0) return FALSE;
+    {
+        ULONG len = us->Length / sizeof(WCHAR);
+        PWCH s = us->Buffer;
+        /* skip NT device prefix */
+        j = 0;
+        if (len > 4 && s[0] == (WCHAR)0x5C && s[1] == L'?' && s[2] == L'?' && s[3] == (WCHAR)0x5C) j = 4;
+        else if (len > 22 && s[0] == L'\\' && s[1] == L'\\' &&
+                 (s[2] == L'D' || s[2] == L'd') && (s[3] == L'E' || s[3] == L'e') &&
+                 (s[4] == L'V' || s[4] == L'v') && (s[5] == L'I' || s[5] == L'i') &&
+                 (s[6] == L'C' || s[6] == L'c') && (s[7] == L'E' || s[7] == L'e')) {
+            while (j < len && s[j] != (WCHAR)0x5C) j++;      /* 跳过设备名 */
+            while (j < len && s[j] == (WCHAR)0x5C) j++;        /* 跳过反斜杠 */
+            /* 设备路径无盘符可用：直接放弃（返回 FALSE，保守不排除） */
+            return FALSE;
+        }
+        for (k = 0; j < len && k + 1 < cap; j++, k++) {
+            WCHAR c = s[j];
+            if (c == L'/') c = (WCHAR)0x5C;
+            if (c >= L'a' && c <= L'z') c = (WCHAR)(c - 32);
+            out[k] = c;
+        }
+        out[k] = 0;
+        return k > 0;
+    }
+}
+
+/* 当前进程是否位于受保护目录下（PID 缓存：命中零系统调用） */
+static BOOLEAN Rb2PidInExcludeDirs(VOID)
+{
+    ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+    ULONG i, j, k;
+    WCHAR path[RB2_EXDIR_LEN];
+    BOOLEAN excluded = FALSE;
+
+    if (s_ExDirN == 0) return FALSE;              /* 未配置：零开销 */
+    for (i = 0; i < s_ExPidN; i++)
+        if (s_ExPid[i].Pid == pid) return s_ExPid[i].Excluded;
+
+    if (Rb2CurrentImagePath(path, RB2_EXDIR_LEN)) {
+        for (j = 0; j < s_ExDirN && !excluded; j++) {
+            for (k = 0; s_ExDir[j][k] && path[k] == s_ExDir[j][k]; k++) { }
+            if (s_ExDir[j][k] == 0 &&
+                (path[k] == 0 || path[k] == (WCHAR)0x5C))     /* 目录自身或其后代 */
+                excluded = TRUE;
+        }
+    }
+    if (s_ExPidN >= RB2_EXPIID_MAX) s_ExPidN = 0;  /* 满：整体清空重建（保守简单） */
+    s_ExPid[s_ExPidN].Pid = pid;
+    s_ExPid[s_ExPidN].Excluded = excluded;
+    s_ExPidN++;
+    return excluded;
+}
+
 static VOID Rb2LoadExcl(VOID)
 {
     PVOID d = NULL; ULONG sz = 0, ty = 0, i, n; PWCHAR w;   /* [P3] o 已由 olen 取代 */
@@ -247,6 +378,12 @@ BOOLEAN RbFeatAdmit(PVOID Ext)
     CHAR safe[16]; ULONG k;
     UNREFERENCED_PARAMETER(Ext);
     if (s_Panic) return FALSE;                 /* panic 拒绝不计入 AdmitRejects（D6） */
+    /* [103] 安装目录排除（按进程镜像路径前缀）：软件不得缓存自己。
+     * 未配置 ExcludeDirs 时 s_ExDirN==0 → 常数时间早退，热路径零开销。 */
+    if (s_ExDirN && Rb2PidInExcludeDirs()) {
+        Rb2Count(15, 1);                       /* 计入 AdmitRejects，可观测 */
+        return FALSE;
+    }
     if (!s_ExclN) return TRUE;
     img = PsGetProcessImageFileName(PsGetCurrentProcess());
     if (!img) return TRUE;
@@ -274,13 +411,19 @@ VOID Rb2ReloadFlags(VOID)
 {
     ULONG v = 0;
     Rb2GetDW(L"Features", L"Flags", 0, &v);
-    /* [FIX M15] 驱动侧强制掩码：WBCOAL（bit3）接线完成前绝不允许置位。
-     * 原唯一拦截点在用户态 rbfeatctl，reg add 即可绕过——而 rbwback.c 的
-     * 队列/锁/信号量从未初始化，RbWbSubmit 对全零 s_Q 操作 = 立即蓝屏。
-     * 运行时掩码与 rb_wiring.h 编译期接线开关是两层独立防线，互不替代。 */
+    /* [101/103] WBCOAL 已接线（RB_WIRED_WBCOAL=1，RbFeatInit 起停线程）：
+     * 原「未接线强制剥离」已解除，允许置位。保留唯一的运行时红线——
+     * WBCOAL 与 L2 互斥（同置会让 L2 落盘与写合并节奏互相干扰）。
+     * 命令面（rbfeatctl flags）已双向强制，此处为 reg add 绕过的第二道防线。 */
+#if !RB_WIRED_WBCOAL
     if (v & RB2F_WBCOAL) {
         v &= ~RB2F_WBCOAL;
         RbLog(1, __LINE__, 0, L"flags: WBCOAL forced off (not wired)");
+    }
+#endif
+    if ((v & RB2F_WBCOAL) && (v & RB2F_L2)) {
+        v &= ~RB2F_L2;
+        RbLog(1, __LINE__, 0, L"flags: L2 forced off (mutually exclusive with WBCOAL)");
     }
     /* [FIX F2] MEMGUARD（bit4）零消费：全驱动无任何 RB2F_MEMGUARD 判定，
      * 置位=纯假成功。与 WBCOAL 同款强制剥离（实现接线前不可启用）。 */
@@ -290,6 +433,7 @@ VOID Rb2ReloadFlags(VOID)
     }
     g_Rb2Flags = v;
     Rb2LoadExcl();
+    Rb2LoadExcludeDirs();   /* [103] 安装目录排除名单（随 REFRESH 热载） */
     if (v & RB2F_ETW) RbEtwEnsure();     /* [Build15] ETW 懒注册 */
     RbThermalReloadCfg();                /* [D6/FR-PF-03] 温度护栏阈值运行期可配（PASSIVE） */
 }

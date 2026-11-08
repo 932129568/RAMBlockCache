@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -301,6 +301,31 @@ public sealed class SetupEngine
             SetupLog.Warn($"self-copy failed: {ex.Message}");
         }
         WriteInstallLocation(opts.InstallDir);
+
+        // ---- 3.4) [103] 默认排除：软件自己的安装目录不进缓存 ----
+        /* 需求：装到哪个目录，就排除哪个目录（跨机器一致，用户无需配置）。
+         * 驱动侧 Features\ExcludeDirs（REG_MULTI_SZ，目录全路径）在 RbFeatAdmit
+         * 里按【进程镜像全路径前缀】匹配：安装目录下的 Controller/CLI/桥接 node
+         * 产生的 IO 一律不进缓存（WDM 块层拿不到文件名，进程路径是其等价且
+         * 不受文件碎片影响的判据）。追加而非覆盖：覆盖安装保留用户既有条目。 */
+        try
+        {
+            var featKey = @"SYSTEM\CurrentControlSet\Services\RAMBlockCache\Features";
+            using var fk = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(featKey, writable: true);
+            if (fk != null)
+            {
+                var cur = fk.GetValue("ExcludeDirs") as string[] ?? Array.Empty<string>();
+                var want = System.IO.Path.TrimEndingDirectorySeparator(opts.InstallDir.Trim());
+                var merged = cur.Where(s => !string.IsNullOrWhiteSpace(s))
+                                .Concat(new[] { want })
+                                .Distinct(StringComparer.OrdinalIgnoreCase)
+                                .ToArray();
+                fk.SetValue("ExcludeDirs", merged, Microsoft.Win32.RegistryValueKind.MultiString);
+                line.Report($"      已排除安装目录（不进缓存）：{want}");
+            }
+        }
+        catch (Exception ex) { line.Report($"      [!] 安装目录排除写入失败（不影响安装）：{ex.Message}"); }
+
 
         // ---- 3.5) [P3.15 2026-11-06] 桥接开机任务注册（Web 控制台自启）----
         /* RAMBlockCacheBridge：SYSTEM/HIGHEST/ONSTART，动作 = 便携 node 跑

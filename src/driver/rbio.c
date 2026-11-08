@@ -599,7 +599,11 @@ static VOID RbLatNote(BOOLEAN sampled, LARGE_INTEGER t0, int slot)
     t1.QuadPart = KeQueryPerformanceCounter(NULL).QuadPart;
     if (t1.QuadPart <= t0.QuadPart) return;
     us = (ULONG)(((t1.QuadPart - t0.QuadPart) * 1000000ULL) / (ULONGLONG)g_Rb.QpcFreq);
-    /* [U1 2026-11-06] 直方图入桶：桶号 = floor(log2(us))（MSB 位索引，us==0 归桶 0），
+    /* [102] 亚微秒样本归 1：QPC 精度足够时高速命中读可算出 us==0，若原样入桶
+     * 会落在桶 0（分位回读 1<<0=1，但 EWMA 用 0 当"无样本"哨兵 → 永久显示
+     * 未采样，两者自相矛盾）。钳到 1µs 使"有样本"与"无样本"可区分。 */
+    if (us == 0) us = 1;
+    /* [U1 2026-11-06] 直方图入桶：桶号 = floor(log2(us))（MSB 位索引），
      * log2 下界近似；每 64 笔读一次原子自增（与 EWMA 更新同成本级，R26 先例合规）。 */
     {
         ULONG v = us;
@@ -607,6 +611,9 @@ static VOID RbLatNote(BOOLEAN sampled, LARGE_INTEGER t0, int slot)
         while (v >>= 1) bIdx++;
         InterlockedIncrement((volatile LONG *)&g_Rb.ReadLatHist[slot][bIdx]);
     }
+    /* [102] EWMA 首发判定改用直方图总数（不再依赖 old==0 哨兵）：
+     * 原实现 old==0 既表示"无样本"又可能是"样本值 0"，钳制后已不可能为 0，
+     * 但保留 total 判定更稳健（并发下首次写入不会互相覆盖）。 */
     old = (ULONG)g_Rb.ReadLatEwmaUs[slot];
     if (old == 0) { InterlockedExchange(&g_Rb.ReadLatEwmaUs[slot], (LONG)us); return; }
     InterlockedExchange(&g_Rb.ReadLatEwmaUs[slot], (LONG)((old * 7u + us) / 8u));

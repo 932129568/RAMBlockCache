@@ -103,6 +103,31 @@ export function AnimatedValue({
   return <span className={className}>{text}</span>;
 }
 
+/* ============================ Hint ============================ */
+/* [UI-HINT 2026-11-09] 悬停详解：可见文案只留"是什么+提升"，鼠标靠近显示完整说明 */
+export function Hint({ text, children }: { text: string; children: ReactNode }) {
+  return (
+    <span className="relative group">
+      <span style={{ textDecoration: 'underline dotted', textUnderlineOffset: 3, cursor: 'help' }}>
+        {children}
+      </span>
+      <span
+        className="hidden group-hover:block absolute z-50 left-0 top-full mt-1 w-80 rounded-[var(--rbc-radius-sm)] text-xs"
+        style={{
+          background: 'var(--rbc-bg-elevated)',
+          color: 'var(--rbc-text-secondary)',
+          border: '1px solid var(--rbc-border-strong)',
+          boxShadow: 'var(--rbc-shadow-card)',
+          padding: '8px 10px',
+          lineHeight: 1.6,
+        }}
+      >
+        {text}
+      </span>
+    </span>
+  );
+}
+
 /* ============================ PageHeader ============================ */
 
 export function PageHeader({

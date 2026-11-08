@@ -45,6 +45,7 @@ export default function EmergencyPage() {
     key: string;
     label: string;
     hint: string;
+    detail: string;
     icon: React.ReactNode;
     tone: 'danger' | 'primary' | 'secondary';
     confirm: string;
@@ -54,6 +55,7 @@ export default function EmergencyPage() {
       key: 'panic',
       label: '全局熔断',
       hint: '一切 I/O 立即直通磁盘（数据安全优先的保守动作）',
+      detail: '熔断=缓存引擎全局旁路：所有读写立即直达磁盘，不再命中缓存。用于排障或紧急避险（例如怀疑磁盘异常时）。完全可逆：解除熔断后缓存恢复工作，期间缓存的统计仍累计。',
       icon: <Icons.shield size={22} />,
       tone: 'danger',
       confirm: '所有 I/O 立即直通磁盘，缓存不再命中（可随时解除）。',
@@ -63,6 +65,7 @@ export default function EmergencyPage() {
       key: 'panicClear',
       label: '解除熔断',
       hint: '等自愈世代追平后恢复，超时 fail-closed',
+      detail: '恢复正常缓存路径：驱动会等待在飞 I/O 的自愈世代追平后再恢复，确保不撕裂数据；超时则拒绝恢复（fail-closed，安全方向）。',
       icon: <Icons.refresh size={22} />,
       tone: 'secondary',
       confirm: '驱动将等待自愈世代追平后恢复缓存；超时则拒绝恢复（fail-closed）。',
@@ -72,6 +75,7 @@ export default function EmergencyPage() {
       key: 'flush',
       label: '立即刷写脏数据',
       hint: '把全部脏块落盘（直写模式下通常无脏数据）',
+      detail: '把回写模式下尚未落盘的脏数据立即全部写盘（全局 FLUSH）。适合关机前、拔盘前或希望立即落定数据的时刻；直写模式没有脏数据，点击秒回。',
       icon: <Icons.download size={22} />,
       tone: 'secondary',
       confirm: '确认立即刷写全部脏数据到磁盘？',
@@ -81,6 +85,7 @@ export default function EmergencyPage() {
       key: 'exitSafeMode',
       label: '退出安全模式',
       hint: safeMode ? '当前处于安全模式' : '当前不在安全模式（驱动按状态响应）',
+      detail: '安全模式=强制全局直写直到再次进入正常态（放弃回写收益、换取断电零丢失）。退出后恢复原本的写模式。驱动按当前状态响应：不在安全模式时点击无副作用。',
       icon: <Icons.sliders size={22} />,
       tone: 'secondary',
       confirm: '确认退出安全模式？',
@@ -136,6 +141,7 @@ export default function EmergencyPage() {
             key={t.key}
             type="button"
             disabled={busy !== null}
+            title={t.detail}
             onClick={() => void run(t.key, t.confirm, t.label, t.action)}
             {...(busy
               ? {}

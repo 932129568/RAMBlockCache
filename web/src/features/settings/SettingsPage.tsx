@@ -5,7 +5,7 @@ import type { RbConfig } from '@protocol/types';
 import { useDriverStore } from '@state/driver-store';
 import { confirmDialog } from '@state/confirm-store';
 import { toast } from '@state/toast-store';
-import { Badge, PageHeader, Toggle } from '@components/ui';
+import { Badge, Hint, PageHeader, Toggle } from '@components/ui';
 
 /** 合法缓存块大小（驱动 rbctl.c rb_legal_bs[] / rbrebuild.c 五档白名单同款） */
 // [2026-11-07 BugFix] 79/83 号卷级免重启几何重建已落地：切档由驱动在卷级重建
@@ -71,6 +71,13 @@ export default function SettingsPage() {
       .finally(() => setRbfeatBusy(undefined));
   };
   const RB2_BITS: Record<string, number> = { PREFETCH: 1, HOT: 2, ETW: 32, THERMAL: 64, WBCOAL: 8 };
+  const RB2_HINTS: Record<'PREFETCH' | 'HOT' | 'THERMAL' | 'ETW' | 'WBCOAL', string> = {
+    PREFETCH: '预取引擎开关：读缓存未命中时按窗口向前回填，连续读场景显著提速。实时热生效。',
+    HOT: '热区追踪与预热：统计高频访问的磁盘区域，冷启动/重启后优先预热这些区域，让缓存更快进入高命中状态。',
+    THERMAL: '温度护栏：监测磁盘温度，过热时自动暂停预取，避免长时间满速预取导致磁盘过热降速。',
+    ETW: 'ETW 内核事件遥测：输出驱动内部事件跟踪，供性能分析与问题诊断使用；日常使用无需开启。',
+    WBCOAL: '回写合写调度：回写模式下按每卷限速节奏把脏数据合并成顺序写落盘，平滑写延迟、减少随机写碎片。与 L2 二级缓存互斥，二者只能开一个。',
+  };
   const flagOn = (k: 'PREFETCH' | 'HOT' | 'THERMAL' | 'ETW' | 'WBCOAL') => {
     const f = rbfeat?.stats?.flags;
     const bit = RB2_BITS[k] ?? 0;
@@ -173,23 +180,24 @@ export default function SettingsPage() {
         <form onSubmit={onSaved}>
           <div className="grid grid-cols-2 gap-3">
             <Group title="缓存开关">
-                            <Row label="总开关 Enabled">
+                            <Row label="总开关 Enabled" hint="缓存引擎总开关：关闭后所有读写直接访问磁盘（全局旁路），所有缓存功能停用；重新开启即时生效，无需重启。">
                 <Controller control={form.control} name="Enabled" render={({ field }) => (
                   <Toggle checked={field.value === 1} onChange={(b) => field.onChange(b ? 1 : 0)} ariaLabel="总开关 Enabled" />
                 )} />
               </Row>
-                            <Row label="读缓存 ReadCacheEnabled">
+                            <Row label="读缓存 ReadCacheEnabled" hint="读缓存：磁盘读到的数据存入内存，同一位置再次读取时直接从内存返回。重复读、程序启动、常用文件访问提速最明显，顺序大文件读取可达数倍提升。">
                 <Controller control={form.control} name="ReadCacheEnabled" render={({ field }) => (
                   <Toggle checked={field.value === 1} onChange={(b) => field.onChange(b ? 1 : 0)} ariaLabel="读缓存 ReadCacheEnabled" />
                 )} />
               </Row>
-                            <Row label="写缓存 WriteCacheEnabled">
+                            <Row label="写缓存 WriteCacheEnabled" hint="写缓存：写请求经过缓存引擎。直写模式下写入即落盘；回写模式下写入先进缓存、后台落盘。关闭后写 I/O 完全旁路、不经过缓存。">
                 <Controller control={form.control} name="WriteCacheEnabled" render={({ field }) => (
                   <Toggle checked={field.value === 1} onChange={(b) => field.onChange(b ? 1 : 0)} ariaLabel="写缓存 WriteCacheEnabled" />
                 )} />
               </Row>
               <Select
                 label="全局写模式 WriteBack"
+                hint="直写：写入缓存的同时立即写盘，任何时刻断电/崩溃都不丢数据，写延迟与裸盘相当。回写：写入只需进入缓存即完成，后台按节奏合并落盘，写延迟大幅降低、写吞吐提升；代价是异常断电时最近几秒未落盘的数据可能丢失。每个卷可在「卷加速」页单独覆盖此全局设置。"
                 options={[
                   { value: 0, text: '直写（写入即落盘）' },
                   { value: 1, text: '回写（写延迟更低）' },
@@ -201,29 +209,33 @@ export default function SettingsPage() {
             <Group title="容量与内存预算">
               <Num
                 label="缓存上限 CacheSizeMB (MB)"
+                hint="缓存可占用的最大内存（MB）。「自动内存预算」开启时此值仅作为上限兜底，实际容量随系统可用内存动态伸缩；关闭时按此值固定分配。缓存越大，能装下的热数据越多，命中率越高。"
                 min={0}
                 max={1048576}
                 {...form.register('CacheSizeMB', { valueAsNumber: true, min: 0, max: 1048576 })}
               />
-                            <Row label="自动内存预算 AutoMemory">
+                            <Row label="自动内存预算 AutoMemory" hint="按系统实际可用内存自动伸缩缓存容量：内存紧张时自动让出内存给其他程序，空闲时自动扩展。日常使用推荐开启；专用缓存机可用固定值。">
                 <Controller control={form.control} name="AutoMemory" render={({ field }) => (
                   <Toggle checked={field.value === 1} onChange={(b) => field.onChange(b ? 1 : 0)} ariaLabel="自动内存预算 AutoMemory" />
                 )} />
               </Row>
               <Num
                 label="保留内存 MemReserveMB (MB)"
+                hint="为缓存引擎预留的内存池大小（MB），0=按物理内存容量自动适配。预留可避免高负载时缓存内存分配失败导致性能波动。"
                 min={0}
                 max={65536}
                 {...form.register('MemReserveMB', { valueAsNumber: true, min: 0, max: 65536 })}
               />
               <Num
                 label="可用内存占用上限 AutoUsePct %"
+                hint="允许缓存占用的「系统可用内存」百分比上限。调高=缓存更大、命中更多；调低=给其他程序留更多内存余量。"
                 min={10}
                 max={95}
                 {...form.register('AutoUsePct', { valueAsNumber: true, min: 10, max: 95 })}
               />
               <Select
                 label="缓存块大小 BlockSize"
+                hint="缓存引擎内部的数据块粒度（实际块=此值×16）。4K 小块适合随机小 I/O（数据库、程序加载、大量小文件）；64K 大块适合顺序大文件（视频剪辑、大文件拷贝）。切换免重启：引擎后台重建，重建期间缓存性能短暂回落。"
                 options={[...(BLOCK_SIZES.includes(cfg.BlockSize) ? [] : [{ value: cfg.BlockSize, text: `${cfg.BlockSize / 1024} KB（当前值）` }]), ...BLOCK_SIZES.map((b) => ({ value: b, text: `${b / 1024} KB` }))]}
                 {...form.register('BlockSize', { valueAsNumber: true })}
               />
@@ -235,35 +247,40 @@ export default function SettingsPage() {
             <Group title="回写与回收">
               <Num
                 label="回写落盘间隔 FlushIntervalMs（毫秒，0=关闭）"
+                hint="回写模式下，后台把缓存中的脏数据写回磁盘的周期（毫秒）。调小=落盘更频繁、断电时可能丢失的数据更少；调大=合并更充分、写入效率更高。0=关闭周期落盘（仅按脏水位触发）。直写模式没有脏数据，此项不生效。"
                 min={0}
                 max={600000}
                 {...form.register('FlushIntervalMs', { valueAsNumber: true, min: 0, max: 600000 })}
               />
               <Num
                 label="脏水位高 DirtyHighPct %"
+                hint="脏数据占缓存容量的比例上限（%）。达到后驱动加速落盘，防止脏数据堆积过多、缩小断电丢失窗口。"
                 min={15}
                 max={99}
                 {...form.register('DirtyHighPct', { valueAsNumber: true, min: 15, max: 99 })}
               />
               <Num
                 label="脏水位低 DirtyLowPct %"
+                hint="加速落盘进行到脏比例回落到此值（%）即停止冲刺（须低于高水位）。一冲一落形成滞后区间，避免落盘频繁启停。"
                 min={5}
                 max={89}
                 {...form.register('DirtyLowPct', { valueAsNumber: true, min: 5, max: 89 })}
               />
-                            <Row label="空闲回收 IdleReclaimEnabled">
+                            <Row label="空闲回收 IdleReclaimEnabled" hint="系统空闲时自动回收长期没有被访问的缓存块，把内存还给其他程序。">
                 <Controller control={form.control} name="IdleReclaimEnabled" render={({ field }) => (
                   <Toggle checked={field.value === 1} onChange={(b) => field.onChange(b ? 1 : 0)} ariaLabel="空闲回收 IdleReclaimEnabled" />
                 )} />
               </Row>
               <Num
                 label="空闲回收阈值 IdleReclaimSec"
+                hint="缓存块多久未被访问后视为「长期未使用」（秒），是空闲回收的判定阈值。"
                 min={0}
                 max={86400}
                 {...form.register('IdleReclaimSec', { valueAsNumber: true, min: 0, max: 86400 })}
               />
               <Select
                 label="回写落盘并行度 ParallelFlush"
+                hint="回写脏数据落盘的并发路数。并行越高回写吞吐越高（最终受磁盘写入能力限制）；直写模式没有脏数据、不消费此参数；运行期修改即时生效。"
                 options={[
                   { value: 1, text: '1 路' },
                   { value: 2, text: '2 路' },
@@ -280,6 +297,7 @@ export default function SettingsPage() {
               </p>
               <Select
                 label="TinyLFU 频率准入"
+                hint="准入过滤器：内存压力下按「访问频率」决定新数据是否进缓存。开启后，一次性的大文件拷贝、杀毒扫描等顺序流量不再把常用热数据挤出缓存。"
                 options={[
                   { value: 0, text: '关闭' },
                   { value: 1, text: '开启' },
@@ -292,7 +310,7 @@ export default function SettingsPage() {
             </Group>
 
             <Group title="开机行为">
-              <Row label="开机自动加速所有数据卷 AutoAttach">
+              <Row label="开机自动加速所有数据卷 AutoAttach" hint="开机自动加速所有数据卷（Windows 系统盘除外）。关闭时每次开机手动打开需要的卷。">
                 <Toggle
                   checked={bootCfgQuery.data?.AutoAttach === 1}
                   onChange={(b) => void setBootPolicy({ AutoAttach: b ? 1 : 0 })}
@@ -300,7 +318,7 @@ export default function SettingsPage() {
                   disabled={bootBusy}
                 />
               </Row>
-              <Row label="开机恢复上次加速的卷 ResumeOnBoot">
+              <Row label="开机恢复上次加速的卷 ResumeOnBoot" hint="开机自动恢复上次加速过的卷（下方显示当前记录）。比「开机自动加速所有卷」更可控：只恢复你明确开启过的。">
                 <Toggle
                   checked={bootCfgQuery.data?.ResumeOnBoot === 1}
                   onChange={(b) => void setBootPolicy({ ResumeOnBoot: b ? 1 : 0 })}
@@ -317,7 +335,7 @@ export default function SettingsPage() {
 
             <Group title="预取与分页">
               <label className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
-                <span>分页 IO 进缓存 CachePagingIo</span>
+                <span><Hint text="内存映射文件的读写（程序加载 DLL、映射大文件）也纳入缓存：提高这类文件的读取命中率。关闭时映射 I/O 直接读写磁盘、不占缓存。">分页 IO 进缓存 CachePagingIo</Hint></span>
                 <Toggle
                   checked={!!form.watch('CachePagingIo')}
                   onChange={(b) => form.setValue('CachePagingIo', b ? 1 : 0, { shouldDirty: true })}
@@ -328,7 +346,7 @@ export default function SettingsPage() {
                 映射文件读写（如加载 DLL）进入缓存：提高映射文件读取命中率。
               </p>
               <label className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
-                <span>预取引擎 ReadaheadEnabled</span>
+                <span><Hint text="预取引擎：检测到顺序读取模式时，提前把后续数据读入缓存。大文件拷贝、连续读取场景显著提速。">预取引擎 ReadaheadEnabled</Hint></span>
                 <Toggle
                   checked={!!form.watch('ReadaheadEnabled')}
                   onChange={(b) => form.setValue('ReadaheadEnabled', b ? 1 : 0, { shouldDirty: true })}
@@ -337,6 +355,7 @@ export default function SettingsPage() {
               </label>
               <Num
                 label="预取窗口 ReadaheadWindowKB (KB)"
+                hint="每次预取向前多读的窗口大小（KB）。窗口越大顺序读越快，占用内存也越多。"
                 min={64}
                 max={4096}
                 {...form.register('ReadaheadWindowKB', { valueAsNumber: true })}
@@ -347,20 +366,21 @@ export default function SettingsPage() {
             </Group>
 
             <Group title="只读字段">
-              <ReadOnly label="SystemVolumeCached" value={cfg.SystemVolumeCached} />
-              <ReadOnly label="Frozen" value={cfg.Frozen} />
-              <ReadOnly label="IdleFlush" value={cfg.IdleFlush} />
-              <ReadOnly label="WriteRelease" value={cfg.WriteRelease} />
+              <ReadOnly label="SystemVolumeCached" value={cfg.SystemVolumeCached} hint="Windows 系统盘是否被缓存。出于安全默认不缓存；可在「卷加速」页手动开启。" />
+              <ReadOnly label="Frozen" value={cfg.Frozen} hint="1=引擎处于冻结/重建窗口，此时 I/O 走旁路。" />
+              <ReadOnly label="IdleFlush" value={cfg.IdleFlush} hint="空闲回写开关的当前状态（驱动内部语义）。" />
+              <ReadOnly label="WriteRelease" value={cfg.WriteRelease} hint="写释放模式状态（驱动内部语义）。" />
               <ReadOnly
                 label="VolumeFilter"
                 value={JSON.stringify(cfg.VolumeFilter)}
+                hint="卷过滤白名单（本版本驱动不消费此字段；逐卷策略在「卷加速」页设置）。"
               />
             </Group>
 
             <Group title="特性开关">
               {([['PREFETCH', '预取（提升连续读）'], ['HOT', '热区预热（冷启动更快命中）'], ['THERMAL', '温度护栏（过热暂停预取）'], ['ETW', 'ETW 遥测'], ['WBCOAL', '回写合写（平滑写延迟）']] as const).map(([k, label]) => (
                 <label key={k} className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
-                  <span>{label} · {k}</span>
+                  <Hint text={RB2_HINTS[k]}>{label} · {k}</Hint>
                   <Toggle
                     checked={flagOn(k)}
                     disabled={rbfeatBusy === k || rbfeat?.exe !== 'found'}
@@ -431,10 +451,10 @@ export default function SettingsPage() {
   );
 }
 
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
+function Row({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
     <div className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
-      <span>{label}</span>
+      <span>{hint ? <Hint text={hint}>{label}</Hint> : label}</span>
       {children}
     </div>
   );
@@ -455,17 +475,19 @@ function Group({ title, children }: { title: string; children: React.ReactNode }
 
 function Num({
   label,
+  hint,
   min,
   max,
   ...rest
 }: {
   label: string;
+  hint?: string;
   min?: number | string;
   max?: number | string;
 } & React.InputHTMLAttributes<HTMLInputElement>) {
   return (
     <label className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
-      <span>{label}</span>
+      <span>{hint ? <Hint text={hint}>{label}</Hint> : label}</span>
       <input type="number" min={min} max={max} className="rbc-input" style={{ width: 120 }} {...rest} />
     </label>
   );
@@ -473,15 +495,17 @@ function Num({
 
 function Select({
   label,
+  hint,
   options,
   ...rest
 }: {
   label: string;
+  hint?: string;
   options: Array<{ value: number; text: string }>;
 } & React.SelectHTMLAttributes<HTMLSelectElement>) {
   return (
     <label className="flex items-center justify-between gap-3 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
-      <span>{label}</span>
+      <span>{hint ? <Hint text={hint}>{label}</Hint> : label}</span>
       <select className="rbc-input" style={{ width: 160 }} {...rest}>
         {options.map((o) => (
           <option key={o.value} value={o.value}>
@@ -511,7 +535,9 @@ function L2Manager({ rbfeat, reload }: { rbfeat: RbfeatState; reload: () => void
   return (
     <>
       <div className="flex items-baseline justify-between gap-3 text-xs">
-        <span style={{ color: 'var(--rbc-text-secondary)' }}>L2 容器状态</span>
+        <span style={{ color: 'var(--rbc-text-secondary)' }}>
+          <Hint text="L2 二级读缓存：内存缓存淘汰下来的热数据写入卷上的容器文件，再次读取时先查 L2、未中再读盘。内存是第一级、L2 是第二级，适合「工作集大于内存但重复读多」的场景。仅 4K 块几何可用、单加速卷、与 WBCOAL 互斥。">L2 容器状态</Hint>
+        </span>
         <span className="font-mono" style={{ color: 'var(--rbc-text-tertiary)' }}>{l2Line}</span>
       </div>
       <div className="flex items-center gap-2 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
@@ -522,8 +548,10 @@ function L2Manager({ rbfeat, reload }: { rbfeat: RbfeatState; reload: () => void
         <input type="number" className="rbc-input" style={{ width: 88 }} min={1} max={512} value={gb}
                onChange={(e) => setGb(Math.max(1, Math.min(512, Number(e.target.value) || 1)))} />
         <button type="button" className="rbc-input" disabled={busy || !letter || rbfeat?.exe !== 'found'}
+                title="把当前容器卷/容量写入配置并立即生效"
                 onClick={() => call('enable')}>启用</button>
         <button type="button" className="rbc-input" disabled={busy || rbfeat?.exe !== 'found'}
+                title="关闭 L2 并保存索引（容器文件保留，可再次启用）"
                 onClick={() => call('disable')}>停用</button>
       </div>
       <p className="text-xs" style={{ color: 'var(--rbc-text-tertiary)', margin: '-4px 0 8px' }}>
@@ -549,7 +577,9 @@ function ExclManager({ rbfeat, reload }: { rbfeat: RbfeatState; reload: () => vo
   return (
     <>
       <div className="flex items-baseline justify-between gap-3 text-xs">
-        <span style={{ color: 'var(--rbc-text-secondary)' }}>内置排除（defrag/dfrgui/wbengine/vssadmin/msmpeng）</span>
+        <span style={{ color: 'var(--rbc-text-secondary)' }}>
+          <Hint text="进程排除集：被排除进程（如杀毒扫描、磁盘碎片整理）的读写绕过缓存直达磁盘，避免它们的海量顺序流量污染缓存、挤掉热数据。内置默认排除：defrag/dfrgui/wbengine/vssadmin/msmpeng。">内置排除（defrag/dfrgui/wbengine/vssadmin/msmpeng）</Hint>
+        </span>
         <Toggle checked={useDef} disabled={busy || rbfeat?.exe !== 'found'}
                 onChange={(b) => call('def', { on: b })} ariaLabel="UseDefaultExcl" />
       </div>
@@ -567,13 +597,12 @@ function ExclManager({ rbfeat, reload }: { rbfeat: RbfeatState; reload: () => vo
   );
 }
 
-function ReadOnly({ label, value, note }: { label: string; value: string | number; note?: string }) {
+function ReadOnly({ label, value, hint }: { label: string; value: string | number; hint?: string }) {
   return (
     <div className="flex items-baseline justify-between gap-3 text-xs">
-      <span style={{ color: 'var(--rbc-text-secondary)' }}>{label}</span>
-      <span className="font-mono" style={{ color: 'var(--rbc-text-tertiary)' }} title={note}>
+      <span style={{ color: 'var(--rbc-text-secondary)' }}>{hint ? <Hint text={hint}>{label}</Hint> : label}</span>
+      <span className="font-mono" style={{ color: 'var(--rbc-text-tertiary)' }}>
         {value}
-        {note ? ' *' : ''}
       </span>
     </div>
   );

@@ -5,7 +5,7 @@ import type { RbVolumeInfo, RbVolumeList } from '@protocol/types';
 import { useDriverStore } from '@state/driver-store';
 import { confirmDialog } from '@state/confirm-store';
 import { toast } from '@state/toast-store';
-import { Badge, Button, EmptyState, Icons, PageHeader, SkeletonCard } from '@components/ui';
+import { Badge, Button, EmptyState, Hint, Icons, PageHeader, SkeletonCard } from '@components/ui';
 
 const WRITEMODE_TEXT: Record<number, string> = {
   [RB_WRITEMODE.THROUGH]: '直写',
@@ -73,7 +73,11 @@ export default function VolumesPage() {
     if (mode === v.WriteMode) return;
     const okGo = await confirmDialog({
       title: `确认将卷 ${v.Letter}: 的写模式切换为「${WRITEMODE_TEXT[mode] ?? mode}」？`,
-      body: '回写模式：写入先进缓存，后台合并落盘，写延迟更低。',
+      body: mode === RB_WRITEMODE.BACK
+        ? '回写模式：写入先进缓存即完成，后台按节奏合并落盘，写延迟显著降低；异常断电时最近未落盘的少量数据可能丢失。'
+        : mode === RB_WRITEMODE.THROUGH
+          ? '直写模式：写入同时落盘，断电不丢数据。'
+          : '跟随全局：使用设置页的全局写模式。',
       danger: mode === RB_WRITEMODE.BACK,
     });
     if (!okGo) return;
@@ -193,7 +197,7 @@ function VolumeCard({
         <span className="flex-1" />
 
         <label className="flex items-center gap-1.5 text-xs" style={{ color: 'var(--rbc-text-secondary)' }}>
-          写模式
+          <Hint text="直写=写即落盘，断电不丢数据；回写=写进缓存后台落盘，写延迟更低；跟随全局=使用设置页的全局写模式。">写模式</Hint>
           <select
             aria-label={`卷 ${v.Letter} 写模式`}
             value={v.WriteMode}
@@ -207,14 +211,18 @@ function VolumeCard({
           </select>
         </label>
 
-        <Button
-          tone={attached ? 'secondary' : 'primary'}
-          disabled={!canToggle}
-          onClick={onToggle}
-          ariaLabel={`卷 ${v.Letter} ${attached ? '热停用' : '热开启'}`}
-        >
-          {attached ? '热停用' : '热开启'}
-        </Button>
+        <Hint text={attached
+          ? '热停用：本卷读写立即旁路缓存、直达磁盘（数据不受影响），缓存中该卷内容丢弃。'
+          : '热开启：本卷读写进入缓存加速，即时生效，无需重启。回写模式下写延迟更低。'}>
+          <Button
+            tone={attached ? 'secondary' : 'primary'}
+            disabled={!canToggle}
+            onClick={onToggle}
+            ariaLabel={`卷 ${v.Letter} ${attached ? '热停用' : '热开启'}`}
+          >
+            {attached ? '热停用' : '热开启'}
+          </Button>
+        </Hint>
       </div>
 
       {/* [UX-FIX 2026-11-05] FreeMB 恒为 0：块层过滤器无文件系统语义，拿不到

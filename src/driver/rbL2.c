@@ -55,6 +55,12 @@ static volatile ULONG64 s_VolId;
  * 真正关闭由控制面（REFRESH IOCTL / Rb2Tick 周期 / flags-off / 关机）执行。 */
 static volatile LONG s_Reopen;
 static KEVENT  s_OpEv; static ULONG64 s_TryTick64; static volatile LONG s_IdxDirty;
+/* [FIX O9-L2IO 2026-11-09] 容器 IO 事件：ZwWriteFile/ZwReadFile 的 Event 参数
+ * 需要事件【句柄】，R2-W8 误传 KEVENT 栈地址 → 每次容器 IO 必然
+ * STATUS_INVALID_HANDLE（0xC0000008）→ L2 存储自出生写不进一个字节
+ * （l2s 恒 0 的真根因，3425 次现场实锤）。改为打开期 ZwCreateEvent 建真句柄 +
+ * ObReferenceObjectByHandle 持对象引用，Close 配对释放。 */
+static HANDLE  s_EvH; static PVOID s_EvObj;
 /* [D7] L2 状态：0=Flags关/未开 1=已打开 2=拒绝-多卷 3=拒绝-块大小 4=拒绝-配置无效 */
 static ULONG   s_State;
 /* [F1] 在飞操作计数：probe/store（及 Periodic 索引落盘）触碰 s_File/s_Idx 的
@@ -103,19 +109,21 @@ static ULONG RbL2Hash(ULONG64 blk) { return (ULONG)((blk * 2654435761ull) % s_Sl
 
 static NTSTATUS RbL2Io(HANDLE file, BOOLEAN wr, ULONG64 off, PVOID buf, ULONG len)
 {
-    LARGE_INTEGER o; IO_STATUS_BLOCK ib; NTSTATUS st; KEVENT ev;
+    LARGE_INTEGER o; IO_STATUS_BLOCK ib; NTSTATUS st;
     if (!file) return STATUS_DEVICE_NOT_READY;
-    /* [FIX R2-W8] 用真实事件替代 NULL：同步文件对象下 PENDING"基本不可达"
-     * 的判断依赖内部实现细节；过去兜底等的是永不置位的 s_OpEv——一旦可达
-     * 即永久占死 worker。改传自有事件，等待必然被完成置位 */
-    KeInitializeEvent(&ev, NotificationEvent, FALSE);
+    /* [FIX O9-L2IO] R2-W8 曾把 KEVENT 栈地址当事件句柄传给 Zw*File（第二参是
+     * HANDLE）→ 每次容器 IO 必然 0xC0000008。现在传打开期创建的真事件句柄：
+     * NotificationEvent，每次 IO 前 Clear，完成后置位；PENDING 时等对象引用。
+     * 同步文件句柄下 PENDING"基本不可达"，此兜底只为绝对安全（绝不弃缓冲）。 */
+    if (!s_EvH || !s_EvObj) return STATUS_DEVICE_NOT_READY;
+    KeClearEvent(s_EvObj);
     o.QuadPart = (LONG64)off;
-    if (wr) st = ZwWriteFile(file, &ev, NULL, NULL, &ib, buf, len, &o, NULL);
-    else    st = ZwReadFile (file, &ev, NULL, NULL, &ib, buf, len, &o, NULL);
+    if (wr) st = ZwWriteFile(file, s_EvH, NULL, NULL, &ib, buf, len, &o, NULL);
+    else    st = ZwReadFile (file, s_EvH, NULL, NULL, &ib, buf, len, &o, NULL);
     if (st == STATUS_PENDING) {                    /* 有界兜底：事件必然置位 */
         LARGE_INTEGER t; t.QuadPart = -1500000000LL; /* 15s 步进观察 */
         for (;;) {
-            if (KeWaitForSingleObject(&ev, Executive, KernelMode, FALSE, &t) == STATUS_SUCCESS)
+            if (KeWaitForSingleObject(s_EvObj, Executive, KernelMode, FALSE, &t) == STATUS_SUCCESS)
                 break;
             RbLog(1, __LINE__, STATUS_IO_TIMEOUT, L"l2 io slow, keep waiting (never abandon buffer)");
         }
@@ -427,6 +435,23 @@ static VOID RbL2LazyOpenInt(BOOLEAN ControlPath)
     }
     RbL2IdxOpen();
     RbL2IdxLoad();                                 /* 重建内存索引（安全校验在探测时） */
+    /* [FIX O9-L2IO] 容器 IO 事件句柄（Zw*File 第二参需 HANDLE，非 KEVENT*） */
+    if (!s_EvH) {
+        OBJECT_ATTRIBUTES ea; HANDLE h = NULL; PVOID obj = NULL;
+        InitializeObjectAttributes(&ea, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+        if (NT_SUCCESS(ZwCreateEvent(&h, EVENT_MODIFY_STATE | SYNCHRONIZE, &ea,
+                                     NotificationEvent, FALSE)) &&
+            NT_SUCCESS(ObReferenceObjectByHandle(h, EVENT_MODIFY_STATE,
+                                                 *ExEventObjectType, KernelMode, &obj, NULL))) {
+            s_EvH = h; s_EvObj = obj;
+        } else {
+            if (h) ZwClose(h);
+            ZwClose(s_File); s_File = NULL;
+            if (s_State != 4) { s_State = 4; RbLog(1, __LINE__, 0, L"l2: refused (event alloc failed)"); }
+            InterlockedExchange(&s_Opening, 0);
+            return;
+        }
+    }
     s_State = 1;                                   /* [D7] 已打开 */
     s_Halt = 0;                                    /* [F1] 开机闸解除 */
     InterlockedExchange(&s_Opening, 0);
@@ -457,6 +482,8 @@ static VOID RbL2CloseIntEx(BOOLEAN Persist)
     if (s_File && Persist) RbL2IdxSave();          /* 排空后才持久化；[FIX R6-01] 拒绝/换卷态不持久化 */
     if (s_IdxFile) { ZwClose(s_IdxFile); s_IdxFile = NULL; }
     if (s_File)    { ZwClose(s_File);    s_File = NULL; }
+    if (s_EvObj)   { ObDereferenceObject(s_EvObj); s_EvObj = NULL; }
+    if (s_EvH)     { ZwClose(s_EvH);     s_EvH = NULL; }   /* [FIX O9-L2IO] 配对释放 */
     old = InterlockedExchangePointer(&s_Idx, NULL);   /* [F1] 原子摘指针后再释放，收窄 free->NULL 间解引用窗口 */
     if (old) Rb2Free(old);
     s_Slots = 0;

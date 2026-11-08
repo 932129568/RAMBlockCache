@@ -39,7 +39,7 @@ $ErrorActionPreference = 'Stop'
 
 # Build19 delivered driver pin. Override with -ExpectedSha256 or a <sys>.sha256
 # sidecar file next to the source sys. If none is available the gate FAILS CLOSED.
-$DefaultExpectedSha256 = '83e258ce393abe397911653bcfc40858d63beb516494e57d1153e0456ce63f79'
+$DefaultExpectedSha256 = '6e8534f4a97b4a7f938bd25624645bc3feb4d184a1bafda5e728be22c000a333'
 
 Write-Host '== RAMBlockCache V10.4.3 deploy (verify-before-change) =='
 

@@ -41,7 +41,7 @@
 | I28 | **EXPID 修复上机验收 PASS，两处根因合并闭环** | ✅ 已验收 | 14:08 部署 `723a46d7…`（签自 `21d30711…`）Valid，14:14:19 重启，看门狗 `33/33 / BootFails=0`、自禁用未触发、F/D=1。**elapsed 951 s > 历史 700–895 s 复现窗口**，零 41/1001/6008、dump 仍 5 份最新 13:00:31、无 MEMORY.DMP、日志段 ERROR=0、canary 逐位一致、`o9_watch FAIL=0`（17 项 PASS）。在修复版上重跑主动冲击：A-D 520/520（12 路）+ E 200/200（16 路）= **720/720**（E 器具修正：有界 8 MiB 载荷 + 90 s 超时；此前 136/200 全为 `TimeoutExpired`，非驱动故障）。五件套 + syncio 9/9 + refcount 17/17 + expid 84 交错全绿。⇒ 119 号 `0x93` 精确修复与 121 号 `s_ExPidN` 并发修复**同时覆盖并真机闭环**。限定：负向证据，不等于内核整体/A2 回写验证；`RbBugCheckCb` 两阶段修复仍只在下次崩溃时才被验证；`00:32` 池腐坏仍未点名分配点。见 122 号 |
 | I29 | **git 推送已恢复** | ✅ 已闭环 | 此前多次 `CONNECT tunnel 502` / schannel 提前关闭导致 `ahead 1..4`；14:3x 恢复，`7f60cf5..d85d8ce` 五个提交全部推上 `origin/main`，`main == origin/main == d85d8ce`，工作区 clean |
 | I30 | **收尾交接 + 文档基线补齐** | ✅ 已闭环 | 交接文档 `deliverables/123-handover-2026-11-09.md`（自包含，覆盖全天事故链、4 次错误归因、当前验收态、遗留台账、红线、工具索引、下一步）。收尾核查发现 `README.md:17` / `67:13` / `67:130` 的 sys 基线仍停在 `98f150ba…`、`o9_setup_repack.ps1` 注释硬编码该旧哈希 → 已跑 `sync_setup_hash.ps1`（`UPDATED`，三处同步为 `723a46d7…` / 181,472 B，README.txt sys 锚点回读一致）并把注释改为动态解析说明；脚本 AST 0 错、UTF8 BOM+CRLF、门禁⑤ 复跑 PASS |
-| I31 | **交接提交待推（网络再次不稳）** | ⏳ 待网络 | `8e62189`（123 号交接 + 文档基线 + I30）本地已提交、工作区 clean，但 `origin/main` 仍 `86f877c`，`ahead 1`。14:3x 曾成功推送 5 个提交，随后 `schannel: server closed abruptly` / `CONNECT tunnel 502` 重试 3 次未通。网络恢复后执行 `git push origin main` 即可，本地不丢 |
+| I31 | **交接批提交待推（网络再次不稳）** | ⏳ 待网络 | 14:3x 曾成功推送 5 个提交（`origin/main=86f877c`），随后 `schannel: server closed abruptly` / `CONNECT tunnel 502` 反复出现，多次重试未通。本地有若干交接批提交待推、工作区 clean，实际 ahead 数以 `git status -sb` 为准。网络恢复后执行 `git push origin main` 即可，本地不丢 |
 
 > **口径纪律**：I6 的 PASS 只覆盖「U 盘插拔不再冻结/黑屏」这一场景，观察约 2.5 分钟；不构成「池腐坏已根治」「内核已修」「缓存数据面或回写正确性已验证」。I10/I11/I12 为明确的未闭环项。
 

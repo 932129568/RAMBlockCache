@@ -243,14 +243,22 @@ typedef struct _RB_IOCTL_SYNC {
     KEVENT          Ev;
     IO_STATUS_BLOCK Iosb;
     volatile LONG   State;
+    /* [FIX O9-SYNCIO 2026-11-09] 引用计数（主路径 1 + 完成例程 1）。
+     * 与 rbdev.c RB_SYNCCTX 同款：完成例程 SetEvent 后仍要读 State，
+     * 主路径可能已被唤醒抢先收尾；持有引用期间 ctx 必定有效。 */
+    volatile LONG   Refs;
     PVOID           InPool;
     PVOID           OutPool;
 } RB_IOCTL_SYNC, *PRB_IOCTL_SYNC;
 
+static VOID RbIoctlSyncFreePools(PRB_IOCTL_SYNC s)
+{
+    if (s->InPool)  { ExFreePoolWithTag(s->InPool, RB_POOL_TAG);  s->InPool = NULL; }
+    if (s->OutPool) { ExFreePoolWithTag(s->OutPool, RB_POOL_TAG); s->OutPool = NULL; }
+}
 static VOID RbIoctlSyncFree(PRB_IOCTL_SYNC s)
 {
-    if (s->InPool)  ExFreePoolWithTag(s->InPool, RB_POOL_TAG);
-    if (s->OutPool) ExFreePoolWithTag(s->OutPool, RB_POOL_TAG);
+    RbIoctlSyncFreePools(s);
     ExFreePoolWithTag(s, RB_POOL_TAG);
 }
 
@@ -259,13 +267,14 @@ static NTSTATUS NTAPI RbIoctlSyncComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID c)
     PRB_IOCTL_SYNC s = (PRB_IOCTL_SYNC)c;
     UNREFERENCED_PARAMETER(dev);
     KeSetEvent(&s->Ev, IO_NO_INCREMENT, FALSE);
-    /* 三态 CAS：WAITING->DONE（主路径收尾）；若已是 ORPHAN，由本例程收尾。
-     * IoCompleteRequest 会写 s->Iosb / s->OutPool，二者此时必定有效。 */
+    /* 本例程持有 s 的一份引用，KeSetEvent 与下面的 CAS 都不会 UAF。 */
     if (InterlockedCompareExchange(&s->State, RB_SYNC_STATE_DONE,
                                    RB_SYNC_STATE_WAITING) == RB_SYNC_STATE_ORPHAN) {
         IoCompleteRequest(irp, IO_NO_INCREMENT);
-        RbIoctlSyncFree(s);
+        RbIoctlSyncFreePools(s);
     }
+    if (InterlockedDecrement(&s->Refs) == 0)
+        ExFreePoolWithTag(s, RB_POOL_TAG);   /* 最后一方归还，此后不触碰 s */
     return STATUS_MORE_PROCESSING_REQUIRED;
 }
 
@@ -286,6 +295,7 @@ NTSTATUS RbSendSyncIoctl(PDEVICE_OBJECT target, ULONG ioctl,
     RtlZeroMemory(s, sizeof(*s));
     KeInitializeEvent(&s->Ev, NotificationEvent, FALSE);
     s->State = RB_SYNC_STATE_WAITING;
+    s->Refs = 2;              /* 主路径 1 + 完成例程 1；最后一方归还 s */
 
     if (inSize) {
         s->InPool = ExAllocatePool2(POOL_FLAG_NON_PAGED, inSize, RB_POOL_TAG);
@@ -318,7 +328,11 @@ NTSTATUS RbSendSyncIoctl(PDEVICE_OBJECT target, ULONG ioctl,
                     break;      /* 完成例程刚刚裁决：改走正常收尾 */
                 RbLog(2, __LINE__, STATUS_IO_TIMEOUT,
                       L"sync ioctl timeout: IRP ownership passed to completion routine");
-                return STATUS_IO_TIMEOUT;   /* 不释放、不拷贝、不读 ctx */
+                /* 不释放 InPool/OutPool（late IRP 完成仍会写 OutPool），
+                 * 只释放主路径引用；完成例程持另一份引用负责最终收尾。 */
+                if (InterlockedDecrement(&s->Refs) == 0)
+                    ExFreePoolWithTag(s, RB_POOL_TAG);
+                return STATUS_IO_TIMEOUT;
             }
         }
     }
@@ -328,7 +342,10 @@ NTSTATUS RbSendSyncIoctl(PDEVICE_OBJECT target, ULONG ioctl,
     st = s->Iosb.Status;
     if (NT_SUCCESS(st) && out && outSize) RtlCopyMemory(out, s->OutPool, outSize);
     if (returned) *returned = NT_SUCCESS(st) ? (ULONG)s->Iosb.Information : 0;
-    RbIoctlSyncFree(s);
+    RbIoctlSyncFreePools(s);
+    /* 主路径释放自己的引用；若完成例程已跑完，这里就是最后一方。 */
+    if (InterlockedDecrement(&s->Refs) == 0)
+        ExFreePoolWithTag(s, RB_POOL_TAG);
     return st;
 }
 

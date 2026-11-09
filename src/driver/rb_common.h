@@ -172,9 +172,14 @@ typedef struct _RB_IOCTX {
     UCHAR            Major;
     UCHAR            Passthru;  /* [P0-1] 透传写：worker 内先失效缓存区间再前转（rbio.c） */
     /* [83 收窄#1] Rsvd[0] = g_Rb.DataPathInFlight 计数标记（RbCtxAlloc 显式置
-     * 1/0，RbCtxFree 读它决定是否 decrement）；Rsvd[1] 占位。lookaside 复用
-     * 不清零，故 RbCtxAlloc 必须显式赋值（见 rbio.c），不能依赖旧值。 */
-    UCHAR            Rsvd[2];
+     * 1/0，RbCtxFree 读它决定是否 decrement）。
+     * [FIX O9-ADMIT 2026-11-09] Admitted = 发起线程上下文一次性裁决的
+     * RbFeatAdmit 结果（1=准入 / 0=排除）。PASSIVE worker 属于 System 进程，
+     * 在 worker 里重新调用 RbFeatAdmit 会看到 "System" 而放行，使进程排除
+     * 策略整体失效（124 号 T4 实测 MSMPENG.EXE 仍 18/18 命中缓存）。
+     * lookaside 复用不清零，故 RbCtxAlloc 必须显式赋值，不能依赖旧值。 */
+    UCHAR            Rsvd[1];
+    UCHAR            Admitted;
     LARGE_INTEGER    Offset;
     ULONG            Length;
 } RB_IOCTX, *PRB_IOCTX;

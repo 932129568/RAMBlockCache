@@ -97,6 +97,12 @@ typedef struct _RB_SYNCCTX {
     KEVENT          evt;
     IO_STATUS_BLOCK iosb;
     volatile LONG   State;      /* RB_SYNC_STATE_* */
+    /* [FIX O9-SYNCIO 2026-11-09] 两个执行体各持一引用（主路径 + 完成例程），
+     * 最后递减到 0 的一方才把 ctx 归还 lookaside。原实现里完成例程
+     * `KeSetEvent` 之后仍要读 ctx->State，而主路径可能被事件唤醒后抢先
+     * 释放 ctx（124 号 T5：C1→M2→C2 交错确定性 UAF）。引用计数保证
+     * 完成例程持有引用期间 ctx 必然有效，且超时/正常路径无需再猜谁先跑。 */
+    volatile LONG   Refs;
     PVOID           PoolBuf;    /* 池化数据缓冲，IRP 只看见它 */
     ULONG           Len;
     BOOLEAN         IsWrite;
@@ -128,14 +134,15 @@ static NTSTATUS NTAPI RbSyncComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID c)
     RB_SYNCCTX *ctx = (RB_SYNCCTX *)c;
     UNREFERENCED_PARAMETER(dev);
     KeSetEvent(&ctx->evt, IO_NO_INCREMENT, FALSE);
-    /* 三态 CAS：WAITING->DONE（主路径收尾）；已是 ORPHAN 则由本例程收尾。
-     * IoCompleteRequest 会写 ctx->iosb / ctx->PoolBuf，二者此时必定有效。 */
+    /* 本例程持有 ctx 的一份引用，故上面 KeSetEvent 与下面 CAS 都不会 UAF。 */
     if (InterlockedCompareExchange(&ctx->State, RB_SYNC_STATE_DONE,
                                    RB_SYNC_STATE_WAITING) == RB_SYNC_STATE_ORPHAN) {
         IoCompleteRequest(irp, IO_NO_INCREMENT);
         if (ctx->PoolBuf) ExFreePoolWithTag(ctx->PoolBuf, RB_POOL_TAG);
-        RbSyncCtxFree(ctx);
+        ctx->PoolBuf = NULL;
     }
+    if (InterlockedDecrement(&ctx->Refs) == 0)
+        RbSyncCtxFree(ctx);       /* 最后一方归还；此后绝不再触碰 ctx */
     return STATUS_MORE_PROCESSING_REQUIRED;   /* 保住 IRP，由唯一收尾方处理 */
 }
 
@@ -153,6 +160,7 @@ NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
     RtlZeroMemory(ctx, sizeof(*ctx));      /* lookaside 分配不清零 */
     KeInitializeEvent(&ctx->evt, NotificationEvent, FALSE);
     ctx->State = RB_SYNC_STATE_WAITING;
+    ctx->Refs = 2;             /* 主路径 1 + 完成例程 1；最后一方归还 ctx */
     ctx->Len = len;
     ctx->IsWrite = doWrite;
     ctx->CallerBuf = buf;
@@ -192,7 +200,11 @@ NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
                     break;      /* 完成例程刚裁决：改走正常收尾 */
                 RbLog(2, __LINE__, STATUS_IO_TIMEOUT,
                       L"sync io timeout: IRP ownership passed to completion routine");
-                return STATUS_IO_TIMEOUT;   /* 不释放、不拷贝、不读 ctx */
+                /* 主路径释放自己的引用后立即返回，不再触碰 ctx。
+                 * late IRP 完成时完成例程仍持有另一份引用，会安全收尾并归还。 */
+                if (InterlockedDecrement(&ctx->Refs) == 0)
+                    RbSyncCtxFree(ctx);
+                return STATUS_IO_TIMEOUT;
             }
         }
     }
@@ -211,6 +223,9 @@ NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
     if (NT_SUCCESS(s) && !doWrite) RtlCopyMemory(buf, ctx->PoolBuf, len);
     if (pInfo) *pInfo = NT_SUCCESS(s) ? ctx->iosb.Information : 0;
     ExFreePoolWithTag(ctx->PoolBuf, RB_POOL_TAG);
-    RbSyncCtxFree(ctx);
+    ctx->PoolBuf = NULL;
+    /* 主路径释放自己的引用；若完成例程已跑完，这里就是最后一方。 */
+    if (InterlockedDecrement(&ctx->Refs) == 0)
+        RbSyncCtxFree(ctx);
     return s;
 }

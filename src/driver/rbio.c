@@ -122,6 +122,7 @@ PVOID RbCtxAlloc(VOID)
 {
     PRB_IOCTX c = (PRB_IOCTX)ExAllocateFromNPagedLookasideList(&g_Rb.IoCtxLa);
     if (c) {
+        c->Admitted = 1;       /* [FIX O9-ADMIT] 缺省放行；workerpath/flush 会按上下文覆盖 */
         if (InterlockedCompareExchange(&g_Rb.Recreating, 0, 0) != 0) {
             c->Rsvd[0] = 1;
             InterlockedIncrement(&g_Rb.DataPathInFlight);
@@ -701,7 +702,9 @@ static VOID RbReadWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
 
     /* 原 IRP 只判定一次预取/准入；分片不放大特性钩子次数。 */
     RbFeatOnRead(ext, (ULONG64)cur, len);
-    if (!RbFeatAdmit(ext)) {
+    /* [FIX O9-ADMIT] 消费 dispatch 在发起线程上下文裁决的结果；本 worker
+     * 属于 System 进程，绝不能在这里重新调用 RbFeatAdmit（会误判为放行）。 */
+    if (!ctx->Admitted) {
         RbNoteBypass(ext, RB_BYPASS_ADMIT);
         RbReadDirectFallback(ext, tgt, len, (LONGLONG)cur, &s, &info);
         goto done;
@@ -842,7 +845,9 @@ static VOID RbWriteWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
     }
 
     /* [ADMIT-1] 进程排除同样作用于写缓存（直写下盘，不入缓存） */
-    if (!RbFeatAdmit(ext)) {
+    /* [FIX O9-ADMIT] 消费 dispatch 在发起线程上下文裁决的结果；本 worker
+     * 属于 System 进程，绝不能在这里重新调用 RbFeatAdmit（会误判为放行）。 */
+    if (!ctx->Admitted) {
         LARGE_INTEGER o; o.QuadPart = off;
         /* [P0-1] 直写下盘前失效同区间缓存旧副本：否则旧脏块会被后续
          * 自愈/周期回写落盘，覆盖本次排除进程直写的新数据。
@@ -1576,6 +1581,7 @@ NTSTATUS RbDispatchReadWrite(PDEVICE_OBJECT dev, PIRP irp)
     PRB_DEV_EXT ext;
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
     ULONG len;
+    BOOLEAN admitted;      /* [FIX O9-ADMIT] 发起线程上下文一次性裁决的准入结果 */
 
     /* [P2-2] 控制设备无 DeviceExtension（DeviceExtensionSize=0）：分发表共享，
      * 防御性直接完成，杜绝越界解引用 ext->Refs（旧代码无守卫）。 */
@@ -1647,6 +1653,14 @@ NTSTATUS RbDispatchReadWrite(PDEVICE_OBJECT dev, PIRP irp)
         if (len > (g_Rb.MaxCacheIoKB << 10)) RbNoteBypass(ext, RB_BYPASS_IO_TOO_LARGE);
         return RbDispatchPassthrough(ext, dev, irp);
     }
+    /* [FIX O9-ADMIT 2026-11-09] 进程准入只在**发起线程上下文**裁决一次。
+     * 原实现在 dispatch 内联路径(:1663/:1699) 与 PASSIVE worker(:704/:845)
+     * 各调一次 RbFeatAdmit；worker 属于 System 进程，PsGetCurrentProcess()
+     * 返回 "System"，重判必然放行 —— 排除进程被内联拒绝后 goto workerpath，
+     * worker 又放行并命中缓存（124 号 T4 实测 MSMPENG.EXE 仍 18/18 命中）。
+     * 本版把结果存入 RB_IOCTX.Admitted 随 IRP 传递，worker 直接消费，
+     * 每条 IRP 的 Rb2Count(15,1) 也恰好只计一次。 */
+    admitted = RbFeatAdmit(ext);
     /* [OPT 2026-11-01] 内联写吸收快路径（回写模式）：rb_write_ex 吸收成功且无
      * direct 区间时就地完成（省 dispatch→worker 往返）。pre=NULL = 无写前快照
      * （core 契约 "mask==NULL 视为 0 容量"）：吸收成功则快照本就不需要（无失败
@@ -1660,7 +1674,7 @@ NTSTATUS RbDispatchReadWrite(PDEVICE_OBJECT dev, PIRP irp)
     if (sp->MajorFunction == IRP_MJ_WRITE &&
         KeGetCurrentIrql() <= APC_LEVEL &&
         RbIsWriteBack(ext) &&
-        RbFeatAdmit(ext)) {
+        admitted) {
         PVOID tgt = RbMapIrpBuffer(irp);
         if (tgt) {
             rb_write_pre  pre; pre.mask = NULL; pre.dseq = NULL; pre.max_bits = 0; pre.base = 0; pre.bits = 0;
@@ -1696,7 +1710,7 @@ NTSTATUS RbDispatchReadWrite(PDEVICE_OBJECT dev, PIRP irp)
         LARGE_INTEGER lat0;
         BOOLEAN latS, allHit;
         RbFeatOnRead(ext, (ULONG64)sp->Parameters.Read.ByteOffset.QuadPart, len);
-        if (!RbFeatAdmit(ext)) goto workerpath;
+        if (!admitted) goto workerpath;
         tgt = RbMapIrpBuffer(irp);
         if (!tgt) goto workerpath;
         latS = RbLatSampleStart(&lat0);
@@ -1731,6 +1745,7 @@ workerpath:
         }
         ctx->Irp = irp; ctx->Ext = ext; ctx->Major = sp->MajorFunction;
         ctx->Passthru = 0;
+        ctx->Admitted = (UCHAR)(admitted ? 1 : 0);   /* [FIX O9-ADMIT] 随 IRP 传递 */
         ctx->Offset = sp->Parameters.Read.ByteOffset; ctx->Length = len;
         IoMarkIrpPending(irp);
         if (g_Rb.IoWorkerCount) {
@@ -1783,6 +1798,7 @@ NTSTATUS RbDispatchFlush(PDEVICE_OBJECT dev, PIRP irp)
         }
         ctx->Irp = irp; ctx->Ext = ext; ctx->Major = IRP_MJ_FLUSH_BUFFERS;
         ctx->Passthru = 0;
+        ctx->Admitted = 1;   /* FLUSH 不做进程准入；RbCtxAlloc 缺省亦为 1，显式留证 */
         IoMarkIrpPending(irp);
         if (g_Rb.IoWorkerCount) RbSubmitIo(ctx);
         else {

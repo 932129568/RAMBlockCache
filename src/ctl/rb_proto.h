@@ -136,6 +136,10 @@ typedef struct RB_CONFIG_T {
     uint32_t AutoUsePct;
     uint32_t BlockSize;
     uint32_t TinyLFU;      /* [F1 2026-11-06] 0=OFF 1=ON（末尾纯追加，偏移冻结） */
+    /* [F1 / Gate12 2026-11-09] sizeof(RB_CONFIG)=156（含 TinyLFU@152）。
+     * 契约冻结：既有字段偏移不动，新字段只追加末尾；字段名与偏移由
+     * src/scripts/check_config_decode_contract.py 与
+     * web/bridge/server/proto-decode.ts decodeConfig() 双向比对守着。 */
 } RB_CONFIG;
 
 /* ---- 每卷策略设置（RB_MSG_SET_VOLUME）；新字段追加于末尾 ---- */

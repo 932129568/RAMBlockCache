@@ -49,6 +49,16 @@ STATVAL_KEYS = ["engine_bs", "rebuild_count", "rebuild_status",
                 "rebuild_in_progress", "rebuild_utc"]
 
 
+def strip_ts_comments(text):
+    """[FIX O9-COMMENT 2026-11-09] 静态契约必须先剥离 TS 注释再匹配。
+    124 号 T7c 变异测试证明：只给 decodeStats 的字段赋值行加 `//` 前缀，
+    原实现仍能在注释文本里正则命中并按 PASS 放行（假绿）。此处移除
+    块注释与「行首（含缩进）//」行注释；不误伤字符串里的 `//`（如 URL）。
+    """
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"(?m)^[ \t]*//.*$", "", text)
+
+
 def main():
     fails = []
     paths = (PROTO_H, DECODE_TS, TYPES_TS, HTTP_TS, STAT_TEST, CTL_C, CI_YML)
@@ -63,7 +73,7 @@ def main():
         return 1
 
     proto = PROTO_H.read_text(encoding="utf-8-sig")
-    decode = DECODE_TS.read_text(encoding="utf-8-sig")
+    decode = strip_ts_comments(DECODE_TS.read_text(encoding="utf-8-sig"))
     types = TYPES_TS.read_text(encoding="utf-8-sig")
     http = HTTP_TS.read_text(encoding="utf-8-sig")
     test = STAT_TEST.read_text(encoding="utf-8-sig")

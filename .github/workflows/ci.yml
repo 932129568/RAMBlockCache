@@ -133,6 +133,15 @@ jobs:
       - name: Gate11 check_installer_contract
         run: python src/scripts/check_installer_contract.py
 
+      # —— [124 F9 2026-11-09] RB_CONFIG ↔ decodeConfig 字段级契约（Gate12）——
+      # 124 号 T7c 变异测试证明：删掉 proto-decode.ts 的 ['TinyLFU', 152]
+      # 后原有 8 道门禁全绿（66 号白屏同款缺口）；只加 `//` 注释前缀也能
+      # 骗过不剥离注释的 Gate8 正则。本门双向比对 C 头 23 个 u32 字段的
+      # 名称与偏移、VolumeFilter@64、sizeof=156、TinyLFU 分级长度守卫，
+      # 且两侧都先剥离注释。CI 持续调用本脚本。
+      - name: Gate12 check_config_decode_contract
+        run: python src/scripts/check_config_decode_contract.py
+
       # —— Web 类型检查 + 生产构建（41 号 §11.5 阶段 2 接入）——
       # --loglevel=error 抑制 Node 27 alpha 上 npm 12.2.1 的已知 engines 假警告
       # （CI 侧同时抑制 Node 22 与 package.json engines 的 EBADENGINE 提示）。

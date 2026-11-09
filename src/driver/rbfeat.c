@@ -258,10 +258,30 @@ static BOOLEAN Rb2CurrentImagePath(WCHAR *out, ULONG cap)
     us->MaximumLength = (USHORT)(sizeof(buf) - sizeof(UNICODE_STRING));
     us->Length = 0;
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) return FALSE;
+    /* [FIX O9-EXDIR 2026-11-09] 124 号 T3 实测：ProcessImageFileName(27)
+     * 返回 NT 设备路径 "\Device\HarddiskVolumeN\..."，而 Features\ExcludeDirs
+     * 存的是 DOS 盘符路径（如 "D:\加速"）；原归一化只处理 "\??\" 与双反斜杠
+     * "\\DEVICE"（后者对实际返回值是死代码），结果 "\DEVICE\..." 与 "D:\..."
+     * 在 index 0 即失配 ⇒ excluded 恒 FALSE ⇒ 排除策略整体失效。
+     * 改用 ProcessImageFileNameWin32(43)，用户态实测直接返回盘符形式
+     * "F:\workbuddy\...\python.exe"，与注册表口径一致。若 43 在内核不可用
+     * 或返回空，回退 27 保持旧行为（保守不排除），绝不因查询失败而崩溃。 */
+#ifndef ProcessImageFileNameWin32
+#define ProcessImageFileNameWin32 ((PROCESSINFOCLASS)43)
+#endif
     st = ZwQueryInformationProcess(NtCurrentProcess(),
-                                   (PROCESSINFOCLASS)27 /* ProcessImageFileName */,
+                                   ProcessImageFileNameWin32,
                                    buf, need, &need);
-    if (!NT_SUCCESS(st) || us->Length == 0) return FALSE;
+    if (!NT_SUCCESS(st) || us->Length == 0) {
+        us->Buffer = (PWCH)((PUCHAR)buf + sizeof(UNICODE_STRING));
+        us->MaximumLength = (USHORT)(sizeof(buf) - sizeof(UNICODE_STRING));
+        us->Length = 0;
+        need = sizeof(buf);
+        st = ZwQueryInformationProcess(NtCurrentProcess(),
+                                       (PROCESSINFOCLASS)27 /* ProcessImageFileName */,
+                                       buf, need, &need);
+        if (!NT_SUCCESS(st) || us->Length == 0) return FALSE;
+    }
     {
         ULONG len = us->Length / sizeof(WCHAR);
         PWCH s = us->Buffer;

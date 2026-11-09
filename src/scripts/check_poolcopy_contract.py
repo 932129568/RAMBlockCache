@@ -43,6 +43,8 @@ def main():
         "rbfeat": root / "src/driver/rbfeat.c",
         "rbattach": root / "src/driver/rbattach.c",
         "rbL2": root / "src/driver/rbL2.c",
+        "rbdriver": root / "src/driver/rbdriver.c",
+        "rbproto": root / "src/ctl/rb_proto.h",
         "ci": root / ".github/workflows/ci.yml",
     }
     for k, p in paths.items():
@@ -56,6 +58,7 @@ def main():
     feat = strip_c(paths["rbfeat"].read_text(encoding="utf-8-sig"))
     attach = strip_c(paths["rbattach"].read_text(encoding="utf-8-sig"))
     l2 = strip_c(paths["rbL2"].read_text(encoding="utf-8-sig"))
+    driver = strip_c(paths["rbdriver"].read_text(encoding="utf-8-sig"))
     ci = paths["ci"].read_text(encoding="utf-8")
 
     # A1/A2 119 号：MaximumLength 必须与 UNICODE_STRING 头对齐，且旧写法绝迹
@@ -110,6 +113,20 @@ def main():
         if "RtlCopyMemory((PCHAR)(rec + 1), src, RB2_L2BLK);" not in l2:
             fails.append("A6b rbL2: L2 record payload copy missing or changed")
 
+    # A8 00:32 根因（130 号）：RbLogSnapshot 输出容量钳位。
+    # 环容量 512、RB_LOG_LIST.Items[64]；无钳位时写 61440 B 到 7688 B
+    # 信封，越界 53240 B，写入内容即日志 Unicode 文本。
+    if "for (i = 0; i < valid && n < RB_LOG_MAX; i++)" not in driver:
+        fails.append("A8 rbdriver: RbLogSnapshot missing 'n < RB_LOG_MAX' "
+                     "clamp - 00:32 pool corruption (53KB OOB) would return")
+    if "for (i = 0; i < valid && n < maxCount; i++)" not in driver:
+        fails.append("A8b rbdriver: RbLogQueryPair must keep 'n < maxCount' "
+                     "clamp (0x809 LOGQ output)")
+    if "#define RB_LOG_MAX       64" not in paths["rbproto"].read_text(
+            encoding="utf-8-sig"):
+        fails.append("A8c rb_proto.h: RB_LOG_MAX=64 ABI changed; "
+                     "re-verify snapshot capacity")
+
     # A7 CI 自检
     if "check_poolcopy_contract.py" not in ci:
         fails.append("A7 CI: Gate13 not registered in ci.yml")
@@ -121,7 +138,7 @@ def main():
         return 1
     print("Gate13 pool-copy contract: PASS "
           "(A1/A2 119 layout, A3/A4 121 atomic slot, A5 reg value, "
-          "A6 L2 record, A7 CI)")
+          "A6 L2 record, A8 log snapshot clamp, A7 CI)")
     print("result: PASS (0 fail, 0 warn)")
     return 0
 

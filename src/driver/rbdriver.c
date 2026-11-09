@@ -142,7 +142,17 @@ ULONG RbLogSnapshot(RB_LOG_LIST *out)
     /* 与 RbLog 同一把锁：防快照遍历到半写入的记录（Count/Cursor 与 Items 不一致） */
     KeAcquireSpinLock(&g_LogLock, &irql);
     valid = (g_LogHead < RB_LOG_CAP) ? g_LogHead : RB_LOG_CAP;
-    for (i = 0; i < valid; i++) {
+    /* [FIX O9-LOGSNAP 2026-11-09] 输出目标 RB_LOG_LIST.Items 只有
+     * RB_LOG_MAX(64) 条，而环容量 RB_LOG_CAP = RB_LOGQ_MAX(512)。
+     * 原循环以 valid(<=512) 为上界且不钳 n，环内日志超过 64 条后会把
+     * 最多 512*120=61440 B 写进 7688 B 的 LogList（RB_MSG 信封 8224 B），
+     * 越界约 53 KB 覆盖相邻池块，写入内容正是日志文本（Unicode）。
+     * 这是 11-09 00:32 0x7E/0xC0000005 池腐坏的根因：
+     * rbL2.c:650 的 "l2: store rejected (out of window)" 中 " (ou"
+     * 被堆压缩线程当空闲块链表指针读到（rbx=0x0075006F00280020）。
+     * 完整 96 字符文本由 IOCTL_RB_LOGQ(0x809) 分页提供，本接口保持
+     * 「最近 64 条」的对外契约不变，仅把写入量钳回容量内。 */
+    for (i = 0; i < valid && n < RB_LOG_MAX; i++) {
         ULONG idx = (ULONG)((g_LogHead - 1 - i) % RB_LOG_CAP);
         RB_LOGQ_REC *src;
         RB_LOG_REC  *dst;

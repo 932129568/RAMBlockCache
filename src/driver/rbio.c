@@ -1402,6 +1402,8 @@ static VOID RbFlushIrpWorker(PRB_IOCTX ctx)
 {
     PRB_DEV_EXT ext = ctx->Ext;
     BOOLEAN persisted = TRUE;
+    int f0 = 0, f1 = 0;
+    int e0 = 0, e1 = 0;
     /* [96 §2] 迟到 FLUSH 重校验：重建/卸载窗口内不触碰缓存流（M5 纪律——
      * 窗口内流可能正被软摘链/待销毁；持久化由重建自身的 flush×2 或卸载
      * 序列保证），降级为直接前转。常态（两门皆 0）行为逐字不变。 */
@@ -1410,9 +1412,26 @@ static VOID RbFlushIrpWorker(PRB_IOCTX ctx)
          * 并以残留脏量为成败判据。旧代码 flush(s,0) 只写到低水位且忽略
          * 结果、随后仍以成功态转发——下层盘故障导致回写失败时，文件系统
          * 误判数据已落盘，掉电即丢失（静默数据损坏）。 */
-        rb_stream_flush(ext->Stream, 1);
-        if (rb_stream_dirty_bytes(ext->Stream) > 0)
+        /* [FIX A2-FLUSH 2026-11-09] 判据改为「本次 FLUSH 是否发生下层盘写失败」，
+         * 不再用「flush 返回瞬间的全局 dirty_bytes 是否归零」。
+         *   ① 取 flush 前失败序号 → force flush → 取 flush 后序号，差分非 0
+         *      即 core 的 cfg.writeback 返回非 0，必须如实报错（P0-2 纪律）；
+         *   ② 并发写线程在 force-flush 的 64 轮扫描期间产生的新脏不再参与
+         *      判据，消除 125 号「回写态 8/16 线程 100% err=1117」的假失败；
+         *   ③ 若本次被跳过（exec_seq 不增长，别的 flusher 正持有所有权）且仍
+         *      有脏，只记 Warn 留痕、不拒绝写：那次正在执行的 FLUSH 或后续
+         *      周期回写会落盘；把它判失败会重新引入 125 号同款假失败。
+         *      下层盘写失败始终由 ① 拒绝，P0-2「不谎称成功」不被弱化。 */
+        f0 = rb_stream_flush_fail_seq(ext->Stream);
+        e0 = rb_stream_flush_exec_seq(ext->Stream);
+        (void)rb_stream_flush(ext->Stream, 1);
+        f1 = rb_stream_flush_fail_seq(ext->Stream);
+        e1 = rb_stream_flush_exec_seq(ext->Stream);
+        if (f1 != f0)
             persisted = FALSE;
+        else if (e1 == e0 && rb_stream_dirty_bytes(ext->Stream) > 0)
+            RbLog(1, __LINE__, 0,
+                  L"FLUSH IRP: serial flush skipped (concurrent flusher), dirty deferred");
     }
     if (persisted) {
         RbForward(ext->FilterDevice, ctx->Irp);
@@ -1423,7 +1442,8 @@ static VOID RbFlushIrpWorker(PRB_IOCTX ctx)
         irp->IoStatus.Status = STATUS_IO_DEVICE_ERROR;
         irp->IoStatus.Information = 0;
         IoCompleteRequest(irp, IO_NO_INCREMENT);
-        RbLog(2, __LINE__, 0, L"FLUSH IRP failed: dirty writeback incomplete");
+        RbLog(2, __LINE__, 0,
+              L"FLUSH IRP failed: lower-layer writeback error or skipped flush with dirty");
     }
     RbCtxFree(ctx);          /* [FIX M10] 先还 ctx 后减引用 */
     RbIoCompleteMark();      /* [96 §2] C10：FLUSH worker 完成出口 */

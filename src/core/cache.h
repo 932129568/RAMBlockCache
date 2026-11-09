@@ -227,6 +227,14 @@ void rb_stream_invalidate_range(rb_stream *s, rb_u64 offset, rb_u64 len);
 void rb_stream_trim(rb_stream *s);
 /* ---- flush ---- */
 size_t rb_stream_flush(rb_stream *s, int force);
+/* [FIX A2-FLUSH 2026-11-09] 单调的「下层盘写失败」序号（只增不减）。
+ * IRP_MJ_FLUSH_BUFFERS 的成败 = force flush 前后该序号的差分，而不是
+ * 「flush 返回瞬间全局 dirty_bytes 是否归零」：并发写会持续产生新脏，
+ * 后者在回写态并发下必然误判（125 号真机 err=1117）。返回 0 表示无失败。 */
+int rb_stream_flush_fail_seq(rb_stream *s);
+/* 单调的「本次 force flush 真正执行完」序号；flush_active 被别的 flusher
+ * 占用而跳过时不增长。driver 用它区分「跳过」与「执行后并发新脏」。 */
+int rb_stream_flush_exec_seq(rb_stream *s);
 /* NEW: zone-parallel flush. zone_sel in [0,nzones). Caller supplies a
  * reusable workspace (one per worker thread). Returns bytes written.
  * Safety: per-sub dirty-generation validation; disk I/O outside stripe locks;

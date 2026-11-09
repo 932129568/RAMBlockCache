@@ -214,4 +214,8 @@ RbLog(2, __LINE__, 0, L"FLUSH IRP failed: dirty writeback incomplete");
 | 巡检产物 | `C:\Users\Public\o9\watch\watch-20261109-15*.txt` |
 | 独立 oracle | `C:\Users\Public\o9\rbc_e2e_verify.exe`（源码 `src/core/rbc_e2e_verify.c`） |
 
-> 口径纪律：本报告的 PASS 均为给定负载与判据下的证据，不等于内核整体正确；A2 因 §5 缺陷保持 **FAIL**。
+## 13. 后续：缺陷已修复（见 126 号）
+
+用户随后要求「修复完成后进一步压测」。**修复已落地并通过用户态全套回归**：core 新增下层写失败序号与 FLUSH 执行序号、driver 判据改为失败序号差分、新增并发回归 `test_a2flush.c`；Release 26/26、ASan 全套、新回归 10/10 + 3/3、`qa_teeth 3/3 KILLED`、驱动 `BUILD OK`（新 sys `3c0b0505…`，未签名）。真机复测需一次 UAC 部署 + 一次重启，复测脚本 `a2_reverify_after_reboot.py` 已备好并验证 fail-closed。完整改动、验证数据与下一步见 **`deliverables/126-a2-flush-fix-and-reverify-2026-11-09.md`** 与 `KNOWN_ISSUES.md` I39。
+
+> 口径纪律：本报告的 PASS 均为给定负载与判据下的证据，不等于内核整体正确；A2 因 §5 缺陷保持 **FAIL**，直到 126 号 §6 的真机复测通过。

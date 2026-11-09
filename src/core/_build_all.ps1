@@ -20,7 +20,8 @@ $Tests = @(
   "edge_v3","edge_v4","stress_v3","stress_v4","bench_readhit","test_auditfix",
   "test_write_ex","test_wsconc","test_rebuild","test_sparse_miss","test_exclude",
   "test_flushpar",  # [PF-16] 1/2/4/8/16-way zone flush: zero data loss + rough throughput
-  "test_tinylfu"   # [F1] TinyLFU admission: hot-set preservation + OFF parity
+  "test_tinylfu",   # [F1] TinyLFU admission: hot-set preservation + OFF parity
+  "test_a2flush"    # [A2-FLUSH 2026-11-09] concurrent FLUSH judgement regression
 )
 $relOk=0; $relFail=0; $runFail=0
 foreach ($t in $Tests) {

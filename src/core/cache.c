@@ -340,6 +340,18 @@ struct rb_stream {
      * 直写+失效假设"直写是盘面最终语"，若在途回写其后落盘即以旧数据覆盖
      * 已镜像新值，且失效已清脏位 → 污染永久化（QA BLOCKER-1 实证）。 */
     volatile LONG wb_active;
+    /* [FIX A2-FLUSH 2026-11-09] 下层 writeback 失败的单调序号。
+     * IRP_MJ_FLUSH_BUFFERS 的成败必须锚定「本次 FLUSH 是否发生盘写失败」，
+     * 而不是「返回瞬间全局 dirty_bytes 是否归零」：并发写线程会在 force
+     * flush 的 64 轮扫描期间持续产生新脏，后者必然被误判成刷脏失败
+     * （125 号真机：回写态 8/16 线程 100% err=1117 / ERROR_IO_DEVICE）。
+     * 只由 flush_pass 在「下层 cfg.writeback 返回非 0」时递增；gen 校验
+     * 弃写（并发覆写/失效）属正常并发保护，不计失败。 */
+    volatile LONG flush_fail_seq;
+    /* [FIX A2-FLUSH] 本次 force flush 是否真正拿到所有权并执行完的序号。
+     * driver 用它区分「跳过（别人正持有 flush_active）」与「执行了但并发写
+     * 又产生新脏」：只有前者且仍有脏时才保守报错，后者必须判成功。 */
+    volatile LONG flush_exec_seq;
     volatile long flush_active;      /* serial-flush ownership (0/1) */
     volatile long zflush_cnt;        /* active zoned flushers (excluded vs serial) */
     volatile long reclaim_active;    /* reclaim serialization (0/1) */
@@ -1088,7 +1100,7 @@ rb_stream *rb_stream_create(rb_engine *eng, rb_u64 file_id)
     for(i=0;i<RB_NSTRIPES;i++)RB_RW_INIT(&s->stripes[i]);
     for(i=0;i<RB_CHAIN_SHARDS;i++)RB_M_INIT(&s->chain[i]);   /* [D2] 16 片锁 */
     for(i=0;i<RB_NBUCKETS;i++)RB_B_INIT(&s->bspin[i]);       /* [OPT-SPIN] 快路径桶锁 */
-    s->flush_active=0; s->zflush_cnt=0;
+    s->flush_active=0; s->zflush_cnt=0; s->flush_fail_seq=0; s->flush_exec_seq=0;
     s->last_read_off=(rb_u64)-1;
     RB_M_LOCK(&eng->streams_lock);
     s->next=eng->streams; s->prev=NULL;
@@ -2235,7 +2247,7 @@ static int stage_run(rb_stream *s, const rb_frun *run, rb_flushws *ws,
      * 复核不通过（run 覆盖子块未全部仍脏）→ 跳过本 run：真正还脏的子块由
      * 下一帧快照拾取（force 路径循环至净帧，不丢数据）。 */
     {
-        uint16_t want=0; rb_u32 q;
+        uint16_t want=0;   /* 复用外层 q（原来重复声明触发 C4456 隐藏警告） */
         for(q=0;q<run->nsubs;q++) want|=(uint16_t)(1u<<(run->sub+q));
         /* [FIX DATA-3 R4 2026-11-03] restoring 复核前移到暂存期：快照与 stage
          * 之间 invalidate keep 路径可对 run 内子块置 restoring（保留 dirty
@@ -2386,16 +2398,26 @@ expand_done:
         }
         {
             int teardown = eng->teardown_discard;
+            int revalidated, wb_rc = 0, ok;
             /* [FIX WS-RACE-2] 落盘前 gen 复检：stage 与锁外 writeback 之间缓存
              * 可能已被并发写/失效改动（吸收升 dseq / 直写后失效升 dseq / 恢复
              * 改写 / 块被回收重建）。任一字块代次或块身份不符 → 弃写整个 run
              * （不 clean：数据未落盘；脏位仍在的下帧重来，已被直写+失效取代的
              * 以直写数据为盘面最终语）。gen 校验原只保护 clean 不错清、保护不了
              * 已发出的磁盘写——QA BLOCKER-1 的根洞在此。无盘 IO 持锁（R2 纪律）。 */
-            int ok = teardown ? 1
-                 : (eng->cfg.writeback && stage_revalidate(s,ws,nsl) &&
-                    eng->cfg.writeback(eng->cfg.user_ctx,s->file_id,
-                                       seg_base,ws->stage,seg_len)==0);
+            /* [FIX A2-FLUSH 2026-11-09] 拆开复合 ok 表达式，只为把「下层盘写
+             * 返回非 0」这一真实失败单独记账。求值顺序与短路语义逐字保持：
+             * teardown 跳过盘写；非 teardown 先 stage_revalidate，通过后才
+             * 调 cfg.writeback。gen 校验弃写属正常并发保护（脏位保留、下帧
+             * 重收），绝不计入失败；否则每次并发覆写都会误报盘故障。 */
+            revalidated = teardown ? 1
+                 : (eng->cfg.writeback && stage_revalidate(s,ws,nsl));
+            if(!teardown && revalidated)
+                wb_rc = eng->cfg.writeback(eng->cfg.user_ctx,s->file_id,
+                                           seg_base,ws->stage,seg_len);
+            if(!teardown && revalidated && wb_rc!=0)
+                InterlockedIncrement((volatile LONG*)&s->flush_fail_seq);
+            ok = teardown ? 1 : (revalidated && wb_rc==0);
             if(ok){
                 rb_u32 st[RB_NSTRIPES]; int nst=0, si; size_t q; size_t cleared_seg=0;
                 if(teardown){
@@ -2587,10 +2609,23 @@ static size_t flush_stream(rb_stream *s, int force)
      * the exact counter (caused the historic dirty underflow). */
     /* FIX: only clear engine flag when ENGINE is fully drained */
     if(RB_ALOAD64(&eng->total_dirty)==0)RB_ASTORE32(&eng->need_flush,0);
+    /* [FIX A2-FLUSH] 只有真正持有 flush_active 并跑完 flush_pass 才计数。
+     * flush_acquire 失败时走的是上面的 `return 0`，不会到达这里。 */
+    InterlockedIncrement((volatile LONG*)&s->flush_exec_seq);
     return total;
 }
 size_t rb_stream_flush(rb_stream *s, int force)
 { if(!s)return 0; return flush_stream(s,force); }
+/* [FIX A2-FLUSH 2026-11-09] IRP_MJ_FLUSH_BUFFERS 判成败用的单调失败序号。
+ * driver 在 force flush 前后各取一次：差分非 0 = 本次发生下层盘写失败，
+ * 必须如实报错；并发写线程在扫描期间产生的新脏不递增该序号，故不会再
+ * 把「有并发写」误判成「刷脏失败」（125 号 8/16 线程 100% err=1117）。 */
+int rb_stream_flush_fail_seq(rb_stream *s)
+{ return s ? (int)InterlockedCompareExchange(
+                 (volatile LONG*)&s->flush_fail_seq,0,0) : 0; }
+int rb_stream_flush_exec_seq(rb_stream *s)
+{ return s ? (int)InterlockedCompareExchange(
+                 (volatile LONG*)&s->flush_exec_seq,0,0) : 0; }
 size_t rb_stream_flush_zoned(rb_stream *s, int zone_sel, int nzones, rb_flushws *ws)
 {
     size_t w;

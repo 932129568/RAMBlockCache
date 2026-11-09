@@ -2173,8 +2173,13 @@ VOID RbRefreshMemoryBudget(VOID)
          *     向下调整立即生效（应用抢内存时必须马上退让，不能等）。
          *  ② 下限保护：预算不低于 256MB（除非可用内存真的不够），避免
          *     "预算趋零 → 缓存形同关闭 → 命中率崩塌"的悬崖。
-         *  ③ 上限收敛：不超过 CacheSizeMB（若用户配置了固定值），
-         *     防止硬件内存特别大时缓存无限膨胀。 */
+         *  ③ AutoMemory=1 时预算不封顶于 CacheSizeMB——预算即上限
+         *     （语义见 rbctl.c:99 注释：自动模式以动态预算为准，
+         *     CacheSizeMB 只是预算未算出时的回退值）。需要硬上限请用
+         *     AutoMemory=0 + CacheSizeMB（[FIX A3 2026-11-09] 起该组合
+         *     真正生效：切换时清 dynamic_limit，固定水位接管）。
+         *     （旧注释声称"不超过 CacheSizeMB"，但实现中从无此钳位，
+         *     属失实陈述，2026-11-09 更正。） */
         if (budget > s_prev_budget) {
             /* 向上：需显著增长才调（5% 迟滞） */
             if (s_prev_budget && budget - s_prev_budget < s_prev_budget / 20) budget = s_prev_budget;

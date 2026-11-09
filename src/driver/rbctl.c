@@ -187,6 +187,17 @@ VOID RbApplyEngineConfig(const RB_CONFIG *cfg)
     if (!g_Rb.Engine || !cfg) return;
     mb = (rb_u64)cfg->CacheSizeMB;
     rb_engine_set_max_bytes(g_Rb.Engine, mb * 1024ull * 1024ull);
+    /* [FIX A3 2026-11-09] AutoMemory 1→0 切换必须清动态预算：dynamic_limit
+     * 一旦非 0，rb_effective_caps（cache.c:1040 if(dl)）全程以 dl 为准，
+     * 由 CacheSizeMB 推导的 hard/evict 固定水位被整体旁路。旧代码只改
+     * max_bytes，dl 保持 sticky——收缩不回收存量、can_create 按旧 dl 放行
+     * 超限分配。E1 真机实测（e1_result.json）：AutoMemory=0/CacheSizeMB=8
+     * 下再填 64MB，CurBytes 129→194MB（超限 24 倍）、EvictBytes=0。
+     * 清零后回落固定水位（语义与 rbctl.c:102 注释一致：AutoMemory=0 →
+     * 以配置值 CacheSizeMB 为准）；重开 AutoMemory 时预算线程 ≤30s 重新
+     * 下发 dl，无窗口问题。 */
+    if (!cfg->AutoMemory)
+        rb_engine_set_dynamic_limit(g_Rb.Engine, 0);
     rb_engine_set_watermarks_pct(g_Rb.Engine, cfg->DirtyHighPct, cfg->DirtyLowPct);
     rb_engine_set_idle_reclaim(g_Rb.Engine, (rb_u64)cfg->IdleReclaimSec * 1000);
     /* [FIX S7-15] WriteRelease 原本只在引擎创建时应用（SET_CONFIG 改了不生效）——

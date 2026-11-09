@@ -1,0 +1,101 @@
+for (i = 0; i < 256; i++) {
+for (j = 0; j < 8; j++) t = (t & 1) ? (0xEDB88320u ^ (t >> 1)) : (t >> 1);
+while (pre[k] && k + 1 < cap) { path[k] = pre[k]; k++; }
+if (k + 3 < cap) {
+path[k++] = s_Letter; path[k++] = L':'; path[k++] = L'\\';
+while (*name && k + 1 < cap) path[k++] = *name++;
+for (i = 0; path[i] != L'\0' && i < 512; ++i) {
+for (v = 0; v < 2 && count < RB_MAX_CRITICAL; ++v) {
+while (i < n && w[i] && count < RB_MAX_CRITICAL) {
+letters[count++] = letter;
+for (v = 0; v < 3 && count < RB_MAX_CRITICAL; ++v) {
+letters[count++] = g_Rb.SystemDriveLetter; /* %SystemRoot% 在系统卷 */
+letters[count++] = letter;
+for (i = 0; i < 8; i++) { h ^= v & 0xFF; h *= 1099511628211ULL; v >>= 8; } }
+for (i = 0; i < 4; i++) { h ^= v & 0xFF; h *= 1099511628211ULL; v >>= 8; } }
+for (i = 0; i < 4; i++) { h ^= v & 0xFF; h *= 1099511628211ULL; v >>= 8; } }
+snap[n++] = e;
+if (j < 30) out[j++] = cur[i];
+if (add && j < 31) out[j++] = up;
+snap[n++] = e;
+for (i = 0; i < 3000; i++) {                        /* 60s 上限 */
+snap[n++] = e;
+for (b = 0; b < 32; b++) total += (UINT64)(ULONG)hist[b];
+for (b = 0; b < 32; b++) {
+if (c->DirtyHighPct < 10 || c->DirtyHighPct > 99) c->DirtyHighPct = 60;
+if (c->DirtyHighPct < 15) c->DirtyHighPct = 15;
+if (c->DirtyLowPct < 5) c->DirtyLowPct = 5;
+if (c->AutoUsePct < 10 || c->AutoUsePct > 95) c->AutoUsePct = 80;
+if (c->FlushIntervalMs != 0 && c->FlushIntervalMs < 1000) c->FlushIntervalMs = 1000;
+for (i = 0; i < 50; i++) {                 /* 50 × 100ms = 5s 上界 */
+for (i = 0; i < (LONG)RB_EVENT_MAX && n < q.MaxCount; i++) {
+out->Items[n++] = *e;
+if (!req || inLen < RB_EXCL_HDR_SIZE) return STATUS_BUFFER_TOO_SMALL;
+if (inLen < RB_EXCL_REQ_SIZE(req->Count)) return STATUS_BUFFER_TOO_SMALL;
+if (n < 0) return STATUS_INVALID_PARAMETER;
+if (!q || inLen < sizeof(RB_LOGQ_REQ) || outLen < RB_LOGQ_RESP_SIZE(RB_LOGQ_BATCH)) {
+for (i = 0; i < valid && n < RB_LOG_MAX; i++) {
+if (fails < 1000) fails += 1; else fails = 1000;
+for (i = 0; i < available && count < Capacity; i++) {
+if (before != 0 && before == src->Sequence) Out[count++] = copy;
+if (!s || bytes < 2 * sizeof(WCHAR)) return 0;
+snap[n++] = e;
+snap[n++] = e;
+while (RbRebuildIsActive() && spin++ < 3000)
+while (RbRebuildIsActive() && spin2++ < 3000)
+snap[n++] = e;
+while (g_Rb.ZombiePending && spin++ < 3000) {
+while (g_Rb.FallbackInFlight && spin++ < 1500)
+while (p[i] && i < 8) { sd[i] = p[i]; i++; }
+sd[i++] = g_Rb.SystemDriveLetter ? g_Rb.SystemDriveLetter : L'?';
+if (v < RB_MAX_CACHE_IO_KB_MIN) v = RB_MAX_CACHE_IO_KB_MIN;
+while (InterlockedCompareExchange(&s_EtwUsers, 0, 0) && spin++ < 500)
+if (slot < 16)
+while (RB2_SVC[n] && n < cap) { path[n] = RB2_SVC[n]; n++; }
+if (Sub && *Sub && n < cap) {
+path[n++] = L'\\';
+while (Sub[k] && n < cap) path[n++] = Sub[k++];
+sub[n++] = Letter; sub[n] = 0;
+for (k = 0; j < len && k + 1 < cap; j++, k++) {
+if (cur < 0 || cur >= RB2_EXPIID_MAX) { slot = 0; next = 1; }
+for (i = 0; i < RB2_DEFEXCL_N && s_ExclN < 32; i++) {
+while (src[j] && j < 15) { s_Excl[s_ExclN][j] = src[j]; j++; }
+while (i < n && s_ExclN < 32) {
+for (j = 0; j < 15 && img[j] && pat[j]; j++) {
+for (k = 0; k < 15 && img[k]; k++) safe[k] = img[k];
+snap[nsnap++] = e;
+if ((g_Rb2Flags & RB2F_L2) && !s_Panic && KeGetCurrentIrql() == PASSIVE_LEVEL && Len <= (1u << 20))
+if (Hits < 2) {
+if (!ext || !ext->Stream || ext->Removed || Len == 0 || Len > (16u << 20))
+if (n < 64) { top[n++] = s_Hz[i]; }
+if (off + (4ULL << 20) <= cap)
+if (pn.Group == 0 && pn.Number < 64) return pn.Number;
+if (c < 64) {
+if (c < 64) {
+for (i = 0; i < 64; i++) {
+if (mr->len > (1UL << 20) && ms >= rs && me <= re) {
+for (i = 0; i + 1 < RB_EVENT_TEXT && stageText[i]; i++)
+if (rc < 0 || mcnt < 0 || mcnt > RB_MAX_RANGES) {
+if (cpu < 64) { g_Rb.IoWorkerByCpu[cpu] = (UCHAR)(i + 1); filled++; }
+if (pn.Group == 0 && pn.Number < 64) {
+if (len == 0 || len > (g_Rb.MaxCacheIoKB << 10) ||
+if (len > (g_Rb.MaxCacheIoKB << 10)) RbNoteBypass(ext, RB_BYPASS_IO_TOO_LARGE);
+for (k = 0; k < RB_FLUSH_WORKERS; k++) {
+if (n < 1) n = 1;
+if (want < 1) want = 1;
+for (i = 0; i < RB_FLUSH_WORKERS; i++) {
+for (i = 0; i < RB_FLUSH_WORKERS; i++) {
+for (i = 0; i < RB_FLUSH_WORKERS; i++) {
+if (r < 512)  r = 512;
+if (avail > 384 && budget < 256) budget = 256;
+if (ms < 1000) ms = 1000;
+for (g = 0; g < ng && s_N < 64; g++) {
+for (i = 0; i < n && s_N < 64; i++) {
+s_Hnd[s_N] = h; s_Obj[s_N++] = o;
+for (i = 0; i < 16; i++)
+for (i = 0; i < 16; i++)
+if (rbCount < RB_MAX_VOLUMES) {          /* 首见 = 开窗基线 */
+for (k2 = 0; k2 < softCount && k2 < 16; k2++)
+for (i = 0; i < RB_THERM_SLOTS; i++) {
+for (i = 0; i < RB_THERM_SLOTS; i++)
+for (spins = 0; spins < 6000; spins++) {

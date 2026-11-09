@@ -157,13 +157,18 @@ static NTSTATUS RbL2Io(HANDLE file, BOOLEAN wr, ULONG64 off, PVOID buf, ULONG le
     return STATUS_IO_DEVICE_ERROR;
 }
 
-static VOID RbL2Path(WCHAR *path, PCWSTR name)
+static VOID RbL2Path(WCHAR *path, ULONG cap, PCWSTR name)
 {
     static const WCHAR pre[] = L"\\??\\";
     ULONG k = 0;
-    while (pre[k]) { path[k] = pre[k]; k++; }
-    path[k++] = s_Letter; path[k++] = L':'; path[k++] = L'\\';
-    while (*name) path[k++] = *name++;
+    /* [FIX O9-BUF 2026-11-09] 130 号同类排查：原实现无容量参数、三个写入点
+     * 均无上界，仅靠 name 恰好 14 WCHAR 才不溢出 path[96]。由调用方传入
+     * RTL_NUMBER_OF(path)，逐段钳位并始终为末尾 NUL 保留一格。 */
+    while (pre[k] && k + 1 < cap) { path[k] = pre[k]; k++; }
+    if (k + 3 < cap) {
+        path[k++] = s_Letter; path[k++] = L':'; path[k++] = L'\\';
+    }
+    while (*name && k + 1 < cap) path[k++] = *name++;
     path[k] = 0;
 }
 
@@ -171,7 +176,7 @@ static VOID RbL2IdxOpen(VOID)
 {
     UNICODE_STRING u; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK ib; WCHAR path[96]; NTSTATUS st;
     if (s_IdxFile) return;
-    RbL2Path(path, L"RAMBoostL2.idx");
+    RbL2Path(path, RTL_NUMBER_OF(path), L"RAMBoostL2.idx");
     RtlInitUnicodeString(&u, path);
     InitializeObjectAttributes(&oa, &u, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
     st = ZwCreateFile(&s_IdxFile, FILE_READ_DATA | FILE_WRITE_DATA, &oa, &ib, NULL,
@@ -365,7 +370,7 @@ static VOID RbL2LazyOpenInt(BOOLEAN ControlPath)
      * CAS 门落败方直接返回（下一 miss 自然重检）。门内所有出口必须释放。 */
     if (InterlockedCompareExchange(&s_Opening, 1, 0) != 0) return;
 
-    RbL2Path(path, L"RAMBoostL2.bin");
+    RbL2Path(path, RTL_NUMBER_OF(path), L"RAMBoostL2.bin");
     RtlInitUnicodeString(&u, path);
     InitializeObjectAttributes(&oa, &u, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
     st = ZwCreateFile(&s_File, FILE_READ_DATA | FILE_WRITE_DATA, &oa, &ib, NULL,

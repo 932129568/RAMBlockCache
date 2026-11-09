@@ -148,6 +148,12 @@ jobs:
       - name: Gate13 check_poolcopy_contract
         run: python src/scripts/check_poolcopy_contract.py
 
+      # Gate14：全库「定长数组 + 自增下标写入」守恒清单 + 钳位证据。
+      # 130 号 RbLogSnapshot 越界之后的系统性排查产物；新增写入点或删钳位
+      # 都会 FAIL，强制先人工审计再登记。131 号。
+      - name: Gate14 check_buffer_write_contract
+        run: python src/scripts/check_buffer_write_contract.py
+
       # —— Web 类型检查 + 生产构建（41 号 §11.5 阶段 2 接入）——
       # --loglevel=error 抑制 Node 27 alpha 上 npm 12.2.1 的已知 engines 假警告
       # （CI 侧同时抑制 Node 22 与 package.json engines 的 EBADENGINE 提示）。

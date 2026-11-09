@@ -97,8 +97,15 @@ VOID Rb2StatsFill(PRB_STATS2 o)
 static NTSTATUS Rb2Query(PCWSTR Sub, PCWSTR Name, PVOID *OutData, PULONG OutSize, PULONG OutType)
 {
     WCHAR path[200]; UNICODE_STRING u; ULONG n = 0, k = 0;
-    while (RB2_SVC[n]) { path[n] = RB2_SVC[n]; n++; }
-    if (Sub && *Sub) { path[n++] = L'\\'; while (Sub[k]) path[n++] = Sub[k++]; }
+    /* [FIX O9-BUF 2026-11-09] 130 号同类排查：原实现三个写入点（base 复制、
+     * 反斜杠、Sub 复制）均无上界，仅靠当前调用方恰好传 <=11 WCHAR 的 Sub
+     * 才不溢出。任何新调用方传入长 Sub 都会栈越界。统一钳到 cap，末位留 NUL。 */
+    const ULONG cap = (ULONG)(RTL_NUMBER_OF(path) - 1);
+    while (RB2_SVC[n] && n < cap) { path[n] = RB2_SVC[n]; n++; }
+    if (Sub && *Sub && n < cap) {
+        path[n++] = L'\\';
+        while (Sub[k] && n < cap) path[n++] = Sub[k++];
+    }
     path[n] = 0;
     RtlInitUnicodeString(&u, path);
     return RbRegQueryValue(&u, Name, OutData, OutSize, OutType);

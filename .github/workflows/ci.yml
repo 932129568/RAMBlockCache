@@ -142,6 +142,12 @@ jobs:
       - name: Gate12 check_config_decode_contract
         run: python src/scripts/check_config_decode_contract.py
 
+      # Gate13：钉死 00:32 池腐坏根因族的两处越界写修复（119 号
+      # UNICODE_STRING 布局 8B 越界、121 号 s_ExPidN TOCTOU 越界写），
+      # 外加 RbReadRegValue / L2 记录两处池拷贝长度契约。128/129 号。
+      - name: Gate13 check_poolcopy_contract
+        run: python src/scripts/check_poolcopy_contract.py
+
       # —— Web 类型检查 + 生产构建（41 号 §11.5 阶段 2 接入）——
       # --loglevel=error 抑制 Node 27 alpha 上 npm 12.2.1 的已知 engines 假警告
       # （CI 侧同时抑制 Node 22 与 package.json engines 的 EBADENGINE 提示）。

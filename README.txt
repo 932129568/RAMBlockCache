@@ -19,7 +19,7 @@
 部署门禁哈希锚点（重要）
 ----------------------------------------------------------------
   scripts\deploy.ps1 / verify_deploy_signature.ps1 内置
-  DefaultExpectedSha256 = 7b3f3743bd1fc20880c8579c7c8ff73942e3e934ced16a4d533f9f20f68be667
+  DefaultExpectedSha256 = a155de451381857090913a54843c7236f31f07f565193604f42fa179b5956f89
   该值对应本包 dist\RAMBlockCache.sys（2026-11-09 132 号部署批：
   RbLogSnapshot 越界写修复等，181,984 字节）。（2026-10-21 更正：原文字误写 115,424；哈希才是唯一权威标识，字节数仅供人工核对）
   任何源码改动后必须重新编译 + 重新签名，

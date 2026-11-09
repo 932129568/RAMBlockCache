@@ -93,7 +93,13 @@ NTSTATUS RbWbInit(VOID)
      * 句柄此处关闭，对象引用由 RbWbStop 结束时释放。 */
     {
         HANDLE h = NULL;
-        NTSTATUS st = PsCreateSystemThread(&h, THREAD_ALL_ACCESS, NULL, NULL, NULL, RbWbThread, NULL);
+        OBJECT_ATTRIBUTES oa;
+        /* [FIX O9-OBREF2 2026-11-09] 全库第 3 处漏传 OBJ_KERNEL_HANDLE 的
+         * PsCreateSystemThread；下面 ObReferenceObjectByHandle 用 KernelMode
+         * 引用，必须是内核句柄，否则 Verifier / 内核 bad handle detection
+         * 会以 0xC4/0xF6 或 0x93 bugcheck（09:34、12:22 两次实测）。 */
+        InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+        NTSTATUS st = PsCreateSystemThread(&h, THREAD_ALL_ACCESS, &oa, NULL, NULL, RbWbThread, NULL);
         if (!NT_SUCCESS(st)) return st;
         ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
                                   (PVOID *)&s_Thread, NULL);

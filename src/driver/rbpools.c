@@ -114,9 +114,15 @@ NTSTATUS Rb2PoolInit(VOID)
         n = KeQueryActiveProcessorCountEx((USHORT)g); if (n > per) n = per;
         for (i = 0; i < n && s_N < 64; i++) {
             PPROCESSOR_NUMBER pn = (PPROCESSOR_NUMBER)Rb2Alloc(sizeof(*pn)); HANDLE h; PVOID o;
+            OBJECT_ATTRIBUTES oa;
             if (!pn) { (void)Rb2PoolShutdown(); return STATUS_INSUFFICIENT_RESOURCES; }
             pn->Group = (USHORT)g; pn->Number = (UCHAR)i;
-            st = PsCreateSystemThread(&h, 0, NULL, NULL, NULL, Rb2Worker, pn);
+            /* [FIX O9-OBREF2 2026-11-09] 同 rbfeat.c/rbio.c：必须传
+             * OBJ_KERNEL_HANDLE 的 &oa，否则下面的 ObReferenceObjectByHandle
+             * (..., KernelMode) 引用的是进程句柄表里的用户态句柄 →
+             * Verifier 0xC4/0xF6 或内核 0x93 bad handle detection。 */
+            InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+            st = PsCreateSystemThread(&h, 0, &oa, NULL, NULL, Rb2Worker, pn);
             /* [P1-6] 中途失败先收尾已建线程（join+关句柄），否则 shutdown
              * join 不到、卸载后线程继续引用驱动代码映像（0xC4/0x1）。 */
             if (!NT_SUCCESS(st)) { Rb2Free(pn); (void)Rb2PoolShutdown(); return st; }

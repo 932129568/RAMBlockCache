@@ -14,7 +14,7 @@
 |---|---|
 | 版本 | V10.5.0 Build 19（机器版本 `10.4.1.19`，Protocol 9） |
 | `dist/RAMBlockCache-Setup.exe` | `0214454a2868eb5d8f0a95c5ebc5be39b63bba7418bbfde6faf017d645477069` · **签名 Valid** |
-| `dist/RAMBlockCache.sys` | `544ba6d9a22325339294807140bcb7689cea3b88a9db1a06a3f4b6d247ed17d4` · **签名 Valid** · 三处部署锚点同步 |
+| `dist/RAMBlockCache.sys` | `98f150bab277377a3e92b45e9bfb78a9b590a789c7387ec66871f5442ea5de24` · **签名 Valid** · 三处部署锚点同步 |
 | 静默安装引擎 | `src/setup/ramboostsetup.exe` · **签名 Valid**（SmartScreen/AV 体验） |
 | 签名证书 | `CN=RAMBoostFS Root`（测试证书链，WinVerifyTrust 有效） |
 | 平台 | Windows 10/11 x64；需管理员 + 测试签名模式 |

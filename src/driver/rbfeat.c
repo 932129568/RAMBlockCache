@@ -469,7 +469,7 @@ static VOID Rb2Tick(PVOID Ctx)
 }
 NTSTATUS RbFeatInit(VOID)
 {
-    HANDLE h; OBJECT_ATTRIBUTES oa; UNICODE_STRING u; NTSTATUS st;
+    HANDLE h; OBJECT_ATTRIBUTES oa; NTSTATUS st;
     if (InterlockedCompareExchange(&s_Init, 1, 0)) return STATUS_SUCCESS;
 #if RB_WIRED_WBCOAL
     /* [101] WBCOAL 后台线程随特性层起停（线程创建失败不阻断特性层——
@@ -493,9 +493,15 @@ NTSTATUS RbFeatInit(VOID)
         InterlockedExchange(&s_Init, 0);
         return st;
     }
-    RtlInitUnicodeString(&u, L"\\Rb2Tick");
-    InitializeObjectAttributes(&oa, &u, OBJ_KERNEL_HANDLE, NULL, NULL);
-    st = PsCreateSystemThread(&h, 0, NULL, NULL, NULL, Rb2Tick, NULL);
+    /* [FIX O9-OBREF 2026-11-09] Driver Verifier 0xC4/0xF6 实捕（09:34 蓝屏）：
+     * 原代码初始化了带 OBJ_KERNEL_HANDLE 的 oa，却把 PsCreateSystemThread 的
+     * ObjectAttributes 实参写成 NULL -> Rb2Tick 线程句柄落在进程句柄表；随后
+     * ObReferenceObjectByHandle(h, ..., KernelMode, ...) 以内核模式引用用户态
+     * 句柄 = "A driver references a user-mode handle as kernel mode"。
+     * 修：传 &oa 使句柄成为内核句柄；去掉对象名，避免 RbFeatRecover 重建同名
+     * 线程对象时 STATUS_OBJECT_NAME_COLLISION。与 rbio.c:1211/1291 同范式。 */
+    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+    st = PsCreateSystemThread(&h, 0, &oa, NULL, NULL, Rb2Tick, NULL);
     if (!NT_SUCCESS(st)) {
         /* [FIX M16] 线程创建失败不再静默（无 Rb2Tick = L2 落盘/热区衰减/温控全停摆）：
          * 记日志、关池、回滚 s_Init，使后续 REFRESH 可重试 */
@@ -567,7 +573,7 @@ NTSTATUS RbFeatShutdown(VOID)
  * 解闩 + 重建 Rb2Tick（保持 s_Init=1，不重走计数器/池初始化）。 */
 VOID RbFeatRecover(VOID)
 {
-    HANDLE h = NULL; OBJECT_ATTRIBUTES oa; UNICODE_STRING u;   /* [FIX A-12] h 初值 NULL：创建失败时不得对未初始化句柄调 ZwClose */
+    HANDLE h = NULL; OBJECT_ATTRIBUTES oa;   /* [FIX A-12] h 初值 NULL：创建失败时不得对未初始化句柄调 ZwClose */
     if (!s_Init) return;                       /* 未初始化过：无需复活 */
     /* 先有界复核旧 Tick：Shutdown join 超时后线程可能已延迟退出，
      * 此时需清理旧句柄再重建（不能只解闩——旧线程已死，解闩等于没复活） */
@@ -580,9 +586,10 @@ VOID RbFeatRecover(VOID)
     }
     InterlockedExchange(&s_Stop, 0);
     if (s_TickObj) return;                     /* 旧 Tick 确认仍存活（幂等） */
-    RtlInitUnicodeString(&u, L"\\Rb2Tick");
-    InitializeObjectAttributes(&oa, &u, OBJ_KERNEL_HANDLE, NULL, NULL);
-    if (NT_SUCCESS(PsCreateSystemThread(&h, 0, NULL, NULL, NULL, Rb2Tick, NULL)) &&
+    /* [FIX O9-OBREF 2026-11-09] 同 RbFeatInit：复活路径必须同样传 &oa
+     * (OBJ_KERNEL_HANDLE)，否则重建的 Rb2Tick 句柄再次触发 0xC4/0xF6。 */
+    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (NT_SUCCESS(PsCreateSystemThread(&h, 0, &oa, NULL, NULL, Rb2Tick, NULL)) &&
         NT_SUCCESS(ObReferenceObjectByHandle(h, 0, *PsThreadType, KernelMode, &s_TickObj, NULL))) {
         s_TickH = h;
         /* [85 B15] 不得在池闩未解时谎报「recovered」：如实列出池闩 / L2 状态。

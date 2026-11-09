@@ -79,20 +79,28 @@ NTSTATUS RbForward(PDEVICE_OBJECT dev, PIRP irp)
 }
 
 /* ===== 同步盘 I/O（worker/flusher PASSIVE 调用） =====
- * [C5-r2 重写] 旧实现超时后直接放弃在飞 IRP：堆 ctx 泄漏，
- * 下层最终完成时向已释放缓冲写入（UAF/数据踩踏）。
- * 新实现核心不变式：【永不放弃缓冲 —— 我们从不停止等待】
- *   1) 挂自己的完成例程（STATUS_MORE_PROCESSING_REQUIRED），
- *      IRP 生命周期由本函数全程看护；
- *   2) 15s 步进观察；超时 → IoCancelIrp 请求取消 → 继续等待；
- *      取消后绝大多数栈在有限时间内完成（端口驱动自带超时兜底）；
- *   3) evt 置位（完成/取消完成）→ IoCompleteRequest 释放 MDL 锁定
- *      → 读 iosb → 释放 ctx。缓冲在完成前始终有效，无 UAF 无泄漏。
- * 极端情形（存储栈 bug 级永久挂起）：worker 线程驻留等待，
- * 与“物理盘真死”同域，由 RbStopIoWorkers 的 join 超时面处理。 */
+ * [FIX O9-SYNCIO 2026-11-09 真正修复] 原「永不停止等待」在设备消失时
+ *   让 worker/flusher 线程永久驻留；直接加超时返回又会让 late IRP 写回
+ *   调用者数据缓冲（UAF/数据踩踏）。改为三态 CAS 所有权移交：
+ *   1) 数据缓冲也池化（每次 IO 一次 memcpy），IRP 全程不触碰调用者缓冲；
+ *   2) 完成例程 STATUS_MORE_PROCESSING_REQUIRED，IRP 由我们看护；
+ *   3) 30s 有界等待（5s x 6，首次超时 IoCancelIrp）；超时后主路径
+ *      CAS(WAITING->ORPHAN) 并立即返回 STATUS_IO_TIMEOUT，不释放任何资源；
+ *      late IRP 完成时由完成例程 IoCompleteRequest + 释放池缓冲 + ctx；
+ *   4) 完成例程先到的交错由 CAS(WAITING->DONE) 裁决，仍由主路径收尾。
+ *   全交错模型验证：deliverables/gstack/model/syncio_model.py（9/9 PASS）。
+ * 数据完整性：超时返回非成功 → 回写回调向 core 报失败 → 脏块不清脏、
+ *   不会被误标已落盘；读路径超时返回错误，不提交 cache 视图。
+ * 代价：每次同步 IO 多一次非分页池分配（len 字节）与一次 memcpy；
+ *   换来的是「无死等、无 UAF、无泄漏、无双重释放」。 */
 typedef struct _RB_SYNCCTX {
     KEVENT          evt;
     IO_STATUS_BLOCK iosb;
+    volatile LONG   State;      /* RB_SYNC_STATE_* */
+    PVOID           PoolBuf;    /* 池化数据缓冲，IRP 只看见它 */
+    ULONG           Len;
+    BOOLEAN         IsWrite;
+    PVOID           CallerBuf;  /* 仅成功读时拷回 */
 } RB_SYNCCTX;
 
 /* [W1.5] RB_SYNCCTX 非分页旁视池（CTX-1 IoCtxLa 先例，见本文件 :76-77）。
@@ -112,18 +120,23 @@ VOID  RbSyncCtxPoolInit(VOID)
 }
 VOID  RbSyncCtxPoolDelete(VOID) { ExDeleteNPagedLookasideList(&g_Rb.SyncCtxLa); }
 
-/* 同步盘 I/O 的步进等待上限：15s（LARGE_INTEGER 相对超时 = 100ns 单位取负）。
- * 语义：超过 15s 未完成即请求取消并继续等待（见 RbSyncIo 不变式），
- * 与 RbStopIoWorkers 的 30s join 宽限同族。 */
-#define RB_SYNC_IO_STEP_100NS  1500000000LL
+/* 步进与预算见 rb_common.h（控制面 10s / 数据面 30s）。
+ * 旧版本地 15s 无限步进已由三态所有权状态机取代。 */
 
 static NTSTATUS NTAPI RbSyncComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID c)
 {
     RB_SYNCCTX *ctx = (RB_SYNCCTX *)c;
     UNREFERENCED_PARAMETER(dev);
-    UNREFERENCED_PARAMETER(irp);
     KeSetEvent(&ctx->evt, IO_NO_INCREMENT, FALSE);
-    return STATUS_MORE_PROCESSING_REQUIRED;   /* 保住 IRP，由等待方收尾 */
+    /* 三态 CAS：WAITING->DONE（主路径收尾）；已是 ORPHAN 则由本例程收尾。
+     * IoCompleteRequest 会写 ctx->iosb / ctx->PoolBuf，二者此时必定有效。 */
+    if (InterlockedCompareExchange(&ctx->State, RB_SYNC_STATE_DONE,
+                                   RB_SYNC_STATE_WAITING) == RB_SYNC_STATE_ORPHAN) {
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        if (ctx->PoolBuf) ExFreePoolWithTag(ctx->PoolBuf, RB_POOL_TAG);
+        RbSyncCtxFree(ctx);
+    }
+    return STATUS_MORE_PROCESSING_REQUIRED;   /* 保住 IRP，由唯一收尾方处理 */
 }
 
 NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
@@ -132,17 +145,31 @@ NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
     RB_SYNCCTX *ctx;
     PIRP irp;
     NTSTATUS s;
+    LARGE_INTEGER to;
+    ULONG budget;
 
-    /* [W1.5] 池化分配（原 ExAllocatePool2 每 IO 一次非分页分配/释放） */
-    ctx = RbSyncCtxAlloc();
+    ctx = (RB_SYNCCTX *)RbSyncCtxAlloc();
     if (!ctx) return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(ctx, sizeof(*ctx));      /* lookaside 分配不清零 */
     KeInitializeEvent(&ctx->evt, NotificationEvent, FALSE);
+    ctx->State = RB_SYNC_STATE_WAITING;
+    ctx->Len = len;
+    ctx->IsWrite = doWrite;
+    ctx->CallerBuf = buf;
+
+    /* 数据缓冲池化：IRP 全程只看见 PoolBuf，超时后调用者 buf 可立即失效。 */
+    ctx->PoolBuf = ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                   (SIZE_T)len, RB_POOL_TAG);
+    if (!ctx->PoolBuf) { RbSyncCtxFree(ctx); return STATUS_INSUFFICIENT_RESOURCES; }
+    if (doWrite) RtlCopyMemory(ctx->PoolBuf, buf, len);
+    else         RtlZeroMemory(ctx->PoolBuf, len);
 
     irp = IoBuildSynchronousFsdRequest(doWrite ? IRP_MJ_WRITE : IRP_MJ_READ,
                                        ext->LowerDevice,
-                                       buf, (ULONG)len, off,
+                                       ctx->PoolBuf, (ULONG)len, off,
                                        &ctx->evt, &ctx->iosb);
     if (!irp) {
+        ExFreePoolWithTag(ctx->PoolBuf, RB_POOL_TAG);
         RbSyncCtxFree(ctx);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -153,26 +180,24 @@ NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
 
     s = IoCallDriver(ext->LowerDevice, irp);
     if (s == STATUS_PENDING) {
-        BOOLEAN cancelRequested = FALSE;
+        to.QuadPart = -RB_SYNC_IO_STEP_100NS;
+        budget = RB_SYNC_IO_DATA_BUDGET;
         for (;;) {
-            LARGE_INTEGER to;
-            to.QuadPart = -RB_SYNC_IO_STEP_100NS;   /* 15s 步进 */
             s = KeWaitForSingleObject(&ctx->evt, Executive, KernelMode, FALSE, &to);
-            if (s == STATUS_SUCCESS) break;   /* 下层完成（含取消完成） */
-            if (!cancelRequested) {
-                IoCancelIrp(irp);             /* [BUG-004] 请求取消，而非弃单 */
-                cancelRequested = TRUE;
-                RbLog(1, __LINE__, STATUS_IO_TIMEOUT,
-                      L"sync io slow, cancel requested");
-                continue;
+            if (s == STATUS_SUCCESS) break;
+            if (budget == RB_SYNC_IO_DATA_BUDGET) IoCancelIrp(irp);
+            if (--budget == 0) {
+                if (InterlockedCompareExchange(&ctx->State, RB_SYNC_STATE_ORPHAN,
+                                               RB_SYNC_STATE_WAITING) == RB_SYNC_STATE_DONE)
+                    break;      /* 完成例程刚裁决：改走正常收尾 */
+                RbLog(2, __LINE__, STATUS_IO_TIMEOUT,
+                      L"sync io timeout: IRP ownership passed to completion routine");
+                return STATUS_IO_TIMEOUT;   /* 不释放、不拷贝、不读 ctx */
             }
-            /* 取消已请求仍未完成：继续等（绝不放弃缓冲） */
-            RbLog(1, __LINE__, STATUS_IO_TIMEOUT,
-                  L"sync io cancel pending, keep waiting");
         }
     }
 
-    /* evt 已置位（同步完成路径同样会跑完成例程），统一收尾（PASSIVE） */
+    /* 主路径是唯一收尾方 */
     IoCompleteRequest(irp, IO_NO_INCREMENT);
     s = ctx->iosb.Status;
     RbDiagRecord(RB_DIAG_KIND_SYNC_IO, RB_DIAG_PHASE_COMPLETE, s,
@@ -183,7 +208,9 @@ NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
      * 截断落盘）、短读会把不足部分当已提交 commit。归一为设备错误。 */
     if (NT_SUCCESS(s) && ctx->iosb.Information < (ULONG_PTR)len)
         s = STATUS_IO_DEVICE_ERROR;
+    if (NT_SUCCESS(s) && !doWrite) RtlCopyMemory(buf, ctx->PoolBuf, len);
     if (pInfo) *pInfo = NT_SUCCESS(s) ? ctx->iosb.Information : 0;
+    ExFreePoolWithTag(ctx->PoolBuf, RB_POOL_TAG);
     RbSyncCtxFree(ctx);
     return s;
 }

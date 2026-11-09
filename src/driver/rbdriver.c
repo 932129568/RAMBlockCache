@@ -68,6 +68,13 @@ static ULONG g_LogHead = 0;
 static KSPIN_LOCK g_LogLock;
 static LONG g_LogInit = 0;
 
+/* [REMOVED 2026-11-09 11:2x] 113 号的「开机 60s 窗口门控」已删除。
+ * 该门控用跳过挂栈来规避 U 盘 surprise removal，属于掩盖而非修复：
+ * 同步 IO 仍会死等，60s 内插盘仍会触发。本批已在 rbattach.c /
+ * rbdev.c 用三态所有权状态机真正修好两条同步 IO 路径（有界等待 +
+ * 池化缓冲 + late IRP 由完成例程收尾），因此所有卷恢复无差别挂栈，
+ * U 盘走完整 AddDevice -> 几何 -> 拔盘拆除 路径，由底层正确性保证安全。 */
+
 void RbLogInit(VOID)
 {
     KeInitializeSpinLock(&g_LogLock);
@@ -950,12 +957,35 @@ NTSTATUS RbDispatchPnp(PDEVICE_OBJECT dev, PIRP irp)
          * 旧代码在本例程（DISPATCH_LEVEL）同步调 rb_stream_flush——取
          * ERESOURCE/阻塞盘 IO，违反本文件"拆除落 PASSIVE"契约，Verifier
          * 下即 0xC4 家族 bugcheck。 */
+        /* [FIX O9-PNP 2026-11-09 11:5x] 不再唤醒全局 flush。
+         * surprise removal 后设备已物理消失，KeSetEvent(FlushWake) 会让
+         * 后台线程跑 RbFlushAllDirty -> rb_engine_flush -> 对死设备发同步 IO；
+         * 而正常关机/休眠的脏数据落盘由 Power 分支独立保证，不依赖这里。
+         * 本分支只做「停接 + 透传」，把拆除完全交给随后的 REMOVE。 */
         InterlockedExchange(&ext->Removed, 1);
         ext->IsAttached = FALSE;
-        KeSetEvent(&g_Rb.FlushWake, IO_NO_INCREMENT, FALSE);
         return RbForward(dev, irp);
 
     case IRP_MN_REMOVE_DEVICE:
+        /* [FIX O9-PNP 2026-11-09 11:5x] 真正根因：surprise removal 后
+         * 下层设备已物理消失，仍把 REMOVE IRP 下发给 ext->LowerDevice 时，
+         * 该 IRP 可能永远不完成；PnP 管理器持有设备树锁等它完成 = 整机冻结
+         * （10:07 与 11:45 两次实测：屏幕正常、全系统无响应、无 dump、
+         *  连驱动日志都停止，且同步 IO 超时日志从未出现）。
+         * 处置：Removed 已置（设备已消失）时不再下发，直接完成 IRP 让 PnP
+         * 状态机前进；本层过滤设备交给僵尸队列，由 reaper 在 PASSIVE 异步
+         * 拆除（不在这里做 60s 排空 / flush，避免再次阻塞移除流程）。
+         * 计划内 REMOVE（Removed==0，下层完好）保持原转发路径不变。 */
+        ext->IsAttached = FALSE;
+        if (ext->Removed) {
+            irp->IoStatus.Status = STATUS_SUCCESS;
+            irp->IoStatus.Information = 0;
+            IoCompleteRequest(irp, IO_NO_INCREMENT);
+            RbZombieQueueExt(ext);
+            RbLog(1, __LINE__, 0,
+                  L"remove: surprise-removed volume completed locally, deferred to reaper");
+            return STATUS_SUCCESS;
+        }
         /* [FIX M4] 计划内 REMOVE 不在此置 Removed：Removed=1 会封杀 destroy 内
          * flush 的回写回调（RbWritebackCb 经 RbGetExt 检查 Removed）导致有序拆除
          * 丢全部脏数据。改为：窗口内新 I/O 仍入缓存（LowerDevice 尚未拆，安全），

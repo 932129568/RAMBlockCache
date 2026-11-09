@@ -1,8 +1,39 @@
 # 已知 Bug 与遗留问题清单（KNOWN_ISSUES）
 
 > 截至 2026-11-06 22:5x · >4K 几何内核态 UAF 已修（用户态 core 域闭环，发布层重放待 UAC；详见 **72/73/74** 号文档）
+> **【2026-11-09 追加】** 本文件 0-A…0-H 为 11-06/11-07 历史清单；11-09 的 Verifier 实捕、U 盘热插拔事故链、根因修复与真机验收见下方 **0-I 节**。历史条目的「当前发布基线」已被后续批次取代，引用时以 0-I 的实测哈希为准。
 > 状态图例：✅ 已修复（有验证） · 🔧 已修复（待真机复验） · 🟡 已知限制/设计行为 · ⏳ 待评审/待做 · ⛔ 阻断
 > 历史命名：仓库目录名 `RAMBlockCache-V10.4.3-build19-源码包` 中的 **V10.4.3-build19** 为历史遗留目录名，非发布版本；发布版本以 `src/common/version.h` 与本文「当前发布基线」为准。
+
+## 0-I. 2026-11-09 · Verifier 实捕与 U 盘热插拔事故链（109–117 号）
+
+> 交付物：`deliverables/109`…`117-*-2026-11-09.md`。当前运行镜像 **`98f150ba…` / Valid / 180,960 B**（12:05 部署、12:07:16 开机、看门狗 30/30、Verifier `0x001209BB` 在岗）。本节结论以真机证据为准，覆盖 0-A…0-H 中同名的历史陈述。
+
+| # | 项 | 状态 | 证据 / 说明 |
+|---|---|---|---|
+| I1 | **09:34 `0xC4 / 0xF6` Verifier 实捕** | ✅ 已修并真机加载 | `0xF6` = 把用户态句柄当内核态句柄引用。根因 `rbfeat.c` 两处 `PsCreateSystemThread` 漏传已初始化为 `OBJ_KERNEL_HANDLE` 的 `&oa`（实参 `NULL`），随后却用 `KernelMode` 调 `ObReferenceObjectByHandle`；`rbio.c` 同类调用正确。修：传 `&oa` + 去线程对象名；另补 `rbL2.c` 的 `ZwCreateEvent` 显式原型消除 C4013。见 110 号 |
+| I2 | **10:07 首次整机冻结（U 盘拔出后）** | ✅ 根因已闭环 | 屏幕正常、全系统无响应、无 dump 无 1001。当批误判为「同步 IO 死等」，见 I4 更正。见 111 号 |
+| I3 | **10:44 `0x7E / 0xC0000047` 是 112 号引入的回归** | ✅ 已承认并整体回退 | `0xC0000047 = STATUS_SEMAPHORE_LIMIT_EXCEEDED`。112 号把 KEVENT/iosb/in/out 全池化却在**正常完成路径立即释放 ctx**，late IRP 完成时 `KeSetEvent` 到已复用池 → 对象头损坏。已回退到 10:02 实机版并留 `[REVERT]` 注释防重犯。见 113 号 |
+| I4 | **同步 IO「死等」是两批误判方向** | ✅ 已纠正 | 112 号（有界等待 + leak-by-design）→ 引入 I3 回归；115 号（三态 CAS 所有权移交 + 完成例程 `MORE_PROCESSING_REQUIRED`，`syncio_model.py` 9/9）→ **11:45 仍冻结**，且 96 秒内新增的 `sync ioctl timeout` 日志 **0 条**，证明根本没走到同步 IO 等待分支。115 号修的是真缺陷，保留不回退，但**不是卡点**。见 112/115/116 号 |
+| I5 | **真正根因 = `IRP_MN_REMOVE_DEVICE` 下发已消失设备** | ✅ 已修并真机验收 | `RbDispatchPnp` 原无条件把 REMOVE IRP 下发给 `ext->LowerDevice`；U 盘 surprise removal 后下层物理消失，IRP 永不完成，**PnP 管理器持设备树锁等待** → 整机冻结、日志服务停止、硬断电无 dump。修：`ext->Removed` 时本地 `IoCompleteRequest` + `RbZombieQueueExt` 交 reaper 异步拆；计划内 REMOVE（Removed==0）路径逐字未改。另删 SURPRISE_REMOVAL 的 `KeSetEvent(FlushWake)`。见 116 号 |
+| I6 | **12:07 重启后两轮 U 盘插拔验收 PASS** | ✅ 真机 | 门控已删除、U 盘走完整挂栈路径：`04:08:29` / `04:08:42` 各 2 条 `AddDevice: filter on volume stack` → `04:08:38` / `04:08:45` `remove: surprise-removed volume completed locally, deferred to reaper` → `04:08:49` ×2 `zombie ext deleted`。本次开机段 `skip runtime hot-plugged` = 0（历史 4 条属 114 号门控版）。`o9_watch` `FAIL=0 WARN=0 VERIFIER_EVENT=0`、零 41/1001/6008、无新 dump、五件套全绿、canary 逐位一致。见 117 号 |
+| I7 | **114 号的「60 秒开机窗口门控」是规避，已删除** | ✅ 已删 | 用户明确要求「修好所有缺陷，而不是简单掩盖」。门控曾让 U 盘卷不挂栈从而不复现，但两条同步 IO 死等仍在代码里。现所有卷恢复正常挂栈，安全性由 I5 的底层正确性保证 |
+| I8 | **`CM_DEVCAP_REMOVABLE` 判据在本机不可用** | 🟡 实测限制 | 本机 SanDisk Extreme Pro 的 `Capabilities=0x10`（`CM_DEVCAP_UNIQUEID`），**不含 `0x4`**。任何「按可移动介质跳过」的方案在这台机器上会漏判，不能替代修复 |
+| I9 | **结论更正（三处）** | ✅ 已归档 | ① `UpperFilters=[volsnap]` **不代表过滤器解绑**：本驱动是 `rbattach.c` 定向挂载（`DriverEntry ... no UpperFilter` + 每次开机 7 条 `AddDevice`），110 号「系统实际 passthrough」是错的，已加更正框；② `volmgr id=161`「转储创建失败」是每次蓝屏/硬关后开机的常规噪声（历史 12 条），真 bugcheck 后为 `0x00020042`、硬关后为 `0x00000042`，111 号「强关时曾尝试写转储」是过度解读，已撤回；③ 0x7E 的 `FAILURE_BUCKET_ID = ...RAMBlockCache!RbThermalReloadCfg` **符号点名不可信**（`rbthermal.c:32-38` 无 semaphore 操作，cdb 自报 `Unable to verify timestamp`，PDB 错位），不要据此改该函数 |
+| I10 | **11-09 00:32 的 `0x7E / 0xC0000005` 池腐坏仍未点名分配点** | ⛔ 未闭环 | Kernel Generated Triage Dump 无模块表、我方不在栈（`nt!RtlpHpVsSlotCompactChunks`），只能佐证「池腐坏延迟表现」，非 Verifier 实捕。I1 的 `0xC4/0xF6` 与 I3 的 `0x7E/0xC0000047` 均**不是**这个 bucket。`108 §4.3` 一周无池腐坏门槛从 **12:07:16 重新计时** |
+| I11 | **115 号超时/orphan 分支无真机覆盖** | 🟡 限制 | 本次 `sync ioctl timeout` 0 条，几何 IOCTL 正常完成。三态 CAS 的超时移交目前只有 `syncio_model.py` 9/9 全交错模型验证，需专门方向触发（下层不响应）才能确证 |
+| I12 | **I5 的权衡：设备节点残留未完全排除** | 🟡 已知限制 | 不下发 REMOVE IRP → 下层对象由 USB 总线/PnP 自行移除、本层由 reaper 延迟回收。`zombie ext deleted` ×2 证明本层 ext 已回收；拔盘后 `removable volumes=0` 属正常态，**不构成「无残留」的排除证据**。该风险远轻于整机冻结 |
+| I13 | **内核复审计：未发现新的阻塞级缺陷** | ✅ 结论 | `RbGetExt()`（`rbdev.c:37-43`）在 `ext->Removed` 时返回 NULL → `RbWritebackCb` / `RbReadbackCb` 直接 `return 1`，**不会向已消失设备发同步 IO**。故 `RbZombieReap` 的 `rb_stream_flush`、`RbFlushAllDirty`（Power 关机路径）对死卷只产生回调失败、不产生盘 IO。**附带更正**：116 号删除 `FlushWake` 的理由（「避免对死设备发同步 IO」）不准确，但删除本身无害且减少无谓遍历，维持不改 |
+| I14 | **reaper 对死卷脏数据静默丢弃，无留痕** | 🟡 低优先级 | `RbVolumeRemove` 有 `DATA-1` 的「脏数据未能落盘」WARN/事件，`RbZombieReap` 就绪路径直接 `flush + destroy` 无日志。设备已物理消失时脏数据本就无法落盘（结果等价），属可观测性缺口。**本批不为此重编驱动**：会让刚真机验收的 `98f150ba…` 作废、观察期重新计时，代价大于收益 |
+| I15 | **发布链：`dist\RAMBlockCache-Setup.exe` 仍是 11-08 载荷** | ⏳ 待一次 UAC | 当前 Setup `0214454a…` / 275,420,504 B / Valid，其内嵌 payload 的 sys 是 11-08 的 `544ba6d9…`，缺 11-09 五项修复。`build_setup.ps1:121` 直接拷 `dist\RAMBlockCache.sys`，重打包即可带入 `98f150ba…`。已产出 **一次 UAC 原子脚本** `C:\Users\Public\o9\RB-setup-repack.cmd`（重打包 → ASCII stage 签名 → 拷回 → 台账/文档回填 → 门禁⑤；任一步失败字节级回滚 Setup + README.md + 67 号 + 台账）。AST 0 错、纯 ASCII CRLF wrapper。**不需要重启、不碰驱动/Verifier/注册表** |
+| I16 | **`README.txt` 整篇 mojibake（历史遗留）** | 🟡 不可逆 | 文件自 `HEAD` 起即为「UTF-8 中文被按 GBK 解读后再存 UTF-8」的双重编码（BOM=True，35,080 B）。逆转预演：标题可恢复为「完整开发包」，但正文有 **484 处 `?`** 字节丢失且 **CRLF 被吞并导致段落并成一行**，无法无损还原。它是门禁⑤ 的 sys 锚点文件，**本批不改写**；需独立文档批次用原始正确文本重建并保留锚点行。另其 Setup 大小行仍写 `272,872,792 B`（实际 275,420,504 B） |
+| I17 | **取证能力已补齐** | ✅ 已落地 | `CrashDumpEnabled=2`（内核转储）、`AlwaysKeepMemoryDump=1`、`i8042prt` + `kbdhid` 的 `CrashOnCtrlScroll=1`；PDB 按签名哈希逐代归档于 `o9\pdb\`（含 `index.tsv` 3 字段 TSV）。此前 10:07 / 10:11 / 11:46 三次硬挂起都因无 dump 只能静态推断；**今后再挂起按 `Ctrl` + `Scroll Lock` ×2 抓内核栈，不要长按电源** |
+| I18 | **sys 文档基线已同步** | ✅ 已修 | `sync_setup_hash.ps1` 实跑 `UPDATED`：`README.md:17`、`67:13`、`67:130` 的 sys 基线从 `544ba6d9…` 同步为 `98f150ba…` / 180,960 B；`README.txt` sys 锚点回读一致、门禁⑤ 不受影响 |
+| I19 | **红线维持** | ⛔ 禁改 | A2 回写验证 **FROZEN**（全部验收在 `WriteBack=0` 直写态）；`Flags=0`、`DirtyBytes=0`、Verifier 保留在岗、禁 `method=2`、禁 `POST /rb/bootcfg`、禁 `verifier /reset`、禁 64K 解禁（0-D D8）。每日 09:30 只读巡检有效至 11-16 |
+| I20 | **12:22 BugCheck `0x93 INVALID_KERNEL_HANDLE`（第三次句柄违规）** | 🔧 已修，待 cdb 点名 | 117 号验收后 15 分钟崩溃，`BOOT=12:22:11`，事件 41+1001+6008、`volmgr 161=0x00020042`（真 bugcheck）、新 dump `110926-13859-01.dmp`（226,816 B）。`bugcodes.h:1412` 实证 `0x93`；微软参数表 `Arg3=0/Arg4=1` = **引用无效内核句柄 + bad handle detection 启用**。Verifier `0x001209BB` 在岗。**根因**：110 号只修 `rbfeat.c` 2 处，全库 9 处 `PsCreateSystemThread` 里还有 **`rbio.c:2374` / `rbpools.c:119` / `rbwback.c:96`** 传 `NULL` 对象属性却用 `KernelMode` 调 `ObReferenceObjectByHandle`，与 09:34 `0xC4/0xF6` 同族（两条检测路径不同、根因同一）。本批三处全部补 `OBJ_KERNEL_HANDLE` 的 `&oa`，grep 断言全库遗漏数 = 0；重编 18 源 0 警告 `d258490a…`；门禁五件套 + 双模型全绿。崩溃前 `12:19:23` 另有一次卷 surprise removal、`12:19:55` zombie 回收，2 分 26 秒后崩溃。**未修完的部分**：0x93 精确调用栈需 UAC 取 dump 后由 cdb 给出——本批已修 `o9_fix_deploy.ps1` 的符号路径，改为按**崩溃镜像哈希**动态指向 `o9\pdb\<sha>` 归档目录（不再混入会被重编覆盖的 Release PDB，即 114 号假点名的根），输出 `cdb_1222_0x93.txt`。**静态证据不等于实捕点名**；若栈落在别处须追加修复。见 118 号 |
+| I21 | **观察期门槛再次重置** | 🟡 事实 | `108 §4.3` 一周无池腐坏门槛从 **12:22:11** 重新计时。117 号 PASS 只覆盖 U 盘插拔场景，本次是运行 15 分钟后另一条路径，两批互不否定也互不替代。部署完成前 `98f150ba…` 仍带 I20 三处缺陷，可能再次蓝屏；按 `Ctrl`+`Scroll Lock`×2 抓内核转储，勿连续重启 |
+
+> **口径纪律**：I6 的 PASS 只覆盖「U 盘插拔不再冻结/黑屏」这一场景，观察约 2.5 分钟；不构成「池腐坏已根治」「内核已修」「缓存数据面或回写正确性已验证」。I10/I11/I12 为明确的未闭环项。
 
 ## 0-H. 2026-11-06 20:xx–22:5x · >4K 几何 UAF（详见 72/73/74 号）
 

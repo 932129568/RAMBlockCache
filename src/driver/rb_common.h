@@ -33,6 +33,23 @@
 #include "../common/version.h"      /* [Commit5] 唯一版本事实来源 */
 
 #define RB_POOL_TAG        'bRBC'
+
+/* [FIX O9-SYNCIO 2026-11-09] 同步 IO 所有权三态（rbattach.c:RbSendSyncIoctl
+ * 与 rbdev.c:RbSyncIo 共用）。原先两条路径在 STATUS_PENDING 后无限等待，
+ * 下层设备消失时 PASSIVE 工作项永久卡死（10:07 整机冻结）；直接加超时返回
+ * 又会让 late IRP 写调用者栈 / 已释放池块（10:44 0x7E）。
+ * 正确修法：池化全部 IO 上下文 + 完成例程，用 CAS 决定唯一收尾方：
+ *   WAITING : 主路径在等，完成例程未裁决
+ *   DONE    : 完成例程先到，主路径收尾
+ *   ORPHAN  : 主路径超时离开，完成例程在 IRP 最终完成时收尾
+ * 全交错模型验证见 deliverables/gstack/model/syncio_model.py（9/9 PASS）。 */
+#define RB_SYNC_STATE_WAITING   0L
+#define RB_SYNC_STATE_DONE      1L
+#define RB_SYNC_STATE_ORPHAN    2L
+#define RB_SYNC_IO_STEP_100NS   50000000LL   /* 5s 步进 */
+#define RB_SYNC_IO_BUDGET       2            /* 控制面 10s 总预算 */
+#define RB_SYNC_IO_DATA_BUDGET  6            /* 数据面 30s（慢盘/大块留余量） */
+
 /* [FIX 2026-11-05] 注册表参数键绝对路径（共享宏）。原 rbdriver.c 文件局部宏被
  * rbattach.c/rbctl.c 手写复刻时写成 L"\Registry\..."——单反斜杠的 \R/\M/\S/\C
  * 均为 MSVC 未定义转义（C4129 丢反斜杠），运行时路径分隔符全失，

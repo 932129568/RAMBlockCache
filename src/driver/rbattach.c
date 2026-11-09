@@ -222,37 +222,113 @@ BOOLEAN RbIsBootCriticalPdo(PDEVICE_OBJECT pdo)
 }
 
 /* =====================================================================
- * [R3] 同步 IOCTL —— [V10.3 Patch E] 5s 有界等待，超时 IoCancelIrp 后继续等，
- *      杜绝下层未 START/挂死时永久等待（D3 闭环，与 rbio.c RbSyncIo 同模式）。
+ * [FIX O9-SYNCIO 2026-11-09] 同步 IOCTL：有界等待 + 三态所有权移交。
+ * 历史：原实现在 STATUS_PENDING 后 for(;;) 无限等待（"永不放弃在飞 IRP"），
+ *   设备消失时 PASSIVE 几何工作项永久卡死 = 10:07 整机冻结。112 号曾改为
+ *   「池化 + 10s 超时 + leak-by-design」但正常路径立即释放含 KEVENT 的 ctx，
+ *   late IRP 完成时 KeSetEvent 到已复用池块 = 10:44 0x7E / 0xC0000047。
+ * 本版（113 号回退之后的真正修复）：
+ *   1) event / iosb / in / out 全部 NonPagedPool，IRP 全程不触碰调用者栈；
+ *   2) 自设完成例程（STATUS_MORE_PROCESSING_REQUIRED），IRP 由我们看护；
+ *   3) 10s 有界等待（5s x 2，首次超时 IoCancelIrp）；超时后主路径用 CAS
+ *      把 State 从 WAITING 置 ORPHAN 并立即返回 STATUS_IO_TIMEOUT，
+ *      **不释放任何资源、不拷贝输出**；late IRP 最终完成时由完成例程
+ *      IoCompleteRequest + 释放全部池块（模型 syncio_model.py 9/9 全交错验证）；
+ *   4) 完成例程先到的交错由 CAS(WAITING->DONE) 裁决，仍由主路径收尾。
+ * 因此：无无限等待、无 UAF、无泄漏、无双重释放；超时只是让该卷几何保持
+ *   未知并走透传，不再冻结系统。门控（rbdriver.c）降级为减少无用挂栈的
+ *   优化，不再是安全依赖。
  * ===================================================================== */
+typedef struct _RB_IOCTL_SYNC {
+    KEVENT          Ev;
+    IO_STATUS_BLOCK Iosb;
+    volatile LONG   State;
+    PVOID           InPool;
+    PVOID           OutPool;
+} RB_IOCTL_SYNC, *PRB_IOCTL_SYNC;
+
+static VOID RbIoctlSyncFree(PRB_IOCTL_SYNC s)
+{
+    if (s->InPool)  ExFreePoolWithTag(s->InPool, RB_POOL_TAG);
+    if (s->OutPool) ExFreePoolWithTag(s->OutPool, RB_POOL_TAG);
+    ExFreePoolWithTag(s, RB_POOL_TAG);
+}
+
+static NTSTATUS NTAPI RbIoctlSyncComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID c)
+{
+    PRB_IOCTL_SYNC s = (PRB_IOCTL_SYNC)c;
+    UNREFERENCED_PARAMETER(dev);
+    KeSetEvent(&s->Ev, IO_NO_INCREMENT, FALSE);
+    /* 三态 CAS：WAITING->DONE（主路径收尾）；若已是 ORPHAN，由本例程收尾。
+     * IoCompleteRequest 会写 s->Iosb / s->OutPool，二者此时必定有效。 */
+    if (InterlockedCompareExchange(&s->State, RB_SYNC_STATE_DONE,
+                                   RB_SYNC_STATE_WAITING) == RB_SYNC_STATE_ORPHAN) {
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        RbIoctlSyncFree(s);
+    }
+    return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
 NTSTATUS RbSendSyncIoctl(PDEVICE_OBJECT target, ULONG ioctl,
                          PVOID in, ULONG inSize, PVOID out, ULONG outSize, PULONG returned)
 {
-    KEVENT ev; PIRP irp; IO_STATUS_BLOCK iosb; NTSTATUS st;
-    LARGE_INTEGER to; BOOLEAN cancelled = FALSE;
+    PRB_IOCTL_SYNC s;
+    PIRP irp;
+    NTSTATUS st;
+    LARGE_INTEGER to;
+    ULONG budget;
 
     PAGED_CODE();
-    KeInitializeEvent(&ev, NotificationEvent, FALSE);
-    irp = IoBuildDeviceIoControlRequest(ioctl, target, in, inSize, out, outSize,
-                                        FALSE, &ev, &iosb);
-    if (!irp) return STATUS_INSUFFICIENT_RESOURCES;
+
+    s = (PRB_IOCTL_SYNC)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                        sizeof(*s), RB_POOL_TAG);
+    if (!s) return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(s, sizeof(*s));
+    KeInitializeEvent(&s->Ev, NotificationEvent, FALSE);
+    s->State = RB_SYNC_STATE_WAITING;
+
+    if (inSize) {
+        s->InPool = ExAllocatePool2(POOL_FLAG_NON_PAGED, inSize, RB_POOL_TAG);
+        if (!s->InPool) { RbIoctlSyncFree(s); return STATUS_INSUFFICIENT_RESOURCES; }
+        RtlCopyMemory(s->InPool, in, inSize);
+    }
+    if (outSize) {
+        s->OutPool = ExAllocatePool2(POOL_FLAG_NON_PAGED, outSize, RB_POOL_TAG);
+        if (!s->OutPool) { RbIoctlSyncFree(s); return STATUS_INSUFFICIENT_RESOURCES; }
+        RtlZeroMemory(s->OutPool, outSize);
+    }
+
+    irp = IoBuildDeviceIoControlRequest(ioctl, target, s->InPool, inSize,
+                                        s->OutPool, outSize, FALSE,
+                                        &s->Ev, &s->Iosb);
+    if (!irp) { RbIoctlSyncFree(s); return STATUS_INSUFFICIENT_RESOURCES; }
+    IoSetCompletionRoutine(irp, RbIoctlSyncComplete, s, TRUE, TRUE, TRUE);
 
     st = IoCallDriver(target, irp);
     if (st == STATUS_PENDING) {
+        to.QuadPart = -RB_SYNC_IO_STEP_100NS;
+        budget = RB_SYNC_IO_BUDGET;
         for (;;) {
-            to.QuadPart = -50000000LL;                 /* 5s 步进 */
-            st = KeWaitForSingleObject(&ev, Executive, KernelMode, FALSE, &to);
+            st = KeWaitForSingleObject(&s->Ev, Executive, KernelMode, FALSE, &to);
             if (st == STATUS_SUCCESS) break;
-            if (!cancelled) {
-                IoCancelIrp(irp);                       /* 强制完成，杜绝永久挂起 */
-                cancelled = TRUE;
-                continue;
+            if (budget == RB_SYNC_IO_BUDGET) IoCancelIrp(irp);
+            if (--budget == 0) {
+                if (InterlockedCompareExchange(&s->State, RB_SYNC_STATE_ORPHAN,
+                                               RB_SYNC_STATE_WAITING) == RB_SYNC_STATE_DONE)
+                    break;      /* 完成例程刚刚裁决：改走正常收尾 */
+                RbLog(2, __LINE__, STATUS_IO_TIMEOUT,
+                      L"sync ioctl timeout: IRP ownership passed to completion routine");
+                return STATUS_IO_TIMEOUT;   /* 不释放、不拷贝、不读 ctx */
             }
-            /* 已取消仍未完成则继续等（RbSyncIo 同款：永不放弃在飞 IRP） */
         }
     }
-    st = iosb.Status;
-    if (returned) *returned = NT_SUCCESS(st) ? (ULONG)iosb.Information : 0;
+
+    /* 主路径是唯一收尾方：IoCompleteRequest 后 I/O 管理器写 Iosb / OutPool */
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    st = s->Iosb.Status;
+    if (NT_SUCCESS(st) && out && outSize) RtlCopyMemory(out, s->OutPool, outSize);
+    if (returned) *returned = NT_SUCCESS(st) ? (ULONG)s->Iosb.Information : 0;
+    RbIoctlSyncFree(s);
     return st;
 }
 
@@ -270,6 +346,10 @@ VOID RbRefreshVolumeGeometry(PRB_DEV_EXT ext)
 
     PAGED_CODE();
     if (!ext || !ext->LowerDevice) return;
+    /* [FIX O9-HANG 2026-11-09] surprise removal 已置 Removed：设备正在消失，
+     * 此时再向它发同步 IOCTL 只会得到永不返回的 IRP。几何保持未知即透传，
+     * 比让 PASSIVE 工作项卡死安全。 */
+    if (ext->Removed) return;
 
     ext->GeometryValid = FALSE;                       /* 先置无效：失败即透传 */
 

@@ -24,6 +24,18 @@
 #include "rb_common.h"
 #include "rb_common2.h"
 
+/* [FIX O9-OBREF 2026-11-09] ZwCreateEvent 的原型只在本机 WDK 的 km\ntifs.h，
+ * 本文件未包含该头（ntifs.h 与 wdm.h 混用有冲突风险）。此前编译器按 C4013
+ * 隐式声明为 "int ZwCreateEvent()"，内核驱动的未声明调用属未定义行为。
+ * 按 WDK 原型补显式声明，与 ntoskrnl.lib 导出一致（ZwCreateEvent 返回
+ * NTSTATUS，HANDLE 经第一参数写出）。 */
+NTSYSAPI NTSTATUS NTAPI ZwCreateEvent(
+    PHANDLE            EventHandle,
+    ACCESS_MASK        DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    EVENT_TYPE         EventType,
+    BOOLEAN            InitialState);
+
 #define RB2_L2BLK       (64*1024)
 /* [FIX R6-01] 记录头 16B -> 24B：加卷身份 VolId（索引键仅 LBA 的根治）。
  * 容器尺寸公式随之变化——旧 v2 容器大小不符即走重建路径（旧数据一次性作废，

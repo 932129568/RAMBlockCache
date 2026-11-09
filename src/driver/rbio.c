@@ -2360,6 +2360,7 @@ NTSTATUS RbStartFlushThread(VOID)
 {
     HANDLE h = NULL;
     PETHREAD obj = NULL;
+    OBJECT_ATTRIBUTES oa;
     NTSTATUS s;
     PAGED_CODE();
     /* [83 2026-11-07 M6] 防二次启动：RbUnload 中止恢复(:1135)与重建回滚都可能
@@ -2371,7 +2372,13 @@ NTSTATUS RbStartFlushThread(VOID)
         return STATUS_DEVICE_BUSY;
     }
     KeClearEvent(&g_Rb.FlushStop);
-    s = PsCreateSystemThread(&h, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+    /* [FIX O9-OBREF2 2026-11-09] 110 号只修了 rbfeat.c 两处，本处仍是
+     * PsCreateSystemThread(..., ObjectAttributes=NULL) + 随后的
+     * ObReferenceObjectByHandle(..., KernelMode)：句柄落在当前进程句柄表，
+     * 被当内核句柄引用 = 09:34 的 0xC4/0xF6 与 12:22 的 0x93（内核
+     * bad handle detection 抓到「引用无效内核句柄」）同族。补 &oa。 */
+    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+    s = PsCreateSystemThread(&h, THREAD_ALL_ACCESS, &oa, NULL, NULL,
                              RbFlushThread, NULL);
     if (NT_SUCCESS(s)) {
         /* [FIX S-ObRef] 返回值必检（同 IO worker）；绝不裸覆盖 g_Rb.FlushThread */

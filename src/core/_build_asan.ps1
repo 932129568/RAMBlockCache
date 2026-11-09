@@ -22,7 +22,8 @@ $Tests = @(
   "test_flushpar",  # [PF-16] 1/2/4/8/16-way zone flush: zero data loss + rough throughput
   "test_tinylfu",   # [F1] TinyLFU admission: hot-set preservation + OFF parity
   "test_a2flush",   # [A2-FLUSH 2026-11-09] concurrent FLUSH judgement regression
-  "test_p0evict"    # [P0-EVICT 2026-11-10] I47 discriminative storm (tiny cap + WB + concurrent RW + flush + churn)
+  "test_p0evict",
+  "test_p0v2"     # [P0-V2 2026-11-10] multi-stream + churn create/destroy + cross-stream evict    # [P0-EVICT 2026-11-10] I47 discriminative storm (tiny cap + WB + concurrent RW + flush + churn)
 )
 $ok=0; $fail=0; $runFail=0
 foreach ($t in $Tests) {

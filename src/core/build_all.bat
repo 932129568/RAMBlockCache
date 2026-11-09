@@ -14,7 +14,7 @@ rem and run_all.bat runs that exe. Single run-list source lives in run_all.bat.
 rem [88 H-10 2026-11-07] test_rebuild.c is now in the authoritative list.
 rem Its own header comment predates this addition and still says the opposite;
 rem that comment is historical text (core sources are out of batch-A scope).
-set TESTS=test_spinfast test_cache test_counter test_geom test_mixed test_parflush test_regress test_release test_v5 test_v6 test_bigread test_flush_many edge_v3 edge_v4 stress_v3 stress_v4 bench_readhit test_auditfix test_write_ex test_wsconc test_rebuild test_exclude test_flushpar test_tinylfu test_a2flush
+set TESTS=test_spinfast test_cache test_counter test_geom test_mixed test_parflush test_regress test_release test_v5 test_v6 test_bigread test_flush_many edge_v3 edge_v4 stress_v3 stress_v4 bench_readhit test_auditfix test_write_ex test_wsconc test_rebuild test_exclude test_flushpar test_tinylfu test_a2flush test_p0evict
 
 rem [FIX QA5-1] Judgement by cl exit code, not exe existence:
 rem a stale exe from an earlier build masked a real LNK1104 link failure as

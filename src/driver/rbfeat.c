@@ -228,22 +228,32 @@ static VOID Rb2LoadExcludeDirs(VOID)
 /* 取当前进程镜像全路径（NT 路径 \Device\HarddiskVolumeN\... 或 \??\C:\...），
  * 归一化为大写、反斜杠、去 \??\ / \Device\HarddiskVolumeN 前缀 → "C:\..." 形式。
  * 失败返回 FALSE（调用方按"不排除"处理，方向保守）。 */
+/* [FIX O9-QIP 2026-11-09 13:0x] 12:22 / 12:47 / 13:00 三次 BugCheck 0x93
+ * (INVALID_KERNEL_HANDLE, Arg4=1 bad handle detection)。cdb 用精确归档 PDB
+ * 点名：RbDispatchReadWrite -> RbFeatAdmit -> Rb2PidInExcludeDirs ->
+ * Rb2CurrentImagePath+0x79 -> nt!ObpReferenceObjectByHandleWithTag ->
+ * nt!ExHandleLogBadReference。原实现把 PsGetCurrentProcess() 返回的
+ * **PEPROCESS 内核对象指针**当作进程句柄传给 ZwQueryInformationProcess
+ * 的第一个参数（Arg1 正是那个内核地址）。
+ * 正解：Zw* 在 KernelMode 下用 NtCurrentProcess() 伪句柄 ((HANDLE)-1)；
+ * 并加 IRQL 守卫——ZwQueryInformationProcess 必须 PASSIVE_LEVEL，
+ * 而本函数位于 IO 热路径，非 PASSIVE 时保守返回 FALSE（不排除）。 */
 static BOOLEAN Rb2CurrentImagePath(WCHAR *out, ULONG cap)
 {
-    PEPROCESS proc = PsGetCurrentProcess();
     WCHAR buf[RB2_EXDIR_LEN * 2];
     UNICODE_STRING *us = (UNICODE_STRING *)buf;
     ULONG need = sizeof(buf), j, k;
     NTSTATUS st;
-    ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
 
-    UNREFERENCED_PARAMETER(proc);
-    /* 缓冲区布局：[UNICODE_STRING 头][路径字符] */
-    us = (UNICODE_STRING *)buf;
-    us->Buffer = (PWCH)(buf + 8);
-    us->MaximumLength = (USHORT)(sizeof(buf) - 8);
+    /* 缓冲区布局：[UNICODE_STRING 头][路径字符]。原实现按 "+8 个 WCHAR" 定位
+     * 数据区却把 MaximumLength 写成 sizeof(buf)-8，多报 8 字节（内核按
+     * MaximumLength 回写时会越界 8 字节）。统一用 sizeof(UNICODE_STRING)。 */
+    us->Buffer = (PWCH)((PUCHAR)buf + sizeof(UNICODE_STRING));
+    us->MaximumLength = (USHORT)(sizeof(buf) - sizeof(UNICODE_STRING));
     us->Length = 0;
-    st = ZwQueryInformationProcess(PsGetCurrentProcess(), (PROCESSINFOCLASS)27 /* ProcessImageFileName */,
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) return FALSE;
+    st = ZwQueryInformationProcess(NtCurrentProcess(),
+                                   (PROCESSINFOCLASS)27 /* ProcessImageFileName */,
                                    buf, need, &need);
     if (!NT_SUCCESS(st) || us->Length == 0) return FALSE;
     {

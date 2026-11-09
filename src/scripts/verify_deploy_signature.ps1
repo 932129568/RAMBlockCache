@@ -24,7 +24,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$DefaultExpectedSha256 = '98f150bab277377a3e92b45e9bfb78a9b590a789c7387ec66871f5442ea5de24'
+$DefaultExpectedSha256 = '9e0a39cc2cfacb094e9bd4a66182c05143000d893589e482c9e2b12e92b620b6'
 
 $scriptsDir = $PSScriptRoot
 $root       = Split-Path -Parent $scriptsDir   # = src\

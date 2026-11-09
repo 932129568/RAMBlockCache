@@ -596,6 +596,14 @@ static VOID RbCrashFill(RB_CRASH_HDR *h)
     RtlStringCchCopyW(h->LastNote, 24, L"crash snapshot");
 }
 
+/* secondary dump 数据块的唯一标识；两次回调必须填同一个 GUID。
+ * 直接实例化（INITGUID 顺序在 wdm 头已锁定，不可靠，同 rbetw.c）。 */
+static const GUID RB_CRASH_DUMP_GUID =
+    { 0x2b91c607,0xe4d8,0x4a35,{0x8c,0x17,0xd6,0x90,0x4b,0x2e,0x73,0xa5} };
+/* 第一次（探测）回调记录的申请长度，供第二次写入时复用；bugcheck 时
+ * 其余 CPU 已冻结，单线程执行，普通 static 即可。 */
+static ULONG s_CrashWant = 0;
+
 static VOID NTAPI RbBugCheckCb(
     KBUGCHECK_CALLBACK_REASON Reason,
     PKBUGCHECK_REASON_CALLBACK_RECORD Rec,
@@ -605,24 +613,50 @@ static VOID NTAPI RbBugCheckCb(
     KBUGCHECK_SECONDARY_DUMP_DATA *dd;
     RB_CRASH_HDR *h;
     RB_DIAG_CRASH_BLOB *blob;
+    ULONG want;
     UNREFERENCED_PARAMETER(Rec);
     UNREFERENCED_PARAMETER(ReasonSpecificDataLength);
     if (Reason != KbCallbackSecondaryDumpData) return;
     dd = (KBUGCHECK_SECONDARY_DUMP_DATA *)ReasonSpecificData;
-    if (dd->MaximumAllowed < sizeof(RB_CRASH_HDR)) return;
-    if (dd->MaximumAllowed >= sizeof(RB_DIAG_CRASH_BLOB)) {
+    if (!dd) return;
+
+    /* [FIX O9-CRASHDUMP 2026-11-09 13:0x] cdb 精确点名：
+     * crashdmp!GetSecondaryDumpCallbackSize -> RbBugCheckCb+0x42 ->
+     * __memset_repmovs -> KiPageFault。系统对本回调调用两次：
+     *   ① 探测阶段 OutBuffer == NULL，只许申报 Guid/OutBufferLength，
+     *      原实现无条件 RtlZeroMemory(dd->OutBuffer=NULL, ...) = 写空指针；
+     *   ② 写入阶段 OutBuffer 非 NULL，但 MaximumAllowed == 0，
+     *      原实现开头的 MaximumAllowed 判据会直接 return，永远写不进数据。
+     * 这就是 12:22/12:47/13:00 三次 volmgr 161 = 0x00020042「转储创建失败」、
+     * 只有 minidump 没有完整内核转储的根因。 */
+    dd->Guid = RB_CRASH_DUMP_GUID;
+
+    if (!dd->OutBuffer) {
+        want = sizeof(RB_DIAG_CRASH_BLOB);
+        /* 仅当系统明确给出非零上限时才裁剪；MaximumAllowed 在第二次回调
+         * 恒为 0，不能拿它当容量判据（原实现正是这样才永远写不进数据）。 */
+        if (dd->MaximumAllowed != 0 && dd->MaximumAllowed < want)
+            want = sizeof(RB_CRASH_HDR);
+        s_CrashWant = want;
+        dd->OutBufferLength = want;
+        return;                       /* 绝不触碰 OutBuffer */
+    }
+
+    /* 第二次：以第一次申报的长度为准（MaximumAllowed 此时为 0，不可用） */
+    want = s_CrashWant;
+    if (want == 0) { dd->OutBufferLength = 0; return; }
+    if (want >= sizeof(RB_DIAG_CRASH_BLOB)) {
         blob = (RB_DIAG_CRASH_BLOB *)dd->OutBuffer;
         RtlZeroMemory(blob, sizeof(*blob));
         RbCrashFill(&blob->Header);
         blob->EventSize = sizeof(RB_DIAG_EVENT);
         blob->Sequence = (ULONGLONG)s_DiagSeq;
         blob->EventCount = RbDiagSnapshot(blob->Events, RB_DIAG_EXPORT_COUNT);
-        dd->OutBufferLength = sizeof(RB_DIAG_CRASH_BLOB);
     } else {
         h = (RB_CRASH_HDR *)dd->OutBuffer;
         RbCrashFill(h);
-        dd->OutBufferLength = sizeof(RB_CRASH_HDR);
     }
+    dd->OutBufferLength = want;
 }
 
 VOID RbRegisterCrashHooks(PDRIVER_OBJECT drv)

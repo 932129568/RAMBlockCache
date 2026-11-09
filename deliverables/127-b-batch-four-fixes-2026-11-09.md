@@ -10,7 +10,7 @@
 
 | 项 | 结果 |
 |---|---|
-| 驱动编译 | `_build_manual.ps1` **BUILD OK**，新 sys `632220d22c205397c5ff417e3959924dba326ef1ba1fed4e27a96a5e00f9c757` / 179,712 B（**未签名，禁止部署**） |
+| 驱动编译 | `_build_manual.ps1` **BUILD OK**，新 sys `bdaaad57905d4574ad3ef59fd2cc09cb044a7e7d02b8cfcbe140a405fb916e27` / 179,712 B（**未签名，禁止部署**） |
 | core Release | **26/26 编译 + 26/26 运行**（B 批未改 core 源码，仍全量回归确认无连带影响） |
 | Python 门禁 | **9/9 PASS**（含新增 Gate12）、`check_ps_syntax` 72 文件 0 失败、`check_signature` PASS |
 | 模型 | **4/4 PASS**（refcount 17/17、syncio 9/9、expid 84 交错、新增 syncio_refcount 1024 交错） |
@@ -37,6 +37,8 @@
 | `src/driver/rbfeat.c` | `Rb2CurrentImagePath` 改用 `ProcessImageFileNameWin32(43)`（用户态实测返回盘符形式 `F:\...`）；43 失败/空时**回退 27** 保持旧行为，绝不因查询失败崩溃；保留 `\??\` 剥离逻辑 |
 | `src/driver/rb_common.h` | `RB_IOCTX` 把 `Rsvd[2]` 改为 `Rsvd[1] + Admitted`（**结构大小不变**），携带一次性裁决结果 |
 | `src/driver/rbio.c` | `RbDispatchReadWrite` 在直通分支之后、`admitted = RbFeatAdmit(ext)` **只裁决一次**；内联两处与 `workerpath` 的 `ctx->Admitted` 全部消费该结果；worker 的 `:704`/`:845` 改为 `if (!ctx->Admitted)`，**不再调用** `RbFeatAdmit`；`RbCtxAlloc` 显式初始化 `Admitted=1`（保守放行）；FLUSH ctx 亦显式置 1 |
+
+**编译期复核**：WDK `ntddk.h:5449` 已定义 `ProcessImageFileNameWin32 = 43` 为 `PROCESSINFOCLASS` 枚举值。初版写的 `#ifndef ProcessImageFileNameWin32 / #define ...` 对枚举名不生效（`#ifndef` 只看宏），会生成同名宏污染整个编译单元；已删除并改用**原生枚举常量**，重编后 sys 哈希更新为 `bdaaad57…`。这是 B 批唯一一次「编译通过但语义不干净」的自查修正。
 
 **结果**：`RbFeatAdmit` 全库调用点从 4 收敛为 1；每条 IRP 的 `Rb2Count(15,1)` 恰好计一次。排除进程读走到 `RbReadDirectFallback`（下盘直读、不进 core），写走到直写分支。
 

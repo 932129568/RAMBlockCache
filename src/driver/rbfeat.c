@@ -265,10 +265,10 @@ static BOOLEAN Rb2CurrentImagePath(WCHAR *out, ULONG cap)
      * 在 index 0 即失配 ⇒ excluded 恒 FALSE ⇒ 排除策略整体失效。
      * 改用 ProcessImageFileNameWin32(43)，用户态实测直接返回盘符形式
      * "F:\workbuddy\...\python.exe"，与注册表口径一致。若 43 在内核不可用
-     * 或返回空，回退 27 保持旧行为（保守不排除），绝不因查询失败而崩溃。 */
-#ifndef ProcessImageFileNameWin32
-#define ProcessImageFileNameWin32 ((PROCESSINFOCLASS)43)
-#endif
+     * 或返回空，回退 27 保持旧行为（保守不排除），绝不因查询失败而崩溃。
+     * WDK ntddk.h:5449 已把 ProcessImageFileNameWin32 = 43 定义为
+     * PROCESSINFOCLASS 枚举值，直接用枚举常量；切勿 #define 同名宏
+     * （#ifndef 对枚举名不生效，会污染整个编译单元）。 */
     st = ZwQueryInformationProcess(NtCurrentProcess(),
                                    ProcessImageFileNameWin32,
                                    buf, need, &need);

@@ -189,14 +189,20 @@ static const CHAR *s_DefExcl[] = {
 static WCHAR  s_ExDir[RB2_EXDIR_MAX][RB2_EXDIR_LEN];
 static ULONG  s_ExDirN;
 static struct { ULONG Pid; BOOLEAN Excluded; } s_ExPid[RB2_EXPIID_MAX];
-static ULONG  s_ExPidN;
+/* [FIX O9-EXPID 2026-11-09] 原为普通 ULONG，检查/索引/++ 三步无锁；并发
+ * IO worker 下会出现 TOCTOU：线程 A 读到 63 通过 "满则清零" 检查，线程 B
+ * 把计数推到 64，A 再用 s_ExPid[s_ExPidN] 索引 64 项数组 = 越界写。而本变量
+ * 恰好紧跟数组声明，越界写的 Pid 会覆盖计数本身，读侧 for(i<s_ExPidN)
+ * 随即变成大范围越界读 → 静态区/池腐坏（与 00:32 未点名的 0x7E 同族候选）。
+ * 改为 volatile LONG + Interlocked 原子占槽，并把读侧上界钳到 64。 */
+static volatile LONG s_ExPidN;
 
 static VOID Rb2LoadExcludeDirs(VOID)
 {
     PVOID d = NULL; ULONG sz = 0, ty = 0, i, n;
     PWCHAR w;
     s_ExDirN = 0;
-    s_ExPidN = 0;
+    InterlockedExchange((volatile LONG *)&s_ExPidN, 0);
     if (!NT_SUCCESS(Rb2Query(L"Features", L"ExcludeDirs", &d, &sz, &ty))) return;
     if (ty == REG_MULTI_SZ) {
         w = (PWCHAR)d; n = sz / sizeof(WCHAR);
@@ -286,12 +292,16 @@ static BOOLEAN Rb2CurrentImagePath(WCHAR *out, ULONG cap)
 static BOOLEAN Rb2PidInExcludeDirs(VOID)
 {
     ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
-    ULONG i, j, k;
+    ULONG i, j, k, n, slot;
+    LONG cur, next;
     WCHAR path[RB2_EXDIR_LEN];
     BOOLEAN excluded = FALSE;
 
     if (s_ExDirN == 0) return FALSE;              /* 未配置：零开销 */
-    for (i = 0; i < s_ExPidN; i++)
+    /* [FIX O9-EXPID] 读侧上界钳到 64：即使计数曾被并发写到异常值也不越界读。 */
+    n = (ULONG)InterlockedCompareExchange((volatile LONG *)&s_ExPidN, 0, 0);
+    if (n > RB2_EXPIID_MAX) n = RB2_EXPIID_MAX;
+    for (i = 0; i < n; i++)
         if (s_ExPid[i].Pid == pid) return s_ExPid[i].Excluded;
 
     if (Rb2CurrentImagePath(path, RB2_EXDIR_LEN)) {
@@ -302,10 +312,21 @@ static BOOLEAN Rb2PidInExcludeDirs(VOID)
                 excluded = TRUE;
         }
     }
-    if (s_ExPidN >= RB2_EXPIID_MAX) s_ExPidN = 0;  /* 满：整体清空重建（保守简单） */
-    s_ExPid[s_ExPidN].Pid = pid;
-    s_ExPid[s_ExPidN].Excluded = excluded;
-    s_ExPidN++;
+    /* [FIX O9-EXPID] 原子占槽：CAS 循环把「满则清零 + 取槽 + ++」合成一次
+     * 原子状态迁移，slot 恒在 [0,63]，彻底消除 TOCTOU 越界写。失败则重试，
+     * 无锁、无自旋上限（每次 CAS 失败必有其它线程前进一步，系统层面有界）。 */
+    for (;;) {
+        cur = InterlockedCompareExchange((volatile LONG *)&s_ExPidN, 0, 0);
+        if (cur < 0 || cur >= RB2_EXPIID_MAX) { slot = 0; next = 1; }
+        else                                 { slot = (ULONG)cur; next = cur + 1; }
+        if (InterlockedCompareExchange((volatile LONG *)&s_ExPidN, next, cur) == cur)
+            break;
+    }
+    /* 先写 Excluded 后写 Pid，并用 MemoryBarrier 保证读侧不会看到「Pid 已发布
+     * 但判定值还没写」的半成品条目。 */
+    s_ExPid[slot].Excluded = excluded;
+    MemoryBarrier();
+    s_ExPid[slot].Pid = pid;
     return excluded;
 }
 

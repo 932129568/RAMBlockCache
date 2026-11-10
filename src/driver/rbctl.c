@@ -230,7 +230,7 @@ static void RbDiscardAllCachedData(void)
     }
 }
 
-static void RbApplyConfig(const RB_CONFIG *cfg)
+static NTSTATUS RbApplyConfig(const RB_CONFIG *cfg)
 {
     RB_CONFIG c = *cfg;
     RB_CONFIG saved;
@@ -246,14 +246,36 @@ static void RbApplyConfig(const RB_CONFIG *cfg)
     if (g_Rb.Engine &&
         ((g_Rb.Config.Enabled && !c.Enabled) ||
          (g_Rb.Config.WriteBack && !c.WriteBack))) {
+        rb_stats tst;
+        rb_u64 dirty_before = 0, dirty_after = 0;
+        rb_engine_get_stats(g_Rb.Engine, &tst);
+        dirty_before = tst.dirty_bytes;
         rb_engine_flush(g_Rb.Engine, 1);
-        /* [FIX DATA-13] 刷脏之后必须丢缓存视图：透传期磁盘可被任意改写，
-         * 留下的干净块全是潜在陈旧数据（恢复加速后读命中即返回旧内容）。 */
+        rb_engine_get_stats(g_Rb.Engine, &tst);
+        dirty_after = tst.dirty_bytes;
+        /* [FIX I48 2026-11-10] 反丢失门（fail-closed）：旧实现忽略 flush 结果、
+         * 无条件 discard_all——而 rb_stream_discard_all 无差别销毁【含脏块】
+         * 并计入 lost_dirty_bytes（cache.c count_lost=1），随后日志谎称
+         * "dirty flushed"。实测（e4/e5 探针，AV 在位）：回写 flush 连续失败时
+         * 一次 WB→直写切换即静默丢弃 7.87MB 已 ack 写入。现语义：
+         * ① flush 后仍有脏 ⇒ 拒绝本次降档（配置不生效、不持久化），如实报
+         *    STATUS_IO_DEVICE_ERROR，WB 保持开启，dirty 留驻等下次重试；
+         * ② 仅当脏清零才丢视图（DATA-13 语义不变）；日志只在真成功时写
+         *    "dirty flushed"。 */
+        if (dirty_after != 0) {
+            RbLog(2, __LINE__, STATUS_IO_DEVICE_ERROR,
+                  L"cfg transition REFUSED: dirty remains after flush (data-safe), write-back kept");
+            return STATUS_IO_DEVICE_ERROR;
+        }
         RbDiscardAllCachedData();
         RbLog(0, __LINE__, 0,
-              (g_Rb.Config.Enabled && !c.Enabled)
-                  ? L"cfg: Enabled 1->0, dirty flushed + cache view dropped before passthrough"
-                  : L"cfg: WriteBack 1->0, dirty flushed + cache view dropped before write-through");
+              (dirty_before == 0)
+                  ? ((g_Rb.Config.Enabled && !c.Enabled)
+                        ? L"cfg: Enabled 1->0, cache view dropped before passthrough (no dirty)"
+                        : L"cfg: WriteBack 1->0, cache view dropped before write-through (no dirty)")
+                  : ((g_Rb.Config.Enabled && !c.Enabled)
+                        ? L"cfg: Enabled 1->0, dirty flushed + cache view dropped before passthrough"
+                        : L"cfg: WriteBack 1->0, dirty flushed + cache view dropped before write-through"));
     }
     /* [FIX W12 -> 83 2026-11-07 运行期几何重建]
      * 旧 W12 在这里把 c.BlockSize 回滚成旧值（只持久化、运行值不变），导致
@@ -275,6 +297,7 @@ static void RbApplyConfig(const RB_CONFIG *cfg)
     RbSaveConfig(&saved);              /* FIX[P2-1]: 持久化（内部有 PASSIVE 守卫）；
                                         * 重建 worker 会 RbRegQueryValue 回读复核，防 void 写假成功 */
     KeSetEvent(&g_Rb.FlushWake, IO_NO_INCREMENT, FALSE);
+    return STATUS_SUCCESS;
 }
 
 /* ---- IOCTL_RB_REQUEST 消息处理（static handler：每消息一个，分发顺序与旧版 switch 一致） ---- */
@@ -409,7 +432,20 @@ static VOID RbMsgSetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     }
 
     /* 先应用配置（含持久化）；CfgLock 短锁、RbSaveConfig 内部 PASSIVE 守卫。 */
-    RbApplyConfig(&msg->Data.Config);
+    {
+        /* [FIX I48] 降档被 fail-closed 拒绝（脏未清）时如实回错、不落盘、
+         * 不排队重建：配置副本保持旧值，调用方（桥接/UI）能看到失败。 */
+        NTSTATUS ast = RbApplyConfig(&msg->Data.Config);
+        if (!NT_SUCCESS(ast)) {
+            if (pst) *pst = ast;
+            RbLog(1, __LINE__, ast, L"SET_CONFIG rejected (config transition refused, data-safe)");
+            ExAcquireFastMutex(&g_Rb.CfgLock);
+            msg->Data.Config = g_Rb.Config;   /* 回显运行配置副本 */
+            ExReleaseFastMutex(&g_Rb.CfgLock);
+            *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_CONFIG);
+            return;
+        }
+    }
 
     if (isRebuildRequest) {
         NTSTATUS qst = RbRequestGeometryRebuild(newBs);

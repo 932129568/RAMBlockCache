@@ -304,6 +304,10 @@ int RbWritebackCb(void *ctx, rb_u64 file_id, rb_u64 off, const void *data, size_
     o.QuadPart = (LONGLONG)off;
     s = RbSyncIo(ext, TRUE, &o, (PVOID)data, (ULONG)len, NULL);
     RbNoteIoResult(ext, s);
+    /* [FIX I48] 回写失败状态此前不可观测（只知"失败"不知"为何"）——
+     * 失败时如实记录 NTSTATUS（CANCELLED=5s 首超时取消 / TIMEOUT / 盘错可区分）。 */
+    if (!NT_SUCCESS(s))
+        RbLog(1, __LINE__, s, L"writeback sync io failed (dirty retained)");
     RbDerefExt(ext);
     return NT_SUCCESS(s) ? 0 : 1;
 }

@@ -131,6 +131,28 @@ def main():
     if "check_poolcopy_contract.py" not in ci:
         fails.append("A7 CI: Gate13 not registered in ci.yml")
 
+    # A9 [I48 2026-11-10] WB/Enabled 降档必须 fail-closed（数据安全门）：
+    #   旧实现忽略 flush 结果并无条件 discard（core 侧 count_lost=1 计入
+    #   lost_dirty_bytes），AV 在位时 flush 连续失败 → 一次降档即静默丢弃
+    #   7.87MB 已 ack 脏数据（e4/e5 探针实证）。断言：丢弃点之前必须有
+    #   dirty_after 守卫，且守卫分支必须返回 STATUS_IO_DEVICE_ERROR。
+    rbctl_txt = root / "src/driver/rbctl.c"
+    if not rbctl_txt.is_file():
+        fails.append("A9 rbctl.c missing")
+    else:
+        ctl = rbctl_txt.read_text(encoding="utf-8-sig")
+        didx = ctl.find("RbDiscardAllCachedData();")
+        if didx < 0:
+            fails.append("A9 rbctl: RbDiscardAllCachedData call site missing")
+        else:
+            guard = ctl[max(0, didx - 2400):didx]
+            if "dirty_after != 0" not in guard:
+                fails.append("A9 rbctl: discard without 'dirty_after != 0' guard "
+                             "- data-loss regression (I48)")
+            if "STATUS_IO_DEVICE_ERROR" not in guard:
+                fails.append("A9 rbctl: transition refusal return missing "
+                             "- fail-open regression (I48)")
+
     if fails:
         for f in fails:
             print("[FAIL] %s" % f)

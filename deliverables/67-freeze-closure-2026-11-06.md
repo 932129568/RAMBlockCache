@@ -9,8 +9,8 @@
 
 | 项 | 值 |
 |---|---|
-| Setup | `77d6950aa47d5746cf6b979998dbbf5af28e5d611a7545abcee9e4722556c72b` · 278,742,360 B · **签名 Valid** |
-| sys | `29527798b068668f23bf3eb7ad2df0d0de4e93bf0e6d55310185e052bbed25e1` · 181,984 B · **签名 Valid**（本轮重编重签，三锚点已同步） |
+| Setup | `baadd2ab28e4981857544518710cfe033e5c3f76efbdda0496671fbbf770dadc` · 278,734,168 B · **签名 Valid** |
+| sys | `a155de451381857090913a54843c7236f31f07f565193604f42fa179b5956f89` · 182,496 B · **签名 Valid**（本轮重编重签，三锚点已同步） |
 | 变化（历史行，当前基线见 §0） | Setup 从 301,794,648 B → 276,153,688 B（-25.6MB）：剔除 Rust `target/` + `.mimosa/` 约 101.9MB 开发产物，加入 npm 12.2.1 完整目录约 17MB；SPA 由 Node 27 + npm 12.2.1 重建 |
 | 部署（历史行，当前基线见 §0） | sys 未变 → 不重新部署、不破锚点、无需重启；`Seq=10/Ack=8/Armed=1` 待用户重启后自动解除 |
 
@@ -127,4 +127,4 @@
 
 **新增**：`src/scripts/check_node_contract.py`、`check_coexist.ps1`、`set_node27_path.ps1`、`use_node27.ps1`、`finalize_node27.ps1`、`RB-finalize-node27.cmd`、`deliverables/67-freeze-closure-2026-11-06.md`（本文）。
 **修改**：`.github/workflows/ci.yml`、`src/scripts/build_setup.ps1`、`qa_teeth.ps1`、`sync_anchors.ps1`、`src/core/test_race1106.c`（仅注释）、`web/package.json` + `package-lock.json`（engines）、`README.md`、`README.txt`（不动锚点哈希行）、`KNOWN_ISSUES.md`（C7 / 0-E / 历史 D 段）、`deliverables/59/65/66 号`、工作区记忆。
-**发布物**：`dist/RAMBlockCache-Setup.exe`（`77d6950a…`，Valid）；`dist/RAMBlockCache.sys` 已重编重签（`29527798…`）。
+**发布物**：`dist/RAMBlockCache-Setup.exe`（`baadd2ab…`，Valid）；`dist/RAMBlockCache.sys` 已重编重签（`a155de45…`）。

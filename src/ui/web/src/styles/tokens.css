@@ -1,0 +1,1304 @@
+@import "tailwindcss";
+
+/* =========================================================================
+ * 设计令牌 —— 唯一事实源是 src/ui/controller/RAMBlockCache.Controller/Theme/Dark.xaml
+ * 本文件由该 XAML 手工映射生成，颜色值逐条对应（2026-10-31 核对）。
+ * 修改令牌时：先改 Dark.xaml，再同步本文件，禁止单方面漂移。
+ *
+ * 纪律：零死令牌。没有消费方的令牌不入库（沿用 Dark.xaml 的 [FIX B26] 约定）。
+ * ========================================================================= */
+
+/* ---- Tailwind 4 规范注册：令牌 → 原子类（bg-surface/text-secondary/...）----
+ * [适配 2026-10-31] 与下方 :root 变量同源：@theme 生成工具类，:root 供
+ * style={} 与 echarts/运行时取值。两侧必须一致，改动同步。
+ * [亮色化 2026-10-31] 决策人拍板弃纯黑——Web 控制台采用亮色调色板；
+ * Dark.xaml 映射仅保留语义名对应（web 侧色值独立演化，XAML 不动）。 */
+@theme {
+  --color-app: #f3f5f9;
+  --color-sidebar: #ffffff;
+  --color-statusbar: #ffffff;
+  --color-surface: #ffffff;
+  --color-surface-hover: #eef2f8;
+  --color-elevated: #ffffff;
+  --color-input: #f6f8fb;
+  --color-border: #e4e8ef;
+  --color-border-default: #d4dbe6;
+  --color-border-strong: #bcc6d6;
+  --color-primary: #17233c;
+  --color-secondary: #5a6880;
+  --color-tertiary: #8b97ac;
+  --color-disabled: #b9c2d2;
+  --color-on-accent: #ffffff;
+  --color-accent: #0f86e0;
+  --color-accent-hover: #2f9af0;
+  --color-accent-active: #0b6fbd;
+  --color-accent-subtle: #e3f2fe;
+  --color-success-fg: #0e8a56;
+  --color-success-bg: #e6f7ef;
+  --color-success-border: #b7e4cf;
+  --color-warning-fg: #a06e08;
+  --color-warning-bg: #fdf3dd;
+  --color-warning-border: #eed9a4;
+  --color-danger-fg: #d0443b;
+  --color-danger-bg: #fdedec;
+  --color-danger-border: #f3c4c0;
+  --color-danger-solid: #e05248;
+  --color-info-fg: #0f6fbe;
+  --color-info-bg: #e6f3fd;
+  --color-neutral-fg: #5a6880;
+  --color-neutral-bg: #eef1f6;
+  --color-neutral-border: #d4dbe6;
+  --color-chart-1: #0f86e0;
+  --color-chart-2: #7c5cf0;
+  --color-track: #e7ebf2;
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+    "Microsoft YaHei", sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, monospace;
+}
+
+:root {
+  /* ---- [亮色化 2026-10-31] 背景层级 ---- */
+  --rbc-bg-app: #f3f5f9;
+  /* [死令牌清理] 2026-10-31 弃侧栏改造遗留（--rbc-bg-sidebar / --rbc-bg-statusbar），2026-11-12 删除 */
+  --rbc-bg-surface: #ffffff;
+  --rbc-bg-surface-hover: #eef2f8;
+  --rbc-bg-elevated: #ffffff;
+  --rbc-bg-input: #f6f8fb;
+
+  /* ---- 描边 ---- */
+  --rbc-border: #e4e8ef;
+  --rbc-border-default: #d4dbe6;
+  --rbc-border-strong: #bcc6d6;
+
+  /* ---- 文字层级 ---- */
+  --rbc-text-primary: #17233c;
+  --rbc-text-secondary: #5a6880;
+  --rbc-text-tertiary: #8b97ac;
+  --rbc-text-disabled: #b9c2d2;
+  --rbc-text-on-accent: #ffffff;
+
+  /* ---- 强调（只表达交互身份，禁止表达状态） ---- */
+  --rbc-accent: #0f86e0;
+  --rbc-accent-hover: #2f9af0;
+  --rbc-accent-active: #0b6fbd;
+  --rbc-accent-subtle: #e3f2fe;
+  /* [UI-2026-11-12] 原值 `#8c0f86e0` 犯了与 --rbc-chart-area-fill 同一个错：
+   * 按 ARGB 顺序写 #AARRGGBB，而 CSS 的 8 位十六进制是 #RRGGBBAA ——
+   * 实际被读成 R=8c G=0f B=86 A=e0（88% 不透明的**深紫**）。
+   *
+   * 而且它是个**死令牌**：全仓库没有任何规则消费它，`:focus-visible` 直接用了
+   * var(--rbc-accent)，于是文件末尾 forced-colors 段里对它的覆盖（改 Highlight）
+   * 一直是空操作——高对比度用户的焦点环并没有走系统色。
+   *
+   * 处置：值改成别名（焦点环本来就该与强调色同色，实心而非 55% 半透明——
+   * WCAG 2.1 AA 要求焦点指示与相邻色对比 ≥3:1，半透明环反而更弱），
+   * 并让 `:focus-visible` 真正消费它，高对比度覆盖随之生效。
+   * 同理：`--rbc-chart-area-fill` 与 BenefityPage 的兜底值也已一并改正。 */
+  --rbc-focus-ring: var(--rbc-accent);
+
+  /* ---- 语义五色（三件套 + 实心） ---- */
+  --rbc-success-fg: #0e8a56;
+  --rbc-success-bg: #e6f7ef;
+  --rbc-success-border: #b7e4cf;
+  --rbc-success-solid: #12945e;
+
+  --rbc-warning-fg: #a06e08;
+  --rbc-warning-bg: #fdf3dd;
+  --rbc-warning-border: #eed9a4;
+
+  --rbc-danger-fg: #d0443b;
+  --rbc-danger-bg: #fdedec;
+  --rbc-danger-border: #f3c4c0;
+  --rbc-danger-solid: #e05248;
+  --rbc-danger-solid-hover: #ea6a61;
+
+  --rbc-info-fg: #0f6fbe;
+  --rbc-info-bg: #e6f3fd;
+  --rbc-info-border: #bcdcf7;
+
+  --rbc-neutral-fg: #5a6880;
+  --rbc-neutral-bg: #eef1f6;
+  --rbc-neutral-border: #d4dbe6;
+
+  /* ---- 进度轨道 ---- */
+  --rbc-track-bg: #e7ebf2;
+
+  /* ---- 图表专用色 ----
+   * 数据系（青蓝+紫）只表达"量"；语义系直引 Rbc*Fg，不设独立键。
+   * 禁第三色系；禁语义色画中性趋势；禁强调色画状态点。 */
+  --rbc-chart-1: #0f86e0;
+  --rbc-chart-2: #7c5cf0;
+  --rbc-chart-grid: #e7ebf2;
+  --rbc-chart-axis-text: #8b97ac;
+  /* [UI-2026-11-12 真缺陷] 原值 `#1f0f86e0` 是按**安卓 ARGB** 顺序写的（alpha=0x1f 在前），
+   * 但 CSS 的 8 位十六进制是 #RRGGBBAA —— 浏览器把它读成 R=1f G=0f B=86 A=e0，
+   * 即 88% 不透明的深紫。结果命中率面积图变成一整块紫色实心矩形，把网格线
+   * 和折线全糊住了（截图确认）。tsc/build 都不会报，只有长这样。
+   * 改成正规的 rgba：与 --rbc-chart-1 同源的 12% 淡蓝。
+   * 教训：CSS 颜色不要用 8 位 hex 表达透明度，ARGB 顺序在 Web 上是错的。 */
+  --rbc-chart-area-fill: rgba(15, 134, 224, 0.12);
+  --rbc-chart-track: #e7ebf2;
+  /* [UI-2026-11-12] 三档热度改为别名，统一到 --rbc-stripe-1..3。
+   * 改前是三个独立硬编码值（#dceafb/#6db6ef/#0f86e0），与分片矩阵的四档
+   * 阶梯只差一档，同一份"热度"语义维护两处。BenefitPage 消费
+   * var(--rbc-chart-heat-*)，别名化后它无需改一行就吃到同一阶梯。 */
+  --rbc-chart-heat-1: var(--rbc-stripe-1);
+  --rbc-chart-heat-2: var(--rbc-stripe-2);
+  --rbc-chart-heat-3: var(--rbc-stripe-3);
+
+  /* ---- 字体 ---- */
+  --rbc-font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+    "Microsoft YaHei", sans-serif;
+  --rbc-font-mono: "Cascadia Mono", Consolas, monospace;
+
+  /* ---- 间距 / 圆角 / 布局常量 ---- */
+  --rbc-pad-card: 16px;
+  --rbc-pad-btn-x: 12px;
+  --rbc-pad-btn-y: 8px;
+  /* [死令牌清理] 2026-10-31 弃侧栏改造遗留（--rbc-pad-statusbar-x），2026-11-12 删除 */
+  --rbc-radius-xs: 4px;
+  --rbc-radius-sm: 6px;
+  --rbc-radius-md: 10px;
+  --rbc-radius-lg: 12px;
+  --rbc-radius-pill: 999px;
+  /* [死令牌清理] 2026-10-31 弃侧栏改造遗留（--rbc-sidebar-width / --rbc-statusbar-height），2026-11-12 删除 */
+
+  /* ---- 动效令牌（来源：Controls/Motion.cs，此处只做时长映射） ---- */
+  --rbc-dur-90: 90ms;
+  --rbc-dur-120: 120ms;
+  --rbc-dur-180: 180ms;
+  --rbc-dur-240: 240ms;
+  --rbc-dur-320: 320ms;
+  --rbc-dur-480: 480ms;
+}
+
+/* ---- 全局视觉层（UI 重设计 2026-10-31）----
+ * 焦点环 / 文本选中 / 滚动条 / 控件过渡：一处定义，全站生效。 */
+:focus-visible {
+  /* 走焦点环令牌而不是直接引 --rbc-accent：否则文件末尾 forced-colors 段里
+   * 对 --rbc-focus-ring 的覆盖（Highlight）永远是空操作，高对比度用户拿不到系统色。 */
+  outline: 2px solid var(--rbc-focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--rbc-radius-xs);
+}
+::selection {
+  background: var(--rbc-accent-subtle);
+  color: var(--rbc-text-primary);
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--rbc-border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--rbc-border-strong);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+button,
+select,
+input,
+[role="button"] {
+  transition:
+    background-color var(--rbc-dur-120) ease,
+    border-color var(--rbc-dur-120) ease,
+    color var(--rbc-dur-120) ease,
+    opacity var(--rbc-dur-120) ease;
+}
+
+/* =========================================================================
+ * UI 重设计层（2026-10-31）—— 现代控制台视觉语言：
+ * 玻璃拟态 / 分层光影 / 渐变强调 / 微交互 / 入场动效。
+ * 页面只消费 .rbc-* 类，不再各自手写内联视觉。
+ * ========================================================================= */
+
+:root {
+  /* 光影令牌（亮色系：柔和漫射影 + 极浅内高光） */
+  --rbc-shadow-card: 0 1px 2px rgba(16, 24, 40, 0.05), 0 4px 14px rgba(16, 24, 40, 0.06);
+  --rbc-shadow-card-hover: 0 2px 4px rgba(16, 24, 40, 0.06), 0 12px 30px rgba(16, 24, 40, 0.1);
+  --rbc-shadow-pop: 0 16px 48px rgba(16, 24, 40, 0.16), 0 4px 12px rgba(16, 24, 40, 0.1);
+  --rbc-glow-accent: 0 0 0 1px rgba(15, 134, 224, 0.3), 0 0 14px rgba(15, 134, 224, 0.14);
+  --rbc-surface-glass: rgba(255, 255, 255, 0.78);
+  --rbc-elevated-glass: rgba(255, 255, 255, 0.92);
+}
+
+/* 应用级渐变背景：冷灰底 + 左上品牌蓝晕 + 右下紫晕，营造光源纵深 */
+.rbc-app-bg {
+  background:
+    radial-gradient(1100px 480px at 12% -8%, rgba(15, 134, 224, 0.07), transparent 62%),
+    radial-gradient(900px 420px at 96% 108%, rgba(124, 92, 240, 0.05), transparent 60%),
+    var(--rbc-bg-app);
+}
+
+/* 卡片：白面 + 悬停浮起 + 品牌描边 */
+.rbc-card {
+  position: relative;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(255, 255, 255, 0.75) 46%),
+    var(--rbc-bg-surface);
+  border: 1px solid var(--rbc-border);
+  border-radius: var(--rbc-radius-lg);
+  padding: var(--rbc-pad-card);
+  box-shadow: var(--rbc-shadow-card);
+  transition:
+    border-color var(--rbc-dur-180) ease,
+    box-shadow var(--rbc-dur-180) ease,
+    transform var(--rbc-dur-180) ease;
+}
+.rbc-card::before {
+  /* 顶缘 1px 高光：白卡上以极浅描边模拟光源 */
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.9), transparent);
+  pointer-events: none;
+}
+.rbc-card:hover {
+  border-color: var(--rbc-border-strong);
+  box-shadow: var(--rbc-shadow-card-hover);
+  transform: translateY(-1px);
+}
+/* 强调卡：左侧 2px 标尺 + 淡染色，比整卡染色克制
+ * [UI-2026-11-12] 原来这里用的是 rgba(76,194,255,…) —— 浅青 #4cc2ff，
+ * 与 --rbc-accent(#0f86e0) **不是一个蓝**。后果是"加速中"的卷卡和普通卡
+ * 在白底上几乎看不出区别（浅青 5% 叠白 ≈ 不可见）。统一到 accent 令牌。 */
+.rbc-card-accent {
+  border-color: var(--rbc-accent-border);
+  background:
+    linear-gradient(180deg, var(--rbc-accent-tint), transparent 46%),
+    var(--rbc-bg-surface);
+}
+
+/* [UI-2026-11-12] 危险卡：应急页的「全局熔断」等破坏性操作。
+ * 改前这些卡复用 .rbc-card-accent（当时它只是浅青描边 + 淡染，被借来表达
+ * "危险"），但标尺加上后蓝标尺 + 红边框撞成两种语义。危险必须有自己的变体。 */
+.rbc-card-danger {
+  border-color: var(--rbc-danger-border);
+  background:
+    linear-gradient(180deg, var(--rbc-danger-tint), transparent 46%),
+    var(--rbc-bg-surface);
+}
+
+.rbc-card-accent::after,
+.rbc-card-danger::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 2px;
+  border-radius: 0 var(--rbc-radius-xs) var(--rbc-radius-xs) 0;
+  pointer-events: none;
+}
+.rbc-card-accent::after {
+  background: var(--rbc-accent);
+}
+.rbc-card-danger::after {
+  background: var(--rbc-danger-solid);
+}
+
+/* 按钮：渐变主键 / 描边次键 / 幽灵键 / 危险键，统一按压回弹 */
+.rbc-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--rbc-radius-sm);
+  padding: var(--rbc-pad-btn-y) var(--rbc-pad-btn-x);
+  font-size: 12px;
+  line-height: 1.2;
+  border: 1px solid transparent;
+  transition:
+    transform var(--rbc-dur-90) ease,
+    box-shadow var(--rbc-dur-180) ease,
+    border-color var(--rbc-dur-180) ease,
+    background-color var(--rbc-dur-180) ease,
+    color var(--rbc-dur-180) ease;
+  cursor: pointer;
+}
+.rbc-btn:active:not(:disabled) {
+  transform: scale(0.965);
+}
+.rbc-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.rbc-btn-primary {
+  background: linear-gradient(180deg, var(--rbc-accent-hover), var(--rbc-accent) 55%, var(--rbc-accent-active));
+  color: #ffffff;
+  border-color: rgba(15, 134, 224, 0.55);
+  font-weight: 600;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.3) inset, 0 2px 10px rgba(15, 134, 224, 0.25);
+}
+.rbc-btn-primary:hover:not(:disabled) {
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.3) inset, var(--rbc-glow-accent);
+}
+.rbc-btn-secondary {
+  background: var(--rbc-bg-surface);
+  color: var(--rbc-text-primary);
+  border-color: var(--rbc-border-strong);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+}
+.rbc-btn-secondary:hover:not(:disabled) {
+  border-color: rgba(76, 194, 255, 0.45);
+  box-shadow: var(--rbc-glow-accent);
+  color: var(--rbc-accent);
+}
+.rbc-btn-ghost {
+  background: transparent;
+  color: var(--rbc-text-secondary);
+  border-color: transparent;
+}
+.rbc-btn-ghost:hover:not(:disabled) {
+  background: var(--rbc-bg-surface-hover);
+  color: var(--rbc-text-primary);
+}
+/* [UI-2026-11-12] 危险键：原先写死 #fff + rgba(179,56,47)/rgba(242,122,114)，
+ * 亮色下这两个 rgba 来自旧的冷色主题，与当前暖灰底冲突（灰绿边缘）。
+ * 改为语义令牌，双主题各自定义。 */
+.rbc-btn-danger {
+  background: linear-gradient(180deg, var(--rbc-danger-solid-hover), var(--rbc-danger-solid));
+  color: var(--rbc-text-on-danger);
+  border-color: var(--rbc-danger-border);
+  font-weight: 600;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), var(--rbc-danger-glow-soft);
+}
+.rbc-btn-danger:hover:not(:disabled) {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), var(--rbc-danger-glow);
+}
+
+/* 输入控件：内凹质感 + 聚焦辉光 */
+.rbc-input {
+  background: var(--rbc-bg-input);
+  color: var(--rbc-text-primary);
+  border: 1px solid var(--rbc-border-strong);
+  border-radius: var(--rbc-radius-sm);
+  padding: 4px 8px;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.28);
+  transition: border-color var(--rbc-dur-120) ease, box-shadow var(--rbc-dur-120) ease;
+}
+/* [UI-2026-11-12] 聚焦边框原为 rgba(76,194,255,.55)（冷蓝）—— 与琥珀强调色
+ * 同时出现时形成「双色高亮」，是旧主题残留。改走 --rbc-accent。 */
+.rbc-input:focus {
+  outline: none;
+  border-color: var(--rbc-accent);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.18), var(--rbc-glow-accent);
+}
+
+/* 玻璃面板（侧栏/状态栏/弹层） */
+.rbc-glass {
+  background: var(--rbc-surface-glass);
+  backdrop-filter: blur(14px) saturate(150%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
+}
+
+/* 导航项：悬停滑移 + 活动指示
+ * [UI-2026-11-12] 加 white-space:nowrap + flex:0 0 auto：此前窄窗口下
+ * header 挤爆，中文标签被**逐字换行**（"状态"渲染成竖排两行、"已连接"
+ * 竖排三行）。中文没有词间空格，一旦允许换行就会一个字一行，非常难看。 */
+.rbc-nav-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  border-radius: var(--rbc-radius-sm);
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--rbc-text-secondary);
+  overflow: hidden;
+  transition:
+    color var(--rbc-dur-120) ease,
+    background-color var(--rbc-dur-120) ease;
+}
+.rbc-nav-item:hover {
+  background: var(--rbc-bg-surface-hover);
+  color: var(--rbc-text-primary);
+}
+
+/* KPI 数值：渐变强调文字
+ * [UI-2026-11-12] 原为硬编码 #17233c→#43536e（深蓝，旧冷色主题），
+ * 在暖灰底上是本案唯一一处"冷色文字"。改为令牌：
+ * 亮色 = 近黑→暖灰（克制，不与琥珀抢），暗色 = 亮白→浅灰。 */
+.rbc-value-glow {
+  background: linear-gradient(180deg, var(--rbc-value-grad-a), var(--rbc-value-grad-b));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.rbc-value-accent {
+  background: linear-gradient(180deg, var(--rbc-accent-hover), var(--rbc-accent-active));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* 入场动效（纯 CSS，供非 motion 元素使用） */
+@keyframes rbc-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.rbc-fade-up {
+  animation: rbc-fade-up var(--rbc-dur-240) ease both;
+}
+.rbc-fade-up-late {
+  animation: rbc-fade-up var(--rbc-dur-320) ease both;
+  animation-delay: 60ms;
+}
+
+/* ---- 骨架屏 shimmer（[A7 2026-11-11] 独立命名）----
+ * 原先 Skeleton 组件复用 .rbc-breach（SLO 违约扫光）：暖黄底色 + 2.2s。
+ * 语义错位（骨架屏不是违约），且暖黄让加载态看起来像告警。
+ * 骨架独立为中性灰蓝扫光 + 更快的 1.4s（加载感知更"轻"）。 */
+@keyframes rbc-skeleton {
+  0% {
+    background-position: -140% 0;
+  }
+  100% {
+    background-position: 240% 0;
+  }
+}
+.rbc-skeleton {
+  background: linear-gradient(
+    100deg,
+    var(--rbc-track-bg) 30%,
+    var(--rbc-bg-surface-hover) 50%,
+    var(--rbc-track-bg) 70%
+  );
+  background-size: 220% 100%;
+  animation: rbc-skeleton 1.4s ease-in-out infinite;
+}
+
+/* SLO 违约 shimmer 扫光（亮色系：暖黄浅底） */
+@keyframes rbc-shimmer {
+  0% {
+    background-position: -140% 0;
+  }
+  100% {
+    background-position: 240% 0;
+  }
+}
+.rbc-breach {
+  background: linear-gradient(
+    100deg,
+    rgba(160, 110, 8, 0.05) 30%,
+    rgba(160, 110, 8, 0.14) 50%,
+    rgba(160, 110, 8, 0.05) 70%
+  );
+  background-size: 220% 100%;
+  animation: rbc-shimmer 2.2s linear infinite;
+}
+
+/* ---- 弹层进出场（radix data-state 驱动）----
+ * [A7 2026-11-11] 原实现只有 [data-state="open"] 入场，没有出场：
+ * radix 在关闭时会把 data-state 置为 "closed" 并保持节点挂载到动画结束，
+ * 缺出场规则 → 弹层瞬间消失，观感断裂。补齐 closed 动画并显式声明
+ * animation-fill-mode: both，保证结束时停在终态而不是回弹。
+ * 注意：radix 依赖「动画结束」事件卸载节点；若 duration 为 0（减弱动效），
+ * 浏览器仍会触发 animationend（0ms 动画），不会卡住。 */
+@keyframes rbc-pop-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.97) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1) translateY(0);
+  }
+}
+@keyframes rbc-pop-out {
+  from {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1) translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.98) translateY(4px);
+  }
+}
+.rbc-pop-in[data-state="open"] {
+  animation: rbc-pop-in var(--rbc-dur-180) cubic-bezier(0, 0, 0.2, 1) both;
+}
+.rbc-pop-in[data-state="closed"] {
+  animation: rbc-pop-out var(--rbc-dur-120) cubic-bezier(0.4, 0, 1, 1) both;
+}
+
+/* 遮罩淡入淡出（与弹层同步，避免"弹层已走、遮罩还在"） */
+@keyframes rbc-overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes rbc-overlay-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+.rbc-overlay[data-state="open"] {
+  animation: rbc-overlay-in var(--rbc-dur-180) ease both;
+}
+.rbc-overlay[data-state="closed"] {
+  animation: rbc-overlay-out var(--rbc-dur-120) ease both;
+}
+
+/* ---- Toast 进出场（radix 的 data-state + data-swipe 三态）----
+ * radix Toast 用 data-state="open|closed" 且滑动关闭时挂 data-swipe="move|end|cancel"。
+ * 只做 translateX + opacity：Toast 从右下角滑入，右滑关闭时跟随手指。
+ * 不用 scale（缩放在小尺寸卡片上会显得"抖"）。 */
+@keyframes rbc-toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@keyframes rbc-toast-out {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+}
+.rbc-toast[data-state="open"] {
+  animation: rbc-toast-in var(--rbc-dur-240) cubic-bezier(0, 0, 0.2, 1) both;
+}
+.rbc-toast[data-state="closed"] {
+  animation: rbc-toast-out var(--rbc-dur-180) cubic-bezier(0.4, 0, 1, 1) both;
+}
+.rbc-toast[data-swipe="move"] {
+  transform: translateX(var(--radix-toast-swipe-move-x, 0));
+  transition: none;
+}
+.rbc-toast[data-swipe="cancel"] {
+  transform: translateX(0);
+  transition: transform var(--rbc-dur-180) ease;
+}
+
+/* IoctlMatrix 单元格悬停辉光 */
+.rbc-iom-cell {
+  transition: border-color var(--rbc-dur-120) ease, box-shadow var(--rbc-dur-120) ease;
+}
+/* [UI-2026-11-12] 悬停辉光原为 rgba(15,134,224,.45)（冷蓝）→ 统一走强调色 */
+.rbc-iom-cell:hover {
+  border-color: var(--rbc-accent);
+  box-shadow: var(--rbc-glow-accent);
+}
+
+/* 连接徽标呼吸点（亮色系微动效） */
+@keyframes rbc-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.82);
+  }
+}
+.rbc-pulse-dot {
+  animation: rbc-pulse 2s ease-in-out infinite;
+}
+
+/* =========================================================================
+ * [UI-2026-11-12] 设计层增补 —— 分片热力矩阵（Stripe Matrix）
+ *
+ * 背景：驱动的 RbStats 里有 StripeRead[64] / StripeWrite[64] / StripeCount，
+ * 协议已传输、types.ts 已声明，但**前端零消费**。这 128 个计数是块缓存
+ * 唯一的「指纹级」信号（哪个分片承压、读写是否失衡、有没有冷分片），
+ * 比命中率更能说明"这台机器上的缓存正在干什么"。
+ *
+ * 定调：不做曲线、不做雷达图。做成**半导体测试机探针卡**那样的双排
+ * 条形矩阵 —— 64 格 × 2 行，按对数刻度分 4 档着色。信息密度高、不假装
+ * 精确（只给档位，不给假小数）、扫一眼就有结论。
+ *
+ * 与既有颜色的关系：四档热度复用图表色系（`--rbc-chart-heat-*` 是同一阶梯的
+ * 别名，见上方 :root）。0 档必须"看得见但安静"，否则冷分片会消失在底色里，
+ * 人就无法判断"是没有流量"还是"渲染失败"。
+ *
+ * 【2026-11-12 修正记录】本节初稿误把本控制台当成暖调琥珀主题，写入了
+ * 一组暖灰/琥珀值。实际 `--rbc-accent` 是 #0f86e0（冷蓝），底色 #f3f5f9，
+ * `--rbc-value-glow` 的 #17233c→#43536e 才是本体。所有值已改回与该调色板
+ * 一致；同时删掉了一个 `[data-theme="dark"]` 块——全仓库无人设置
+ * `data-theme`，那会是死代码（违背「零死令牌」）。暗色主题是**待做特性**，
+ * 不是已有实现，见 deliverables/163。
+ * ========================================================================= */
+
+:root {
+  /* 危险实心键上的文字色（与 --rbc-text-on-accent 分开：两者底色明度不同） */
+  --rbc-text-on-danger: #ffffff;
+  --rbc-danger-glow-soft: 0 2px 12px rgba(224, 82, 72, 0.26);
+  --rbc-danger-glow: 0 0 16px rgba(224, 82, 72, 0.3);
+
+  /* KPI 渐变文字：原为 .rbc-value-glow 里的硬编码 #17233c→#43536e，
+   * 现在令牌化（值不变），这样它和 --rbc-text-primary 能一起调。 */
+  --rbc-value-grad-a: #17233c;
+  --rbc-value-grad-b: #43536e;
+
+  /* 分片矩阵：四档热度，取自本调色板既有的蓝色阶梯（track → info → accent） */
+  --rbc-stripe-0: #e7ebf2;
+  --rbc-stripe-1: #c9e2f8;
+  --rbc-stripe-2: #6db6ef;
+  --rbc-stripe-3: #0f86e0;
+
+  /* 分片矩阵几何 */
+  --rbc-stripe-gap: 2px;
+  --rbc-stripe-h: 18px;
+  --rbc-stripe-h-hot: 24px;
+  --rbc-stripe-radius: 1px;
+  --rbc-stripe-idle-border: #dbe1ea;
+
+  /* 强调色的描边档（导航激活态、聚焦容器）。
+   * 此前是硬编码 rgba(15,134,224,0.28) 散在 App.tsx 里，现在令牌化。 */
+  --rbc-accent-border: rgba(15, 134, 224, 0.28);
+  /* 强调色的极淡填充（激活卡片顶缘渐变）。原为 rgba(76,194,255,0.05)，
+   * 那是与 accent 不同的浅青，叠白后几乎不可见。 */
+  --rbc-accent-tint: rgba(15, 134, 224, 0.06);
+  --rbc-danger-tint: rgba(224, 82, 72, 0.06);
+
+  /* 内容画布最大宽度：这是给桌面控制台用的，不是营销页。
+   * 原 max-w-6xl = 1152px，在 2K/4K 屏上两侧留出大片死区，
+   * 而 5 列 KPI + 64 格矩阵恰恰需要横向空间。 */
+  --rbc-canvas-max: 1600px;
+}
+
+/* ---- 分片矩阵 ---- */
+.rbc-matrix {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.rbc-matrix-row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--rbc-stripe-gap);
+}
+
+/* 行首标（READ / WRITE）：等宽窄字，宽度固定保证两排严格对齐 */
+.rbc-matrix-tag {
+  flex: 0 0 44px;
+  font-family: var(--rbc-font-mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--rbc-text-tertiary);
+  padding-bottom: 4px;
+  user-select: none;
+}
+
+.rbc-stripe {
+  flex: 1 1 0;
+  min-width: 0;
+  height: var(--rbc-stripe-h);
+  border-radius: var(--rbc-stripe-radius);
+  background: var(--rbc-stripe-0);
+  border: 1px solid transparent;
+  transition:
+    background-color var(--rbc-dur-120) ease,
+    box-shadow var(--rbc-dur-120) ease,
+    transform var(--rbc-dur-120) ease;
+}
+
+/* 冷分片：给一条极淡的边，避免"没渲染"与"没流量"混淆 */
+.rbc-stripe[data-lv="0"] {
+  border-color: var(--rbc-stripe-idle-border);
+}
+.rbc-stripe[data-lv="1"] {
+  background: var(--rbc-stripe-1);
+}
+.rbc-stripe[data-lv="2"] {
+  background: var(--rbc-stripe-2);
+}
+.rbc-stripe[data-lv="3"] {
+  background: var(--rbc-stripe-3);
+}
+
+/* 热分片长高 6px：不靠颜色单通道编码（色盲友好），也用形态第二次编码 */
+.rbc-stripe[data-hot="1"] {
+  height: var(--rbc-stripe-h-hot);
+}
+
+.rbc-stripe:hover,
+.rbc-stripe[data-active="1"] {
+  box-shadow: 0 0 0 1px var(--rbc-accent);
+  transform: scaleY(1.18);
+  z-index: 2;
+}
+
+/* 图例 */
+.rbc-matrix-legend {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 10px;
+  color: var(--rbc-text-tertiary);
+}
+.rbc-legend-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: var(--rbc-stripe-radius);
+  border: 1px solid transparent;
+  margin-right: 4px;
+  vertical-align: -1px;
+}
+.rbc-legend-swatch[data-lv="0"] {
+  background: var(--rbc-stripe-0);
+  border-color: var(--rbc-stripe-idle-border);
+}
+.rbc-legend-swatch[data-lv="1"] {
+  background: var(--rbc-stripe-1);
+}
+.rbc-legend-swatch[data-lv="2"] {
+  background: var(--rbc-stripe-2);
+}
+.rbc-legend-swatch[data-lv="3"] {
+  background: var(--rbc-stripe-3);
+}
+
+/* 小标签（Kicker）：仪表盘面板上的分区标 */
+.rbc-kicker {
+  font-family: var(--rbc-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--rbc-text-tertiary);
+}
+
+/* ---- 页面分区（四段式页面的唯一骨架）----
+ * [UI-2026-11-12] 6 个页面此前各写各的间距与标题层级：有的用 PageHeader 副标题，
+ * 有的直接堆卡片，同一"小节"在 A 页是 text-xs+灰、在 B 页是 text-sm+黑。
+ * 这里定死三段结构：标题行（kicker + 右侧结论徽标）/ 正文 / 脚注。
+ * 页面只需给出语义，不给视觉。 */
+.rbc-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.rbc-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--rbc-border);
+  /* [UI-2026-11-12] 窄窗口（703px 实测）下 kicker 与右侧说明会互相挤压，
+   * 说明文字被压成每行两字。允许换行后说明整段落到下一行，仍右对齐。 */
+  flex-wrap: wrap;
+}
+.rbc-section-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.rbc-section-note {
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--rbc-text-tertiary);
+}
+
+/* ---- 高对比度支持（对应 P1-5 WCAG 2.1 AA）----
+ * Windows 高对比度模式会强制覆盖颜色，语义令牌不应再参与判定。
+ * 焦点环与状态点改用系统色，保证讲述人/高对比度用户可辨。 */
+@media (forced-colors: active) {
+  :root {
+    --rbc-accent: Highlight;
+    --rbc-focus-ring: Highlight;
+    --rbc-success-fg: ButtonText;
+    --rbc-danger-fg: ButtonText;
+  }
+}
+
+/* ---- 尊重系统减弱动效设置 ----
+ * [A7 2026-11-11] 原先只把 --rbc-dur-* 归零，但循环动画（shimmer / pulse /
+ * skeleton）的时长是硬编码的（2.2s / 2s / 1.4s），不受令牌影响 → 减弱动效下
+ * 仍在持续扫光/呼吸。这里显式关掉所有无限循环动画，并把过渡压到 1ms
+ * （用 1ms 而非 0，避免某些浏览器把 0 视为"无过渡"而跳过 animationend）。
+ * JS 侧（motion 组件）由 src/lib/motion.ts 的 useMotion() 统一接管。 */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --rbc-dur-90: 0ms;
+    --rbc-dur-120: 0ms;
+    --rbc-dur-180: 0ms;
+    --rbc-dur-240: 0ms;
+    --rbc-dur-320: 0ms;
+    --rbc-dur-480: 0ms;
+  }
+
+  /* 无限循环动画全部停摆，保留静态底色（信息不丢，只是不动） */
+  .rbc-breach,
+  .rbc-skeleton,
+  .rbc-pulse-dot {
+    animation: none !important;
+  }
+  /* 一次性入场动画压到瞬时：仍会触发 animationend，radix 卸载链路不受影响 */
+  .rbc-fade-up,
+  .rbc-fade-up-late,
+  .rbc-pop-in[data-state="open"],
+  .rbc-pop-in[data-state="closed"],
+  .rbc-overlay[data-state="open"],
+  .rbc-overlay[data-state="closed"],
+  .rbc-toast[data-state="open"],
+  .rbc-toast[data-state="closed"] {
+    animation-duration: 1ms !important;
+    animation-delay: 0ms !important;
+  }
+  /* 骨架屏在减弱动效下不显示扫光，但仍要看得见"这里是占位" */
+  .rbc-skeleton {
+    background: var(--rbc-track-bg);
+  }
+}
+
+/* ============================================================================
+ * Incrementally appended to src/ui/web/src/styles/tokens.css (Line 883+)
+ * Preserves all existing 882 lines, @theme, and .rbc-section flex layout.
+ * All 18 --rbc-lg-* tokens below have 100% consumption in liquid-glass.css.
+ * ============================================================================ */
+
+:root {
+  /* 1. 桌面透光透色动态色相 (由 WPF WebView2 宿主推送或默认亮色主题驱动，不触碰 Session 0 Bridge) [3 tokens] */
+  --rbc-lg-desktop-h1: 206 88% 54%;
+  --rbc-lg-desktop-h2: 192 84% 48%;
+  --rbc-lg-desktop-alpha: 0.16;
+
+  /* 2. 液态玻璃折射与滤镜参数 [3 tokens] */
+  --rbc-lg-blur: 20px;
+  --rbc-lg-saturate: 185%;
+  --rbc-lg-brightness: 104%;
+
+  /* 3. 亮色水晶液态玻璃体渐变染色 (对齐现有 --rbc-bg-app:#f3f5f9 与 --rbc-accent:#0f86e0) [3 tokens] */
+  --rbc-lg-fill-top: rgba(255, 255, 255, 0.74);
+  --rbc-lg-fill-mid: rgba(255, 255, 255, 0.46);
+  --rbc-lg-fill-bot: rgba(232, 243, 254, 0.56);
+
+  /* 4. 菲涅尔内高光、镜面切割边与环境光阴影 [5 tokens] */
+  --rbc-lg-rim-hi: rgba(255, 255, 255, 0.92);
+  --rbc-lg-rim-lo: rgba(15, 134, 224, 0.26);
+  --rbc-lg-fresnel-inset:
+    inset 0 1.5px 1px 0 rgba(255, 255, 255, 0.92),
+    inset 1px 0 1px 0 rgba(255, 255, 255, 0.62),
+    inset 0 -1.5px 2.5px 0 rgba(15, 134, 224, 0.12),
+    inset 0 12px 28px -6px rgba(255, 255, 255, 0.45);
+  --rbc-lg-shadow-elev:
+    0 14px 34px -10px rgba(15, 23, 42, 0.10),
+    0 4px 12px -2px rgba(15, 134, 224, 0.06);
+  --rbc-lg-shadow-active:
+    0 16px 38px -8px rgba(15, 134, 224, 0.20),
+    0 4px 14px -2px rgba(15, 134, 224, 0.12);
+
+  /* 5. 流体阻尼曲线与鼠标追踪光泽坐标 [4 tokens] */
+  --rbc-lg-ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --rbc-lg-dur-morph: 360ms;
+  --rbc-lg-ptr-x: 50%;
+  --rbc-lg-ptr-y: 20%;
+}
+
+/* 衔接 tokens.css:834 forced-colors 与 :849 prefers-reduced-motion */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --rbc-lg-dur-morph: 0ms;
+  }
+}
+
+@media (forced-colors: active) {
+  :root {
+    --rbc-lg-fill-top: Canvas;
+    --rbc-lg-fill-mid: Canvas;
+    --rbc-lg-fill-bot: Canvas;
+    --rbc-lg-fresnel-inset: none;
+    --rbc-lg-shadow-elev: none;
+    --rbc-lg-shadow-active: none;
+  }
+}
+
+/* ============================================================================
+ * [239 APPEND ONLY] Deep-sea Liquid Glass optical tokens.
+ * Prefix is --rbc-glass-* (NOT --rbc-lg-*) on purpose: the contract test counts
+ * exactly 18 --rbc-lg-* declarations in this file. All 18 tokens below are
+ * consumed by the appended block in liquid-glass.css (zero dead tokens).
+ * ============================================================================ */
+:root {
+  --rbc-glass-canvas-bg: #060b14;
+  --rbc-glass-orb-cyan: rgba(56, 189, 248, 0.28);
+  --rbc-glass-orb-indigo: rgba(129, 140, 248, 0.24);
+  --rbc-glass-orb-teal: rgba(45, 212, 191, 0.18);
+
+  --rbc-glass-card-fill: linear-gradient(
+    145deg,
+    rgba(255, 255, 255, 0.12) 0%,
+    rgba(255, 255, 255, 0.04) 50%,
+    rgba(125, 211, 252, 0.08) 100%
+  );
+  --rbc-glass-card-fill-hover: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.17) 0%,
+    rgba(255, 255, 255, 0.06) 55%,
+    rgba(56, 189, 248, 0.13) 100%
+  );
+  --rbc-glass-pill-fill: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.18) 0%,
+    rgba(255, 255, 255, 0.06) 100%
+  );
+
+  --rbc-glass-blur-card: 24px;
+  --rbc-glass-blur-pill: 36px;
+  --rbc-glass-saturate: 185%;
+  --rbc-glass-contrast: 108%;
+
+  --rbc-glass-fresnel-rim: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.58) 0%,
+    rgba(255, 255, 255, 0.14) 34%,
+    rgba(56, 189, 248, 0.14) 68%,
+    rgba(186, 230, 253, 0.44) 100%
+  );
+  --rbc-glass-shadow-depth:
+    0 20px 44px -14px rgba(2, 6, 23, 0.74),
+    0 4px 16px -2px rgba(15, 23, 42, 0.48);
+  --rbc-glass-shadow-thickness:
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.44),
+    inset 0 -1px 2px 0 rgba(56, 189, 248, 0.24),
+    inset 0 0 24px 0 rgba(255, 255, 255, 0.04);
+
+  --rbc-glass-specular-core: rgba(255, 255, 255, 0.26);
+  --rbc-glass-specular-halo: rgba(56, 189, 248, 0.15);
+  --rbc-glass-caustic-beam: rgba(165, 243, 252, 0.18);
+  --rbc-glass-ambient-cycle: 18s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --rbc-glass-ambient-cycle: 0ms;
+  }
+}
+
+/* ============================================================================
+ * [APPEND 2026-11-15] iOS 26 Liquid Glass optical & spring tokens.
+ * Origin: deliverables/243-ios26-liquid-glass-and-fullstack-wiring-2026-11-15.md 3.1
+ *
+ * Contract: the existing 18 --rbc-lg-* and 18 --rbc-glass-* declarations above
+ * are untouched. Every --rbc-glass-* name repeated in the night block below
+ * already exists, so the unique count stays exactly 18 / 18.
+ * --rbc-bg-app is intentionally NOT redeclared here: this file's header forbids
+ * @theme / :root drift, and the light sky tint is produced by the mesh
+ * gradients appended to liquid-glass.css instead.
+ * ============================================================================ */
+:root {
+  /* 1. Light-crystal surfaces (body text stays #17233c, >7:1 on glass) */
+  --rbc-surface-card: rgba(255, 255, 255, 0.56);
+  --rbc-surface-elevated: rgba(255, 255, 255, 0.74);
+  --rbc-border-subtle: rgba(255, 255, 255, 0.72);
+
+  /* 2. Semantic duration aliases -> existing 320ms / 180ms, so the
+   *    prefers-reduced-motion block above zeroes them automatically. */
+  --rbc-dur-normal: var(--rbc-dur-320);
+  --rbc-dur-fast: var(--rbc-dur-180);
+
+  /* 3. 13 optical / spring tokens; every one is consumed in liquid-glass.css. */
+  --rbc-ios-mesh-primary: rgba(56, 189, 248, 0.34);
+  --rbc-ios-mesh-secondary: rgba(129, 140, 248, 0.28);
+  --rbc-ios-mesh-tertiary: rgba(45, 212, 191, 0.26);
+
+  --rbc-ios-card-bg: linear-gradient(
+    145deg,
+    rgba(255, 255, 255, 0.76) 0%,
+    rgba(255, 255, 255, 0.46) 52%,
+    rgba(224, 242, 254, 0.64) 100%
+  );
+  --rbc-ios-card-well: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.52) 0%,
+    rgba(241, 248, 255, 0.34) 100%
+  );
+  --rbc-ios-pill-bg: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.88) 0%,
+    rgba(240, 249, 255, 0.62) 100%
+  );
+  --rbc-ios-fresnel-edge: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.96) 0%,
+    rgba(255, 255, 255, 0.38) 38%,
+    rgba(56, 189, 248, 0.28) 72%,
+    rgba(255, 255, 255, 0.88) 100%
+  );
+  --rbc-ios-glass-shadow:
+    0 18px 40px -14px rgba(15, 23, 42, 0.14),
+    0 4px 14px -2px rgba(56, 189, 248, 0.12),
+    inset 0 1.5px 1px 0 rgba(255, 255, 255, 0.92),
+    inset 0 -1px 2px 0 rgba(125, 211, 252, 0.35);
+  --rbc-ios-specular-spot: radial-gradient(
+    280px circle at var(--rbc-lg-ptr-x, 50%) var(--rbc-lg-ptr-y, 20%),
+    rgba(255, 255, 255, 0.72) 0%,
+    rgba(186, 230, 253, 0.26) 42%,
+    transparent 74%
+  );
+
+  --rbc-ios-radius-card: 26px;
+  --rbc-ios-radius-well: 20px;
+  --rbc-ios-radius-pill: 999px;
+  --rbc-ios-spring: linear(
+    0, 0.009, 0.035 2.1%, 0.141, 0.281 6.7%, 0.723 12.9%, 0.938 16.7%,
+    1.017, 1.077, 1.121, 1.149 24.3%, 1.159, 1.163, 1.161, 1.154 29.9%,
+    1.129 32.8%, 1.051 39.6%, 1.017 43.1%, 0.991, 0.977 51%, 0.974 53.8%,
+    0.975 57.1%, 0.997 69.8%, 1.003 76.9%, 1.004 83.8%, 1
+  );
+}
+
+/* 4. Deep-sea night glass. Overrides --rbc-ios-* plus 12 EXISTING
+ *    --rbc-glass-* names only (no new names -> unique count stays 18). */
+.rbc-glass-deep,
+body:has(.rbc-glass-deep) {
+  --rbc-surface-card: rgba(15, 23, 42, 0.54);
+  --rbc-surface-elevated: rgba(30, 41, 59, 0.68);
+  --rbc-border-subtle: rgba(255, 255, 255, 0.18);
+
+  --rbc-ios-mesh-primary: rgba(56, 189, 248, 0.28);
+  --rbc-ios-mesh-secondary: rgba(129, 140, 248, 0.24);
+  --rbc-ios-mesh-tertiary: rgba(45, 212, 191, 0.18);
+
+  --rbc-ios-card-bg: linear-gradient(
+    145deg,
+    rgba(255, 255, 255, 0.13) 0%,
+    rgba(255, 255, 255, 0.04) 52%,
+    rgba(56, 189, 248, 0.10) 100%
+  );
+  --rbc-ios-card-well: linear-gradient(
+    180deg,
+    rgba(15, 23, 42, 0.52) 0%,
+    rgba(15, 23, 42, 0.34) 100%
+  );
+  --rbc-ios-pill-bg: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.18) 0%,
+    rgba(255, 255, 255, 0.06) 100%
+  );
+  --rbc-ios-fresnel-edge: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.56) 0%,
+    rgba(255, 255, 255, 0.12) 38%,
+    rgba(56, 189, 248, 0.18) 72%,
+    rgba(186, 230, 253, 0.42) 100%
+  );
+  --rbc-ios-glass-shadow:
+    0 20px 44px -14px rgba(2, 6, 23, 0.72),
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.42),
+    inset 0 -1px 2px 0 rgba(56, 189, 248, 0.24);
+  --rbc-ios-specular-spot: radial-gradient(
+    280px circle at var(--rbc-lg-ptr-x, 50%) var(--rbc-lg-ptr-y, 20%),
+    rgba(255, 255, 255, 0.24) 0%,
+    rgba(56, 189, 248, 0.12) 42%,
+    transparent 74%
+  );
+
+  --rbc-glass-canvas-bg: #060b14;
+  --rbc-glass-orb-cyan: rgba(56, 189, 248, 0.28);
+  --rbc-glass-orb-indigo: rgba(129, 140, 248, 0.24);
+  --rbc-glass-orb-teal: rgba(45, 212, 191, 0.18);
+  --rbc-glass-card-fill: var(--rbc-ios-card-bg);
+  --rbc-glass-fresnel-rim: var(--rbc-ios-fresnel-edge);
+  --rbc-glass-pill-fill: var(--rbc-ios-pill-bg);
+  --rbc-glass-shadow-depth: 0 20px 44px -14px rgba(2, 6, 23, 0.72);
+  --rbc-glass-shadow-thickness: inset 0 1px 1px 0 rgba(255, 255, 255, 0.42);
+  --rbc-glass-specular-core: rgba(255, 255, 255, 0.26);
+  --rbc-glass-specular-halo: rgba(56, 189, 248, 0.15);
+  --rbc-glass-caustic-beam: rgba(165, 243, 252, 0.18);
+}
+
+/* ============================================================================
+ * U3 分层液态玻璃令牌（v22）—— 双色散倒角折射 + 底部焦散反射 + 碰撞边缘高光
+ *
+ * 为什么另起 --rbc-layer-* 一族：--rbc-lg-*（18）/ --rbc-glass-*（18）/
+ * --rbc-ios-*（13）三族都被 liquid-glass.contract.test.ts 的数量断言钉死，
+ * 往里面加值会直接打红契约门禁。新族单独受 host-mode.contract.test.ts 保护。
+ *
+ * 不落 [data-theme="dark"] 块：全仓库无人设置 data-theme（见本文件 :651 的
+ * 既有修正记录），写进去就是死令牌 —— 手册 v22 的该块已按此纪律剔除。
+ * ========================================================================= */
+
+:root {
+  /* 底层薄玻璃（.rbc-section）：高透，负责"透出桌面"
+   *
+   * [292 2026-11-19] 三档填充全部下调，理由是一次可复算的叠层实测：
+   *   用户反馈"底层的液态玻璃跟磨砂玻璃一样，只能透色一点"。
+   *   查下来不是缺滤镜，而是三层白纱在合成后把桌面盖掉了 6 成 —— 算式：
+   *     scrim 0.34（见下方 luma 说明，实际生效值不是 0.14）
+   *     → +section 0.16 → 0.446
+   *     → +card    0.26 → 0.590
+   *   也就是说"玻璃"只剩 41% 的透射率，再叠 DWM 亚克力的系统级重模糊，
+   *   肉眼得到的必然是一块**磨砂塑料**，而不是液态玻璃。
+   *   本版把三层同时压到 0.05 / 0.05 / 0.08，合成
+   *     1-(0.95×0.95×0.92) = 0.170
+   *   透射率 83%，桌面纹理（壁纸图案、窗口形状）第一次能被眼睛读到。
+   *   层次关系不变：card(0.08) > section(0.05)，不会出现上下颠倒。
+   *   这条不能只改一处 —— 只压 scrim 的话，section/card 两层仍然各自
+   *   贡献 0.16 与 0.26，用户看到的依旧是一块白。 */
+  --rbc-layer-section-fill: linear-gradient(
+    145deg,
+    rgba(255, 255, 255, 0.05) 0%,
+    rgba(241, 245, 249, 0.03) 100%
+  );
+  /* 顶层厚玻璃（.rbc-card）：比 section 略实一档，负责"透出底层" */
+  --rbc-layer-card-fill: linear-gradient(
+    148deg,
+    rgba(255, 255, 255, 0.08) 0%,
+    rgba(248, 250, 252, 0.05) 52%,
+    rgba(241, 245, 249, 0.06) 100%
+  );
+  /* 顶层折射模糊。
+   * [292] 26px -> 20px。26px 是为"能分辨嵌套厚玻璃"选的档位，但那是在
+   * 白纱 0.59 的前提下 —— 白纱压到 0.17 之后，过大的模糊会把 card 底下
+   * 好不容易透上来的内容重新糊平，"透形"立刻退化回"透色"。
+   * 20px 仍足以把 card 与 section 的边界软化成折射过渡，又保留了形状信息。
+   * 不取更小（如 10px）：那会让文字底下的高频细节跟着清晰，
+   * 与 section 内圈的 26px 形成"双层锐利"，反而读起来像没做处理的贴纸。 */
+  --rbc-layer-card-blur: 20px;
+  /* [292 2026-11-19] 185% -> 130%。
+   * 185% 的饱和提升是为"白纱 0.59 之下，把被冲淡的颜色抢救回来"设计的。
+   * 白纱降到 0.17 之后这层抢救变成了**过度染色**：本机壁纸是亮青海面，
+   * 乘 1.85 之后整块玻璃泛出一层饱和的青绿，与用户"像染过色的塑料板"的
+   * 观感直接相关。130% 只做"略微提神"，不再改变原色。
+   * 注意 section 侧用的是固定 118%（见 liquid-glass.css），两者不要拉平 ——
+   * 层次感靠"外层淡、内层略浓"的差，拉平就糊成一片。 */
+  --rbc-layer-card-saturate: 130%;
+  --rbc-layer-card-brightness: 104%;
+  /* 宿主真透色时的对比度守护（桌面模糊由 DWM 负责，页面负责不漏字）。
+   * [v23 2026-11-19] 0.62 -> 0.14。这不是调参偏好，是修复一个实测缺陷：
+   * 0.62 的白纱叠在底层玻璃 fill（最大 alpha 0.24）之上，合成不透明度
+   *   0.62 + 0.24×(1-0.62) = 0.711
+   * 与不透明兜底底色 #f3f5f9 的亮度几乎一致，肉眼无法分辨 ⇒ 桌面亚克力
+   * 被彻底遮死，整页读起来是一块灰白板（用户第一条抱怨）。
+   * 0.14 + 0.24×(1-0.14) = 0.335，DWM 桌面真透色可穿透 2/3 以上。
+   * 文字可读性由 --rbc-layer-text-halo 单独兜住，不靠这层白纱。
+   * 该值同时是 useLiquidGlassPointer 亮度自适应的低端点（luma=0）。
+   *
+   * [292 2026-11-19] 0.14 -> 0.06。
+   * 0.14 在"桌面亚克力负责模糊、页面只负责不漏字"的分工下仍然偏厚：
+   * 它叠在 0.05 的 section 填充之上，合成 0.19，仍是整页最显眼的一层白。
+   * 而且实际生效的从来不是这个 0.14 —— 见 useLiquidGlassPointer 的 luma 段：
+   * 宿主发来的 luma 会把它插值顶到 0.34，用户看到的是 0.34 而不是 0.14。
+   * 本版把端点区间整体下移（0.04..0.14），令牌默认值同步取低段 0.06。 */
+  --rbc-layer-host-scrim: rgba(255, 255, 255, 0.06);
+
+  --rbc-layer-section-rim:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.72),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.36);
+  --rbc-layer-card-rim:
+    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.92),
+    inset 0 -1.5px 2px 0 rgba(186, 230, 253, 0.45),
+    inset 1px 0 0 0 rgba(255, 255, 255, 0.56),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.44);
+  --rbc-layer-card-shadow:
+    0 14px 32px -8px rgba(15, 23, 42, 0.15),
+    0 4px 10px -2px rgba(15, 23, 42, 0.08);
+  /* 随指针偏转的青/紫双色散菲涅尔倒角（零 url()，纯渐变） */
+  --rbc-layer-bevel-gradient: linear-gradient(
+    var(--rbc-rim-angle, 135deg),
+    rgba(255, 255, 255, 0.96) 0%,
+    rgba(56, 189, 248, 0.44) 24%,
+    rgba(255, 255, 255, 0.14) 50%,
+    rgba(167, 139, 250, 0.38) 78%,
+    rgba(255, 255, 255, 0.88) 100%
+  );
+  /* 文字对比度守护：scrim 降到 0.14 后，正文不再有白纱垫底，
+   * 必须靠一层极浅的文字阴影把笔画从桌面图上"托"起来。
+   * 只作用于 .rbc-section 的继承文本，不做全页 text-shadow（会糊掉数字与图表）。 */
+  --rbc-layer-text-halo: 0 1px 2px rgba(255, 255, 255, 0.55);
+}
+
+/* WPF 宿主真透色：底层薄玻璃降到 alpha 0.12，让 DWM 亚克力透上来。
+ * 类由 useLiquidGlassPointer 在收到 rbc-desktop-accent 时挂到 <html>。
+ *
+ * [v23 2026-11-19] 本块内的 --rbc-layer-host-scrim 原为 0.62 —— 那才是
+ * 「整页灰白」的真正杀手：它选择器权重 (0,1,1) 高于 :root 的 (0,1,0)，
+ * 于是只在宿主模式下生效、只在宿主模式下把人眼看到的一切遮死。
+ * 修 :root 而不修这里等于没修。现在两处同值 0.14，方向一致。 */
+html.rbc-host-transparent {
+  /* [284 2026-11-19] section 填充从 0.12/0.08 提到 0.16/0.10。
+   *
+   * 不是"更白一点更好看"，而是修一个层次缺陷：scrim 已经降到 0.14，
+   * 0.08 的 section 填充叠上去合成只有 0.21，等于没画 —— 用户在截图里看到的
+   * "扁平淡青框"就是这个数值的直接结果。0.16/0.10 合成约 0.28，
+   * 足以让容器边界被眼睛读到，同时仍然透出 7 成桌面。
+   * （section 的厚度感由 liquid-glass.css 的内阴影负责，这里只负责"底色存在感"。）
+   *
+   * [292 2026-11-19] 上述 0.16 判断在"白纱合计 0.59"的前提下成立，方向却过头了：
+   * 容器边界被读到之后，桌面也被盖掉了。0.16 -> 0.05 / 0.10 -> 0.03。
+   * 现在边界感完全交给 liquid-glass.css 的三条 inset 内阴影（那才是物理厚度），
+   * 填充只留一层几乎无色的底，负责"这一块与桌面不是同一张纸"。 */
+  --rbc-layer-section-fill: linear-gradient(
+    145deg,
+    rgba(255, 255, 255, 0.05) 0%,
+    rgba(248, 250, 252, 0.03) 100%
+  );
+  /* 卡片从 0.32/0.24/0.30 降到 0.26/0.18/0.22。
+   *
+   * 用户第三条抱怨的后半段是「里面的 D:/C:/E: 卡片近乎实心白条」。
+   * 0.32 的白叠在 section 之上，合成接近 0.48，在深色壁纸上就是一条白胶带，
+   * 而且它把 section 与桌面之间的第三层彻底遮断（看见的只有"白条+白条"）。
+   * 降到 0.26 后卡片仍是全场最亮的一层（层次不倒置），但底下能透出 section
+   * 的微光与桌面纹理，玻璃才立得住。
+   * backdrop-filter 的 26px 模糊由 liquid-glass.css 负责，这里只调颜色。
+   *
+   * [292 2026-11-19] 0.26 仍然太实（用户原话："只能透色一点"）。0.26 -> 0.08。
+   * 注意这里必须与 :root 同步改：本块的权重 (0,1,1) 高于 :root 的 (0,1,0)，
+   * 宿主模式下生效的是本块 —— 只改 :root 等于完全没改，这是 v22 遗留 0.62
+   * 时踩过的同一个坑（见本块上方 scrim 的注释）。 */
+  --rbc-layer-card-fill: linear-gradient(
+    148deg,
+    rgba(255, 255, 255, 0.08) 0%,
+    rgba(248, 250, 252, 0.05) 55%,
+    rgba(241, 245, 249, 0.06) 100%
+  );
+  --rbc-layer-host-scrim: rgba(255, 255, 255, 0.06);
+}
+
+/* 强制色模式：光学层全部退化为系统色，不留半透明死层 */
+@media (forced-colors: active) {
+  :root,
+  html.rbc-host-transparent {
+    --rbc-layer-section-fill: none;
+    --rbc-layer-card-fill: none;
+    --rbc-layer-card-blur: 0px;
+    --rbc-layer-card-saturate: 100%;
+    --rbc-layer-card-brightness: 100%;
+    --rbc-layer-host-scrim: Canvas;
+    --rbc-layer-section-rim: none;
+    --rbc-layer-card-rim: none;
+    --rbc-layer-card-shadow: none;
+    --rbc-layer-bevel-gradient: none;
+    --rbc-layer-text-halo: none;
+  }
+}

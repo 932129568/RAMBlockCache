@@ -1,0 +1,81 @@
+/* src/ui/web/src/styles/window-chrome.css
+ *
+ * [284 2026-11-19] 宿主窗口按钮（顶栏三键：最小化 / 最大化 / 关闭）。
+ *
+ * 为什么单独一个文件，而不是塞进 liquid-glass.css：
+ *   liquid-glass.contract.test.ts:43 对**整个文件**断言零 display / 零
+ *   flex-direction / 零 gap（这条契约的本意是"不许覆写 .rbc-section 的 flex
+ *   骨架"，但正则没有限定选择器）。host-mode.contract.test.ts 则从 U3 注释起
+ *   切到文件末尾做同样的断言。窗口按钮天然要 display:flex 居中 ——
+ *   放在那两个文件的任何位置都会让"零违禁"断言自伤。
+ *   独立文件既守住既有契约，也不需要用 !important 或权重花招绕开。
+ *
+ * 造型对齐 Windows 11 原生按钮：40x32、无圆角、关闭悬停变红。
+ * 颜色全部走既有令牌，不新增令牌族（守住 18+18+13 的数量契约）。
+ * ========================================================================= */
+
+.rbc-win-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--rbc-text-secondary);
+  cursor: default;
+  transition:
+    background-color var(--rbc-dur-fast) ease-out,
+    color var(--rbc-dur-fast) ease-out;
+}
+
+.rbc-win-btn:hover {
+  background: var(--rbc-bg-surface-hover);
+  color: var(--rbc-text-primary);
+}
+
+.rbc-win-btn:active {
+  /* 复用既有令牌：tokens.css 里没有 --rbc-surface-active，
+   * 随手写一个不存在的变量会让整条属性静默失效（零死令牌纪律的反面案例）。 */
+  background: var(--rbc-bg-surface-hover);
+  color: var(--rbc-accent-active);
+}
+
+/* 关闭键：Windows 11 语义是悬停即红，配白色图标 */
+.rbc-win-btn-close:hover {
+  background: #c42b1c;
+  color: #ffffff;
+}
+
+.rbc-win-btn-close:active {
+  background: #b1271a;
+  color: #ffffff;
+}
+
+/* 键盘可达性：这三个按钮只能靠 Tab 到达，必须有可见焦点环 */
+.rbc-win-btn:focus-visible {
+  outline: 2px solid var(--rbc-accent);
+  outline-offset: -2px;
+}
+
+/* 减弱动效：取消悬停过渡，保留即时状态切换 */
+@media (prefers-reduced-motion: reduce) {
+  .rbc-win-btn {
+    transition: none;
+  }
+}
+
+/* 强制色模式：交给系统色，红底失效 */
+@media (forced-colors: active) {
+  .rbc-win-btn {
+    color: ButtonText;
+    forced-color-adjust: auto;
+  }
+
+  .rbc-win-btn-close:hover {
+    background: Highlight;
+    color: HighlightText;
+  }
+}

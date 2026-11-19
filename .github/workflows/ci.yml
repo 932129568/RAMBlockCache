@@ -1,0 +1,227 @@
+# RAMBlockCache CI —— 六门禁 + .NET 10 编译 + Web 类型检查/构建（2026-11-06 修订）
+#
+# 范围纪律：
+#  - 六门禁在本工作流原样执行；任何一道 FAIL 即红灯（验收：故意注入协议字段漂移必须红）。
+#  - C# 13/13 测试与 WPF 离屏渲染取证（--capture-wpf）需要 STA 渲染环境，
+#    hosted runner 上不稳定，继续留在本地 QA（qa_recovery_20261024.ps1）；CI 只做编译级检查。
+#  - src/ui/web/ 自 2026-11-06 起接入：npm ci + tsc（主/bridge 双 tsconfig）+ vite build。
+#    工具链契约固定 Node 27 + npm 12.2.1（用户决策）。但 actions/setup-node 的
+#    版本清单尚未收录 27.x（alpha 未发布到该通道），因此 CI 用 Node 22 只做
+#    **编译级兼容检查**；真实构建与分发由 src/scripts/build_setup.ps1 的
+#    Resolve-Node27 强制 27+12.2.1，并把 node.exe 与整个 npm 目录打进安装包。
+#    下面的 check_node_contract.py 会断言该 pin 与内置逻辑没有被改回去。
+#  - PYTHONIOENCODING / PYTHONUTF8 必填：windows-latest 上 Python stdout 是 charmap(cp1252)，
+#    门禁脚本的中文输出会抛 UnicodeEncodeError -> Gate2 假红
+#    （2026-11-06 四次 push 实测 failure，日志 check_proto_sync.py:277）。
+#  - Gate6 依赖仓库内 dist/RAMBlockCache.sys（哈希由 <sys>.sha256 与三锚点自证）。
+#    Hosted runner 不信任 RAMBoostFS 自签测试根，且在非交互会话里导入根证书会
+#    挂起（实测 >4 分钟无返回）。故 CI 用 -AllowUntrustedRoot：仅容忍「链不受
+#    信任」，绝不放过未签名/哈希不符，哈希与三锚点照常强校验；本机门禁⑤不带
+#    该开关，仍强制 Status == Valid（红线不变）。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
+
+jobs:
+  gates:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # [88 B-4 2026-11-07] RAMBlockCache.Setup.csproj targets net8.0-windows;
+      # a 10.0.x-only SDK lacks the net8 WindowsDesktop targeting pack, so keep
+      # 8.0.x installed alongside 10.0.x.
+      - name: Setup .NET 10 + 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.x
+            8.0.x
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: src/ui/web/package-lock.json
+
+      # —— 门禁① 版本单一事实源 + 接线表 + mtime ——
+      # 干净 checkout 无 build/*.out|obj 时 §7 freshness 按设计跳过（本机等价复现 PASS）。
+      - name: Gate1 check_repo
+        run: python src/scripts/check_repo.py
+
+      # —— 门禁② 协议三副本字段级同步（注入漂移即红灯的验收载体）——
+      - name: Gate2 check_proto_sync
+        run: python src/scripts/check_proto_sync.py --strict
+
+      # —— 门禁③ 引用计数模型（17 断言）——
+      - name: Gate3 refcount_model
+        run: python deliverables/gstack/model/refcount_model.py
+
+      # —— 门禁④ XAML StaticResource 全有定义 ——
+      - name: Gate4 check_xaml_resources
+        run: python src/scripts/check_xaml_resources.py
+
+      # —— 门禁⑤ PowerShell 语法/BOM/惯用法（全部活跃 .ps1，当前 58 文件）——
+      - name: Gate5 check_ps_syntax
+        shell: pwsh
+        run: ./src/scripts/check_ps_syntax.ps1
+
+      # —— 门禁⑥ 签名有效性 + 锚点一致（CI 仅容忍「链不受信任」；
+      #      140 B3 起锚点三视图 = deploy.ps1 / verify_deploy_signature.ps1 /
+      #      dist sidecar .sha256；README.txt 已改为包时生成物）——
+      - name: Gate6 check_signature
+        shell: pwsh
+        run: ./src/scripts/check_signature.ps1 -AllowUntrustedRoot
+
+      # —— 工具链契约：Node 27 + npm 12.2.1 固定 + 安装包全内置（防回退到 22）——
+      - name: Assert Node 27 / npm 12.2.1 toolchain contract
+        run: python src/scripts/check_node_contract.py
+
+      # —— >4K 条纹锁修复契约（2026-11-06，73 号）——
+      # 静态只读：断言 rb_write_pass2 用 stripe_of(cs) 而非子块起点、
+      # 几何白名单恰为 4096/8192/16384/32768/65536（64K 已解禁 2026-11-08）、动态门禁资产合规、CI 持续调用本检查。
+      # 完整的 30 轮 Release+ASan 实跑由本机 qa_geom_gate.ps1 -Rounds 30 承担：
+      # hosted runner 无本机 MSVC cl / ASan 运行时 / llvm-symbolizer / ASCII 中转路径，
+      # 且全量约 9 分钟，故 CI 只做防回退的静态契约，不做动态压测。
+      - name: Gate7 check_geom_contract
+        run: python src/scripts/check_geom_contract.py
+
+      # —— [85 B12] RB_STATS 统计五字段 ABI + TS/CLI 手工副本静态契约（Gate8）——
+      # check_proto_sync.py --strict 只管 C# 三副本，不含 src/ui/web/ 的 TS 手工副本
+      # （types.ts / statsSchema / proto-decode.ts）与 CLI statval 键；本门防止
+      # 追加 RB_STATS 字段时漏改 TS 副本导致 66 号 TinyLFU@152 白屏同款事故。
+      # 断言五偏移 1280/1284/1288/1292/1296、sizeof=1304、decodeStats 分级长度
+      # 守卫（1280B 旧回包五字段填 0 不抛 RangeError）、四副本五字段齐备。
+      - name: Gate8 check_stats_contract
+        run: python src/scripts/check_stats_contract.py
+
+      # —— [S2 2026-11-07] CLI 产物新鲜度（Gate9）——
+      # 2026-11-07 实测：ramboostctl.exe 停留在 11-06 06:27，而 ramboostctl.c
+      # 17:52 才加上五个 RB_STATS statval 键；build_setup.ps1:139 会把这个 exe
+      # 原样打进安装包，导致分发包 CLI 无法回答 `statval engine_bs`，打穿
+      # 79 号 E1-c 验收门。check_repo.py 只配 core/ 测试产物，覆盖不到 ctl/。
+      # 内容级断言（五个键字符串）在 CI 可靠；产物不存在时跳过而非误报。
+      - name: Gate9 check_ctl_freshness
+        run: python src/scripts/check_ctl_freshness.py
+
+      # —— [2026-11-07] UI 档位 ↔ 驱动白名单漂移守卫（Gate10）——
+      # 防「Web 下拉只给 4K、驱动白名单却已放开 4 档」这类 UI 档位 ↔ 驱动白名单
+      # 漂移：静态只读断言 SettingsPage.tsx BLOCK_SIZES、rbctl.c rb_legal_bs[]、
+      # rbrebuild.c 重建目标白名单三者恰为 {4096,8192,16384,32768,65536} 且顺序一致，
+      # 三者均不含 128K（76 号 NO-GO 封禁；64K 已于 2026-11-08 解禁），且桥接 configSchema 未用
+      # z.enum / z.literal / refine 把 BlockSize 重新锁死。CI 持续调用本脚本。
+      - name: Gate10 check_blocksize_contract
+        run: python src/scripts/check_blocksize_contract.py
+
+      # —— [88 B-4 2026-11-07] 安装器链静态契约（Gate11）——
+      # 只读、无 subprocess、CI-safe：payload zip / Setup.exe / 启动器未跟踪时
+      # 跳过而非 FAIL；只断言 Payload.cs 载荷清单、payload README 模板的
+      # {{SYS_SHA256}} 占位与 build_setup 渲染接线、index.ts 的 cwd 无关
+      # dist 解析、根级 wrapper 编码、CI 自身注册。
+      - name: Gate11 check_installer_contract
+        run: python src/scripts/check_installer_contract.py
+
+      # —— [124 F9 2026-11-09] RB_CONFIG ↔ decodeConfig 字段级契约（Gate12）——
+      # 124 号 T7c 变异测试证明：删掉 proto-decode.ts 的 ['TinyLFU', 152]
+      # 后原有 8 道门禁全绿（66 号白屏同款缺口）；只加 `//` 注释前缀也能
+      # 骗过不剥离注释的 Gate8 正则。本门双向比对 C 头 23 个 u32 字段的
+      # 名称与偏移、VolumeFilter@64、sizeof=156、TinyLFU 分级长度守卫，
+      # 且两侧都先剥离注释。CI 持续调用本脚本。
+      - name: Gate12 check_config_decode_contract
+        run: python src/scripts/check_config_decode_contract.py
+
+      # Gate13：钉死 00:32 池腐坏根因族的两处越界写修复（119 号
+      # UNICODE_STRING 布局 8B 越界、121 号 s_ExPidN TOCTOU 越界写），
+      # 外加 RbReadRegValue / L2 记录两处池拷贝长度契约。128/129 号。
+      - name: Gate13 check_poolcopy_contract
+        run: python src/scripts/check_poolcopy_contract.py
+
+      # Gate14：全库「定长数组 + 自增下标写入」守恒清单 + 钳位证据。
+      # 130 号 RbLogSnapshot 越界之后的系统性排查产物；新增写入点或删钳位
+      # 都会 FAIL，强制先人工审计再登记。131 号。
+      - name: Gate14 check_buffer_write_contract
+        run: python src/scripts/check_buffer_write_contract.py
+
+      # —— [140 B4 2026-11-10] Gate15 仓库布局契约 ——
+      # 根目录白名单（README.txt 已改为包时生成物，根级不再跟踪）、
+      # 禁止 bin/obj/x64/node_modules 跟踪、禁止乱码路径回流
+      # （I16 同款双重编码不可再现）、禁止 legacy src/ui/wpf 复活。
+      - name: Gate15 check_layout
+        run: python src/scripts/check_layout.py
+
+      # —— [140 B4 2026-11-10] Gate16 构建清单单向事实源 ——
+      # sources.manifest.json <-> 磁盘 <-> RAMBlockCache.vcxproj 三方双向一致；
+      # 驱动/核心/ctl/setup 构建入口不得内联源清单。I51 的陈旧源列表
+      # （缺 rbdev/rbrebuild/read_plan -> 18 个 LNK2019）正是缺这道门的后果。
+      - name: Gate16 check_build_manifest
+        run: python src/scripts/check_build_manifest.py
+
+      # —— [162 G-C 2026-11-12] Gate17 IOCTL 注册表 ——
+      # 161 号 §5.3：DeviceType 0x22 被 rb_proto.h/rb_excl.h/rb_logq.h/
+      # rb_bootcfg.h/rb_common2.h + rbfeatctl.c 六处瓜分，"若撞功能号整体平移"
+      # 只是注释纪律。本门展开 CTL_CODE 成 (DeviceType,Function)，断言全局唯一
+      # 且跨文件同名副本展开值一致。
+      - name: Gate17 check_ioctl_registry
+        run: python src/scripts/check_ioctl_registry.py
+
+      # —— [166 2026-11-12] Gate18 RB_CONFIG TS 生成物新鲜度 ——
+      # 161 号 §5 ③：手写副本 + 事后比对仍是人肉同步。本轮改为从 C 头生成
+      # src/ui/web/src/protocol/rb-config.generated.ts，本门在内存里重跑生成器
+      # 与磁盘文件逐字节比对——改了 rb_proto.h 却忘记重跑生成器即红灯。
+      - name: Gate18 check_proto_codegen
+        run: python src/scripts/check_proto_codegen.py
+
+      # —— [153 C.3 阶段 1 2026-11-12] 审计工具进 CI：只报不拦 ——
+      # tools/audit_probe_failopen.py 当前实测 EXIT 1（FO1 真缺陷 6 条 + FO5 已知
+      # 误报 2 条，处置表见 deliverables/153-e2e-hardening-plan-2026-11-11.md §C.2），
+      # 故 continue-on-error: true —— 日志里看趋势，不阻断其它门禁。
+      # 阶段 2/3 的收紧条件见该报告 §C.3/C.4；本轮不改 build/build.ps1 的 $py 数组。
+      - name: "Audit: probe fail-open (non-blocking)"
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: python -B tools/audit_probe_failopen.py --ignore-cleanup
+
+      # —— 探针退出码契约单测（tests/e2e/test_e2e_exitcode_contract.py，当前 33 例）——
+      # 覆盖 e1/e2/e4/e5/t6 的 0/1/2/3 三态与 return-in-try 陷阱；同样只报不拦。
+      - name: "Test: e2e exit-code contract (non-blocking)"
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: python -B -m unittest discover -s tests/e2e -p "test_e2e_exitcode_contract.py" -v
+
+      # —— Web 类型检查 + 生产构建（41 号 §11.5 阶段 2 接入）——
+      # --loglevel=error 抑制 Node 27 alpha 上 npm 12.2.1 的已知 engines 假警告
+      # （CI 侧同时抑制 Node 22 与 package.json engines 的 EBADENGINE 提示）。
+      - name: Web typecheck + build
+        working-directory: src/ui/web
+        run: |
+          npm ci --no-audit --no-fund --loglevel=error
+          npm run build --loglevel=error
+
+      # —— .NET 10 编译检查（0 警告基线）——
+      - name: Build WPF (net10.0-windows)
+        run: dotnet build src/ui/controller/RAMBlockCache.Controller/RAMBlockCache.Controller.csproj -c Release --no-incremental -warnaserror
+
+      # —— [88 B-4] 安装器工程编译级检查（net8.0-windows；setup-dotnet 已装 8.0.x）——
+      # 本机实跑 `dotnet build ... -c Release` = 0 警告 / 0 错误；补上
+      # 「安装器源码改了却全绿」的空档（88 B-4）。
+      - name: Build Setup installer (net8.0-windows)
+        run: dotnet build src/ui/installer/RAMBlockCache.Setup/RAMBlockCache.Setup.csproj -c Release

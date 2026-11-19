@@ -1,0 +1,1056 @@
+﻿/* rbfeat.c —— V10.3 特性中枢。注册表:
+ *   Services\RAMBlockCache\Features : Flags(DWORD) L2Letter(DWORD) L2SizeGB(DWORD)
+ *                                     ProcessExclude(MULTI_SZ)
+ *   Services\RAMBlockCache\Policies\<X> : ReadAheadMB MaxWriteIops
+ * 安全红线：Flags=0（部署默认）时全部钩子零开销空转，IRP 行为与 V10.2 等价。
+ *
+ * 例程 IRQL 契约：数据路径钩子（RbFeatOnRead/OnHit/OnMiss/Admit）由 rbio.c
+ *   的 worker 线程调用——块设备 I/O 在 dispatch 处 IoMarkIrpPending + 转投
+ *   PASSIVE worker（见 rbio.c 头 IRQL 策略），故钩子运行在 PASSIVE_LEVEL；
+ *   RbFeatOnMiss / RbL2ProbeFill / RbL2Store 内部仍显式自检
+ *   KeGetCurrentIrql()==PASSIVE_LEVEL 才做文件 IO（防将来被 DISPATCH 上下文
+ *   误调，不满足即按 MISS/忽略处理=安全方向）。RbFeatDispatch 在控制面
+ *   PASSIVE 上下文完成 IRP。计数器 s_Cnt 为 per-CPU 分片无锁计数（写侧按
+ *   KeGetCurrentProcessorNumberEx 取片、InterlockedAdd64；读侧聚合）。
+ * 生命周期：RbFeatInit（PASSIVE，CAS 幂等）→ Rb2Tick 后台线程（PASSIVE，
+ * KeDelayExecutionThread）→ RbFeatShutdown（PASSIVE）；注册表读取均 PASSIVE-only。
+ */
+#include "rb_common.h"
+#include "rb_common2.h"
+
+/* 裁剪 WDK 头可能未导出该原型，ntoskrnl 有导出，显式声明 */
+CHAR *PsGetProcessImageFileName(PEPROCESS Process);
+/* [103] 进程镜像全路径查询（ntoskrnl 导出；裁剪 WDK 头缺原型，显式声明） */
+NTSYSAPI NTSTATUS NTAPI ZwQueryInformationProcess(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+#define RB2_SVC  L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\RAMBlockCache"
+
+ULONG  g_Rb2Flags = 0;
+static LONG     s_Init, s_Panic, s_InFeat, s_Stop;
+static RB2_PORT_FILL   s_Fill;
+static RB2_PORT_SHRINK s_Shrink;
+/* [P1-5] Rb2Tick 线程 join 句柄（旧代码 ZwClose 后即失联，Shutdown 无法等待，
+ * 卸载时线程可能仍在跑 → 0xC4/0x1）。句柄保留到 Shutdown join 之后。 */
+static HANDLE   s_TickH;
+static PVOID    s_TickObj;
+/* [v2-RT C2 2026-11-16] s_TickObj/s_TickH 的**认领者**令牌。
+ * RbFeatStopTick 与 RbFeatRecover 都要走「if (s_TickObj) → KeWait →
+ * ObDereferenceObject → s_TickObj=NULL → ZwClose」这同一串裸操作，且都不是
+ * 原子认领。关机分派与 sc stop / 卸载中止并发时会：
+ *   · 同一 PETHREAD 被 ObDereference 两次 → 引用计数提前归零 → UAF；
+ *   · 同一 HANDLE 被 ZwClose 两次 → 0x93 INVALID_KERNEL_HANDLE（本驱动吃过）。
+ * 另：RbFeatRecover 的 InterlockedExchange(&s_Stop, 0) 会让正在等待的
+ * RbFeatStopTick 永远等不到线程退出 → 10s 超时 → 白丢一次落盘。
+ * 用 CAS 令牌把「谁在动 s_TickObj」串行化；认领失败方直接让行。 */
+static volatile LONG s_TickClaim = 0;
+
+/* ---- 分片计数器（热路径零锁；每槽 32 分片，查询时聚合） ----
+ * [PERF-97] 64B 独占槽：原 `volatile LONG64 s_Cnt[16][32]` 相邻分片共享
+ * cache line（8B × 8 分片/行）——命中读热路径每 IO 两次 InterlockedAdd64
+ * （slot 0/2），相邻 CPU 各写同一行的相邻 8 字节 = 每次命中两次跨核行乒乓。
+ * 垫成 64B 独占槽后（16×32×64B = 32KB 静态）行乒乓归零。与 RB_GLOB 的
+ * RB_IOCNT_SLOT 同款手法。 */
+#define RB2_SHARDS 32
+typedef struct _RB2_CNT_SLOT {
+    volatile LONG64 v;
+    UCHAR           Pad[56];
+} RB2_CNT_SLOT;
+C_ASSERT(sizeof(RB2_CNT_SLOT) == 64);
+/* [D6] 14→16：新槽 14=ThermalStops（rbthermal 暂停事件）15=AdmitRejects（准入排除拒绝） */
+static RB2_CNT_SLOT s_Cnt[16][RB2_SHARDS];
+VOID Rb2Count(ULONG slot, LONG64 d)
+{
+    if (slot < 16)
+        InterlockedAdd64(&s_Cnt[slot][KeGetCurrentProcessorNumberEx(NULL) % RB2_SHARDS].v, d);
+}
+VOID Rb2CountersInit(VOID)
+{
+    /* 静态数组已零初始化；预留重置点 */
+}
+static LONG64 Rb2CntSum(ULONG slot)
+{
+    ULONG i; LONG64 s = 0;
+    for (i = 0; i < RB2_SHARDS; i++) s += s_Cnt[slot][i].v;
+    return s;
+}
+VOID Rb2StatsFill(PRB_STATS2 o)
+{
+    o->Flags = g_Rb2Flags;
+    o->Hits       = (ULONG64)Rb2CntSum(0);
+    o->Misses     = (ULONG64)Rb2CntSum(1);
+    o->BytesHit   = (ULONG64)Rb2CntSum(2);
+    o->BytesMiss  = (ULONG64)Rb2CntSum(3);
+    o->PrefIssued = (ULONG64)Rb2CntSum(4);
+    o->PrefFillOk = (ULONG64)Rb2CntSum(5);
+    o->L2Hits     = (ULONG64)Rb2CntSum(7);
+    o->L2Stores   = (ULONG64)Rb2CntSum(8);
+    o->L2Miss     = (ULONG64)Rb2CntSum(9);
+    /* [Build15] 写回计数槽：10=WbQueued 11=WbDone 12=WbThrottled */
+    o->WbQueued    = (ULONG64)Rb2CntSum(10);
+    o->WbDone      = (ULONG64)Rb2CntSum(11);
+    o->WbThrottled = (ULONG64)Rb2CntSum(12);
+    o->HotZones    = RbHotCount();
+    /* [D6] 新统计：L2 状态 + 温度护栏暂停 + 准入排除拒绝 */
+    o->L2State      = RbL2State();
+    o->ThermalStops = (ULONG)Rb2CntSum(14);
+    o->AdmitRejects = (ULONG)Rb2CntSum(15);
+    /* [FIX S-telelemetry] 原恒 0 的误导性遥测字段如实填充 */
+    o->CpuGroups    = KeQueryActiveGroupCount();
+    o->Workers      = Rb2PoolWorkerCount();
+}
+
+/* ---- 注册表（[Commit4] 收敛到 rbdriver.c 唯一原语 RbRegQueryValue） ----
+ * [P3] RB2_SVC 已在文件头定义（唯一一份）；此处旧代码重复 #define 同一宏，
+ * 虽值相同不报错，但两处漂移风险高，删除重复定义。 */
+
+/* 拼 base[\Sub] 路径并读值；返回分页池副本，调用方 ExFreePoolWithTag(*OutData) */
+static NTSTATUS Rb2Query(PCWSTR Sub, PCWSTR Name, PVOID *OutData, PULONG OutSize, PULONG OutType)
+{
+    WCHAR path[200]; UNICODE_STRING u; ULONG n = 0, k = 0;
+    /* [FIX O9-BUF 2026-11-09] 130 号同类排查：原实现三个写入点（base 复制、
+     * 反斜杠、Sub 复制）均无上界，仅靠当前调用方恰好传 <=11 WCHAR 的 Sub
+     * 才不溢出。任何新调用方传入长 Sub 都会栈越界。统一钳到 cap，末位留 NUL。 */
+    const ULONG cap = (ULONG)(RTL_NUMBER_OF(path) - 1);
+    while (RB2_SVC[n] && n < cap) { path[n] = RB2_SVC[n]; n++; }
+    if (Sub && *Sub && n < cap) {
+        path[n++] = L'\\';
+        while (Sub[k] && n < cap) path[n++] = Sub[k++];
+    }
+    path[n] = 0;
+    RtlInitUnicodeString(&u, path);
+    return RbRegQueryValue(&u, Name, OutData, OutSize, OutType);
+}
+
+NTSTATUS Rb2GetDW(PCWSTR Sub, PCWSTR Name, ULONG Def, ULONG *Out)
+{
+    PVOID d = NULL; ULONG sz = 0, ty = 0; NTSTATUS st;
+    *Out = Def;
+    st = Rb2Query(Sub, Name, &d, &sz, &ty);
+    if (NT_SUCCESS(st) && ty == REG_DWORD && sz >= sizeof(ULONG))
+        *Out = *(ULONG *)d;
+    if (d) ExFreePoolWithTag(d, RB_POOL_TAG);
+    return st;
+}
+
+PVOID Rb2Alloc(SIZE_T n) { return ExAllocatePool2(POOL_FLAG_NON_PAGED, n, RB_POOL_TAG); }
+VOID  Rb2Free(PVOID p)   { if (p) ExFreePoolWithTag(p, RB_POOL_TAG); }
+
+/* ---- 每卷策略 ---- */
+/* [D8] ReadAheadMB 语义（FR-PF-02 每卷开关）：
+ *   键缺省            -> 16（默认开）
+ *   显式 0            -> 该卷关闭预取（RbPrefStream 入口直接 return）
+ *   合法非零档        -> {8,16,32,64} 原样采用
+ *   其余非零值        -> 回退 16 并 RbLog（可观测）
+ *   [回滚 2026-10-24] 扩档(128/256/512)撤回：随扩档部署出现三次整机崩溃
+ *   （0x7B/0x7E；minidump：页对齐基址+0xBCC 特权指令异常=控制流破坏形态），
+ *   二分归因先回退，稳定后另议扩档。
+ * MaxWriteIops 行为不变：0 或非法回退 2000，不记日志。 */
+VOID RbPolGetFor(WCHAR Letter, RB2_POL *Pol)
+{
+    WCHAR sub[24]; ULONG n = 0, tmp = 0; NTSTATUS st;
+    Pol->ReadAheadMB = 16; Pol->MaxWriteIops = 2000;   /* 默认 */
+    if (Letter < L'A' || Letter > L'Z') return;
+    /* 手工拼 "Policies\<Letter>"，避免 RtlStringCchPrintf 拉入 UCRT */
+    {
+        static const WCHAR pre[] = L"Policies\\";
+        while (pre[n]) { sub[n] = pre[n]; n++; }
+        sub[n++] = Letter; sub[n] = 0;
+    }
+    st = Rb2GetDW(sub, L"ReadAheadMB", 16, &tmp);
+    if (NT_SUCCESS(st)) {
+        if (tmp == 0) {
+            Pol->ReadAheadMB = 0;                      /* 显式 0：每卷关 */
+        } else if (tmp == 8 || tmp == 16 || tmp == 32 || tmp == 64) {
+            Pol->ReadAheadMB = tmp;
+        } else {
+            RbLog(1, __LINE__, 0, L"pref: invalid ReadAheadMB, fallback 16");
+            Pol->ReadAheadMB = 16;
+        }
+    }
+    /* [FIX W13] MaxWriteIops 合法性 clamp（注释承诺"非法回退 2000"但原代码未实现）：
+     * 上限 100000 IOPS 为防御性边界，超限/异常值回退 2000 并记日志 */
+    if (NT_SUCCESS(Rb2GetDW(sub, L"MaxWriteIops", 0, &tmp)) && tmp) {
+        if (tmp > 100000) {
+            RbLog(1, __LINE__, 0, L"pref: invalid MaxWriteIops, fallback 2000");
+            tmp = 2000;
+        }
+        Pol->MaxWriteIops = tmp;
+    }
+}
+
+/* ---- 进程排除（v2：卷过滤无文件名语义，只做进程级；[D9] 产品化） ---- */
+static CHAR    s_Excl[32][16]; static ULONG s_ExclN;
+/* [D9] 内置默认排除名单（与注册表 ProcessExclude 取并集；Features\UseDefaultExcl=0 整体关闭，缺省开）。
+ * 依据 PRD-02 FR-BL-03：碎片整理/备份/镜像/杀毒扫描类运行期与缓存互相干扰
+ * （PrimoCache 已知问题 #005/#014 同题教训）。大写存储，匹配大小写不敏感。 */
+static const CHAR *s_DefExcl[] = {
+    "DEFRAG.EXE", "DFRGUI.EXE", "WBENGINE.EXE", "VSSADMIN.EXE", "MSMPENG.EXE"
+};
+#define RB2_DEFEXCL_N (sizeof(s_DefExcl)/sizeof(s_DefExcl[0]))
+/* ---- [103] 安装目录排除（按进程可执行文件全路径前缀匹配） ----
+ * 需求：软件自己的安装目录不应被自己缓存。WDM 卷过滤驱动在块层拿不到文件名
+ * （文件系统层概念），但能拿到【进程镜像全路径】——判定「该进程的可执行体
+ * 是否位于受保护目录下」，语义上等价于「排除该文件夹」，且与文件增删/碎片
+ * 无关（不像 LBA 区间会漂移）。
+ *
+ * 配置：Features\ExcludeDirs（REG_MULTI_SZ，目录全路径，如 D:\加速）。
+ * 前缀语义：路径 + '' 前缀匹配（避免 D:\Acc 误伤 D:\Acc2）；目录自身也匹配。
+ *
+ * 性能：热路径每 IO 一次 PID 比对（缓存命中），未命中才查进程路径；
+ * 路径查询结果按 PID 缓存（进程退出后 PID 复用会误判——用 CreateTime 无关
+ * 的保守策略：缓存只增不删，条数上限 64，超限整体清空重建）。
+ * 未配置 ExcludeDirs 时本特性零开销（n==0 早退）。 */
+#define RB2_EXDIR_MAX    8      /* 最多 8 个目录 */
+#define RB2_EXDIR_LEN    260    /* 目录全路径上限（wchar） */
+#define RB2_EXPIID_MAX   64     /* PID 判定缓存条数 */
+static WCHAR  s_ExDir[RB2_EXDIR_MAX][RB2_EXDIR_LEN];
+static ULONG  s_ExDirN;
+static struct { ULONG Pid; BOOLEAN Excluded; } s_ExPid[RB2_EXPIID_MAX];
+/* [FIX O9-EXPID 2026-11-09] 原为普通 ULONG，检查/索引/++ 三步无锁；并发
+ * IO worker 下会出现 TOCTOU：线程 A 读到 63 通过 "满则清零" 检查，线程 B
+ * 把计数推到 64，A 再用 s_ExPid[s_ExPidN] 索引 64 项数组 = 越界写。而本变量
+ * 恰好紧跟数组声明，越界写的 Pid 会覆盖计数本身，读侧 for(i<s_ExPidN)
+ * 随即变成大范围越界读 → 静态区/池腐坏（与 00:32 未点名的 0x7E 同族候选）。
+ * 改为 volatile LONG + Interlocked 原子占槽，并把读侧上界钳到 64。 */
+static volatile LONG s_ExPidN;
+
+static VOID Rb2LoadExcludeDirs(VOID)
+{
+    PVOID d = NULL; ULONG sz = 0, ty = 0, i, n;
+    PWCHAR w;
+    s_ExDirN = 0;
+    InterlockedExchange((volatile LONG *)&s_ExPidN, 0);
+    if (!NT_SUCCESS(Rb2Query(L"Features", L"ExcludeDirs", &d, &sz, &ty))) return;
+    if (ty == REG_MULTI_SZ) {
+        w = (PWCHAR)d; n = sz / sizeof(WCHAR);
+        i = 0;
+        while (i < n && s_ExDirN < RB2_EXDIR_MAX) {
+            ULONG olen = 0, j;
+            while (i + olen < n && w[i + olen]) olen++;
+            if (olen == 0) break;                    /* 双 NUL：名单结束 */
+            if (olen < RB2_EXDIR_LEN) {
+                for (j = 0; j < olen; j++) {
+                    WCHAR c = w[i + j];
+                    if (c == L'/') c = (WCHAR)0x5C;
+                    if (c >= L'a' && c <= L'z') c = (WCHAR)(c - 32);   /* 路径大写归一 */
+                    s_ExDir[s_ExDirN][j] = c;
+                }
+                /* 去尾部反斜杠（统一为 "D:\DIR" 形式，匹配时补反斜杠） */
+                while (olen > 0 && s_ExDir[s_ExDirN][olen - 1] == (WCHAR)0x5C) olen--;
+                s_ExDir[s_ExDirN][olen] = 0;
+                if (olen > 0) s_ExDirN++;
+            }
+            i += olen + 1;
+            /* olen 已被上面的去尾逻辑改写，改用原始长度步进 */
+            { ULONG olen2 = 0; while (i - 1 + olen2 < n && w[i - 1 + olen2]) olen2++; i = i - 1 + olen2 + 1; }
+        }
+    }
+    if (d) ExFreePoolWithTag(d, RB_POOL_TAG);
+}
+
+/* 取当前进程镜像全路径（NT 路径 \Device\HarddiskVolumeN\... 或 \??\C:\...），
+ * 归一化为大写、反斜杠、去 \??\ / \Device\HarddiskVolumeN 前缀 → "C:\..." 形式。
+ * 失败返回 FALSE（调用方按"不排除"处理，方向保守）。 */
+/* [FIX O9-QIP 2026-11-09 13:0x] 12:22 / 12:47 / 13:00 三次 BugCheck 0x93
+ * (INVALID_KERNEL_HANDLE, Arg4=1 bad handle detection)。cdb 用精确归档 PDB
+ * 点名：RbDispatchReadWrite -> RbFeatAdmit -> Rb2PidInExcludeDirs ->
+ * Rb2CurrentImagePath+0x79 -> nt!ObpReferenceObjectByHandleWithTag ->
+ * nt!ExHandleLogBadReference。原实现把 PsGetCurrentProcess() 返回的
+ * **PEPROCESS 内核对象指针**当作进程句柄传给 ZwQueryInformationProcess
+ * 的第一个参数（Arg1 正是那个内核地址）。
+ * 正解：Zw* 在 KernelMode 下用 NtCurrentProcess() 伪句柄 ((HANDLE)-1)；
+ * 并加 IRQL 守卫——ZwQueryInformationProcess 必须 PASSIVE_LEVEL，
+ * 而本函数位于 IO 热路径，非 PASSIVE 时保守返回 FALSE（不排除）。 */
+static BOOLEAN Rb2CurrentImagePath(WCHAR *out, ULONG cap)
+{
+    WCHAR buf[RB2_EXDIR_LEN * 2];
+    UNICODE_STRING *us = (UNICODE_STRING *)buf;
+    ULONG need = sizeof(buf), j, k;
+    NTSTATUS st;
+
+    /* 缓冲区布局：[UNICODE_STRING 头][路径字符]。原实现按 "+8 个 WCHAR" 定位
+     * 数据区却把 MaximumLength 写成 sizeof(buf)-8，多报 8 字节（内核按
+     * MaximumLength 回写时会越界 8 字节）。统一用 sizeof(UNICODE_STRING)。 */
+    us->Buffer = (PWCH)((PUCHAR)buf + sizeof(UNICODE_STRING));
+    us->MaximumLength = (USHORT)(sizeof(buf) - sizeof(UNICODE_STRING));
+    us->Length = 0;
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) return FALSE;
+    /* [FIX O9-EXDIR 2026-11-09] 124 号 T3 实测：ProcessImageFileName(27)
+     * 返回 NT 设备路径 "\Device\HarddiskVolumeN\..."，而 Features\ExcludeDirs
+     * 存的是 DOS 盘符路径（如 "D:\加速"）；原归一化只处理 "\??\" 与双反斜杠
+     * "\\DEVICE"（后者对实际返回值是死代码），结果 "\DEVICE\..." 与 "D:\..."
+     * 在 index 0 即失配 ⇒ excluded 恒 FALSE ⇒ 排除策略整体失效。
+     * 改用 ProcessImageFileNameWin32(43)，用户态实测直接返回盘符形式
+     * "F:\workbuddy\...\python.exe"，与注册表口径一致。若 43 在内核不可用
+     * 或返回空，回退 27 保持旧行为（保守不排除），绝不因查询失败而崩溃。
+     * WDK ntddk.h:5449 已把 ProcessImageFileNameWin32 = 43 定义为
+     * PROCESSINFOCLASS 枚举值，直接用枚举常量；切勿 #define 同名宏
+     * （#ifndef 对枚举名不生效，会污染整个编译单元）。 */
+    st = ZwQueryInformationProcess(NtCurrentProcess(),
+                                   ProcessImageFileNameWin32,
+                                   buf, need, &need);
+    if (!NT_SUCCESS(st) || us->Length == 0) {
+        us->Buffer = (PWCH)((PUCHAR)buf + sizeof(UNICODE_STRING));
+        us->MaximumLength = (USHORT)(sizeof(buf) - sizeof(UNICODE_STRING));
+        us->Length = 0;
+        need = sizeof(buf);
+        st = ZwQueryInformationProcess(NtCurrentProcess(),
+                                       (PROCESSINFOCLASS)27 /* ProcessImageFileName */,
+                                       buf, need, &need);
+        if (!NT_SUCCESS(st) || us->Length == 0) return FALSE;
+    }
+    {
+        ULONG len = us->Length / sizeof(WCHAR);
+        PWCH s = us->Buffer;
+        /* skip NT device prefix */
+        j = 0;
+        if (len > 4 && s[0] == (WCHAR)0x5C && s[1] == L'?' && s[2] == L'?' && s[3] == (WCHAR)0x5C) j = 4;
+        else if (len > 22 && s[0] == L'\\' && s[1] == L'\\' &&
+                 (s[2] == L'D' || s[2] == L'd') && (s[3] == L'E' || s[3] == L'e') &&
+                 (s[4] == L'V' || s[4] == L'v') && (s[5] == L'I' || s[5] == L'i') &&
+                 (s[6] == L'C' || s[6] == L'c') && (s[7] == L'E' || s[7] == L'e')) {
+            while (j < len && s[j] != (WCHAR)0x5C) j++;      /* 跳过设备名 */
+            while (j < len && s[j] == (WCHAR)0x5C) j++;        /* 跳过反斜杠 */
+            /* 设备路径无盘符可用：直接放弃（返回 FALSE，保守不排除） */
+            return FALSE;
+        }
+        for (k = 0; j < len && k + 1 < cap; j++, k++) {
+            WCHAR c = s[j];
+            if (c == L'/') c = (WCHAR)0x5C;
+            if (c >= L'a' && c <= L'z') c = (WCHAR)(c - 32);
+            out[k] = c;
+        }
+        out[k] = 0;
+        return k > 0;
+    }
+}
+
+/* 当前进程是否位于受保护目录下（PID 缓存：命中零系统调用） */
+static BOOLEAN Rb2PidInExcludeDirs(VOID)
+{
+    ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+    ULONG i, j, k, n, slot;
+    LONG cur, next;
+    WCHAR path[RB2_EXDIR_LEN];
+    BOOLEAN excluded = FALSE;
+
+    if (s_ExDirN == 0) return FALSE;              /* 未配置：零开销 */
+    /* [FIX O9-EXPID] 读侧上界钳到 64：即使计数曾被并发写到异常值也不越界读。 */
+    n = (ULONG)InterlockedCompareExchange((volatile LONG *)&s_ExPidN, 0, 0);
+    if (n > RB2_EXPIID_MAX) n = RB2_EXPIID_MAX;
+    for (i = 0; i < n; i++)
+        if (s_ExPid[i].Pid == pid) return s_ExPid[i].Excluded;
+
+    if (Rb2CurrentImagePath(path, RB2_EXDIR_LEN)) {
+        for (j = 0; j < s_ExDirN && !excluded; j++) {
+            for (k = 0; s_ExDir[j][k] && path[k] == s_ExDir[j][k]; k++) { }
+            if (s_ExDir[j][k] == 0 &&
+                (path[k] == 0 || path[k] == (WCHAR)0x5C))     /* 目录自身或其后代 */
+                excluded = TRUE;
+        }
+    }
+    /* [FIX O9-EXPID] 原子占槽：CAS 循环把「满则清零 + 取槽 + ++」合成一次
+     * 原子状态迁移，slot 恒在 [0,63]，彻底消除 TOCTOU 越界写。失败则重试，
+     * 无锁、无自旋上限（每次 CAS 失败必有其它线程前进一步，系统层面有界）。 */
+    for (;;) {
+        cur = InterlockedCompareExchange((volatile LONG *)&s_ExPidN, 0, 0);
+        if (cur < 0 || cur >= RB2_EXPIID_MAX) { slot = 0; next = 1; }
+        else                                 { slot = (ULONG)cur; next = cur + 1; }
+        if (InterlockedCompareExchange((volatile LONG *)&s_ExPidN, next, cur) == cur)
+            break;
+    }
+    /* 先写 Excluded 后写 Pid，并用 MemoryBarrier 保证读侧不会看到「Pid 已发布
+     * 但判定值还没写」的半成品条目。 */
+    s_ExPid[slot].Excluded = excluded;
+    MemoryBarrier();
+    s_ExPid[slot].Pid = pid;
+    return excluded;
+}
+
+static VOID Rb2LoadExcl(VOID)
+{
+    PVOID d = NULL; ULONG sz = 0, ty = 0, i, n; PWCHAR w;   /* [P3] o 已由 olen 取代 */
+    ULONG useDef = 1;
+    /* s_Excl/s_ExclN 无锁读写（有意）：读取方 RbFeatAdmit 每次以当前 s_ExclN
+     * 为界遍历固定尺寸数组，重载中途被读只会多用一轮旧名单（判定偏保守/偏宽松
+     * 一个 IO），不会越界也不影响数据正确性；重载仅由 refresh IOCTL 手动触发。 */
+    s_ExclN = 0;
+    /* [D9] UseDefaultExcl=0 可整体关闭内置名单；键缺省=开。 */
+    Rb2GetDW(L"Features", L"UseDefaultExcl", 1, &useDef);
+    if (useDef) {
+        for (i = 0; i < RB2_DEFEXCL_N && s_ExclN < 32; i++) {
+            const CHAR *src = s_DefExcl[i]; ULONG j = 0;
+            while (src[j] && j < 15) { s_Excl[s_ExclN][j] = src[j]; j++; }
+            s_Excl[s_ExclN][j] = 0;
+            s_ExclN++;
+        }
+    }
+    if (!NT_SUCCESS(Rb2Query(L"Features", L"ProcessExclude", &d, &sz, &ty))) return;
+    if (ty == REG_MULTI_SZ) {
+        w = (PWCHAR)d; n = sz / sizeof(WCHAR);
+        /* [P3] 步进按"真实字符串长度"而非截断后的 o：旧代码把 o 截断到 15
+         * 却仍以 o+1 步进，超长条目之后的整张名单错位（后续条目被拆碎解析，
+         * 进程排除名单部分失效）。现扫描得 olen（真实长度）用于步进，仅
+         * 存储时截断到 15。 */
+        i = 0;
+        while (i < n && s_ExclN < 32) {
+            ULONG olen = 0, j, cp;
+            CHAR *dst;
+            while (i + olen < n && w[i + olen]) olen++;
+            if (olen == 0) break;                   /* 双 NUL：名单结束 */
+            cp = olen > 15 ? 15 : olen;
+            dst = s_Excl[s_ExclN];
+            for (j = 0; j < cp; j++) {
+                WCHAR c = w[i + j];
+                dst[j] = (CHAR)(c < 256 ? c : '?');
+                if (dst[j] >= 'a' && dst[j] <= 'z') dst[j] -= 32;
+            }
+            dst[cp] = 0;
+            s_ExclN++;
+            i += olen + 1;
+        }
+    }
+    if (d) ExFreePoolWithTag(d, RB_POOL_TAG);
+}
+static CHAR Rb2Up(CHAR c){ return (c >= 'a' && c <= 'z') ? (CHAR)(c - 32) : c; }
+/* [D9] 通配匹配：'*'=任意串（含空），'?'=单字符，大小写不敏感。
+ * 经典迭代回溯（串长 ≤15，开销可忽略）；s 为进程镜像名，p 为名单条目。 */
+static BOOLEAN Rb2WildMatch(const CHAR *s, const CHAR *p)
+{
+    ULONG si = 0, pi = 0, star = 0xFFFFFFFF, ss = 0;
+    while (s[si]) {
+        if (p[pi] == '*') { star = pi++; ss = si; continue; }
+        if (p[pi] && (p[pi] == '?' || Rb2Up(s[si]) == Rb2Up(p[pi]))) { si++; pi++; continue; }
+        if (star != 0xFFFFFFFF) { pi = star + 1; si = ++ss; continue; }
+        return FALSE;
+    }
+    while (p[pi] == '*') pi++;
+    return p[pi] == 0;
+}
+/* [D9] 名单条目命中判定：含通配符（'*'/'?'）走通配匹配；
+ * 无通配符保留原前缀语义（一方为另一方前缀即中，15 字符截断对齐）。 */
+static BOOLEAN Rb2ExclHit(const CHAR *img, const CHAR *pat)
+{
+    ULONG j;
+    for (j = 0; pat[j]; j++) if (pat[j] == '*' || pat[j] == '?') return Rb2WildMatch(img, pat);
+    for (j = 0; j < 15 && img[j] && pat[j]; j++) {
+        if (Rb2Up(img[j]) != Rb2Up(pat[j])) return FALSE;
+    }
+    return (j == 15 || !img[j] || !pat[j]) ? TRUE : FALSE;
+}
+BOOLEAN RbFeatAdmit(PVOID Ext)
+{
+    CHAR *img; ULONG i;
+    /* [FIX W11] PsGetProcessImageFileName 对满长 15 字符进程名不保证 NUL 结尾，
+     * 直接交 Rb2WildMatch 会无界扫描——拷入本地定长缓冲并强制终止 */
+    CHAR safe[16]; ULONG k;
+    UNREFERENCED_PARAMETER(Ext);
+    if (s_Panic) return FALSE;                 /* panic 拒绝不计入 AdmitRejects（D6） */
+    /* [103] 安装目录排除（按进程镜像路径前缀）：软件不得缓存自己。
+     * 未配置 ExcludeDirs 时 s_ExDirN==0 → 常数时间早退，热路径零开销。 */
+    if (s_ExDirN && Rb2PidInExcludeDirs()) {
+        Rb2Count(15, 1);                       /* 计入 AdmitRejects，可观测 */
+        return FALSE;
+    }
+    if (!s_ExclN) return TRUE;
+    img = PsGetProcessImageFileName(PsGetCurrentProcess());
+    if (!img) return TRUE;
+    for (k = 0; k < 15 && img[k]; k++) safe[k] = img[k];
+    safe[k] = 0;
+    for (i = 0; i < s_ExclN; i++) {
+        if (Rb2ExclHit(safe, s_Excl[i])) {
+            Rb2Count(15, 1);                   /* [D6] 排除计数：让"为什么没加速"可观测 */
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* ---- 端口 / 生命周期 ---- */
+VOID RbPortRegister(RB2_PORT_FILL Fill, RB2_PORT_SHRINK Shrink) { s_Fill = Fill; s_Shrink = Shrink; }
+VOID Rb2PortFillGen(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa, rb_u64 ViewGen)
+{
+    if (s_Fill) s_Fill(Ext, LbaBytes, Len, SrcVa, ViewGen);
+}
+VOID Rb2IoEnter(VOID) { InterlockedIncrement(&s_InFeat); }
+VOID Rb2IoLeave(VOID) { InterlockedDecrement(&s_InFeat); }
+ULONG Rb2Flags(VOID) { return g_Rb2Flags; }
+VOID Rb2ReloadFlags(VOID)
+{
+    ULONG v = 0;
+    Rb2GetDW(L"Features", L"Flags", 0, &v);
+    /* [101/103] WBCOAL 已接线（RB_WIRED_WBCOAL=1，RbFeatInit 起停线程）：
+     * 原「未接线强制剥离」已解除，允许置位。保留唯一的运行时红线——
+     * WBCOAL 与 L2 互斥（同置会让 L2 落盘与写合并节奏互相干扰）。
+     * 命令面（rbfeatctl flags）已双向强制，此处为 reg add 绕过的第二道防线。 */
+#if !RB_WIRED_WBCOAL
+    if (v & RB2F_WBCOAL) {
+        v &= ~RB2F_WBCOAL;
+        RbLog(1, __LINE__, 0, L"flags: WBCOAL forced off (not wired)");
+    }
+#endif
+    if ((v & RB2F_WBCOAL) && (v & RB2F_L2)) {
+        v &= ~RB2F_L2;
+        RbLog(1, __LINE__, 0, L"flags: L2 forced off (mutually exclusive with WBCOAL)");
+    }
+    /* [FIX F2] MEMGUARD（bit4）零消费：全驱动无任何 RB2F_MEMGUARD 判定，
+     * 置位=纯假成功。与 WBCOAL 同款强制剥离（实现接线前不可启用）。 */
+    if (v & RB2F_MEMGUARD) {
+        v &= ~RB2F_MEMGUARD;
+        RbLog(1, __LINE__, 0, L"flags: MEMGUARD forced off (not wired)");
+    }
+    g_Rb2Flags = v;
+    Rb2LoadExcl();
+    Rb2LoadExcludeDirs();   /* [103] 安装目录排除名单（随 REFRESH 热载） */
+    if (v & RB2F_ETW) RbEtwEnsure();     /* [Build15] ETW 懒注册 */
+    RbThermalReloadCfg();                /* [D6/FR-PF-03] 温度护栏阈值运行期可配（PASSIVE） */
+}
+VOID RbFeatPanic(VOID) { s_Panic = 1; }
+/* [P0-1] panic-clear 专用复位：与 RbFeatPanic 成对。仅在 rbctl.c
+ * RbMsgPanicClear 确认缓存自愈（epoch 握手）成功后调用——严禁在别处
+ * 单独调用，否则特性层（预取/L2）会在透传撤销前重新填充缓存视图。 */
+VOID RbFeatPanicClear(VOID) { InterlockedExchange(&s_Panic, 0); }
+
+static VOID Rb2Tick(PVOID Ctx)
+{
+    LARGE_INTEGER t; ULONG n = 0;
+    UNREFERENCED_PARAMETER(Ctx);
+    for (;;) {
+        t.QuadPart = -10000000LL;     /* 1s 唤醒，便于停线程 */
+        KeDelayExecutionThread(KernelMode, FALSE, &t);
+        if (InterlockedCompareExchange(&s_Stop, 0, 0)) break;
+        if (s_Panic) continue;
+        n++;
+        if (g_Rb2Flags & RB2F_HOT) RbHotDecay();
+        if (g_Rb2Flags & RB2F_PREFETCH) RbPrefGC();
+        if ((g_Rb2Flags & RB2F_THERMAL) && (n % 5 == 0)) RbThermalTick();  /* [Build15] 温度采样 5s */
+        if ((g_Rb2Flags & RB2F_L2) && (n % 60 == 0)) RbL2Periodic();      /* [Build15] L2 落盘 60s */
+        /* [FIX B-U0-8] 运行时挂栈卷孤儿巡检（30s）：TestMode 卷不在 PnP 链上，
+         * 底层卷意外移除时无 REMOVE IRP——此处兜底完整拆除。生产零行为。 */
+        if (n % 30 == 0) RbJanitorSweepRuntimeAttached();
+        /* [FIX AUTOATTACH-2 2026-11-01] 开机迟到盘符补偿：AutoAttach 只依赖
+         * 各卷 PnP START 的一次性工作项，而盘符由 mount manager 后分配 →
+         * 开机必然错过（实测 attached=0/ReadReq=0/1.00×）。30s 巡检补齐。 */
+        if (n % 30 == 0) RbAutoAttachSweep();
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+NTSTATUS RbFeatInit(VOID)
+{
+    HANDLE h; OBJECT_ATTRIBUTES oa; NTSTATUS st;
+    if (InterlockedCompareExchange(&s_Init, 1, 0)) return STATUS_SUCCESS;
+    /* [FIX I52 2026-11-11] WBCOAL 线程只在本函数**成功路径尾部**启动一次
+     * （见下方 :584）。原实现在此入口与尾部各调一次 RbWbInit——其内部会
+     * InitializeListHead（丢弃在队作业）、重初始化在用的 spinlock/semaphore
+     * 并覆盖 s_Thread（泄漏首个线程对象，卸载无法 join → 0xC4）。现由
+     * RbWbInit 自身幂等 + 单调用点双保险。 */
+    /* [FIX R2-M3] 重试前必须解闩：上次 ObReference 失败回滚路径置过 s_Stop=1
+     * 通知旧 Rb2Tick 退出，不复位则新 Rb2Tick 首轮（≤1s）即自退——init 假成功、
+     * L2 落盘/热区/温控静默停摆。对照 Rb2PoolInit 的池闩解闩，两处闩语义对齐。
+     * 时序由 s_Init CAS 串行化，不影响正常 Shutdown→Unload 流程。 */
+    InterlockedExchange(&s_Stop, 0);
+    Rb2ReloadFlags();
+    Rb2CountersInit();
+    RbCrcInit();                              /* [Build15] CRC32 表 */
+    st = Rb2PoolInit();
+    if (!NT_SUCCESS(st)) {
+        /* [FIX M16] 失败回滚 s_Init：原代码 CAS 置位后直接返回失败，
+         * 半初始化永久假成功（特性层永远起不来且不可重试） */
+        InterlockedExchange(&s_Init, 0);
+        return st;
+    }
+    /* [FIX O9-OBREF 2026-11-09] Driver Verifier 0xC4/0xF6 实捕（09:34 蓝屏）：
+     * 原代码初始化了带 OBJ_KERNEL_HANDLE 的 oa，却把 PsCreateSystemThread 的
+     * ObjectAttributes 实参写成 NULL -> Rb2Tick 线程句柄落在进程句柄表；随后
+     * ObReferenceObjectByHandle(h, ..., KernelMode, ...) 以内核模式引用用户态
+     * 句柄 = "A driver references a user-mode handle as kernel mode"。
+     * 修：传 &oa 使句柄成为内核句柄；去掉对象名，避免 RbFeatRecover 重建同名
+     * 线程对象时 STATUS_OBJECT_NAME_COLLISION。与 rbio_worker.c 线程对象 KeWaitForSingleObject 同范式（[142] 自 rbio.c:1211/1291 迁出）。 */
+    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+    st = PsCreateSystemThread(&h, 0, &oa, NULL, NULL, Rb2Tick, NULL);
+    if (!NT_SUCCESS(st)) {
+        /* [FIX M16] 线程创建失败不再静默（无 Rb2Tick = L2 落盘/热区衰减/温控全停摆）：
+         * 记日志、关池、回滚 s_Init，使后续 REFRESH 可重试 */
+        RbLog(2, __LINE__, st, L"feat init: Rb2Tick thread create failed");
+        (void)Rb2PoolShutdown();
+        InterlockedExchange(&s_Init, 0);
+        return st;
+    }
+    /* [P1-5] 保留句柄+对象引用，Shutdown 唤醒后 join 再释放 */
+    st = ObReferenceObjectByHandle(h, 0, *PsThreadType, KernelMode, &s_TickObj, NULL);
+    if (!NT_SUCCESS(st)) {
+        /* [FIX M16] 引用失败 = Shutdown 失去 join 能力（与 C5 同型）：按失败处理 */
+        RbLog(2, __LINE__, st, L"feat init: tick thread reference failed");
+        ZwClose(h);
+        InterlockedExchange(&s_Stop, 1);      /* 通知 Rb2Tick 退出 */
+        (void)Rb2PoolShutdown();
+        InterlockedExchange(&s_Init, 0);
+        return st;
+    }
+    s_TickH = h;
+#if RB_WIRED_WBCOAL
+    /* [101] WBCOAL 后台线程启动（唯一调用点；失败置死标 → 回写永久直投，
+     * 线程缺席时绝不让作业滞留）。[FIX I52] 原入口处还有一次调用，已删除。 */
+    if (!NT_SUCCESS(RbWbInit())) RbWbMarkDead();
+#endif
+    return STATUS_SUCCESS;
+}
+/* [v2 2026-11-16] 只静默 Rb2Tick：停线程 + join，**不**关 L2 / 池 / ETW。
+ * 关机持久化的强制前置（259 F3）：Rb2Tick 的 s_Reopen 路径会在关机中调
+ * RbL2CloseIntEx(FALSE) 置 s_Halt，吞掉 Stage-2 的索引定稿。必须先停线程再落盘。
+ * 幂等：s_TickObj == NULL（已停或从未启动）时直接成功返回。
+ * 超时语义与 RbFeatShutdown 一致：保留句柄（leak-by-design，可重试 join），
+ * 由调用方决定放弃本次落盘 —— 保守方向（拿不到索引 ⇒ 下次冷启动，不会读到旧索引）。
+ * IRQL：PASSIVE（KeWaitForSingleObject 必须 <= APC 且 s_Stop 恢复需 PASSIVE 语义）。
+ * ⚠ 名别搞混：rbpools.c 的 RbFeatQuiesce 是「排空池 + 重建」的重建窗口原语
+ * （rbrebuild.c:494 消费），本函数只停 tick，两者不可合并、不可互调。 */
+NTSTATUS RbFeatStopTick(VOID)
+{
+    NTSTATUS st = STATUS_SUCCESS;
+
+    /* [v2-RT C2] 原子认领。失败方必须让行：并发碰 s_TickObj 会双 ObDereference
+     * （引用计数提前归零 → UAF）与双 ZwClose（0x93）。 */
+    if (InterlockedCompareExchange(&s_TickClaim, 1, 0) != 0) {
+        RbLog(2, __LINE__, 0,
+              L"feat stop-tick: concurrent claim, skipped (avoid double deref)");
+        return STATUS_DEVICE_BUSY;
+    }
+
+    InterlockedExchange(&s_Stop, 1);
+    if (s_TickObj) {
+        LARGE_INTEGER to; to.QuadPart = -100000000LL;   /* 10s 宽限 */
+        NTSTATUS w = KeWaitForSingleObject(s_TickObj, Executive, KernelMode, FALSE, &to);
+        if (w != STATUS_SUCCESS) {
+            RbLog(2, __LINE__, w, L"feat stop-tick: Rb2Tick join timeout (handles kept)");
+            st = STATUS_TIMEOUT;                 /* 保留句柄（leak-by-design），可重试 join */
+        } else {
+            ObDereferenceObject(s_TickObj);
+            s_TickObj = NULL;
+            if (s_TickH) { ZwClose(s_TickH); s_TickH = NULL; }
+        }
+    }
+    InterlockedExchange(&s_TickClaim, 0);
+    return st;
+}
+
+NTSTATUS RbFeatShutdown(VOID)
+{
+#if RB_WIRED_WBCOAL
+    RbWbStop();                           /* [101] 最先停 WBCOAL（PASSIVE；排空/直投残留队列，60s 兜底） */
+#endif
+    /* [v2 2026-11-16] 停 tick 的段已抽成 RbFeatStopTick()：关机持久化路径要复用
+     * 同一段（先停线程再落盘），不能再各写一份 —— 两份实现必然漂移。
+     * ⚠ 不得调 rbpools.c 的 RbFeatQuiesce()：那是「排空池 + Rb2PoolInit 解闩」的
+     * 重建窗口原语（rbrebuild.c:494 消费），在关机路径调它会把刚停的池又拉起来。
+     * 本函数在其之后继续停池、关 L2、注销 ETW。 */
+    {
+        NTSTATUS q = RbFeatStopTick();
+        if (!NT_SUCCESS(q)) {
+            /* 超时：句柄保留可重试，卸载方据此中止（与下方池 join 超时同语义） */
+            RbLog(2, __LINE__, q, L"feat shutdown aborted: Rb2Tick join timeout");
+            return q;
+        }
+    }
+    /* [D5] 先停 worker 池（排空在途淘汰存储作业，30s 有界 join），再关 L2：
+     * 作业内引用 L2 索引/容器句柄，旧顺序（先 RbL2Close 后 Rb2PoolShutdown）
+     * 会在接线后引入 UAF 窗口。
+     * [FIX C5] 池 join 超时如实上报：卸载方据此中止（驻留线程执行已卸载
+     * 代码 = 0xC4/0x1）。超时路径保持 leak-by-design：不关 L2、不释放，
+     * 与本品既有超时语义一致。 */
+    {
+        NTSTATUS st = Rb2PoolShutdown();
+        if (!NT_SUCCESS(st)) {
+            /* [FIX C5] join 超时：此路径已置 s_Stop=1 且 Rb2Tick 已退出，
+             * RbUnload 中止卸载后必须调 RbFeatRecover() 复活特性层，
+             * 否则 s_Stop 闩 + s_Init=1 = 僵尸态（R2-W10） */
+            RbLog(2, __LINE__, st, L"feat shutdown aborted: pool join timeout");
+            return st;
+        }
+    }
+    (void)RbL2Close();          /* [177/P0-C] 返回 BOOLEAN：Shutdown 路径池已停，不期望让路 */
+    RbEtwShutdown();                     /* [Build15] 注销 ETW 提供者 */
+    return STATUS_SUCCESS;
+}
+/* [FIX R2-W10] 特性层复活：C5 中止卸载后 s_Stop 闩 + s_Init=1 使 REFRESH
+ * 无法再启动 Rb2Tick（预取/淘汰/L2 落盘静默死亡）。在 Unload 中止分支调用：
+ * 解闩 + 重建 Rb2Tick（保持 s_Init=1，不重走计数器/池初始化）。 */
+VOID RbFeatRecover(VOID)
+{
+    HANDLE h = NULL; OBJECT_ATTRIBUTES oa;   /* [FIX A-12] h 初值 NULL：创建失败时不得对未初始化句柄调 ZwClose */
+    if (!s_Init) return;                       /* 未初始化过：无需复活 */
+    /* [v2-RT C2] 与 RbFeatStopTick 共用同一张认领令牌。关机分派正在停 tick 时
+     * 这里插进来会：(a) 并发碰 s_TickObj → 双 ObDereference（UAF）/ 双 ZwClose（0x93）；
+     * (b) 自己的 InterlockedExchange(&s_Stop, 0) 把对方正在等待的线程重新拉活，
+     *     让 KeWaitForSingleObject 永远等不到退出 → 对方 10s 超时。
+     * [v2-RT2 N1] 但**不能让行后直接返回**：持有令牌者最长只在 StopTick 里待
+     * 10s（join 上限），有界等待即可排到它后面。原写法直接 return 会形成一个
+     * 真实的永久死亡链：关机 IRP 正在 join（持令牌）→ 用户/服务 sc stop →
+     * RbUnload → RbFeatShutdown → StopTick 拿到 BUSY → 卸载中止 →
+     * RbFeatFullRecover → Recover 撞令牌 no-op ⇒ tick 已死（s_Stop=1）、
+     * 无人复活，而机器还在继续跑。且原文案「retry via REFRESH」是假的：
+     * REFRESH 分支只做 Rb2ReloadFlags + RbL2LazyOpen，不重启 tick；唯一能重启
+     * tick 的 RbFeatInit 被 s_Init 的 CAS 挡死。 */
+    {
+        LARGE_INTEGER iv;
+        ULONG spins = 0;
+        iv.QuadPart = -100000LL;               /* 10ms */
+        while (InterlockedCompareExchange(&s_TickClaim, 1, 0) != 0) {
+            if (spins >= 1100) {               /* 11s > StopTick 的 10s 上限 */
+                RbLog(2, __LINE__, 0,
+                      L"feat recover: tick claim busy >11s, giving up (tick stays down)");
+                return;
+            }
+            KeDelayExecutionThread(KernelMode, FALSE, &iv);
+            spins++;
+        }
+    }
+    /* [v2-RT2 N4] 关机持久化在途时**绝不能**重建 tick。
+     * 「让行 + 有界等待」只解决了令牌互斥，没解决这件事：等到令牌释放后立刻建
+     * Rb2Tick，而 RbShutdownPersist 此刻正在 RbFlushAllDirty + RbL2IdxSaveGuarded；
+     * 新 tick 只要活过 60s 就会 RbL2Periodic -> s_Reopen -> RbL2CloseIntEx 置
+     * s_Halt，把正在进行的索引定稿吞掉（259 F3 原样复现，而且完全由让行改动引入）。
+     * 判定必须在解 s_Stop 之前：解了闩却没建线程会留下「s_Stop=0 但无 tick」的
+     * 不一致态，后续判断全乱。 */
+    if (RbShutdownPersistInFlight()) {
+        InterlockedExchange(&s_TickClaim, 0);
+        RbLog(2, __LINE__, 0,
+              L"feat recover: shutdown persist in flight -> tick NOT restarted (would kill idx finalize)");
+        return;
+    }
+    /* 先有界复核旧 Tick：Shutdown join 超时后线程可能已延迟退出，
+     * 此时需清理旧句柄再重建（不能只解闩——旧线程已死，解闩等于没复活） */
+    if (s_TickObj) {
+        LARGE_INTEGER to; to.QuadPart = -10000000LL;   /* 1s 快速探测 */
+        if (KeWaitForSingleObject(s_TickObj, Executive, KernelMode, FALSE, &to) == STATUS_SUCCESS) {
+            ObDereferenceObject(s_TickObj); s_TickObj = NULL;
+            if (s_TickH) { ZwClose(s_TickH); s_TickH = NULL; }
+        }
+    }
+    InterlockedExchange(&s_Stop, 0);
+    if (s_TickObj) {                           /* 旧 Tick 确认仍存活（幂等） */
+        InterlockedExchange(&s_TickClaim, 0);
+        return;
+    }
+    /* [FIX O9-OBREF 2026-11-09] 同 RbFeatInit：复活路径必须同样传 &oa
+     * (OBJ_KERNEL_HANDLE)，否则重建的 Rb2Tick 句柄再次触发 0xC4/0xF6。 */
+    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (NT_SUCCESS(PsCreateSystemThread(&h, 0, &oa, NULL, NULL, Rb2Tick, NULL)) &&
+        NT_SUCCESS(ObReferenceObjectByHandle(h, 0, *PsThreadType, KernelMode, &s_TickObj, NULL))) {
+        s_TickH = h;
+        /* [85 B15] 不得在池闩未解时谎报「recovered」：如实列出池闩 / L2 状态。
+         * 池闩(rbpools.c:16)与本文件 feat 层 s_Stop 是两个同名变量，
+         * RbFeatRecover() 只解后者；池闩仍置 1 时预取/淘汰/预热永久静默丢弃，
+         * 必须以 PANIC 级日志暴露（卸载中止分支应改走 RbFeatFullRecover）。 */
+        if (Rb2PoolLatch()) {
+            RbLog(2, __LINE__, (LONG)Rb2PoolLatch(),
+                  L"feat recover: Rb2Tick restarted BUT POOL LATCH STILL SET (PANIC) - use RbFeatFullRecover");
+        } else {
+            RbLog(1, __LINE__, (LONG)RbL2State(),
+                  L"feat layer recovered (Rb2Tick restarted; pool latch clear; L2 state in Status)");
+        }
+    } else {
+        /* [FIX A-12] PsCreateSystemThread 成功但 ObReference 失败：h 句柄必须关
+         * （原泄漏），且线程未登记 s_TickObj/s_TickH = 幽灵线程（join 够不到）——
+         * s_Stop=1 通知其自退，与 rbpools leak-by-design 同口径。 */
+        if (h) ZwClose(h);
+        /* [v2-RT2 N2] 原文案「retry via REFRESH」是假承诺：REFRESH 分支只做
+         * Rb2ReloadFlags + RbL2LazyOpen，不重启 tick；唯一能重启 tick 的
+         * RbFeatInit 又被 s_Init 的 CAS 挡死。如实说清楚，别让复盘的人等一个
+         * 永远不会发生的事。 */
+        RbLog(2, __LINE__, 0,
+              L"feat recover: Rb2Tick restart failed (tick stays down; REFRESH does NOT restart it)");
+        InterlockedExchange(&s_Stop, 1);       /* 复活失败保持闩：等下一次 RbFeatRecover 或重装驱动 */
+    }
+    InterlockedExchange(&s_TickClaim, 0);      /* [v2-RT C2] 释放认领令牌（两处出口之一） */
+}
+
+/* [85 B15] 卸载中止分支专用完整复活（成功卸载路径 :1311 不得调用）。
+ * 背景：RbFeatShutdown() 池 join 超时(:391)返回时，rbpools.c:16 池闩已置 1；
+ * 而原 RbFeatRecover() 只解 feat 层同名 s_Stop + 重建 Rb2Tick、不碰池闩 →
+ * Rb2PoolSubmit 永久 STATUS_SHUTDOWN_IN_PROGRESS，预取/淘汰/预热静默丢弃，
+ * :421 还谎报「recovered」形成半死态假象。用户以为 sc stop 失败无影响，
+ * 实际特性层已死。与 B4 共用唯一 helper Rb2PoolRevive()（解池闩，有界重试）。
+ * L2/ETW：RbFeatShutdown 的两条超时返回(:372/:391)都在 RbL2Close()/
+ * RbEtwShutdown()（现 :626）之前，故本路径 L2/ETW 实际未被关闭；这里做幂等
+ * 复核（RbL2LazyOpen 与 REFRESH :450 同款、RbEtwEnsure CAS 幂等且按 Flags 门），
+ * 并把 RbL2State() 如实入日志。返回值留痕：池闩仍死返回非成功，交 S2/REFRESH。 */
+NTSTATUS RbFeatFullRecover(VOID)
+{
+    NTSTATUS poolSt = Rb2PoolRevive();         /* 解池闩（与 B4 共用，有界重试 1 次） */
+    RbFeatRecover();                          /* 解 feat 层闩 + 重建 Rb2Tick（幂等） */
+    RbL2LazyOpen();                           /* 幂等复核（REFRESH 同款） */
+    if (Rb2Flags() & RB2F_ETW) RbEtwEnsure(); /* CAS 幂等，按 Flags 门，避免无条件注册 */
+    if (!NT_SUCCESS(poolSt)) {
+        RbLog(2, __LINE__, poolSt,
+              L"feat full recover: POOL LATCH STILL SET (PANIC) - prefetch/evict/prewarm dead; feat revived; manual REFRESH/reboot required");
+        return poolSt;                        /* 非成功：服务降级留痕 */
+    }
+    /* [v2-RT2 N2] 不能再无条件说「feat layer revived」：RbFeatRecover() 可能因
+     * 令牌竞争在 11s 后放弃（tick 仍死），也可能旧 Tick 存活未重启。以
+     * s_TickObj 是否非空作为唯一可信判据，如实入日志。 */
+    RbLog(s_TickObj ? 1 : 2, __LINE__, (LONG)RbL2State(),
+          s_TickObj
+            ? L"feat full recover: pool latch cleared, Rb2Tick running, L2/ETW rechecked (L2 state in Status)"
+            : L"feat full recover: pool latch cleared BUT Rb2Tick NOT running - feat layer still down");
+    return STATUS_SUCCESS;
+}
+
+/* ---- IOCTL 分发（rbctl.c 主 switch 转发进来；V3-06 改返回 NTSTATUS，内部完成 IRP） ---- */
+NTSTATUS RbFeatDispatch(PIRP Irp)
+{
+    PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(Irp);
+    ULONG code = s->Parameters.DeviceIoControl.IoControlCode;
+    ULONG in = s->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG out = s->Parameters.DeviceIoControl.OutputBufferLength;
+    ULONG_PTR n = 0; NTSTATUS st = STATUS_INVALID_DEVICE_REQUEST;
+    ULONG v;
+    switch (code) {
+    case RB2_IOCTL_STATS:
+        if (out >= sizeof(RB_STATS2)) {
+            PRB_STATS2 p = (PRB_STATS2)Irp->AssociatedIrp.SystemBuffer;
+            RtlZeroMemory(p, sizeof(*p)); p->Version = 2;
+            Rb2StatsFill(p); st = STATUS_SUCCESS; n = sizeof(RB_STATS2);
+        } else st = STATUS_BUFFER_TOO_SMALL;
+        break;
+    case RB2_IOCTL_REFRESH:
+        Rb2ReloadFlags(); RbL2LazyOpen(); st = STATUS_SUCCESS; break;
+    case RB2_IOCTL_SHRINK:
+        if (in >= 4 && s_Shrink) {
+            v = *(ULONG *)Irp->AssociatedIrp.SystemBuffer; if (v > 100) v = 100;
+            st = s_Shrink(v);
+        } else st = STATUS_NOT_SUPPORTED;
+        break;
+    case RB2_IOCTL_SNAPSHOT:
+        RbHotSnapshot(); st = STATUS_SUCCESS; break;
+    case RB2_IOCTL_VOLSTATUS: {
+        /* [D10/FR-BL-06] 每卷加速/旁路状态 + 原因码（PASSIVE）。
+         * C4 范式：持 DevListLock 快照并逐项加引用，锁外才填表（锁内不做多余工作）；
+         * Count 封顶 8（与 RB2_VOLSTATUS_LIST 容量一致），多余快照项照常释放引用。 */
+        PRB2_VOLSTATUS_LIST vl;
+        PRB_DEV_EXT snap[RB_MAX_VOLUMES]; PLIST_ENTRY le;
+        WCHAR crit[RB_MAX_CRITICAL]; ULONG critN = 0;
+        ULONG nsnap = 0, k, i;
+        if (out >= sizeof(RB2_VOLSTATUS_LIST)) {
+            vl = (PRB2_VOLSTATUS_LIST)Irp->AssociatedIrp.SystemBuffer;
+            RtlZeroMemory(vl, sizeof(*vl));
+            /* 引导关键名单快照（InfoMutex 短临界区；此时未持 DevListLock，无嵌套） */
+            ExAcquireFastMutex(&g_Rb.InfoMutex);
+            critN = g_Rb.CriticalCount;
+            if (critN > RB_MAX_CRITICAL) critN = RB_MAX_CRITICAL;
+            for (i = 0; i < critN; i++) crit[i] = g_Rb.CriticalLetters[i];
+            ExReleaseFastMutex(&g_Rb.InfoMutex);
+            ExAcquireFastMutex(&g_Rb.DevListLock);
+            for (le = g_Rb.DevList.Flink;
+                 le != &g_Rb.DevList && nsnap < RB_MAX_VOLUMES; le = le->Flink) {
+                PRB_DEV_EXT e = CONTAINING_RECORD(le, RB_DEV_EXT, ListEntry);
+                InterlockedIncrement(&e->Refs);
+                snap[nsnap++] = e;
+            }
+            ExReleaseFastMutex(&g_Rb.DevListLock);
+            for (k = 0; k < nsnap; k++) {
+                PRB_DEV_EXT e = snap[k];
+                ULONG state, reason;
+                if (e->Removed) {
+                    state = 0; reason = 5;               /* 已移除 */
+                } else if (RbPanicActive()) {
+                    state = 0; reason = 3;               /* panic/安全模式 */
+                } else if (e->IsSystem) {
+                    state = 0; reason = 1;               /* 系统卷默认排除 */
+                } else if (!e->IsAttached) {
+                    state = 0; reason = 2;               /* 用户关闭 */
+                } else if (!e->Stream || !e->GeometryValid) {
+                    state = 0; reason = RB_BYPASS_STREAM_GEOMETRY;
+                } else if (!g_Rb.Config.Enabled ||
+                           !g_Rb.Config.ReadCacheEnabled || !e->ReadEnabled ||
+                           !g_Rb.Config.WriteCacheEnabled || !e->WriteEnabled) {
+                    state = 0; reason = RB_BYPASS_DIRECTION;
+                } else {
+                    LONG recent = InterlockedCompareExchange(&e->LastBypassReason, 0, 0);
+                    if (recent >= RB_BYPASS_IO_TOO_LARGE && recent <= RB_BYPASS_RESOURCE) {
+                        state = 0; reason = (ULONG)recent;   /* 最近 IO 超门/准入/资源降级 */
+                    } else {
+                        state = 1; reason = 0;               /* eligible；不代表已有收益 */
+                        for (i = 0; i < critN; i++)
+                            if (crit[i] == e->Letter) {
+                                RbLog(0, __LINE__, 0,
+                                      L"volstatus: pagefile/dump volume eligible (mount gate decided)");
+                                break;
+                            }
+                    }
+                }
+                if (vl->Count < RB2_VOLSTATUS_MAX) {
+                    vl->Items[vl->Count].Letter = e->Letter;
+                    vl->Items[vl->Count].State  = state;
+                    vl->Items[vl->Count].Reason = reason;
+                    vl->Count++;
+                }
+                RbDerefExt(e);
+            }
+            st = STATUS_SUCCESS; n = sizeof(RB2_VOLSTATUS_LIST);
+        } else st = STATUS_BUFFER_TOO_SMALL;
+        break;
+    }
+    default: break;
+    }
+    Irp->IoStatus.Status = st; Irp->IoStatus.Information = n;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return st;
+}
+BOOLEAN RbFeatRefuseLetter(WCHAR Letter)
+{
+    ULONG v = 0;
+    /* [FIX O9-L2REF 2026-11-09] L2 未启用时该判定一律放行：残值 L2Letter 曾把
+     * 对应卷挡在开机 resume sweep 外（判定不看 L2 flag，卷静默两晚无法恢复）。
+     * L2 在开时维持原语义：容器所在卷不进自动挂载。 */
+    if ((g_Rb2Flags & RB2F_L2) == 0) return FALSE;
+    Rb2GetDW(L"Features", L"L2Letter", 0, &v);
+    return ((WCHAR)v == Letter);
+}
+
+/* ---- 钩子转发（Flags=0 时除计数外全部短路） ---- */
+VOID RbFeatOnHit(PVOID Ext, ULONG64 Lba, ULONG Len)
+{
+    Rb2Count(0, 1); Rb2Count(2, (LONG64)Len);
+    if (g_Rb2Flags & RB2F_HOT) RbHotTrack(Ext, Lba);
+    if (g_Rb2Flags & RB2F_ETW) RbEtwHit();
+}
+NTSTATUS RbFeatOnMiss(PVOID Ext, ULONG64 Lba, ULONG Len, PVOID Dst)
+{
+    Rb2Count(1, 1); Rb2Count(3, (LONG64)Len);
+    if (g_Rb2Flags & RB2F_ETW) RbEtwMiss();
+    if ((g_Rb2Flags & RB2F_L2) && !s_Panic && KeGetCurrentIrql() == PASSIVE_LEVEL && Len <= (1u << 20))
+        return RbL2ProbeFill(Ext, Lba, Len, Dst);
+    return STATUS_NOT_FOUND;
+}
+
+/* [D5] 淘汰回调的 IRQL 排队作业：淘汰可能发生在 >PASSIVE 的持锁路径，
+ * 此时严禁同步做 Zw 文件 IO——拷贝 Src 到非分页缓冲后排入 PASSIVE 作业，
+ * 作业内 RbL2Store 后释放缓冲（成对分配/释放，提交失败不留僵尸）。 */
+typedef struct _RB2_EVICT_JOB {
+    PVOID   Ext;
+    ULONG64 Lba;
+    ULONG   Len;
+    ULONG64 Hits;
+    PVOID   Buf;
+    /* [172/A.3] 失效世代快照：提交方在**拷贝 Src 之前**取（RbL2Gen）。
+     * 拷贝→入队→Store 三段之间任何写触发的 RbL2DropRange/DropAll 都会让
+     * 世代前移，作业到达 RbL2Store 时即被判定为"写前内容"而丢弃。 */
+    ULONG64 Gen;
+} RB2_EVICT_JOB;
+VOID RbEvictJob(PVOID Ctx)
+{
+    RB2_EVICT_JOB *j = (RB2_EVICT_JOB *)Ctx;
+    if (j) {
+        /* [FIX S7-04b] 异步执行期间卷可能已拆除：Ext 引用由提交方 CAS 加引用
+         * （拒绝 0→1 复活，同 RbGetExt 纪律），用完在此归还。 */
+        /* [83 2026-11-07 M5] 重建窗口早退：跳过 RbL2Store（它可能触碰已销毁
+         * 引擎/L2 容器），但引用/内存必须按既有纪律成对归还。 */
+        if (!RbIsDataPathFrozen()) {
+            RbL2Store(j->Ext, j->Lba, j->Len, j->Buf, j->Gen);   /* PASSIVE：内部同步拷贝入容器 */
+        } else {
+            /* [O9-DIAG 2026-11-09] 存储链路诊断：冻结跳过计数可见化 */
+            static volatile LONG s_SkipFrozen = 0;
+            if ((InterlockedIncrement(&s_SkipFrozen) & 0xFFF) == 1)
+                RbLog(1, __LINE__, 0, L"l2: evict job skipped (data path frozen) [diag O9]");
+        }
+        RbDerefExt((PRB_DEV_EXT)j->Ext);
+        Rb2Free(j->Buf);
+        Rb2Free(j);
+    }
+}
+
+/* [D1][FR-L2-01] core evict_victim 淘汰回调（5 参契约，2026-10-15 接线）。
+ * 调用时序（core 侧）：stripe 锁内捕获 -> 锁外本回调 -> 回调返回后 core 才释放
+ * chunk 数据，故 Src 在本次调用内始终可读。冷块过滤 Hits<2 保持（热数据才配持久化）。 */
+VOID RbFeatOnEvict(PVOID Ext, ULONG64 Lba, ULONG Len, PVOID Src, ULONG64 Hits)
+{
+    /* [V10.3.1] V3-07: 淘汰可能发生在持锁路径，严禁 >PASSIVE 触发 Zw 文件 IO
+     * [FIX P2-2 R2 2026-11-03] L2 状态预检：RB2F_L2 位置位但 L2 容器未开
+     * （RbL2State()!=1，含几何门拒绝 state=3——64K 块下 chunk=1MB 必被拒）
+     * 时，本回调会在每次淘汰做 1MB 非分页分配+拷贝+池作业后原样丢弃
+     * （rbL2.c RbL2Store 入口 len!=RB2_L2BLK return）。预检拦截，消除
+     * 64K 几何下每块淘汰 1MB 白拷。 */
+    if ((g_Rb2Flags & RB2F_L2) == 0)        return;
+    if (RbL2State() != 1) {
+        /* [O9-DIAG 2026-11-09] L2 位开而容器未开：预检拦截可见化（洪泛 1/4096） */
+        static volatile LONG s_RejState = 0;
+        if ((InterlockedIncrement(&s_RejState) & 0xFFF) == 1)
+            RbLog(1, __LINE__, 0, L"l2: evict rejected (state!=opened) [diag O9]");
+        return;
+    }
+    if (RbPanicActive())                    return;
+    if (RbIsDataPathFrozen())               return;   /* [83 M5] 重建窗口不再提交淘汰作业 */
+    if (Ext == NULL || Src == NULL || Len == 0) return;
+    if (Hits < 2) {
+        /* [O9-DIAG 2026-11-09] 冷块过滤可见化（Hits>=2 契约的现场观测点） */
+        static volatile LONG s_RejCold = 0;
+        if ((InterlockedIncrement(&s_RejCold) & 0xFFF) == 1)
+            RbLog(1, __LINE__, 0, L"l2: evict rejected (cold, hits<2) [diag O9]");
+        return;
+    }
+    /* [FIX S7-04] PASSIVE 也一律走池异步：原 PASSIVE 分支内联同步 RbL2Store
+     * （一次 ZwWriteFile 64KB+24B）——该回调处于 stream_reclaim 的
+     * reclaim_active 临界区内，L2 盘慢/挂死会把发起回收的 I/O worker 楔住
+     * 数秒~永久（32 worker 逐个耗尽=该卷 I/O 全面停摆）。拷贝+排队后
+     * 数据路径只付出一次非分页拷贝；L2 盘劣化的代价由池 worker 承担。 */
+    {
+        RB2_EVICT_JOB *j; PVOID buf; PRB_DEV_EXT ext = (PRB_DEV_EXT)Ext;
+        ULONG64 gen;
+        /* [FIX S7-04b] 提交前 CAS 加引用（回调执行期间 ext 必然存活，可安全加引用；
+         * 拒绝 0→1 复活）。失败=卷正在拆除，放弃本次存储（安全方向）。 */
+        if (ext->Magic != RB_EXT_MAGIC || ext->Removed) return;
+        {
+            LONG r;
+            for (;;) {
+                r = ext->Refs;
+                if (r <= 0) return;
+                if (InterlockedCompareExchange(&ext->Refs, r + 1, r) == r) break;
+            }
+        }
+        j = (RB2_EVICT_JOB *)Rb2Alloc(sizeof(*j));
+        if (!j) { RbDerefExt(ext); return; }   /* 分配失败=放弃本次存储机会（安全方向） */
+        buf = Rb2Alloc((SIZE_T)Len);
+        if (!buf) { Rb2Free(j); RbDerefExt(ext); return; }
+        /* [172/A.3] 世代快照必须在拷贝**之前**：拷贝之后发生的 drop 会让
+         * Store 入口判定"这份可能是写前内容"而丢弃；反之若在拷贝之后取快照，
+         * 拷贝期间完成的写 + drop 就会被漏掉（快照已越过那次 drop）。 */
+        gen = RbL2Gen();
+        RtlCopyMemory(buf, Src, Len);       /* Src=非分页 chunk 数据，任意 IRQL 可读 */
+        j->Ext = Ext; j->Lba = Lba; j->Len = Len; j->Hits = Hits; j->Buf = buf;
+        j->Gen = gen;
+        if (!NT_SUCCESS(Rb2PoolSubmit(RbEvictJob, j))) {
+            Rb2Free(buf); Rb2Free(j);       /* 提交失败：成对释放 + 归还引用 */
+            RbDerefExt(ext);
+        }
+    }
+}
+VOID RbFeatOnRead(PVOID Ext, ULONG64 Lba, ULONG Len)
+{
+    PRB_DEV_EXT ext = (PRB_DEV_EXT)Ext;
+    if (g_Rb2Flags & RB2F_THERMAL && ext->Letter) RbThermalNote(ext->Letter);
+    /* [契约 B-11] 预取激活后端同判：只对【已挂载缓存】的卷预取（未挂载=无缓存流可填，
+     * 预取纯浪费盘带宽）。系统卷排除由 RbPrefStream 入口既有判断负责；温度字段
+     * 协议未就绪（跳过并注释，不造假）。与前端 IPrefetchGate / CLI
+     * `prefetch check` 同口径。 */
+    if ((g_Rb2Flags & RB2F_PREFETCH) && !s_Panic && !s_InFeat && ext->IsAttached)
+        if (!RbThermalPrefBlocked(ext->Letter)) RbPrefStream(Ext, Lba, Len);
+}
+
+/* ---- 预热通道（真预热：读下层盘 + rb_read_commit 入缓存；best-effort） ---- */
+NTSTATUS Rb2VolRead(PVOID Extp, ULONG64 Off, ULONG Len)
+{
+    PRB_DEV_EXT ext = (PRB_DEV_EXT)Extp;
+    PVOID buf; LARGE_INTEGER o; NTSTATUS s;
+    if (!ext || !ext->Stream || ext->Removed || Len == 0 || Len > (16u << 20))
+        return STATUS_INVALID_PARAMETER;
+    buf = RbAllocAlignedNonPaged((SIZE_T)Len);
+    if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+    o.QuadPart = (LONGLONG)Off;
+    {   /* [FIX 2026-11-06] 预热回填门控：世代在下盘读之前捕获 */
+        rb_u64 vgen = rb_stream_view_gen(ext->Stream);
+        s = RbSyncIo(ext, FALSE, &o, buf, (ULONG)Len, NULL);   /* PASSIVE：预取作业线程内 */
+        if (NT_SUCCESS(s)) rb_read_commit_gen(ext->Stream, (rb_u64)Off, buf, (ULONG)Len, vgen);
+    }
+    RbFreeAligned(buf);
+    return s;
+}

@@ -1,0 +1,575 @@
+{
+  "manifestVersion": 1,
+  "comment": "SINGLE SOURCE OF TRUTH for every compiled source in this repo. Read by build/build.ps1 and enforced bidirectionally by src/scripts/check_build_manifest.py (Gate16). Never inline a source list in a build script again. Paths are repo-relative; driver sources are relative to targets.driver.workDir.",
+  "toolchain": {
+    "msvcRoot": "C:\\Program1\\VC\\Tools\\MSVC\\14.44.35207",
+    "winSdkRoot": "C:\\Program Files (x86)\\Windows Kits\\10",
+    "winSdkVersion": "10.0.26100.0",
+    "wdkRoot": ".nuget/packages/microsoft.windows.wdk.x64/10.0.26100.6584/c"
+  },
+  "targets": {
+    "driver": {
+      "kind": "wdm-driver",
+      "description": "RAMBlockCache.sys - WDM volume filter (BOOT_START, UpperFilters)",
+      "workDir": "src/driver",
+      "outDir": "src/driver/x64/Release",
+      "output": "RAMBlockCache.sys",
+      "compile": {
+        "language": "c",
+        "standard": "/std:c11",
+        "objectiveC": false,
+        "flags": [
+          "/nologo",
+          "/c",
+          "/O2",
+          "/Oi",
+          "/Gy",
+          "/Zi",
+          "/Brepro",
+          "/MT",
+          "/utf-8",
+          "/W3",
+          "/kernel"
+        ],
+        "defines": [
+          "_AMD64_",
+          "_WIN64",
+          "RB_KERNEL_BUILD"
+        ],
+        "includes": [
+          "src/core",
+          "src/common"
+        ],
+        "disabledWarnings": [
+          "4996",
+          "4204",
+          "4214",
+          "4100",
+          "4127",
+          "4244",
+          "4267",
+          "4819",
+          "4189",
+          "4101"
+        ]
+      },
+      "sources": [
+        "rbdriver.c",
+        "rblog.c",
+        "rbmsg.c",
+        "rbdev.c",
+        "rbattach.c",
+        "rbquiesce.c",
+        "rbio.c",
+        "rbio_worker.c",
+        "rbio_flush.c",
+        "rbio_budget.c",
+        "rbctl.c",
+        "rbconfig.c",
+        "rb_stub.c",
+        "rbfeat.c",
+        "rbpools.c",
+        "rbpref.c",
+        "rbhot.c",
+        "rbL2.c",
+        "rbwback.c",
+        "rbio_ports.c",
+        "rbthermal.c",
+        "rbetw.c",
+        "rbrebuild.c",
+        "../core/cache.c",
+        "../core/cache_stats.c",
+        "../core/cache_read.c",
+        "../core/cache_write.c",
+        "../core/cache_flush.c",
+        "../core/cache_evict.c",
+        "../core/read_plan.c"
+      ],
+      "link": {
+        "flags": [
+          "/nologo",
+          "/DRIVER",
+          "/NODEFAULTLIB",
+          "/MANIFEST:NO",
+          "/SUBSYSTEM:NATIVE",
+          "/ENTRY:GsDriverEntry",
+          "/MACHINE:X64",
+          "/DEBUG",
+          "/Brepro",
+          "/RELEASE",
+          "/OPT:REF",
+          "/OPT:ICF"
+        ],
+        "libs": [
+          "ntoskrnl.lib",
+          "hal.lib",
+          "BufferOverflowK.lib",
+          "wdmsec.lib"
+        ],
+        "libDir": ".nuget/packages/microsoft.windows.wdk.x64/10.0.26100.6584/c/Lib/10.0.26100.0/km/x64"
+      },
+      "vcxproj": "src/driver/RAMBlockCache.vcxproj",
+      "unsignedByDefault": true,
+      "deployAnchors": [
+        "src/scripts/deploy.ps1",
+        "src/scripts/verify_deploy_signature.ps1",
+        "README.txt"
+      ]
+    },
+    "core": {
+      "kind": "core-regression",
+      "description": "cache engine user-mode regression hosts (Release + ASan)",
+      "workDir": "tests/core",
+      "outDir": "tests/core/build",
+      "engineSources": [
+        "src/core/cache.c",
+        "src/core/cache_stats.c",
+        "src/core/cache_read.c",
+        "src/core/cache_write.c",
+        "src/core/cache_flush.c",
+        "src/core/cache_evict.c"
+      ],
+      "includes": [
+        "src/core",
+        "tests/core"
+      ],
+      "textualIncludes": [
+        {
+          "file": "src/core/cache_testhook.inc",
+          "includedBy": [
+            "src/core/cache.c"
+          ],
+          "guard": "!RB_KERNEL_BUILD",
+          "why": "user-mode parallel-flush impl needs cache.c static helpers (stripe_of/chunk_lookup/run_length/chunk_clean_done) and the opaque rb_engine layout, so it is textually included rather than linked. Lives under src/core (not tests/) so the engine has no compile-time dependency on the test tree. Kernel build excludes it via RB_KERNEL_BUILD. [168 2026-11-12] moved here from tests/core/support/parflush_stub.c."
+        },
+        {
+          "file": "tests/core/support/parflush_stub.h",
+          "includedBy": [
+            "tests/core/test_parflush.c"
+          ],
+          "guard": "!RB_KERNEL_BUILD",
+          "why": "test-host declaration of rb_engine_flush_parallel; implementation is src/core/cache_testhook.inc. Registered so editing the header produces a freshness signal for the host TU."
+        }
+      ],
+      "compile": {
+        "release": [
+          "/nologo",
+          "/O2",
+          "/W4",
+          "/utf-8"
+        ],
+        "asan": [
+          "/nologo",
+          "/Od",
+          "/Zi",
+          "/W4",
+          "/utf-8",
+          "/fsanitize=address"
+        ]
+      }
+    },
+    "ctl": {
+      "kind": "user-exes",
+      "description": "ramboostctl.exe / rbfeatctl.exe - control-plane CLI",
+      "workDir": "src/ctl",
+      "outDir": "src/ctl",
+      "compile": {
+        "flags": [
+          "/nologo",
+          "/utf-8",
+          "/O2",
+          "/W3"
+        ],
+        "includes": [
+          "src/ctl"
+        ]
+      },
+      "products": [
+        {
+          "output": "ramboostctl.exe",
+          "sources": [
+            "ramboostctl.c",
+            "ctl_conn.c",
+            "ctl_bench.c",
+            "ctl_signature.c",
+            "ctl_events.c",
+            "ctl_preflight.c",
+            "ctl_license.c",
+            "bench_policy.c"
+          ],
+          "libs": [
+            "advapi32.lib",
+            "bcrypt.lib"
+          ],
+          "requiredStrings": [
+            "engine_bs",
+            "rebuild_count",
+            "rebuild_status",
+            "rebuild_in_progress",
+            "rebuild_utc"
+          ]
+        },
+        {
+          "output": "rbfeatctl.exe",
+          "sources": [
+            "rbfeatctl.c"
+          ],
+          "libs": [
+            "advapi32.lib"
+          ]
+        }
+      ]
+    },
+    "setup": {
+      "kind": "user-exes",
+      "description": "ramboostsetup.exe - silent distribution install engine",
+      "workDir": "src/setup",
+      "outDir": "src/setup",
+      "compile": {
+        "flags": [
+          "/nologo",
+          "/W4",
+          "/O2",
+          "/utf-8"
+        ],
+        "includes": [
+          "src/setup"
+        ]
+      },
+      "products": [
+        {
+          "output": "ramboostsetup.exe",
+          "sources": [
+            "ramboostsetup.c"
+          ],
+          "libs": [
+            "advapi32.lib",
+            "wintrust.lib",
+            "crypt32.lib",
+            "shell32.lib",
+            "user32.lib"
+          ]
+        }
+      ]
+    },
+    "ui": {
+      "kind": "dotnet",
+      "description": ".NET WPF products (solution: build/RAMBlockCache.sln)",
+      "sources": [
+        "src/ui/controller/RAMBlockCache.Controller/Interop/DwmLiquidGlassHelper.cs",
+        "src/ui/installer/RAMBlockCache.Setup/Interop/DwmLiquidGlassHelper.cs",
+        "src/ui/controller/RAMBlockCache.Controller/Services/ThinHostModeGuard.cs"
+      ],
+      "projects": [
+        {
+          "name": "RAMBlockCache.Controller",
+          "path": "src/ui/controller/RAMBlockCache.Controller/RAMBlockCache.Controller.csproj"
+        },
+        {
+          "name": "RAMBlockCache.Controller.Tests",
+          "path": "src/ui/controller/RAMBlockCache.Controller.Tests/RAMBlockCache.Controller.Tests.csproj"
+        },
+        {
+          "name": "RAMBlockCache.Setup",
+          "path": "src/ui/installer/RAMBlockCache.Setup/RAMBlockCache.Setup.csproj"
+        }
+      ],
+      "devTools": [
+        {
+          "name": "rbbench",
+          "path": "src/tools/rbbench/rbbench.csproj"
+        },
+        {
+          "name": "rbprobe",
+          "path": "src/tools/rbprobe/rbprobe.csproj"
+        },
+        {
+          "name": "rbtempguard",
+          "path": "src/tools/rbtempguard/rbtempguard.csproj"
+        }
+      ]
+    },
+    "web": {
+      "kind": "node",
+      "description": "React SPA + Node bridge + Rust napi plugin",
+      "workDir": "src/ui/web",
+      "sources": [
+        "src/ui/web/src/styles/liquid-glass.css",
+        "src/ui/web/src/styles/liquid-glass.contract.test.ts",
+        "src/ui/web/src/components/LiquidGlassFilter.tsx",
+        "src/ui/web/src/components/LiquidGlassFilter.test.tsx",
+        "src/ui/web/src/utils/l2Diagnostics.ts",
+        "src/ui/web/src/utils/l2Diagnostics.test.ts",
+        "src/ui/web/src/hooks/useLiquidGlassPointer.ts",
+        "src/ui/web/src/hooks/useLiquidGlassPointer.test.ts",
+        "src/ui/web/src/hooks/useVisibilityAwarePoll.ts",
+        "src/ui/web/src/hooks/useVisibilityAwarePoll.test.ts",
+        "src/ui/web/src/hooks/useNativeGlassSync.ts",
+        "src/ui/web/src/hooks/useNativeGlassSync.test.ts",
+        "src/ui/web/src/styles/dcomp-host.contract.test.ts"
+      ],
+      "commands": {
+        "build": "npm run build",
+        "typecheck": "npm run typecheck:bridge",
+        "test": "npm test"
+      }
+    },
+    "setupPackage": {
+      "kind": "distribution",
+      "description": "dist/RAMBlockCache-Setup.exe - signed installer bundling the signed sys",
+      "entry": "src/scripts/build_setup.ps1",
+      "requires": [
+        "dist/RAMBlockCache.sys",
+        "dist/RAMBlockCache.sys.sha256",
+        "src/ctl/ramboostctl.exe",
+        "src/ctl/rbfeatctl.exe"
+      ]
+    }
+  },
+  "tests": {
+    "suites": {
+      "regression": "default core gate: every entry must build and exit 0",
+      "qa": "incident repros / one-off QA probes, built on demand",
+      "bench": "microbenchmarks, built on demand",
+      "diag": "layout/ABI inspection helpers",
+      "e2e": "real-machine harnesses (not run by CI)"
+    },
+    "hosts": [
+      {
+        "name": "test_cache",
+        "file": "tests/core/test_cache.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_counter",
+        "file": "tests/core/test_counter.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_geom",
+        "file": "tests/core/test_geom.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_mixed",
+        "file": "tests/core/test_mixed.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_parflush",
+        "file": "tests/core/test_parflush.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_regress",
+        "file": "tests/core/test_regress.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_release",
+        "file": "tests/core/test_release.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_v5",
+        "file": "tests/core/test_v5.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_v6",
+        "file": "tests/core/test_v6.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_bigread",
+        "file": "tests/core/test_bigread.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_flush_many",
+        "file": "tests/core/test_flush_many.c",
+        "suite": "regression"
+      },
+      {
+        "name": "edge_v3",
+        "file": "tests/core/edge_v3.c",
+        "suite": "regression"
+      },
+      {
+        "name": "edge_v4",
+        "file": "tests/core/edge_v4.c",
+        "suite": "regression"
+      },
+      {
+        "name": "stress_v3",
+        "file": "tests/core/stress_v3.c",
+        "suite": "regression"
+      },
+      {
+        "name": "stress_v4",
+        "file": "tests/core/stress_v4.c",
+        "suite": "regression"
+      },
+      {
+        "name": "bench_readhit",
+        "file": "tests/core/bench_readhit.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_auditfix",
+        "file": "tests/core/test_auditfix.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_write_ex",
+        "file": "tests/core/test_write_ex.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_wsconc",
+        "file": "tests/core/test_wsconc.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_rebuild",
+        "file": "tests/core/test_rebuild.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_sparse_miss",
+        "file": "tests/core/test_sparse_miss.c",
+        "suite": "regression",
+        "extraSources": [
+          "src/core/read_plan.c"
+        ]
+      },
+      {
+        "name": "test_exclude",
+        "file": "tests/core/test_exclude.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_flushpar",
+        "file": "tests/core/test_flushpar.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_tinylfu",
+        "file": "tests/core/test_tinylfu.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_a2flush",
+        "file": "tests/core/test_a2flush.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_p0evict",
+        "file": "tests/core/test_p0evict.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_p0v2",
+        "file": "tests/core/test_p0v2.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_discard_clean",
+        "file": "tests/core/test_discard_clean.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_keep_vs_discard",
+        "file": "tests/core/test_keep_vs_discard.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_spinfast",
+        "file": "tests/core/test_spinfast.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_evict_wire",
+        "file": "tests/core/test_evict_wire.c",
+        "suite": "regression",
+        "defines": [
+          "RB_EVICT_HOOK_EXTERNAL"
+        ]
+      },
+      {
+        "name": "test_directwrite_stale",
+        "file": "tests/core/test_directwrite_stale.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_race1106",
+        "file": "tests/core/test_race1106.c",
+        "suite": "regression"
+      },
+      {
+        "name": "test_counter_seed",
+        "file": "tests/core/test_counter_seed.c",
+        "suite": "qa"
+      },
+      {
+        "name": "test_bench_policy",
+        "file": "src/ctl/test_bench_policy.c",
+        "suite": "qa",
+        "engineSources": [
+          "src/ctl/bench_policy.c"
+        ]
+      },
+      {
+        "name": "bench_5g",
+        "file": "tests/core/bench_5g.c",
+        "suite": "bench"
+      },
+      {
+        "name": "bench_read_plan",
+        "file": "tests/core/bench_read_plan.c",
+        "suite": "bench",
+        "engineSources": [
+          "src/core/read_plan.c"
+        ]
+      },
+      {
+        "name": "bench_write_absorb",
+        "file": "tests/core/bench_write_absorb.c",
+        "suite": "bench"
+      },
+      {
+        "name": "offchk",
+        "file": "tests/core/offchk.c",
+        "suite": "diag"
+      },
+      {
+        "name": "rbc_e2e_verify",
+        "file": "tests/core/rbc_e2e_verify.c",
+        "suite": "e2e",
+        "standalone": true
+      },
+      {
+        "name": "rbc_lba_probe",
+        "file": "tests/support/rbc_lba_probe.c",
+        "suite": "e2e",
+        "standalone": true
+      },
+      {
+        "name": "rbc_pooltags",
+        "file": "tests/support/rbc_pooltags.c",
+        "suite": "e2e",
+        "standalone": true
+      },
+      {
+        "name": "rbc_uncached_read",
+        "file": "tests/support/rbc_uncached_read.c",
+        "suite": "e2e",
+        "standalone": true
+      }
+    ]
+  },
+  "forbiddenSourceGlobs": [
+    "src/**/*.c",
+    "tests/**/*.c"
+  ]
+}

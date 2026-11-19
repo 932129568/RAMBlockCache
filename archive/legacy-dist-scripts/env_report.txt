@@ -1,0 +1,82 @@
+=== testsigning ===
+指定的项类型无效。
+运行 "bcdedit /?" 获得命令行帮助。
+参数错误。
+=== service query ===
+[SC] EnumQueryServicesStatus:OpenService 失败 1060:
+
+指定的服务未安装。
+
+=== service config ===
+[SC] OpenService 失败 1060:
+
+指定的服务未安装。
+
+=== UpperFilters Volume class ===
+
+HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Class\{71a27cdd-812a-11d0-bec7-08002be2092f}
+    UpperFilters    REG_MULTI_SZ    volsnap
+
+=== driver in system32 ===
+ 驱动器 C 中的卷没有标签。
+ 卷的序列号是 B2DC-AD63
+
+ C:\Windows\System32\drivers 的目录
+
+找不到文件
+=== ProgramFiles install ===
+ 驱动器 C 中的卷没有标签。
+ 卷的序列号是 B2DC-AD63
+
+ C:\Program Files 的目录
+
+找不到文件
+=== verifier settings ===
+
+验证程序标志: 0x00000001
+
+  标准标志:
+
+    [X] 0x00000001 特殊池。
+    [ ] 0x00000002 强制 IRQL 检查。
+    [ ] 0x00000008 池跟踪。
+    [ ] 0x00000010 I/O 验证。
+    [ ] 0x00000020 死锁检测。
+    [ ] 0x00000080 DMA 检查。
+    [ ] 0x00000100 安全检查。
+    [ ] 0x00000800 杂项检查。
+    [ ] 0x00020000 DDI 兼容性检查。
+
+  其他标志:
+
+    [ ] 0x00000004 随机低资源模拟。
+    [ ] 0x00000200 强制挂起 I/O 请求。
+    [ ] 0x00000400 IRP 日志记录。
+    [ ] 0x00002000 堆栈的固定 MDL 检查。
+    [ ] 0x00004000 驱动程序的固定 MDL 检查。
+    [ ] 0x00008000 Power 框架延迟模糊处理。
+    [ ] 0x00010000 端口/微型端口接口检查。
+    [ ] 0x00040000 系统低资源模拟。
+    [ ] 0x00080000 DDI 兼容性检查(额外)。
+    [ ] 0x00200000 NDIS/WLAN 验证。
+    [ ] 0x00800000 内核同步延迟模糊处理。
+    [ ] 0x01000000 VM 开关验证。
+    [ ] 0x02000000 代码完整性检查。
+
+    [X] 指示标志已启用。
+
+  活动规则类: 
+
+    无
+
+  引导模式:
+
+    Persistent
+
+  规则:
+
+    所有规则都在使用默认设置
+
+  验证的驱动程序:
+
+    RAMBoostFS.sys

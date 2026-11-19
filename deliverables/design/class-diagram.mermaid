@@ -1,0 +1,101 @@
+classDiagram
+    class DeployBackup {
+        +bool UpperFiltersExisted
+        +string[] UpperFilters
+        +bool SvcExisted
+        +int SvcStart
+        +int SvcType
+        +int SvcError
+        +string SvcGroup
+        +bool SvcRootExisted
+        +hashtable ParamProps
+        +bool FeatExisted
+        +int FeatFlags
+        +bool FeatKeyExisted
+        +bool PfroExisted
+        +string[] Pfro
+        +bool Sys32Existed
+        +string Sys32Backup
+        +bool Sys32Replaced
+        +bool PdDirExisted
+        +hashtable GuardExisted
+        +hashtable GuardBackup
+        +hashtable TaskExisted
+        +hashtable TaskDef
+        +bool Mutated
+    }
+    class deploy_ps1 {
+        +Invoke-Rollback() void
+        +Resolve-SysSource(Explicit) string
+        +Resolve-ExpectedSha(Sys, Explicit) string
+        +Resolve-SignTool() string
+    }
+    class verify_deploy_signature_ps1 {
+        +Resolve-ExpectedSha(Sys, Explicit) string
+        +exit 0 verified / 1 usage / 2 mismatch / 3 signature / 4 IO
+    }
+    class pfro_pending_ps1 {
+        <<pure library>>
+        +Remove-PfroPathPrefix(Path) string
+        +Split-PfroPairs(Entries) pair[]
+        +Test-PfroPendingReplace(PfroEntries, ExpectedSource, ExpectedTarget) bool
+    }
+    class rb_common_ps1 {
+        +Find-SignTool() string
+        +Find-MSBuild() string
+        +Find-NuGetPkg() string
+        +Resolve-Tool(Explicit, EnvName, Finder) string
+        +Sign-Driver(TimestampUrl, NoTimestamp) void
+        +Assert-Admin() void
+    }
+    class setup_sign_driver_ps1 {
+        +string Target
+        +string Thumbprint
+        +string ResultFile
+        +string TimestampUrl
+        +bool NoTimestamp
+    }
+    class check_ps_syntax_ps1 {
+        +Check-Ps1 BOM+SYN
+        +Check-Cmd ASCII+noBOM
+    }
+    class check_signature_ps1 {
+        +sidecar regex unified
+        +Get-FileHash guarded
+    }
+    class Motion {
+        <<static>>
+        +bool IsReducedMotion
+        +Duration Dur90
+        +Duration Dur120
+        +Duration Dur180
+        +Duration Dur240
+        +Duration Dur480
+        +KeySpline EaseStandard
+        +KeySpline EaseOut
+        +KeySpline EaseIn
+    }
+    class FallbackPalette {
+        <<internal static>>
+        +SolidColorBrush Danger
+        +SolidColorBrush Warning
+        +SolidColorBrush Success
+        +SolidColorBrush Neutral
+        +SolidColorBrush SurfaceHover
+        +SolidColorBrush BorderStrong
+    }
+    class UiStateView {
+        +ColorForRisk(risk) SolidColorBrush
+        -FindBrush(key, fallback) SolidColorBrush
+    }
+    class ToastService {
+        <<deleted U-01>>
+    }
+    deploy_ps1 --> DeployBackup : 采集快照 / 回滚消费
+    deploy_ps1 ..> verify_deploy_signature_ps1 : 子进程调用
+    verify_deploy_signature_ps1 ..> pfro_pending_ps1 : dot-source 纯函数
+    setup_sign_driver_ps1 ..> rb_common_ps1 : dot-source 复用发现+时间戳
+    UiStateView ..> FallbackPalette : 回退色单点
+    CardHover ..> FallbackPalette
+    StateBar ..> FallbackPalette
+    Dark_xaml ..> Motion : x:Static ctl:Motion.Dur90

@@ -1,0 +1,18 @@
+<Application x:Class="RAMBlockCache.Setup.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:h="clr-namespace:RAMBlockCache.Setup.Helpers"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="Theme/Dark.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+            <!-- [U0-2] 向导绑定转换器（与令牌同源：成功/失败语义色等值 Dark.xaml） -->
+            <h:BoolToVisibilityConverter x:Key="B2V"/>
+            <h:NotBoolToVisibilityConverter x:Key="NotB2V"/>
+            <h:NotBoolConverter x:Key="NotB"/>
+            <h:BoolToStatusBrushConverter x:Key="B2VSuccess"/>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

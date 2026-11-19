@@ -1,0 +1,33 @@
+<Window x:Class="RAMBlockCache.Controller.MainWindow" x:Name="Win"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        Title="RAMBlockCache 控制器" Height="800" Width="1280" MinHeight="600" MinWidth="960"
+        AutomationProperties.Name="RAMBlockCache 主窗口"
+        Background="Transparent" WindowStartupLocation="CenterScreen">
+    <Grid Background="Transparent">
+        <!-- [UI-HOST 2026-11-05] WebView2 壳：内嵌 Web 控制台（Bento 六页）。
+             UI 与 Web 端永远一致；原生 WPF 页面已归档至 docs/legacy-wpf-ui/。 -->
+        <wv2:WebView2 x:Name="Web" DefaultBackgroundColor="Transparent" />
+
+        <!-- 加载中遮罩：桥接就绪前显示 -->
+        <Border x:Name="LoadingMask" Background="#0B1220">
+            <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+                <TextBlock Text="RAMBlockCache" Foreground="#E8EEF7" FontSize="28" FontWeight="Bold"
+                           HorizontalAlignment="Center" Margin="0,0,0,10" />
+                <TextBlock x:Name="LoadingText" Text="正在启动控制台服务…"
+                           Foreground="#8FA3BF" FontSize="14"
+                           HorizontalAlignment="Center" Margin="0,0,0,18" />
+                <ProgressBar x:Name="LoadBar" Width="280" Height="4" IsIndeterminate="True"
+                             Foreground="#1F6FEB" HorizontalAlignment="Center" />
+                <Button x:Name="RetryBtn" Content="重试" Width="120" Height="34"
+                        Background="#1F6FEB" Foreground="White" BorderThickness="0"
+                        Cursor="Hand" Visibility="Collapsed" Margin="0,18,0,0"
+                        HorizontalAlignment="Center" Click="RetryBtn_Click" />
+                <TextBlock x:Name="ErrorText" Foreground="#F87171" TextWrapping="Wrap"
+                           MaxWidth="560" TextAlignment="Center" Margin="0,12,0,0"
+                           HorizontalAlignment="Center" Visibility="Collapsed" />
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>

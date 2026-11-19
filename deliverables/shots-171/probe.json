@@ -1,0 +1,198 @@
+{
+  "status": {
+    "top": {
+      "title": "RAMBlockCache 控制台",
+      "textLen": 727,
+      "svgCount": 12,
+      "buttonCount": 0,
+      "main": {
+        "scrollH": 1037,
+        "clientH": 743,
+        "scrollTop": 0
+      },
+      "overflow": [],
+      "tiny": [],
+      "bodyBg": "rgb(243, 245, 249)"
+    },
+    "bottom": {
+      "title": "RAMBlockCache 控制台",
+      "textLen": 727,
+      "svgCount": 12,
+      "buttonCount": 0,
+      "main": {
+        "scrollH": 1037,
+        "clientH": 743,
+        "scrollTop": 294
+      },
+      "overflow": [],
+      "tiny": [],
+      "bodyBg": "rgb(243, 245, 249)"
+    },
+    "errors": [
+      "console: Failed to load resource: the server responded with a status of 404 (Not Found)"
+    ]
+  },
+  "volumes": {
+    "top": {
+      "title": "RAMBlockCache 控制台",
+      "textLen": 440,
+      "svgCount": 8,
+      "buttonCount": 5,
+      "main": {
+        "scrollH": 743,
+        "clientH": 743,
+        "scrollTop": 0
+      },
+      "overflow": [],
+      "tiny": [],
+      "bodyBg": "rgb(243, 245, 249)"
+    },
+    "bottom": {
+      "title": "RAMBlockCache 控制台",
+      "textLen": 440,
+      "svgCount": 8,
+      "buttonCount": 5,
+      "main": {
+        "scrollH": 743,
+        "clientH": 743,
+        "scrollTop": 0
+      },
+      "overflow": [],
+      "tiny": [],
+      "bodyBg": "rgb(243, 245, 249)"
+    },
+    "errors": []
+  },
+  "benefit": {
+    "top": {
+      "title": "RAMBlockCache 控制台",
+      "textLen": 669,
+      "svgCount": 7,
+      "buttonCount": 0,
+      "main": {
+        "scrollH": 1652,
+        "clientH": 743,
+        "scrollTop": 0
+      },
+      "overflow": [],
+      "tiny": [],
+      "bodyBg": "rgb(243, 245, 249)"
+    },
+    "bottom": {
+      "title": "RAMBlockCache 控制台",
+      "textLen": 669,
+      "svgCount": 7,
+      "buttonCount": 0,
+      "main": {
+        "scrollH": 1652,
+        "clientH": 743,
+        "scrollTop": 909
+      },
+      "overflow": [],
+      "tiny": [],
+      "bodyBg": "rgb(243, 245, 249)"
+    },
+    "errors": []
+  },
+  "diagnostics": {
+    "top": {
+      "title": "RAMBlockCache 控制台",
+      "textLen": 1779,
+      "svgCount": 9,
+      "buttonCount": 15,
+      "main": {
+        "scrollH": 1072,
+        "clientH": 743,
+        "scrollTop": 0
+      },
+      "overflow": [],
+      "tiny": [],
+      "bodyBg": "rgb(243, 245, 249)"
+    },
+    "bottom": {
+      "title": "RAMBlockCache 控制台",
+      "textLen": 1777,
+      "svgCount": 9,
+      "buttonCount": 15,
+      "main": {
+        "scrollH": 1072,
+        "clientH": 743,
+        "scrollTop": 329
+      },
+      "overflow": [],
+      "tiny": [],
+      "bodyBg": "rgb(243, 245, 249)"
+    },
+    "errors": []
+  },
+  "emergency": {
+    "top": {
+      "title": "RAMBlockCache 控制台",
+      "textLen": 428,
+      "svgCount": 11,
+      "buttonCount": 4,
+      "main": {
+        "scrollH": 743,
+        "clientH": 743,
+        "scrollTop": 0
+      },
+      "overflow": [],
+      "tiny": [],
+      "bodyBg": "rgb(243, 245, 249)"
+    },
+    "bottom": {
+      "title": "RAMBlockCache 控制台",
+      "textLen": 428,
+      "svgCount": 11,
+      "buttonCount": 4,
+      "main": {
+        "scrollH": 743,
+        "clientH": 743,
+        "scrollTop": 0
+      },
+      "overflow": [],
+      "tiny": [],
+      "bodyBg": "rgb(243, 245, 249)"
+    },
+    "errors": []
+  },
+  "settings": {
+    "top": {
+      "title": "RAMBlockCache 控制台",
+      "textLen": 1338,
+      "svgCount": 7,
+      "buttonCount": 20,
+      "main": {
+        "scrollH": 2092,
+        "clientH": 743,
+        "scrollTop": 0
+      },
+      "overflow": [
+        "DIV.DIV sw=1244 cw=1240",
+        "DIV.flex flex-col gap-6 sw=1244 cw=1240",
+        "FORM.flex flex-col gap-6 sw=1244 cw=1240"
+      ],
+      "tiny": [],
+      "bodyBg": "rgb(243, 245, 249)"
+    },
+    "bottom": {
+      "title": "RAMBlockCache 控制台",
+      "textLen": 1338,
+      "svgCount": 7,
+      "buttonCount": 20,
+      "main": {
+        "scrollH": 2092,
+        "clientH": 743,
+        "scrollTop": 1349
+      },
+      "overflow": [
+        "DIV.DIV sw=1244 cw=1240",
+        "DIV.flex flex-col gap-6 sw=1244 cw=1240",
+        "FORM.flex flex-col gap-6 sw=1244 cw=1240"
+      ],
+      "tiny": [],
+      "bodyBg": "rgb(243, 245, 249)"
+    },
+    "errors": []
+  }
+}

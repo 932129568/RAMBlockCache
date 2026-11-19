@@ -1,0 +1,3231 @@
+<!--
+  ════════════════════════════════════════════════════════════════════════
+  RAMBlockCache Controller · UI 高保真原型 V3.0（WPF 重构视觉靶标 · V10.6 第一批增量）
+  ────────────────────────────────────────────────────────────────────────
+  日期：2026-10-21 · 角色：原型构建师 筑原型（Zhu）· 团队 design-engine-v106
+  基底：V2.0 原型（2026-10-19 · 令牌 04b）原样拷贝；本版叠加 V10.6 第一批增量：
+    · 上游需求 05-v106-requirements-2026-10-21.md（F1 场景预设 / F3 回写引导 /
+      F5 许可试用状态；§2-F1 三档参数表 / §2-F5 许可五态原文采信）
+    · 上游令牌 06-v106-design-tokens-2026-10-21.md（§2 C-1 场景预设卡 / C-2 预设来源
+      chip / C-6 许可卡 / C-7 电源 chip；§4.1 新令牌 N-1~N-3；R-1/R-2/R-4 裁定照做）
+    · 第一批：场景预设卡（设置页首卡）/ 卷卡预设来源 chip / 许可卡（试用中态）/
+      电源 chip（缓存策略卡内联）/ 演示态 +4 / F3 openGuide() 调用点
+    · 第二批（本版）：对话框基座（C-4.1 · C-4 回写引导 / C-5 反作弊警示 /
+      文件选择框共用，openModal 迁基座行为不变）/ C-3 冷热二遍读对比卡（收益页
+      span2 黄金位 · 五态 + 双条形 + 降级横幅）/ C-4 实装（三触发点收敛）/
+      C-5 实装 / 向导第五步（F1 第三入口）/ benchmark 演示态实装 / README.md
+    · 修正轮（Phase 4 审查 REVISE 后）：P0-1 Esc/遮罩关闭 = 取消语义（onClose
+      收敛 + settled 防重入）/ P0-2 双条形 scaleY 生长（红线 6）+ 回归 06 C-3.2
+      纵向形态 / C-2 flash 移除（C-2.4）/ C-3 250ms 节流 + 空态开始对比 +
+      Validating→FileReady / C-4 宽 480 / 遮罩 absolute / 恢复默认轻确认 /
+      许可文本型大值 + 360 激活对话框 / 应急页电源 chip / 三态骨架补齐 /
+      文案对齐 06 白名单
+    · 后续（未含）：C-7 操作进度横幅 / V-6 列表阶梯动效接线 / 许可其余四态演示开关
+  定位：最终交付物是 WPF（net8.0-windows / C# / XAML / 暗色硬约束）；
+        本文件是视觉靶标，所有值可逐项对照转译为 XAML（见 wpf-translation-map.md）。
+  形态：单文件自包含（内联 CSS + JS + SVG），零外部依赖、零 CDN、零图表库。
+        浏览器直接打开；中文界面；术语遵守白名单（Bound/Attached/WriteMode/Panic/
+        DirtyBytes/LostDirtyBytes/UpperFilters 仅允许出现在诊断页并附中文解释）。
+  演示：标题栏「演示态」可在 12 种状态间切换（原 8 态 + V10.6 新增 4 态），用于走查每页五态。
+        全部数值为演示 mock；每个数据位角标 = 数据来源（A/B/C/D 共 21 项接口缺口，
+        图例点标题栏「数据来源」按钮查看）。
+  ════════════════════════════════════════════════════════════════════════
+-->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAMBlockCache 控制器 · 高保真原型 V3.0（WPF 重构视觉靶标 · V10.6 第一批增量）</title>
+<style>
+/* ════════════════════════════════════════════════════════════════════
+   1. 设计令牌（逐值取自 04b-design-tokens-2026-10-19.md 附录 A · V2.0）
+   ════════════════════════════════════════════════════════════════════ */
+:root{
+  /* —— 背景层级（02 §B.1.1）—— */
+  --rbc-bg-app:#0E0E11; --rbc-bg-sidebar:#121216; --rbc-bg-statusbar:#14141A;
+  --rbc-bg-surface:#17171C; --rbc-bg-surface-hover:#1E1E24; --rbc-bg-elevated:#22222A;
+  --rbc-bg-input:#1B1B21; --rbc-bg-skeleton:#1B1B21;
+  /* —— 描边 —— */
+  --rbc-border:#23232B; --rbc-border-default:#2C2C35; --rbc-border-strong:#3A3A45;
+  --rbc-scrim:rgba(0,0,0,.62);
+  /* —— 文字层级（F-1：tertiary 仅 ≥24px 或非信息装饰；<24px 信息文本一律 secondary）—— */
+  --rbc-text-primary:#EDEDF2; --rbc-text-secondary:#9A9AA5; --rbc-text-tertiary:#6B6B76;
+  --rbc-text-disabled:#4A4A54; --rbc-text-on-accent:#06222E;
+  /* —— 强调 / 交互身份（禁止表达状态）—— */
+  --rbc-accent:#4CC2FF; --rbc-accent-hover:#6FD0FF; --rbc-accent-active:#2AA8E8;
+  --rbc-accent-subtle:#0A2636; --rbc-focus-ring:rgba(76,194,255,.55);   /* R-7：α.55，min 3.35:1 */
+  /* —— 语义五色（三件套；solid 仅图形用途）—— */
+  --rbc-success-fg:#63D6A0; --rbc-success-bg:#0E2A20; --rbc-success-border:#1E5C46; --rbc-success-solid:#1F8F63;
+  --rbc-warning-fg:#F2B84B; --rbc-warning-bg:#2E2109; --rbc-warning-border:#7A5310;
+  --rbc-danger-fg:#F27A72;  --rbc-danger-bg:#331312;  --rbc-danger-border:#8A2A26;
+  --rbc-danger-solid:#B3382F; --rbc-danger-solid-hover:#C6453B; --rbc-danger-solid-active:#9E2F27;
+  --rbc-info-fg:#6FB4F5;    --rbc-info-bg:#0C2138;    --rbc-info-border:#1E4E80;
+  --rbc-neutral-fg:#A6A6B0; --rbc-neutral-bg:#1C1C22; --rbc-neutral-border:#3A3A45;
+  /* —— 进度轨道 / 状态条 12% 语义 tint（04b §8.4 机制，预混值）—— */
+  --rbc-track:#23232B;
+  --tint-success:#1E2D2A; --tint-warning:#2F2820; --tint-danger:#2F2025;
+  --tint-info:#1F2734;    --tint-neutral:#26262C;
+  /* —— 图表专用色（02b §A.2 · 仅 2 色系：数据系青蓝 + 语义系绿/琥珀/红）—— */
+  --rbc-chart-1:#4CC2FF; --rbc-chart-2:#2E86D6; --rbc-chart-grid:#23232B;
+  --rbc-chart-axis-text:#9A9AA5;              /* R-2：11px 坐标文字须 AA */
+  --rbc-chart-area-fill:rgba(76,194,255,.12); /* 单色 12% 透明度，非渐变 */
+  --rbc-chart-track:#23232B;
+  --rbc-chart-heat-1:#1E3A4D; --rbc-chart-heat-2:#2E86D6; --rbc-chart-heat-3:#4CC2FF;
+  --rbc-skeleton-highlight:#26262E;
+  /* —— 字体（02 §B.2.1；WPF 落点 = Segoe UI Variable Text / Cascadia Mono→Consolas）—— */
+  --rbc-font-ui:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;
+  --rbc-font-mono:"Cascadia Mono","Consolas","JetBrains Mono","Courier New",monospace;
+  /* —— 间距（space-1..7 · 8pt 栅格）/ 圆角五档 —— */
+  --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-5:24px; --space-6:32px; --space-7:48px;
+  --radius-xs:4px; --radius-sm:6px; --radius-md:10px; --radius-lg:14px; --radius-pill:999px;
+  /* —— 布局常量 —— */
+  --sidebar-w:216px; --statusbar-h:40px; --content-pad:20px; --grid-gap:12px;
+  /* —— 阴影（仅浮层三档，黑色 Blur；卡片/状态条零阴影）—— */
+  --shadow-raised:0 1px 2px rgba(0,0,0,.4); --shadow-floating:0 8px 24px rgba(0,0,0,.55);
+  /* —— 动效令牌（02b §B.1 v1.2：六档时长 + 第 5 条曲线 ease-in-out）—— */
+  --dur-instant:90ms; --dur-fast:120ms; --dur-base:180ms; --dur-slow:240ms; --dur-slower:480ms; --dur-roll:320ms;
+  --ease-standard:cubic-bezier(.2,0,0,1); --ease-out:cubic-bezier(.16,1,.3,1);
+  --ease-in:cubic-bezier(.4,0,1,1); --ease-linear:linear;
+  --ease-in-out:cubic-bezier(.42,0,.58,1);   /* 02b §B.1 第 5 条曲线（脉冲/不确定进度条专用）*/
+  /* —— V10.6 增量令牌（06 §4.1 · N-1~N-3：组件常量不下沉，仅跨组件复用度量升令牌）—— */
+  --rbc-dur-stagger:24ms;        /* N-1 列表首次装载逐项间隔（≤5 项 · V-6 加速页卷卡 / 预设摘要行高亮） */
+  --rbc-scale-overlay-from:0.98; /* N-2 浮层入场缩放起点 0.98→1（V-3：对话框/下拉/轻确认，第二批消费） */
+  --rbc-preset-tier-bar-w:3px;   /* N-3 C-1 三档档位标识条宽度（度量常量，非间距体系成员） */
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   2. 基础 / 排版九阶梯（02 §B.2.2 · 字重仅 400/600）
+   ════════════════════════════════════════════════════════════════════ */
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:#08080B;color:var(--rbc-text-primary);
+  font:400 13px/1.6 var(--rbc-font-ui);
+  display:flex;align-items:center;justify-content:center;padding:20px;
+  -webkit-font-smoothing:antialiased;
+}
+button{font-family:inherit;color:inherit;background:none;border:none;cursor:pointer}
+input,select,textarea{font-family:inherit;color:inherit}
+.num,.mono{font-family:var(--rbc-font-mono);font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+.t-display{font-family:var(--rbc-font-mono);font-size:32px;font-weight:600;line-height:1.15}
+.t-h1{font-size:20px;font-weight:600;line-height:1.3}
+.t-h2{font-size:14px;font-weight:600;line-height:1.4}
+.t-h3{font-size:13px;font-weight:600;line-height:1.45}
+.t-body{font-size:13px;font-weight:400;line-height:1.6}
+.t-small{font-size:12px;font-weight:400;line-height:1.5}
+.t-micro{font-size:11px;font-weight:400;line-height:1.4;color:var(--rbc-text-secondary)}
+.t-mono-stat{font-family:var(--rbc-font-mono);font-size:22px;font-weight:600;line-height:1.2;font-variant-numeric:tabular-nums}
+.t-mono-log{font-family:var(--rbc-font-mono);font-size:12px;font-weight:400;line-height:1.65}
+.dim{color:var(--rbc-text-secondary)}
+.ic{width:16px;height:16px;flex:none;stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.ic-14{width:14px;height:14px}
+.ic-20{width:20px;height:20px}
+.ic-24{width:24px;height:24px}
+
+/* ════════════════════════════════════════════════════════════════════
+   3. 窗口框架（1180×780 · min 900×600 的等比靶标）
+   ════════════════════════════════════════════════════════════════════ */
+.win{
+  width:1180px;height:780px;flex:none;display:flex;flex-direction:column;
+  background:var(--rbc-bg-app);border:1px solid var(--rbc-border-strong);
+  border-radius:var(--radius-md);overflow:hidden;position:relative;
+  box-shadow:0 24px 70px rgba(0,0,0,.72);   /* 桌面窗口投影，非卡片阴影 */
+}
+.titlebar{
+  height:36px;flex:none;display:flex;align-items:center;gap:8px;padding:0 0 0 12px;
+  background:var(--rbc-bg-sidebar);border-bottom:1px solid var(--rbc-border);
+}
+.titlebar .tb-title{font-size:12px;color:var(--rbc-text-secondary)}
+.tb-demo{display:flex;align-items:center;gap:8px;margin-left:auto}
+.tb-demo label{font-size:11px;color:var(--rbc-text-secondary)}
+.tb-demo select{height:22px}
+.caption{display:flex;margin-left:8px}
+.caption button{width:40px;height:36px;display:flex;align-items:center;justify-content:center;color:var(--rbc-text-secondary)}
+.caption button:hover{background:var(--rbc-bg-surface-hover);color:var(--rbc-text-primary)}
+.caption button.close:hover{background:var(--rbc-danger-solid);color:#fff}
+
+/* ════════════════════════════════════════════════════════════════════
+   4. 状态条四段（04b §8.4 · 高 40 · pill 12,4 · 12% tint · 段点击路由）
+   ════════════════════════════════════════════════════════════════════ */
+.statusbar{
+  height:var(--statusbar-h);flex:none;display:flex;align-items:center;
+  padding:0 12px;background:var(--rbc-bg-statusbar);border-bottom:1px solid var(--rbc-border);gap:12px;
+}
+.seg{
+  display:inline-flex;align-items:center;gap:8px;height:24px;padding:0 12px;
+  border-radius:var(--radius-pill);font-size:12px;color:var(--rbc-text-secondary);
+  transition:background-color var(--dur-fast) var(--ease-standard);
+}
+.seg.clickable{cursor:pointer}
+.seg.clickable:hover{filter:brightness(1.25)}
+.seg .dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}
+.seg .seg-val{font-weight:600;color:var(--rbc-text-primary)}
+.seg.ok{background:var(--tint-success);color:var(--rbc-success-fg)}
+.seg.warn{background:var(--tint-warning);color:var(--rbc-warning-fg)}
+.seg.danger{background:var(--tint-danger);color:var(--rbc-danger-fg)}
+.seg.info{background:var(--tint-info);color:var(--rbc-info-fg)}
+.seg.neutral{background:var(--tint-neutral);color:var(--rbc-neutral-fg)}
+.seg .pulse{animation:pulse 1200ms var(--ease-in-out) infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+
+/* Banner（三段式异常的紧凑形态；完整三段在状态页异常卡） */
+.banner[hidden]{display:none}
+.banner{
+  flex:none;display:flex;align-items:center;gap:8px;padding:8px 16px;
+  background:var(--rbc-warning-bg);border-bottom:1px solid var(--rbc-warning-border);
+  color:var(--rbc-warning-fg);font-size:12px;font-weight:600;
+}
+.banner.danger{background:var(--rbc-danger-bg);border-color:var(--rbc-danger-border);color:var(--rbc-danger-fg)}
+.banner .banner-link{margin-left:auto;color:inherit;text-decoration:underline;text-underline-offset:2px;font-weight:600;font-size:12px}
+
+/* ════════════════════════════════════════════════════════════════════
+   5. 侧栏导航（216 · 六项固定顺序：状态/加速/收益/诊断/应急/设置）
+   ════════════════════════════════════════════════════════════════════ */
+.body{flex:1;display:flex;min-height:0}
+.sidebar{
+  width:var(--sidebar-w);flex:none;background:var(--rbc-bg-sidebar);
+  border-right:1px solid var(--rbc-border);padding:16px 12px 12px;display:flex;flex-direction:column;
+}
+.brand{padding:0 4px 16px}
+.brand-name{font-size:14px;font-weight:600}
+.brand-sub{font-size:11px;color:var(--rbc-text-secondary);margin-top:4px}
+.nav{display:flex;flex-direction:column;gap:4px}
+.nav-item{
+  display:flex;align-items:center;gap:12px;padding:8px 12px;border-radius:var(--radius-sm);
+  font-size:14px;color:var(--rbc-text-secondary);text-align:left;position:relative;
+  transition:background-color var(--dur-fast) var(--ease-standard),color var(--dur-fast) var(--ease-standard);
+}
+.nav-item:hover{background:var(--rbc-bg-surface);color:var(--rbc-text-primary)}
+.nav-item.active{background:var(--rbc-bg-surface-hover);color:var(--rbc-text-primary);font-weight:600}
+.nav-item .nav-badge{
+  margin-left:auto;min-width:16px;height:16px;padding:0 4px;border-radius:var(--radius-pill);
+  background:var(--rbc-danger-solid);color:#fff;font-size:11px;font-weight:600;
+  display:none;align-items:center;justify-content:center;
+}
+.nav-item.alert{color:var(--rbc-danger-fg)}
+.nav-item.alert.warn{color:var(--rbc-warning-fg)}
+.nav-item.alert .nav-badge{display:inline-flex}
+.sidebar-foot{margin-top:auto;padding:8px 4px 0;border-top:1px solid var(--rbc-border)}
+
+/* ════════════════════════════════════════════════════════════════════
+   6. 内容区 / 页面入场（240ms 淡入 + 8px · 02b §B.2）
+   ════════════════════════════════════════════════════════════════════ */
+.content{flex:1;overflow-y:auto;padding:var(--content-pad);min-width:0}
+.page{display:none}
+.page.active{display:block}
+.page.active{animation:pageIn var(--dur-slow) var(--ease-out)}
+@keyframes pageIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:16px}
+.page-sub{font-size:12px;color:var(--rbc-text-secondary);margin-top:4px}
+.page-actions{display:flex;gap:8px;align-items:center}
+
+/* ════════════════════════════════════════════════════════════════════
+   7. 四型卡片（04b §8.1 · hover 120ms 抬升 1px + 描边微亮）
+   ════════════════════════════════════════════════════════════════════ */
+.card{
+  background:var(--rbc-bg-surface);border:1px solid var(--rbc-border);
+  border-radius:var(--radius-md);padding:16px;
+  transition:transform var(--dur-fast) var(--ease-standard),
+             border-color var(--dur-fast) var(--ease-standard),
+             background-color var(--dur-fast) var(--ease-standard);
+}
+.card.hoverable:hover{transform:translateY(-1px);border-color:var(--rbc-border-default);background:var(--rbc-bg-surface-hover)}
+.card.pressable:active{transform:translateY(1px);transition-duration:var(--dur-instant)}
+/* 异常卡（语义底 + 左竖条 + 三段式） */
+.card.exception{border-left:none;position:relative;overflow:hidden;padding-left:20px}
+.card.exception::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--ec,var(--rbc-danger-fg))}
+.card.exception.danger{background:var(--rbc-danger-bg);border-color:var(--rbc-danger-border);--ec:var(--rbc-danger-fg)}
+.card.exception.warning{background:var(--rbc-warning-bg);border-color:var(--rbc-warning-border);--ec:var(--rbc-warning-fg)}
+/* 信息卡（蓝系引导） */
+.card.info{background:var(--rbc-accent-subtle);border-color:var(--rbc-info-border)}
+.grid{display:grid;gap:var(--grid-gap)}
+.grid-3{grid-template-columns:repeat(3,1fr)}
+.grid-2{grid-template-columns:repeat(2,1fr)}
+.span2{grid-column:span 2}
+.stack{display:flex;flex-direction:column}
+.gap4{gap:4px}.gap8{gap:8px}.gap12{gap:12px}.gap16{gap:16px}
+.row{display:flex;align-items:center;gap:8px}
+.mt4{margin-top:4px}.mt8{margin-top:8px}.mt12{margin-top:12px}.mt16{margin-top:16px}
+
+/* KPI 数据卡（标签 + 大数字 + 副文本） */
+.kpi-label{font-size:12px;color:var(--rbc-text-secondary)}
+.kpi-val{font-family:var(--rbc-font-mono);font-size:32px;font-weight:600;line-height:1.15;color:var(--rbc-accent);font-variant-numeric:tabular-nums}
+.kpi-unit{font-size:11px;color:var(--rbc-text-secondary);align-self:flex-end;margin:0 0 4px 4px}
+.kpi-sub{font-size:11px;color:var(--rbc-text-secondary);margin-top:4px}
+.kpi-dash{font-family:var(--rbc-font-mono);font-size:32px;font-weight:600;line-height:1.15;color:var(--rbc-text-tertiary)}
+
+/* ════════════════════════════════════════════════════════════════════
+   8. 徽标（02 §B.4.2 · 8px 圆点 + 12px/600 + 1px 语义描边）
+   ════════════════════════════════════════════════════════════════════ */
+.badge{
+  display:inline-flex;align-items:center;gap:8px;padding:4px 12px;border-radius:var(--radius-pill);
+  border:1px solid;font-size:12px;font-weight:600;white-space:nowrap;
+  transition:background-color var(--dur-base) var(--ease-standard),border-color var(--dur-base) var(--ease-standard),color var(--dur-base) var(--ease-standard);
+}
+.badge .dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}
+.badge.success{background:var(--rbc-success-bg);border-color:var(--rbc-success-border);color:var(--rbc-success-fg)}
+.badge.warning{background:var(--rbc-warning-bg);border-color:var(--rbc-warning-border);color:var(--rbc-warning-fg)}
+.badge.danger{background:var(--rbc-danger-bg);border-color:var(--rbc-danger-border);color:var(--rbc-danger-fg)}
+.badge.info{background:var(--rbc-info-bg);border-color:var(--rbc-info-border);color:var(--rbc-info-fg)}
+.badge.neutral{background:var(--rbc-neutral-bg);border-color:var(--rbc-neutral-border);color:var(--rbc-neutral-fg)}
+.badge .corner{font-size:11px;font-weight:400;color:var(--rbc-warning-fg)}  /* 回写段琥珀角标 */
+
+/* ════════════════════════════════════════════════════════════════════
+   9. 按钮四型（04b §8.2 · Padding 12,8 · MinHeight 32 · press 90ms）
+   ════════════════════════════════════════════════════════════════════ */
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  min-height:32px;padding:4px 12px;border-radius:var(--radius-sm);
+  font-size:13px;font-weight:600;white-space:nowrap;
+  transition:background-color var(--dur-fast) var(--ease-standard),
+             color var(--dur-fast) var(--ease-standard),
+             border-color var(--dur-fast) var(--ease-standard),
+             transform 120ms linear;
+}
+.btn:active{transform:translateY(1px);transition-duration:var(--dur-instant)}
+.btn:focus-visible{outline:2px solid var(--rbc-focus-ring);outline-offset:2px}
+.btn-primary{background:var(--rbc-accent);color:var(--rbc-text-on-accent)}
+.btn-primary:hover{background:var(--rbc-accent-hover)}
+.btn-primary:active{background:var(--rbc-accent-active)}
+.btn-secondary{background:transparent;border:1px solid var(--rbc-border-default);color:var(--rbc-text-primary)}
+.btn-secondary:hover{background:var(--rbc-bg-surface-hover)}
+.btn-danger{background:var(--rbc-danger-solid);color:#fff}
+.btn-danger:hover{background:var(--rbc-danger-solid-hover)}
+.btn-danger:active{background:var(--rbc-danger-solid-active)}
+.btn-ghost{background:transparent;color:var(--rbc-text-secondary);padding:4px 8px;min-height:28px;font-weight:400}
+.btn-ghost:hover{background:var(--rbc-bg-input);color:var(--rbc-text-primary)}
+.btn[disabled],.btn.disabled{background:var(--rbc-bg-input);color:var(--rbc-text-disabled);border-color:transparent;cursor:not-allowed;transform:none}
+.btn-danger[disabled],.btn-danger.disabled{background:var(--rbc-bg-input);color:var(--rbc-text-disabled)}
+.btn-sm{min-height:28px;padding:4px 8px;font-size:12px}
+.ctl-reason{font-size:11px;color:var(--rbc-text-secondary);margin-top:4px}   /* 禁用必须配原因 */
+
+/* ════════════════════════════════════════════════════════════════════
+   10. 表单控件（下拉 / 滑块 / 开关 / 文本框 · 02 §B.4.5/§B.4.6）
+   ════════════════════════════════════════════════════════════════════ */
+.select{
+  appearance:none;-webkit-appearance:none;height:28px;padding:0 24px 0 12px;
+  background:var(--rbc-bg-input) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239A9AA5' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 8px center;
+  border:1px solid var(--rbc-border-default);border-radius:var(--radius-sm);
+  font-size:12px;color:var(--rbc-text-primary);cursor:pointer;
+  transition:border-color var(--dur-fast) var(--ease-standard);
+}
+.select:hover{border-color:var(--rbc-border-strong)}
+.select:focus-visible{outline:2px solid var(--rbc-focus-ring);outline-offset:1px}
+.select:disabled{color:var(--rbc-text-disabled);cursor:not-allowed}
+.slider{
+  appearance:none;-webkit-appearance:none;width:100%;height:20px;background:transparent;cursor:pointer;
+}
+.slider::-webkit-slider-runnable-track{height:4px;border-radius:2px;background:var(--rbc-track)}
+/* thumb 垂直居中于 4px 轨道：(14-4)/2 = 5px——滑块几何必需值，按 04b §6.2「1px 分隔保留并注释」先例备案，非疏漏 */
+.slider::-webkit-slider-thumb{
+  appearance:none;-webkit-appearance:none;width:14px;height:14px;margin-top:-5px;border-radius:50%;
+  background:var(--rbc-accent);border:2px solid var(--rbc-bg-app);
+}
+.slider::-moz-range-track{height:4px;border-radius:2px;background:var(--rbc-track)}
+.slider::-moz-range-thumb{width:12px;height:12px;border-radius:50%;background:var(--rbc-accent);border:2px solid var(--rbc-bg-app)}
+.slider:disabled::-webkit-slider-thumb{background:var(--rbc-text-disabled)}
+.slider:disabled{cursor:not-allowed}
+.switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer}
+.switch input{position:absolute;opacity:0;width:0;height:0}
+.switch .track{
+  width:34px;height:20px;border-radius:var(--radius-pill);background:var(--rbc-bg-input);
+  border:1px solid var(--rbc-border-default);position:relative;flex:none;
+  transition:background-color var(--dur-fast) var(--ease-standard),border-color var(--dur-fast) var(--ease-standard);
+}
+.switch .knob{
+  position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;
+  background:var(--rbc-text-secondary);
+  transition:transform var(--dur-fast) var(--ease-standard),background-color var(--dur-fast) var(--ease-standard);
+}
+.switch input:checked + .track{background:var(--rbc-success-solid);border-color:var(--rbc-success-solid)}
+.switch input:checked + .track .knob{transform:translateX(14px);background:#fff}
+.switch input:focus-visible + .track{outline:2px solid var(--rbc-focus-ring);outline-offset:2px}
+.switch.disabled{opacity:.45;cursor:not-allowed}
+.switch .sw-label{font-size:12px;color:var(--rbc-text-primary)}
+.check{display:flex;align-items:flex-start;gap:8px;font-size:13px;color:var(--rbc-text-primary);cursor:pointer}
+.check input{appearance:none;-webkit-appearance:none;width:16px;height:16px;flex:none;margin-top:4px;
+  border:1px solid var(--rbc-border-default);border-radius:var(--radius-xs);background:var(--rbc-bg-input);
+  display:flex;align-items:center;justify-content:center;transition:all var(--dur-fast) var(--ease-standard)}
+.check input:checked{background:var(--rbc-accent);border-color:var(--rbc-accent)}
+.check input:checked::after{content:"";width:9px;height:5px;border-left:2px solid var(--rbc-text-on-accent);border-bottom:2px solid var(--rbc-text-on-accent);transform:rotate(-45deg) translate(0px,-1px)}
+.check input:focus-visible{outline:2px solid var(--rbc-focus-ring);outline-offset:2px}
+.textarea{
+  width:100%;min-height:88px;resize:vertical;background:var(--rbc-bg-input);
+  border:1px solid var(--rbc-border-default);border-radius:var(--radius-sm);
+  color:var(--rbc-text-primary);font-family:var(--rbc-font-mono);font-size:12px;padding:8px;
+}
+.textarea:focus-visible{outline:2px solid var(--rbc-focus-ring);outline-offset:1px}
+.field-label{font-size:12px;color:var(--rbc-text-secondary);margin-bottom:4px}
+
+/* ════════════════════════════════════════════════════════════════════
+   11. 进度条（scaleX 180ms · 确定态；不确定态 1200ms 往复）
+   ════════════════════════════════════════════════════════════════════ */
+.progress{height:6px;border-radius:3px;background:var(--rbc-track);overflow:hidden}
+.progress .bar{height:100%;border-radius:3px;background:var(--rbc-accent);transform-origin:left center;
+  transition:transform var(--dur-base) var(--ease-standard)}
+.progress .bar.ok{background:var(--rbc-success-solid)}
+.progress.indeterminate .bar{width:40%;transform-origin:left center;animation:indet 1200ms var(--ease-in-out) infinite}
+@keyframes indet{0%{transform:translateX(-100%)}100%{transform:translateX(250%)}}
+
+/* ════════════════════════════════════════════════════════════════════
+   12. 骨架屏（单色 shimmer 1400ms · 02b §B.3-8 特许）
+   ════════════════════════════════════════════════════════════════════ */
+.sk{background:var(--rbc-bg-skeleton);border-radius:var(--radius-sm);position:relative;overflow:hidden}
+.sk::after{
+  content:"";position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent 0%,var(--rbc-skeleton-highlight) 50%,transparent 100%);
+  background-size:200% 100%;animation:shimmer 1400ms linear infinite;
+}
+@keyframes shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
+.sk-line{height:12px;margin:8px 0}
+.sk-title{height:16px;width:40%}
+/* V10.6 补充骨架件（06 V-7 点位表：C-4/C-7 chip 96×20 · C-6 大值 120×32 / 按钮行 120×28） */
+.sk-chip{width:96px;height:20px;border-radius:var(--radius-pill);flex:none}
+.sk-big{width:120px;height:32px}
+.sk-btn{width:120px;height:28px}
+
+/* ════════════════════════════════════════════════════════════════════
+   13. 图表卡（02b §A：无外框背景块、无阴影、2 色系）
+   ════════════════════════════════════════════════════════════════════ */
+.chart-card{display:flex;flex-direction:column;gap:12px}
+.chart-head{display:flex;align-items:center;gap:8px}
+.chart-head .t-h3{flex:1}
+.chart-legend{display:flex;gap:12px;font-size:11px;color:var(--rbc-text-secondary)}
+.chart-legend i{display:inline-block;width:14px;height:2px;border-radius:1px;margin-right:4px;vertical-align:middle}
+.chart-foot{font-size:11px;color:var(--rbc-text-secondary)}
+.chart-svg{width:100%;height:auto;display:block}
+.chart-svg .draw{transition:stroke-dashoffset var(--dur-slower) var(--ease-out)}
+.chart-empty{font-size:12px;color:var(--rbc-warning-fg);padding:24px 0;text-align:center}
+/* 环形图 */
+.ring-wrap{display:flex;flex-direction:column;align-items:center;gap:8px}
+.ring{position:relative;width:160px;height:160px}
+.ring svg{transform:rotate(-90deg)}
+.ring .ring-track{stroke:var(--rbc-chart-track)}
+.ring .ring-fill{stroke:var(--rbc-chart-1);stroke-linecap:round;transition:stroke-dashoffset var(--dur-base) var(--ease-standard)}
+.ring.over .ring-fill{stroke:var(--rbc-warning-fg)}
+.ring-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px}
+/* 堆叠条 / 分段条 */
+.stacked{height:10px;border-radius:5px;background:var(--rbc-chart-track);overflow:hidden;display:flex}
+.stacked .sg{height:100%;transition:transform var(--dur-base) var(--ease-standard);transform-origin:left center}
+.stacked.alert{border:1px solid var(--rbc-warning-border)}
+/* 热力条 */
+.heat{display:flex;gap:2px;height:24px}
+.heat .cell{width:4px;height:24px;border-radius:1px;flex:none}
+.heat .cell.anomaly{outline:1px solid var(--rbc-danger-fg);outline-offset:0}
+/* IOCTL 点阵 */
+.ioctl-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px 4px}
+.ioctl-cell{display:flex;flex-direction:column;align-items:center;gap:4px;font-size:11px;color:var(--rbc-text-secondary)}
+.ioctl-cell .dot{width:10px;height:10px;border-radius:50%}
+.ioctl-cell .lat{width:24px;height:3px;border-radius:1.5px;background:var(--rbc-chart-track);position:relative;overflow:hidden}
+.ioctl-cell .lat i{position:absolute;left:0;top:0;bottom:0;background:var(--rbc-chart-1);border-radius:1.5px}
+.ioctl-cell.ok .dot{background:var(--rbc-success-fg)}
+.ioctl-cell.warn .dot{background:var(--rbc-warning-fg)}
+.ioctl-cell.danger .dot{background:var(--rbc-danger-fg)}
+.ioctl-cell.neutral .dot{background:var(--rbc-neutral-fg)}
+.ioctl-cell.warn .lat i{background:var(--rbc-warning-fg)}
+.ioctl-cell.danger .lat i{background:var(--rbc-danger-fg)}
+
+/* Sparkline（02b §A.3 · 无轴无填充 · 末端 3px 实心点） */
+.spark{width:100%;height:28px;display:block}
+
+/* ════════════════════════════════════════════════════════════════════
+   14. 卷卡（04b §8.1 ② · 四列 Grid · 行高 ≥64）
+   ════════════════════════════════════════════════════════════════════ */
+.volcard{display:grid;grid-template-columns:1fr 220px 148px;gap:12px 16px;align-items:center;min-height:64px}
+.volcard-head{grid-column:1 / -1;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.volcard-head .volcard-id{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.volcard-head .source-chip{margin-left:auto;align-self:center}   /* C-2：卷卡右上角，与卡头标题间距 8px */
+.volcard .drive{font-size:20px;font-weight:600;line-height:1.3}
+.volcard .vlabel{font-size:12px;color:var(--rbc-text-secondary)}
+.volcard .sys-tag{font-size:11px;color:var(--rbc-warning-fg)}
+.volcard .ctl-col{display:flex;flex-direction:column;gap:8px}
+.volcard .ctl-col .select,.volcard .ctl-col .btn{width:100%}
+.vol-metrics{font-size:12px;color:var(--rbc-text-secondary);display:flex;flex-wrap:wrap;gap:4px 16px}
+.vol-metrics b{font-family:var(--rbc-font-mono);font-weight:600;color:var(--rbc-text-primary);font-variant-numeric:tabular-nums}
+/* 状态页卷行（每卷一行状态徽标卡） */
+.volrow{display:flex;align-items:center;gap:16px;padding:12px 16px}
+.volrow .drive{font-size:20px;font-weight:600;width:48px;flex:none}
+.volrow .vlabel{width:120px;flex:none;font-size:12px;color:var(--rbc-text-secondary)}
+.volrow .sentence{flex:1;font-size:12px;color:var(--rbc-text-secondary)}
+
+/* ════════════════════════════════════════════════════════════════════
+   15. 自检清单 / 日志 / 版本单轨（诊断页）
+   ════════════════════════════════════════════════════════════════════ */
+.check-row{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--rbc-border)}
+.check-row:last-child{border-bottom:none}
+.check-row .st{width:8px;height:8px;border-radius:50%;flex:none}
+.check-row .st.ok{background:var(--rbc-success-fg)}
+.check-row .st.warn{background:var(--rbc-warning-fg)}
+.check-row .st.danger{background:var(--rbc-danger-fg)}
+.check-row .st.neutral{background:var(--rbc-neutral-fg)}
+.check-row .cr-name{width:150px;flex:none;font-size:13px}
+.check-row .cr-ev{flex:1;font-size:12px;color:var(--rbc-text-secondary);font-family:var(--rbc-font-mono)}
+.log-pane{background:var(--rbc-bg-app);border:1px solid var(--rbc-border);border-radius:var(--radius-sm);padding:8px 12px;max-height:296px;overflow-y:auto}
+.log-line{font-family:var(--rbc-font-mono);font-size:12px;line-height:1.65;color:var(--rbc-text-secondary);white-space:pre-wrap;word-break:break-all}
+.log-line .src-tag{margin-right:8px}
+.log-line.err{color:var(--rbc-danger-fg)}
+.log-line.warn{color:var(--rbc-warning-fg)}
+.src-tag{
+  display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:16px;padding:0 4px;
+  border-radius:var(--radius-xs);border:1px solid var(--rbc-info-border);background:var(--rbc-info-bg);
+  color:var(--rbc-info-fg);font-size:11px;font-weight:600;font-family:var(--rbc-font-mono);cursor:help;
+  vertical-align:1px;flex:none;
+}
+.version-rail{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.version-rail .vr-item{display:flex;flex-direction:column;gap:2px}
+.version-rail .vr-item .vr-k{font-size:11px;color:var(--rbc-text-secondary)}
+.version-rail .vr-item .vr-v{font-family:var(--rbc-font-mono);font-size:13px;font-weight:600}
+.version-rail .vr-sep{color:var(--rbc-text-disabled)}
+
+/* ════════════════════════════════════════════════════════════════════
+   16. 应急页（回滚三步图 / 救援卡）
+   ════════════════════════════════════════════════════════════════════ */
+.rollback{display:grid;grid-template-columns:1fr 24px 1fr 24px 1fr;align-items:stretch;gap:0}
+.rollback .step{background:var(--rbc-bg-surface);border:1px solid var(--rbc-border);border-radius:var(--radius-md);padding:16px}
+.rollback .step .n{
+  width:24px;height:24px;border-radius:50%;background:var(--rbc-accent-subtle);
+  border:1px solid var(--rbc-info-border);color:var(--rbc-info-fg);
+  display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;margin-bottom:8px;
+}
+.rollback .arrow{display:flex;align-items:center;justify-content:center;color:var(--rbc-text-disabled)}
+.danger-zone{border:1px solid var(--rbc-danger-border);border-radius:var(--radius-md);background:var(--rbc-danger-bg);padding:16px}
+.danger-zone .dz-head{display:flex;align-items:center;gap:8px;color:var(--rbc-danger-fg);font-weight:600;font-size:13px;margin-bottom:4px}
+
+/* ════════════════════════════════════════════════════════════════════
+   17. 弹窗 / Toast / 向导（遮罩 #9E000000 · 弹窗 180ms · Toast 进180出120）
+   ════════════════════════════════════════════════════════════════════ */
+.layer{position:absolute;inset:0;z-index:300;display:flex;align-items:center;justify-content:center;background:var(--rbc-scrim)}
+.layer[hidden]{display:none}
+/* 对话框面板内容样式（基座本体见 17.6：C-4/C-5/文件选择框三处复用） */
+.dialog .dlg-title{font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px;margin-bottom:12px}
+.dialog .dlg-part{margin-bottom:12px}
+.dialog .dlg-part .dp-k{font-size:12px;font-weight:600;color:var(--rbc-text-secondary);margin-bottom:4px}
+.dialog .dlg-part .dp-v{font-size:13px;color:var(--rbc-text-primary);line-height:1.6}
+.dialog .dlg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+.dialog.danger .dlg-title{color:var(--rbc-danger-fg)}
+.toast-wrap{position:absolute;right:16px;bottom:16px;z-index:400;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
+.toast{
+  display:flex;align-items:center;gap:8px;max-width:360px;padding:8px 16px;
+  background:var(--rbc-bg-elevated);border:1px solid var(--rbc-border-strong);border-radius:var(--radius-md);
+  box-shadow:var(--shadow-floating);font-size:12px;color:var(--rbc-text-primary);
+  transform:translateY(8px);opacity:0;
+  transition:transform var(--dur-base) var(--ease-out),opacity var(--dur-base) var(--ease-out);
+}
+.toast.show{transform:translateY(0);opacity:1}
+.toast.leaving{transition:transform var(--dur-fast) var(--ease-in),opacity var(--dur-fast) var(--ease-in)}
+.toast .ic{color:var(--rbc-success-fg)}
+.toast.warn .ic{color:var(--rbc-warning-fg)}
+.toast.danger .ic{color:var(--rbc-danger-fg)}
+/* 首次运行向导（560×480 固定 · 五步：认识/环境自检/选卷/选预设/完成） */
+.wizard-layer{z-index:350}
+.wizard{
+  width:560px;height:480px;background:var(--rbc-bg-app);border:1px solid var(--rbc-border-strong);
+  border-radius:var(--radius-md);box-shadow:var(--shadow-floating);
+  display:flex;flex-direction:column;overflow:hidden;
+  transform:translateY(8px);opacity:0;transition:transform var(--dur-base) var(--ease-out),opacity var(--dur-base) var(--ease-out);
+}
+.layer.show .wizard{transform:translateY(0);opacity:1}
+.wizard .wz-head{padding:20px 28px 0}
+.wizard .wz-steps{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--rbc-text-secondary)}
+.wizard .wz-steps .cur{color:var(--rbc-accent);font-weight:600}
+.wizard .wz-body{flex:1;padding:16px 28px;overflow-y:auto}
+.wizard .wz-foot{display:flex;align-items:center;gap:8px;padding:16px 28px 20px;border-top:1px solid var(--rbc-border)}
+.wizard .wz-foot .spacer{flex:1}
+.wz-vol{display:flex;align-items:center;gap:12px;padding:8px 12px;border-radius:var(--radius-sm)}
+.wz-vol:hover{background:var(--rbc-bg-surface)}
+.wz-vol .wz-letter{font-weight:600;width:32px}
+.wz-vol .wz-label{width:110px;font-size:12px;color:var(--rbc-text-secondary)}
+.wz-vol .wz-cap{font-size:12px;color:var(--rbc-text-secondary);font-family:var(--rbc-font-mono)}
+.selfcheck-row{display:flex;align-items:center;gap:12px;padding:8px 0;font-size:13px}
+.selfcheck-row .scr-st{width:16px;height:16px;flex:none;display:flex;align-items:center;justify-content:center;color:var(--rbc-text-disabled)}
+.selfcheck-row.ok .scr-st{color:var(--rbc-success-fg)}
+.selfcheck-row .scr-ev{margin-left:auto;font-size:11px;color:var(--rbc-text-secondary);font-family:var(--rbc-font-mono)}
+
+/* ════════════════════════════════════════════════════════════════════
+   17.5 V10.6 新组件（06 §2 · C-1 场景预设卡 / C-2 预设来源 chip /
+       C-6 许可卡 / C-7 电源 chip · 全部复用 V2 令牌，零新增色值）
+   ════════════════════════════════════════════════════════════════════ */
+/* —— C-1 场景预设卡：卡左内缘 3px 档位语义条（N-3 · R-1 裁定：
+      安全=info / 均衡=accent（品牌默认身份）/ 性能=warning / 自定义=neutral）—— */
+.preset-card{position:relative;overflow:hidden;padding-left:calc(16px + var(--rbc-preset-tier-bar-w))}
+.preset-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:var(--rbc-preset-tier-bar-w);background:var(--preset-tier,var(--rbc-neutral-fg))}
+.preset-card[data-tier="safe"]{--preset-tier:var(--rbc-info-fg)}
+.preset-card[data-tier="balanced"]{--preset-tier:var(--rbc-accent)}
+.preset-card[data-tier="perf"]{--preset-tier:var(--rbc-warning-fg)}
+.preset-card[data-tier="custom"]{--preset-tier:var(--rbc-neutral-fg)}
+/* 受管参数摘要表（默认折叠 · 参数列 200px + 值列等宽 · 行高 28 · 1px 行分隔） */
+.preset-summary{margin-top:12px;border-top:1px solid var(--rbc-border)}
+.preset-summary>summary{
+  list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;height:28px;
+  font-size:12px;color:var(--rbc-text-secondary);user-select:none;
+}
+.preset-summary>summary::-webkit-details-marker{display:none}
+.preset-summary>summary::before{
+  content:"";width:0;height:0;flex:none;
+  border-left:5px solid var(--rbc-text-secondary);
+  border-top:4px solid transparent;border-bottom:4px solid transparent;
+  transition:transform var(--dur-fast) var(--ease-standard);
+}
+.preset-summary[open]>summary::before{transform:rotate(90deg)}
+.preset-summary-row{display:flex;align-items:center;min-height:28px;border-bottom:1px solid var(--rbc-border);
+  transition:background-color var(--dur-base) var(--ease-standard)}
+.preset-summary-row:last-child{border-bottom:none}
+.preset-summary-row .psr-k{width:200px;flex:none;font-size:12px;color:var(--rbc-text-secondary)}
+.preset-summary-row .psr-v{font-size:12px;color:var(--rbc-text-primary);font-family:var(--rbc-font-mono)}
+.preset-summary-row .psr-note{font-size:12px;color:var(--rbc-warning-fg);margin-left:8px;font-family:var(--rbc-font-ui)}
+.preset-summary-row.hl{background:var(--rbc-bg-surface-hover)}   /* Applied 逐行高亮（中性底，不占语义色） */
+/* 差异条 + 差异清单（自定义态 · 条件渲染） */
+.preset-diff-bar{
+  display:flex;align-items:center;gap:8px;margin-top:12px;padding:6px 12px;
+  background:var(--rbc-bg-input);border:1px solid var(--rbc-border);border-radius:var(--radius-sm);
+  font-size:12px;color:var(--rbc-text-secondary);
+}
+.preset-diff-bar .btn{margin-left:auto}
+.preset-diff-rows{padding:4px 0 0}
+.preset-diff-row{display:flex;align-items:center;gap:8px;min-height:24px;padding:0 12px;font-size:12px}
+.preset-diff-row .pd-k{color:var(--rbc-text-primary)}
+.preset-diff-row .pd-v{color:var(--rbc-text-secondary);font-family:var(--rbc-font-mono)}
+.preset-diff-row .pd-cur{color:var(--rbc-warning-fg)}            /* 差异项当前值（偏离提示，非状态） */
+/* —— C-2 预设来源 chip（16px 轻量角标族 · R-2 五重区分 LinkChip：
+      常规字体 / surface 底 / 1px 描边 / 可点击 / 中文文案）—— */
+.source-chip{
+  position:relative;display:inline-flex;align-items:center;height:16px;padding:0 8px;
+  border-radius:var(--radius-pill);background:var(--rbc-bg-surface);border:1px solid var(--rbc-border);
+  font-family:var(--rbc-font-ui);font-size:12px;font-weight:400;line-height:14px;color:var(--rbc-text-secondary);
+  white-space:nowrap;cursor:pointer;flex:none;
+  transition:background-color var(--dur-fast) var(--ease-standard),border-color var(--dur-fast) var(--ease-standard);
+}
+.source-chip::after{content:"";position:absolute;left:0;right:0;top:-2px;bottom:-2px}  /* 命中区上下外扩 2px，视觉高不变 */
+.source-chip:hover{background:var(--rbc-bg-surface-hover);border-color:var(--rbc-border-strong)}
+.source-chip:active{background:var(--rbc-bg-elevated)}
+.source-chip:focus-visible{outline:2px solid var(--rbc-focus-ring);outline-offset:2px}
+/* —— 语义状态族 20px pill（C-6 许可徽标 / C-7 电源 chip 共用 · R-4 双高度体系：Bg + 1px Border + Fg）—— */
+.state-pill{
+  display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:var(--radius-pill);
+  border:1px solid;font-size:12px;font-weight:400;line-height:1;white-space:nowrap;flex:none;
+}
+.state-pill.neutral{background:var(--rbc-neutral-bg);border-color:var(--rbc-neutral-border);color:var(--rbc-neutral-fg)}
+.state-pill.info{background:var(--rbc-info-bg);border-color:var(--rbc-info-border);color:var(--rbc-info-fg)}
+.state-pill.warning{background:var(--rbc-warning-bg);border-color:var(--rbc-warning-border);color:var(--rbc-warning-fg)}
+.state-pill.success{background:var(--rbc-success-bg);border-color:var(--rbc-success-border);color:var(--rbc-success-fg)}
+.state-pill .mono{font-family:var(--rbc-font-mono)}              /* 电量百分比等宽段（C-7.3） */
+/* —— C-6 许可卡大值槽（32px mono 600 · 文本主色——V-4：许可天数是状态展示不是主指标，不用 accent）—— */
+.license-big{font-family:var(--rbc-font-mono);font-size:32px;font-weight:600;line-height:1.15;color:var(--rbc-text-primary);font-variant-numeric:tabular-nums}
+.license-big-text{font-size:17px;font-weight:600;line-height:1.15;color:var(--rbc-text-primary)}   /* 已激活态文本型大值槽（06 C-6.1） */
+.license-unit{font-size:13px;color:var(--rbc-text-secondary);margin-left:4px}   /* 单位分排 */
+/* —— C-2 点击行为（06 C-2.4 裁定）：导航到设置页 + 预设 ComboBox 获得键盘焦点，
+      不做高亮闪烁动画（禁装饰动效，红线 4）—— */
+
+/* ════════════════════════════════════════════════════════════════════
+   17.6 V10.6 第二批：对话框基座（06 §2 C-4.1 · C-4/C-5/文件选择框共用）
+       + C-3 冷热对比卡 + C-4 回写引导对话框 + 向导预设步
+   ════════════════════════════════════════════════════════════════════ */
+/* —— 对话框基座（RbcDialogHost 等价物 · 一次实现三处复用）—— */
+/* 遮罩：#9E000000（V2 既有特许值，与 --rbc-scrim 同值）；absolute 贴 .win（D-a 裁决：
+   桌面 App 语境遮罩限窗口内，与 V2 modal-layer/wizard-layer 一致，不晕染窗口外页面）；
+   入场 opacity 0→1 120ms ease-out，出场 120ms ease-in */
+.dialog-scrim{position:absolute;inset:0;z-index:400;display:flex;align-items:center;justify-content:center;
+  background:#9E000000;opacity:0;transition:opacity var(--dur-fast) var(--ease-out)}
+.dialog-scrim[hidden]{display:none}
+.dialog-scrim.show{opacity:1}
+.dialog-scrim.closing{transition:opacity var(--dur-fast) var(--ease-in)}
+/* 面板：elevated 底 + 1px strong 描边 + radius-lg + Floating 阴影；宽 560 基座 /
+   480（C-4 · .dialog-md）/ 440（C-5 · .dialog-sm）/ 360（C-6 占位框 · .dialog-xs）；
+   入场 = scale(N-2 0.98)→1 + opacity 0→1 + translateY 8px→0，180ms ease-out；出场反向 120ms ease-in；禁弹跳 */
+.dialog{
+  width:560px;max-width:calc(100% - 48px);max-height:calc(100% - 48px);overflow-y:auto;
+  background:var(--rbc-bg-elevated);border:1px solid var(--rbc-border-strong);
+  border-radius:var(--radius-lg);box-shadow:0 8px 24px rgba(0,0,0,.45);padding:24px;
+  transform:translateY(8px) scale(var(--rbc-scale-overlay-from));opacity:0;
+  transition:transform var(--dur-base) var(--ease-out),opacity var(--dur-base) var(--ease-out);
+}
+.dialog-md{width:480px}
+.dialog-sm{width:440px}
+.dialog-xs{width:360px}
+.dialog-scrim.show .dialog{transform:translateY(0) scale(1);opacity:1}
+.dialog-scrim.closing .dialog{transition:transform var(--dur-fast) var(--ease-in),opacity var(--dur-fast) var(--ease-in)}
+.input{
+  width:100%;height:28px;background:var(--rbc-bg-input);
+  border:1px solid var(--rbc-border-default);border-radius:var(--radius-sm);
+  color:var(--rbc-text-primary);font-family:var(--rbc-font-mono);font-size:12px;padding:0 8px;
+}
+.input:focus-visible{outline:2px solid var(--rbc-focus-ring);outline-offset:1px}
+/* —— C-4 对话框内部：三段式段组 / 场景双列清单 / 风险句 / 知情勾选 —— */
+.g-sec{margin-top:16px;padding-top:16px;border-top:1px solid var(--rbc-border)}
+.g-sec.first{margin-top:0;padding-top:0;border-top:none}   /* 首段（标题后）不加分隔线 */
+.g-sec-t{font-size:13px;font-weight:600;color:var(--rbc-text-primary);line-height:18px;margin-bottom:4px}
+.g-sec-b{font-size:13px;color:var(--rbc-text-secondary);line-height:18px}
+.g-advice{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px}
+.g-adv{padding:12px;border-radius:var(--radius-sm);border:1px solid}
+.g-adv.ok{background:var(--rbc-info-bg);border-color:var(--rbc-info-border)}
+.g-adv.no{background:var(--rbc-warning-bg);border-color:var(--rbc-warning-border)}
+.g-adv-t{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;margin-bottom:8px}
+.g-adv.ok .g-adv-t{color:var(--rbc-info-fg)}
+.g-adv.no .g-adv-t{color:var(--rbc-warning-fg)}
+.g-adv-i{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--rbc-text-primary);line-height:24px}
+.g-risk{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--rbc-warning-fg);margin:12px 0}
+.g-ack{margin-top:12px}
+.g-why{font-size:12px;color:var(--rbc-text-secondary);margin-top:4px;min-height:16px}   /* 禁用必须配原因（红线 12） */
+/* —— C-3 冷热二遍读对比卡（收益页 span2 · 五态）—— */
+.cw-path{font-family:var(--rbc-font-mono);font-size:12px;color:var(--rbc-text-secondary);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
+.cw-stage{font-size:13px;color:var(--rbc-text-secondary);margin-bottom:8px}
+.cw-stat{font-family:var(--rbc-font-mono);font-size:12px;color:var(--rbc-text-secondary);margin-top:8px}
+.cw-table{margin-top:12px;border-top:1px solid var(--rbc-border)}
+.cw-row{display:grid;grid-template-columns:150px 1fr 72px 84px 64px;align-items:center;gap:8px;
+  min-height:48px;border-bottom:1px solid var(--rbc-border)}
+.cw-row.head{min-height:28px;font-size:12px;color:var(--rbc-text-secondary)}
+.cw-row .cw-num{font-family:var(--rbc-font-mono);font-size:13px;color:var(--rbc-text-secondary);text-align:right}
+.cw-label{font-size:13px;color:var(--rbc-text-primary)}
+.cw-big{font-family:var(--rbc-font-mono);font-size:32px;font-weight:600;line-height:1.15;
+  color:var(--rbc-text-primary);font-variant-numeric:tabular-nums}
+.cw-big.accent{color:var(--rbc-accent)}   /* 第二遍 = 主指标（V-4） */
+.cw-unit{font-size:13px;color:var(--rbc-text-secondary);margin-left:4px}
+.cw-gain{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:var(--radius-pill);
+  background:var(--rbc-success-bg);border:1px solid var(--rbc-success-border);color:var(--rbc-success-fg);
+  font-size:13px;font-weight:600;gap:4px}
+.cw-gain .mono{font-family:var(--rbc-font-mono)}
+/* 双条形（06 C-3.2 纵向形态：条宽 48px · 区高 120px（数值标签 16 + 条 88 + 基线 1）·
+   顶圆角 sm(6) 底 0 · 坐 1px 基线 · 无外框无背景块 · 两遍同 Y 尺度；
+   生长 = scaleY 0→1（红线 6：禁布局属性动画，V2 transform 范式）） */
+.cw-bars{display:flex;gap:24px;align-items:flex-end;height:120px;margin-top:12px;
+  padding-top:16px;border-bottom:1px solid var(--rbc-border);position:relative}
+.cw-bar-col{display:flex;flex-direction:column;align-items:center;width:48px;height:100%}
+.cw-bar-val{font-family:var(--rbc-font-mono);font-size:13px;line-height:16px;color:var(--rbc-text-secondary);flex:none}
+.cw-bar-slot{flex:1;width:48px;display:flex;align-items:flex-end;min-height:0}
+.cw-bar{width:48px;background:var(--rbc-neutral-fg);border-radius:var(--radius-sm) var(--radius-sm) 0 0;
+  transform-origin:bottom center;transform:scaleY(0);transition:transform var(--dur-slower) var(--ease-out)}
+.cw-bar.p2{background:var(--rbc-chart-1)}
+.cw-bar-cap{display:flex;gap:24px;margin-top:8px}
+.cw-bar-cap>span{width:48px;text-align:center;font-size:12px;color:var(--rbc-text-secondary)}
+.cw-scale{position:absolute;top:0;right:0;font-family:var(--rbc-font-mono);font-size:11px;line-height:16px;color:var(--rbc-chart-axis-text)}
+.cw-degrade{display:flex;align-items:center;gap:8px;min-height:32px;padding:8px 12px;margin-top:12px;
+  background:var(--rbc-warning-bg);border:1px solid var(--rbc-warning-border);border-radius:var(--radius-sm);
+  font-size:12px;color:var(--rbc-warning-fg)}
+.cw-foot{margin-top:12px;border-top:1px solid var(--rbc-border);padding-top:8px}
+.cw-demo-toggle{margin-top:8px}
+.cw-demo-toggle>summary{list-style:none;cursor:pointer;font-size:11px;color:var(--rbc-text-secondary);user-select:none}
+.cw-demo-toggle>summary::-webkit-details-marker{display:none}
+/* —— 向导第 4 步预设卡（3px 语义条 + 单选高亮，语义条配色同 C-1）—— */
+.wz-preset{position:relative;overflow:hidden;display:flex;align-items:center;gap:8px;width:100%;text-align:left;
+  padding:12px 12px 12px calc(12px + var(--rbc-preset-tier-bar-w));
+  background:var(--rbc-bg-surface);border:1px solid var(--rbc-border);border-radius:var(--radius-sm);cursor:pointer;
+  transition:border-color var(--dur-fast) var(--ease-standard),background-color var(--dur-fast) var(--ease-standard)}
+.wz-preset::before{content:"";position:absolute;left:0;top:0;bottom:0;width:var(--rbc-preset-tier-bar-w);background:var(--preset-tier,var(--rbc-neutral-fg))}
+.wz-preset[data-tier="safe"]{--preset-tier:var(--rbc-info-fg)}
+.wz-preset[data-tier="balanced"]{--preset-tier:var(--rbc-accent)}
+.wz-preset[data-tier="perf"]{--preset-tier:var(--rbc-warning-fg)}
+.wz-preset:hover{border-color:var(--rbc-border-strong);background:var(--rbc-bg-surface-hover)}
+.wz-preset.sel{border-color:var(--rbc-accent)}
+.wz-preset .wz-preset-check{width:16px;flex:none;color:var(--rbc-accent)}
+.wz-preset:focus-visible{outline:2px solid var(--rbc-focus-ring);outline-offset:2px}
+
+/* ════════════════════════════════════════════════════════════════════
+   18. reduced-motion 全量降级（02b §B.5：位移归零/脉冲静止/数字直显/
+       图表全显/信息不丢；JS 侧同步关闭插值与描边动画）
+   ════════════════════════════════════════════════════════════════════ */
+body.reduced *,body.reduced *::before,body.reduced *::after{
+  animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important;
+}
+body.reduced .page.active{animation:none}
+body.reduced .card.hoverable:hover{transform:none}
+body.reduced .btn:active{transform:none}
+body.reduced .progress.indeterminate .bar{animation:none;transform:scaleX(.4)}
+body.reduced .seg .pulse{animation:none;opacity:1}
+body.reduced .preset-summary>summary::before{transition:none}
+body.reduced .preset-summary-row.hl{transition:none}
+body.reduced .dialog-scrim{transition:none}
+body.reduced .dialog{transition:none}
+body.reduced .cw-bar{transition:none}
+body.reduced .sk::after{animation:none}                            /* 骨架流光停止：静态 RbcBgSkeleton 底 */
+body.reduced .progress .bar{transition:none}
+</style>
+</head>
+<body>
+<!-- ═══ 线性矢量图标 sprite（禁 emoji · 一律 1.5px 线性） ═══ -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-gauge" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 12l4.2-3.2"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M3 20h18"/><path d="M6 20v-7"/><path d="M12 20V5"/><path d="M18 20v-11"/></symbol>
+    <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M3 12h4l2-6 3 12 2-6h5"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3l10 18H2L12 3z"/><path d="M12 10v5"/><path d="M12 18.4v.2"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h16"/><circle cx="9" cy="6" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="7" cy="18" r="2"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12"/><path d="M7 11l5 5 5-5"/><path d="M4 21h16"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.4-5.7"/><path d="M20 3v4h-4"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M4 12l5 5L20 6"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 7.8v.4"/></symbol>
+    <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v8"/><path d="M6.5 6.5a7 7 0 1 0 11 0"/></symbol>
+    <symbol id="i-drive" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9v6"/><circle cx="17" cy="12" r="1"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M4 12h16"/><path d="M14 6l6 6-6 6"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.5-3 7.7-7 9-4-1.3-7-4.5-7-9V6l7-3z"/><path d="M9 12l2 2 4-4"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></symbol>
+    <symbol id="i-min" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+    <symbol id="i-max" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+  </defs>
+</svg>
+
+<div class="win" id="win">
+  <!-- ═══ 标题栏（含原型专用：演示态切换 + 数据来源图例） ═══ -->
+  <header class="titlebar">
+    <svg class="ic ic-14" style="color:var(--rbc-accent)"><use href="#i-shield"/></svg>
+    <span class="tb-title">RAMBlockCache 控制器</span>
+    <div class="tb-demo">
+      <label for="demo-select">演示态</label>
+      <select id="demo-select" class="select" style="width:132px">
+        <option value="normal">正常</option>
+        <option value="panic-healing">熔断 · 自愈中</option>
+        <option value="panic-settled">熔断 · 已结算</option>
+        <option value="safe-mode">安全模式</option>
+        <option value="dirty-warn">未落盘超阈值</option>
+        <option value="offline">驱动离线</option>
+        <option value="degraded">统计降级</option>
+        <option value="empty">未挂栈（空态）</option>
+        <optgroup label="V10.6 新增">
+          <option value="preset-applying">预设应用中</option>
+          <option value="license-trial">许可 · 试用中</option>
+          <option value="anticheat">反作弊警示</option>
+          <option value="benchmark">二遍读对比</option>
+        </optgroup>
+      </select>
+      <button class="btn btn-ghost btn-sm" id="btn-legend" title="查看数据来源角标图例（A/B/C/D 共 21 项接口缺口）">
+        <svg class="ic ic-14"><use href="#i-info"/></svg>数据来源
+      </button>
+    </div>
+    <div class="caption">
+      <button title="最小化"><svg class="ic ic-14"><use href="#i-min"/></svg></button>
+      <button title="最大化"><svg class="ic ic-14"><use href="#i-max"/></svg></button>
+      <button class="close" title="关闭"><svg class="ic ic-14"><use href="#i-close"/></svg></button>
+    </div>
+  </header>
+
+  <!-- ═══ 常驻四段状态条（驱动/挂栈/加速/风险 · 段点击路由见 JS） ═══ -->
+  <div class="statusbar" id="statusbar">
+    <div class="seg clickable ok" id="seg-driver" data-goto="diag" title="点击前往诊断页">
+      <span class="dot" id="dot-driver"></span><span>驱动</span><span class="seg-val" id="val-driver">已连接</span>
+    </div>
+    <div class="seg clickable info" id="seg-stack" data-goto="accel" title="点击前往加速页">
+      <span class="dot" id="dot-stack"></span><span>挂栈</span><span class="seg-val" id="val-stack">已挂 3 卷</span>
+    </div>
+    <div class="seg clickable success" id="seg-accel" data-goto="status" title="点击前往状态页">
+      <span class="dot" id="dot-accel"></span><span>加速</span><span class="seg-val" id="val-accel">2 卷 · 1 直写 / 1 回写</span>
+    </div>
+    <div class="seg clickable success" id="seg-risk" data-goto="emergency" title="点击前往应急页">
+      <span class="dot" id="dot-risk"></span><span>风险</span><span class="seg-val" id="val-risk">无</span>
+    </div>
+  </div>
+
+  <!-- ═══ Banner（异常的紧凑提示；完整三段式在状态页异常卡） ═══ -->
+  <div class="banner" id="banner" hidden>
+    <svg class="ic ic-14"><use href="#i-alert"/></svg>
+    <span id="banner-text"></span>
+    <button class="banner-link" id="banner-link">前往处置</button>
+  </div>
+
+  <div class="body">
+    <!-- ═══ 侧栏导航 ═══ -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-name">RAMBlockCache</div>
+        <div class="brand-sub">V10.4.3 Build 19（10.3.4.19）</div>
+      </div>
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-page="status"><svg class="ic ic-14"><use href="#i-gauge"/></svg>状态</button>
+        <button class="nav-item" data-page="accel"><svg class="ic ic-14"><use href="#i-bolt"/></svg>加速</button>
+        <button class="nav-item" data-page="earnings"><svg class="ic ic-14"><use href="#i-chart"/></svg>收益</button>
+        <button class="nav-item" data-page="diag"><svg class="ic ic-14"><use href="#i-pulse"/></svg>诊断</button>
+        <button class="nav-item" data-page="emergency"><svg class="ic ic-14"><use href="#i-alert"/></svg>应急<span class="nav-badge" id="nav-emergency-badge">1</span></button>
+        <button class="nav-item" data-page="settings"><svg class="ic ic-14"><use href="#i-sliders"/></svg>设置</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="t-micro" id="motion-state">动效：标准（跟随系统）</div>
+        <div class="t-micro" id="poll-state">统计采样：每秒</div>
+      </div>
+    </aside>
+
+    <!-- ═══ 内容区（六页） ═══ -->
+    <main class="content" id="content">
+      <!-- ═══════════ 第 1 页 · 状态（原总览重构：只回答"现在怎样"） ═══════════ -->
+      <section class="page active" id="page-status">
+        <div class="page-head">
+          <div>
+            <div class="t-h1">状态</div>
+            <div class="page-sub">现在安不安全、有没有在加速，一眼可读。全局操作已迁至加速页与应急页。</div>
+          </div>
+          <div class="page-actions" id="status-actions"></div>
+        </div>
+        <div id="status-body" class="stack gap16"></div>
+      </section>
+
+      <!-- ═══════════ 第 2 页 · 加速（原磁盘重构：每卷配置归一页） ═══════════ -->
+      <section class="page" id="page-accel">
+        <div class="page-head">
+          <div>
+            <div class="t-h1">加速</div>
+            <div class="page-sub">每卷配置归一页：挂栈、写模式、配额、预读窗口都在同一张卷卡上。系统盘默认不加速。</div>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-secondary" id="btn-refresh-drives"><svg class="ic ic-14"><use href="#i-refresh"/></svg>刷新卷列表</button>
+          </div>
+        </div>
+        <div id="accel-body" class="stack gap12"></div>
+      </section>
+
+      <!-- ═══════════ 第 3 页 · 收益（原缓存拆出：七类图表主场 + 渐进披露） ═══════════ -->
+      <section class="page" id="page-earnings">
+        <div class="page-head">
+          <div>
+            <div class="t-h1">收益</div>
+            <div class="page-sub">缓存为你做了什么：一级看三个数，二级看细节；冷热对比可自证缓存有效。</div>
+          </div>
+        </div>
+        <!-- 一级：3 数字 -->
+        <div class="grid grid-3" id="earnings-kpis"></div>
+        <!-- 二级：图表主场（行1 = 冷热对比 span2 + 命中率趋势 span2 · C-3 黄金位） -->
+        <div class="grid grid-3 mt16" id="earnings-charts">
+          <div class="card chart-card span2" id="card-coldwarm">
+            <div class="chart-head">
+              <div class="t-h3">冷热对比</div>
+              <span class="src-tag" title="[B-4] RunColdWarmBenchmark：CLI 同款执行体，与 ramboostctl stats 误差 <2% 硬契约（B 类移交）；FlushFileRange（B-5）不可用时降级横幅">B-4</span>
+            </div>
+            <div id="coldwarm-body"></div>
+          </div>
+          <div class="card chart-card span2" id="card-chart-hitrate">
+            <div class="chart-head">
+              <div class="t-h3">读命中率趋势</div>
+              <span class="src-tag" title="[A1] StatsService 秒级采样 → DriveItemViewModel.HitPct（瞬时值）；缺 60×5s 历史环形缓冲，mock 序列">A1</span>
+              <div class="chart-legend"><span><i style="background:var(--rbc-chart-1)"></i>命中率</span></div>
+            </div>
+            <div id="chart-hitrate"></div>
+            <div class="chart-foot">最近 5 分钟 · 60 采样点（5 秒一点）· 采样中断处断线留缺口，不插值不归零</div>
+          </div>
+          <div class="card chart-card" id="card-chart-ring">
+            <div class="chart-head">
+              <div class="t-h3">缓存占用与上限</div>
+              <span class="src-tag" title="[A3] DriveItemViewModel.CacheUsedBytes/CacheBytesTotal（每卷）；缺全局 used/total 结构化属性（拆 CacheText），mock 合计">A3</span>
+            </div>
+            <div id="chart-ring"></div>
+            <div class="chart-foot" id="ring-foot"></div>
+          </div>
+          <div class="card chart-card span2" id="card-chart-throughput">
+            <div class="chart-head">
+              <div class="t-h3">读写吞吐</div>
+              <span class="src-tag" title="[A2] ReadMbps/WriteMbps（瞬时值）；缺序列缓冲 + 图表接线，mock 序列">A2</span>
+              <div class="chart-legend">
+                <span><i style="background:var(--rbc-chart-1)"></i>读</span>
+                <span><i style="background:var(--rbc-chart-2)"></i>写</span>
+              </div>
+            </div>
+            <div id="chart-throughput"></div>
+            <div class="chart-foot">Y 轴自适应（MB/s）· 双线靠明度差 + 图例区分，不用第三色系</div>
+          </div>
+          <div class="card chart-card" id="card-chart-writemode">
+            <div class="chart-head">
+              <div class="t-h3">写模式构成</div>
+              <span class="src-tag" title="[A4] Drives 集合 Mode 字段 · 纯 UI 派生，无缺口（登记防漏）">A4</span>
+            </div>
+            <div id="chart-writemode"></div>
+            <div class="chart-foot">一眼看懂几卷直写 / 几卷回写；回写段附琥珀角标</div>
+          </div>
+          <div class="card chart-card span2" id="card-chart-heat">
+            <div class="chart-head">
+              <div class="t-h3">64 分片吞吐热力</div>
+              <span class="src-tag" title="[B1] 需 Stripe[64].Throughput 字段；驱动 RB_STATS 是否已有所需数组未知——若无则新协议面（三副本同步 + check_proto_sync），mock 序列">B1</span>
+            </div>
+            <div id="chart-heat"></div>
+            <div class="chart-foot">每格归一化到当期最大值的 33% / 66% 分档 · 全格置灰 = 无数据；单格异常（值为 0 且有压力）标红描边</div>
+          </div>
+          <div class="card chart-card" id="card-chart-dirty">
+            <div class="chart-head">
+              <div class="t-h3">未落盘数据量</div>
+              <span class="src-tag" title="[B2] DirtyBytes 已有（StateBar 消费）；LostDirtyBytes（已确认丢失）字段存在性待确认，mock 序列">B2</span>
+            </div>
+            <div id="chart-dirty"></div>
+            <div class="chart-foot" id="dirty-foot"></div>
+          </div>
+        </div>
+        <!-- 二级折叠：L2/预取/准入/延迟（渐进披露） -->
+        <details class="card mt16" id="earnings-details">
+          <summary class="t-h3" style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px">
+            <svg class="ic ic-14"><use href="#i-chevron-down"/></svg>二级细节：L2 / 预取 / 准入 / 延迟（默认折叠）
+          </summary>
+          <div class="stack gap8 mt12" id="earnings-details-body"></div>
+        </details>
+      </section>
+
+      <!-- ═══════════ 第 4 页 · 诊断（原日志重构：自检 + 版本单轨 + 导出） ═══════════ -->
+      <section class="page" id="page-diag">
+        <div class="page-head">
+          <div>
+            <div class="t-h1">诊断</div>
+            <div class="page-sub">进页自动拉取驱动日志；出问题时先看这里，再导出诊断包找人帮忙。</div>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-secondary" id="btn-export-diag"><svg class="ic ic-14"><use href="#i-download"/></svg>导出诊断包</button>
+          </div>
+        </div>
+        <!-- 自检清单 -->
+        <div class="card">
+          <div class="chart-head" style="margin-bottom:4px">
+            <div class="t-h3">环境自检清单</div>
+            <span class="src-tag" title="[D2] 诊断页整页随 W1-2 交付：自检清单 + 版本单轨 + 导出诊断包；本页为视觉靶标">D2</span>
+          </div>
+          <div id="diag-selfcheck"></div>
+        </div>
+        <!-- 版本单轨 + IOCTL 通道健康 -->
+        <div class="grid grid-2 mt16">
+          <div class="card">
+            <div class="chart-head" style="margin-bottom:12px">
+              <div class="t-h3">版本单轨</div>
+              <span class="src-tag" title="版本串单一事实源：common/version.h → gen_version.ps1 → Version.cs；驱动内部三段号仅诊断页可见">§8.2</span>
+            </div>
+            <div class="version-rail">
+              <div class="vr-item"><span class="vr-k">控制台（面向用户）</span><span class="vr-v">V10.4.3 Build 19（10.3.4.19）</span></div>
+              <span class="vr-sep">·</span>
+              <div class="vr-item"><span class="vr-k">驱动内部版本（用于支持排查）</span><span class="vr-v" id="diag-driver-ver">1.1 Build 19</span></div>
+              <span class="vr-sep">·</span>
+              <div class="vr-item"><span class="vr-k">协议</span><span class="vr-v">Protocol 9</span></div>
+            </div>
+            <div class="chart-foot mt12">术语说明（仅诊断页允许）：Bound = 已挂栈 · Attached = 正在加速 · WriteMode = 写模式 · Panic = 熔断 · DirtyBytes = 未落盘数据 · LostDirtyBytes = 已确认丢失数据 · UpperFilters = 卷过滤链配置。</div>
+          </div>
+          <div class="card">
+            <div class="chart-head" style="margin-bottom:12px">
+              <div class="t-h3">IOCTL 通道健康（12 消息）</div>
+              <span class="src-tag" title="[A5] DriverService 全部调用点；缺统一调用记录点（消息号/结果/耗时/时间戳）供诊断页消费，随 W1-2 落地，mock 序列">A5</span>
+            </div>
+            <div class="ioctl-grid" id="ioctl-grid"></div>
+            <div class="chart-foot mt12">点阵四态：正常（绿）/ 降级（琥珀）/ 不可用（红）/ 未接通（灰 + "—"）；迷你对条 = 该消息本次调用延迟归一化</div>
+          </div>
+        </div>
+        <!-- 日志同屏对照（来源标签） -->
+        <div class="grid grid-2 mt16">
+          <div class="card">
+            <div class="chart-head" style="margin-bottom:8px">
+              <div class="t-h3">驱动日志</div>
+              <span class="src-tag" title="GET_LOG：驱动环形错误日志；进页自动拉取（UX §7.4），不再要求手动点击">驱动</span>
+            </div>
+            <div class="log-pane" id="log-driver"></div>
+          </div>
+          <div class="card">
+            <div class="chart-head" style="margin-bottom:8px">
+              <div class="t-h3">控制台日志</div>
+              <span class="src-tag" title="LogService（UI 侧）；与驱动日志同屏对照，来源标签区分">UI</span>
+            </div>
+            <div class="log-pane" id="log-ui"></div>
+          </div>
+        </div>
+        <div class="chart-foot mt12" id="diag-note"></div>
+      </section>
+
+      <!-- ═══════════ 第 5 页 · 应急（新增：危险操作收口 + 回滚指引） ═══════════ -->
+      <section class="page" id="page-emergency">
+        <div class="page-head">
+          <div>
+            <div class="t-h1">应急</div>
+            <div class="page-sub">出问题时的退路都在这：熔断、安全模式、未落盘核对、回滚指引、救援卡。</div>
+          </div>
+        </div>
+        <div id="emergency-body" class="stack gap16"></div>
+      </section>
+
+      <!-- ═══════════ 第 6 页 · 设置（启动项/缓存策略/准入/预留/卸载/关于） ═══════════ -->
+      <section class="page" id="page-settings">
+        <div class="page-head">
+          <div>
+            <div class="t-h1">设置</div>
+            <div class="page-sub">启动项、场景预设、缓存策略、进程准入、预留与实验、许可、卸载入口。</div>
+          </div>
+        </div>
+        <div class="stack gap16">
+          <!-- 启动项 -->
+          <div class="card">
+            <div class="t-h3" style="margin-bottom:12px">启动项</div>
+            <div class="stack gap12">
+              <label class="check"><input type="checkbox" id="set-autostart" checked><span>开机自动随卷挂载（跳过系统盘 C:）</span></label>
+              <label class="check"><input type="checkbox" id="set-launchonboot"><span>随 Windows 启动本控制台</span></label>
+              <div class="t-micro">写注册表 Run 键；启动时校准，开关与真实状态不漂移。</div>
+            </div>
+          </div>
+          <!-- 场景预设（C-1 · F1：设置页第一张功能卡，置于「缓存策略」之上；内容由 renderSettings 构建） -->
+          <div class="card preset-card" id="preset-card" data-tier="balanced"></div>
+          <!-- 缓存策略（L2/预取/回写周期，从缓存页下沉） -->
+          <div class="card">
+            <div class="row" style="margin-bottom:4px">
+              <div class="t-h3">缓存策略</div>
+              <span class="src-tag" title="配置块自缓存页下沉（UX §4.2）：L2/预取总开关/回写周期归设置页；每卷预读窗口归加速页卷卡">§4.2</span>
+              <span class="state-pill power-chip neutral" id="power-chip" style="margin-left:auto" title="">台式机 · 无电池</span>
+              <span class="src-tag" title="[A-12] 电源状态 chip（06 §2 C-7）：数据源 = 05 §4.1 #10 电源快照（客户端 WMI Win32_Battery，纯前端能力，无协议依赖）；与 F3 对话框结论同源同口径">A-12</span>
+            </div>
+            <div class="t-micro" style="margin-bottom:12px">L2 持久缓存 · 顺序读预取 · 回写周期</div>
+            <!-- L2 -->
+            <div class="stack gap8" style="padding:12px;background:var(--rbc-bg-surface);border:1px solid var(--rbc-border);border-radius:var(--radius-sm)">
+              <div class="row">
+                <span class="t-body" style="font-weight:600">L2 持久缓存</span>
+                <span class="badge neutral" id="l2-state-badge"><span class="dot"></span>已关闭</span>
+                <span class="src-tag" title="[C2] IL2RecoveryReporter：L2 掉电恢复重建事件 UI 可见（W2-4 验收项），随缓存/状态页重建事件条同波落地">C2</span>
+                <div class="row gap8" style="margin-left:auto">
+                  <button class="btn btn-primary btn-sm" id="btn-l2-enable">启用 L2</button>
+                  <button class="btn btn-secondary btn-sm" id="btn-l2-disable">关闭 L2</button>
+                </div>
+              </div>
+              <div class="t-small dim">掉电重启后仍保留的热数据（"开机即热"）。启用后驱动在选中卷创建容器文件 RAMBoostL2.bin，该空间被缓存专用；删除缓存 = 删除该文件。</div>
+              <div class="row gap16" style="flex-wrap:wrap">
+                <div class="row gap8"><span class="t-small dim">容器盘符</span>
+                  <select class="select" id="l2-letter" style="width:80px"><option>D:</option><option>E:</option><option>F:</option></select></div>
+                <div class="row gap8" style="flex:1;min-width:220px"><span class="t-small dim">容量</span>
+                  <input type="range" class="slider" id="l2-size" min="1" max="128" value="32" style="max-width:200px">
+                  <span class="num t-small" id="l2-size-val" style="width:64px">32 GB</span></div>
+                <div class="t-micro" id="l2-hint" style="flex:1;min-width:200px">将在 D: 创建 RAMBoostL2.bin（32 GB）；宿主卷剩余 118.4 GB，空间充足</div>
+              </div>
+              <div class="t-micro" id="l2-counters">本次开机：L2 写入 — 次 · 命中 — 次 · 未命中 — 次</div>
+            </div>
+            <!-- 预取 -->
+            <div class="stack gap8" style="padding:12px;background:var(--rbc-bg-surface);border:1px solid var(--rbc-border);border-radius:var(--radius-sm);margin-top:8px">
+              <div class="row">
+                <span class="t-body" style="font-weight:600">顺序读预取</span>
+                <label class="switch"><input type="checkbox" id="set-prefetch"><span class="track"><span class="knob"></span></span></label>
+                <span class="src-tag" title="[C5] IPrefetchGate：预取激活前置条件门（已验证加速卷/非系统卷/温度正常），启用前校验，随 W3-3 落地">C5</span>
+              </div>
+              <div class="t-small dim">顺序读时按窗口提前把后续数据读入缓存（部署默认关闭；仅建议在已验证加速的 SSD 数据卷开启）。每卷预读窗口见加速页卷卡。</div>
+              <div class="t-micro" id="prefetch-counters">本次开机：发出预读 — 次 · 成功填充 — 次</div>
+              <div class="t-micro" id="thermal-counters">温度护栏暂停预取累计：— 次</div>
+            </div>
+            <!-- 回写周期 -->
+            <div class="stack gap8" style="padding:12px;background:var(--rbc-bg-surface);border:1px solid var(--rbc-border);border-radius:var(--radius-sm);margin-top:8px">
+              <div class="row">
+                <span class="t-body" style="font-weight:600">回写周期</span>
+                <select class="select" id="set-flush" style="width:200px">
+                  <option>10 秒</option><option>30 秒</option><option selected>60 秒（默认）</option><option>5 分钟</option><option>无限（关闭自动回写）</option>
+                </select>
+                <span class="t-micro" id="flush-desc" style="margin-left:auto">每 60 秒自动回写</span>
+              </div>
+              <div class="t-small dim">回写模式下，脏数据每隔该时间自动写入磁盘。设为"无限"仅保留三种落盘时机：立即回写、卸载、关机。直写模式不产生脏数据，本项不生效。</div>
+            </div>
+            <!-- 演示开关：电源状态（C-7 五态走查 · 05 F3 验收#1） -->
+            <details class="cw-demo-toggle" style="margin-top:12px"><summary>演示开关：电源状态（C-7 五态走查）</summary>
+              <div class="row gap8 mt8" style="flex-wrap:wrap">
+                <select class="select" id="power-demo-select" style="width:220px">
+                  <option value="desktop">台式机 · 无电池（neutral）</option>
+                  <option value="laptop">笔记本 · 电池 87%（info）</option>
+                  <option value="low">电池电量低（warning）</option>
+                  <option value="unknown">电源状态未知（neutral）</option>
+                  <option value="loading">读取中（骨架）</option>
+                </select>
+                <span class="t-micro">切换后本页 chip 与 C-4 回写引导对话框的电源态同步（同 Key 同源同口径）</span>
+              </div>
+            </details>
+          </div>
+          <!-- 进程准入排除 -->
+          <div class="card">
+            <div class="row" style="margin-bottom:4px">
+              <div class="t-h3">进程准入排除</div>
+              <span class="src-tag" title="FeatureConfigService.SetProcessExclude（MULTI_SZ）；准入统计 AdmitRejectsText 已有">FR-BL-03</span>
+            </div>
+            <div class="t-small dim" style="margin-bottom:12px">命中名单的进程，其 I/O 不进缓存（直通）。碎片整理/备份/杀毒类工具运行期与缓存互相干扰，建议排除。支持 * ? 通配、大小写不敏感；最多 32 条、每条最多 15 字符。</div>
+            <label class="check" style="margin-bottom:12px"><input type="checkbox" id="set-defaultexcl" checked><span>启用内置排除名单（defrag / dfrgui / wbengine / vssadmin / msmpeng）</span></label>
+            <div class="field-label">自定义名单（每行一个进程镜像名，保存后立即生效）</div>
+            <textarea class="textarea" id="exclude-text" spellcheck="false">vssadmin
+msmpeng</textarea>
+            <div class="row mt12">
+              <div class="t-micro" id="admit-rejects" style="flex:1">已被排除进程拒绝的 I/O 累计：—</div>
+              <button class="btn btn-primary btn-sm" id="btn-save-exclude">保存名单</button>
+            </div>
+          </div>
+          <!-- 预留与实验 -->
+          <div class="card">
+            <div class="row" style="margin-bottom:4px">
+              <div class="t-h3">预留与实验</div>
+              <span class="src-tag" title="W1–W4 波次能力接口占位：契约、错误码与错误路径已就位并可演示；实现随对应波次交付">W1–W4</span>
+            </div>
+            <div class="t-small dim" style="margin-bottom:12px">遥测 / 动效降级 / 向导。默认关、匿名、一键可关三原则。</div>
+            <div class="grid grid-2">
+              <div class="stack gap4">
+                <label class="check"><input type="checkbox" id="set-telemetry"><span>匿名使用遥测（W1-1）</span></label>
+                <div class="t-micro" id="telemetry-status">关闭（默认）：不采集、不上传任何数据</div>
+              </div>
+              <div class="stack gap4">
+                <div class="field-label">减少动效（可访问性降级）</div>
+                <select class="select" id="set-motion" style="width:220px">
+                  <option value="auto" selected>跟随系统设置（默认）</option>
+                  <option value="on">始终开启动效</option>
+                  <option value="off">减少动效</option>
+                </select>
+                <div class="t-micro">降级后位移归零、脉冲静止、数字直显、图表全显——信息不丢。</div>
+              </div>
+            </div>
+            <div class="row mt16" style="flex-wrap:wrap;gap:8px">
+              <span class="t-micro" style="flex:1;min-width:200px">许可试用状态已升级为独立「许可」卡（见下方）</span>
+              <button class="btn btn-secondary btn-sm" id="btn-rerun-wizard">重跑首次向导</button>
+            </div>
+          </div>
+          <!-- 卸载入口 -->
+          <div class="card">
+            <div class="row" style="margin-bottom:4px">
+              <div class="t-h3">卸载</div>
+              <span class="src-tag" title="[D3] 卸载入口随 W1-2 交付：停止加速→回写脏数据→移 UpperFilters 保第三方→提示重启">D3</span>
+            </div>
+            <div class="t-small dim" style="margin-bottom:12px">按向导顺序卸载可保证脏数据落盘，并保留其他软件的卷过滤链配置不被误删。卸载完成后需要重启一次。</div>
+            <button class="btn btn-danger" id="btn-uninstall"><svg class="ic ic-14"><use href="#i-power"/></svg>卸载 RAMBlockCache</button>
+          </div>
+          <!-- 许可（C-6 · F5：独立卡，置于「卸载」与「关于」之间；五态由 renderLicense 渲染） -->
+          <div class="card" id="license-card">
+            <div class="row" style="margin-bottom:4px">
+              <div class="t-h3">许可</div>
+              <span class="src-tag" title="[B-14] LicenseStatus 契约：安装器写入、服务读取（B 类移交）；前端只做状态展示 + 激活入口占位">B-14</span>
+            </div>
+            <div id="license-body"></div>
+          </div>
+          <!-- 关于 -->
+          <div class="card">
+            <div class="t-h3" style="margin-bottom:8px">关于</div>
+            <div class="t-small dim" style="line-height:1.8">
+              RAMBlockCache V10.4.3 Build 19（10.3.4.19）<br>
+              4K 块缓存 · 读写全进内存 · 动态内存自适应（有多少用多少、不写死上限）<br>
+              热加载 / 热卸载免重启 · 熔断自动旁路 · 系统卷硬排除
+            </div>
+            <div class="row mt12">
+              <span class="src-tag" title="[B4] 全局内存预算控件（AutoUsePct/MemReserveMB）：GET_CONFIG 是否暴露待确认，与每卷配额滑块不是同一回事">B4</span>
+              <span class="t-micro">全局内存预算控件待协议字段确认后补充</span>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ═══ 对话框层（C-4/C-5/文件选择框共用基座 · 遮罩 #9E000000 · 出入场 180/120ms）═══ -->
+  <div class="layer dialog-scrim" id="dialog-layer" hidden>
+    <div class="dialog" id="dlg" role="alertdialog" aria-modal="true"></div>
+  </div>
+  <div class="toast-wrap" id="toast-wrap"></div>
+  <div class="layer wizard-layer" id="wizard-layer" hidden>
+    <div class="wizard" id="wizard" role="dialog" aria-modal="true"></div>
+  </div>
+</div>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════
+   APP · RAMBlockCache 高保真原型脚本
+   分区：1 动效令牌 → 2 工具 → 3 状态模型 → 4 渲染 → 5 图表(SVG)
+        6 交互(路由/弹窗/Toast/向导/演示态/轮询) → 7 初始化
+   ════════════════════════════════════════════════════════════════════ */
+(function(){
+'use strict';
+
+/* ─── 1. 动效令牌（02b §B.1 v1.2 · 六档时长 + 4 曲线；06 §4.1 N-1 阶梯间隔） ─── */
+const DUR = {instant:90, fast:120, base:180, slow:240, slower:480, roll:320, stagger:24};
+const EASE = {
+  standard:'cubic-bezier(.2,0,0,1)', out:'cubic-bezier(.16,1,.3,1)',
+  in:'cubic-bezier(.4,0,1,1)', linear:'linear'
+};
+let reduceMode = 'auto';                       // auto | on | off（设置页三选，对应 WPF ReduceMotionIndex）
+const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+function isReduced(){
+  return reduceMode === 'off' || (reduceMode === 'auto' && mq.matches);
+}
+function applyMotionMode(){
+  document.body.classList.toggle('reduced', isReduced());
+  const txt = reduceMode === 'on' ? '始终开启动效'
+            : reduceMode === 'off' ? '减少动效（已降级）' : '标准（跟随系统）';
+  $('#motion-state').textContent = '动效：' + txt;
+}
+
+/* ─── 2. 工具 ─── */
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+const MB = 1048576, GB = 1073741824;
+const DIRTY_THRESHOLD = 500 * MB;
+const DRIVER_VER = '1.1 Build 19';
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+function mulberry32(seed){ return function(){ seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+  let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function fmtBytes(b){
+  if(b == null) return '—';
+  if(b >= GB) return (b / GB).toFixed(1) + ' GB';
+  if(b >= MB) return Math.round(b / MB) + ' MB';
+  return Math.round(b / 1024) + ' KB';
+}
+function fmtNum(n, d){ return n == null ? '—' : n.toLocaleString('zh-CN', {maximumFractionDigits: d == null ? 1 : d, minimumFractionDigits: d == null ? 0 : d}); }
+function genSeries(seed, n, base, amp, lo, hi){
+  const rnd = mulberry32(seed), out = [];
+  for(let i = 0; i < n; i++)
+    out.push(clamp(base + (rnd() - .5) * amp + Math.sin(i / 9) * amp * .25, lo, hi));
+  return out;
+}
+
+/* ─── 3. 状态模型（对应 UiState 单一映射 + UiRisk；演示态 = 原型走查工具） ─── */
+const VIEW = {
+  notConn:   {badge:'未连接',   cls:'neutral', sentence:'未连接到缓存驱动', action:'打开诊断', page:'diag'},
+  denied:    {badge:'无权限',   cls:'danger',  sentence:'没有权限访问缓存驱动', action:'以管理员身份运行', page:'diag'},
+  healing:   {badge:'熔断 · 自愈中', cls:'danger', sentence:'正在把未落盘数据写完，暂不可解除', action:'前往应急页', page:'emergency'},
+  settled:   {badge:'熔断',     cls:'danger',  sentence:'所有读写直接到盘，缓存暂停', action:'解除熔断', page:'emergency'},
+  safe:      {badge:'安全模式', cls:'warning', sentence:'上次未正常退出，已强制直写保护数据', action:'退出安全模式', page:'emergency'},
+  back:      {badge:'加速 · 回写', cls:'success', sentence:'回写模式：更快，异常退出可能丢未落盘数据', action:'查看未落盘量', page:'emergency'},
+  through:   {badge:'加速 · 直写', cls:'success', sentence:'直写模式：缓存正常工作（最安全）', action:'查看收益', page:'earnings'},
+  ready:     {badge:'就绪',     cls:'info',    sentence:'已挂栈，未开启加速', action:'开启加速', page:'accel'},
+  bound:     {badge:'未挂栈',   cls:'info',    sentence:'驱动已就绪，尚未挂到任何卷', action:'运行首次向导', page:'wizard'},
+};
+const EXCEPTIONS = {
+  healing: {tone:'danger', title:'缓存已熔断，正在自愈', parts:[
+    ['① 发生了什么', '缓存已一键熔断：所有读写直接到盘，缓存暂停。'],
+    ['② 影响与风险', '驱动正在把未落盘数据写完（自愈中）；期间写性能回落到无缓存水平。'],
+    ['③ 下一步', '等待状态条「风险」段变为「无」后，到应急页解除熔断。']],
+    actions:[['前往应急页', 'btn-primary', 'emergency'], ['查看诊断', 'btn-ghost', 'diag']]},
+  settled: {tone:'danger', title:'缓存已熔断', parts:[
+    ['① 发生了什么', '缓存已一键熔断：所有读写直接到盘，缓存暂停。'],
+    ['② 影响与风险', '读写性能回落到无缓存水平；未落盘数据仍在写盘过程中。'],
+    ['③ 下一步', '确认盘面无异常后，到应急页解除熔断恢复缓存。']],
+    actions:[['前往应急页', 'btn-primary', 'emergency']]},
+  safe: {tone:'warning', title:'上次未正常退出，已进入安全模式', parts:[
+    ['① 发生了什么', '检测到上次未正常退出，驱动已强制直写保护数据。'],
+    ['② 影响与风险', '写性能下降到直写水平；这是保护机制，不是故障。'],
+    ['③ 下一步', '确认数据无恙后，到应急页退出安全模式。']],
+    actions:[['前往应急页', 'btn-primary', 'emergency'], ['查看诊断', 'btn-ghost', 'diag']]},
+  notConn: {tone:'danger', title:'未连接到缓存驱动', parts:[
+    ['① 发生了什么', '控制台打不开缓存驱动，读不到实时状态。'],
+    ['② 影响与风险', '界面数值可能过期；缓存本身可能仍在工作（驱动独立于控制台）。'],
+    ['③ 下一步', '检查驱动是否安装、是否以管理员身份运行；不行就重装同一版本发布包。']],
+    actions:[['打开诊断', 'btn-primary', 'diag']]},
+  degraded: {tone:'warning', title:'统计暂不可用', parts:[
+    ['① 发生了什么', '驱动连续多轮没有回应统计采样。'],
+    ['② 影响与风险', '界面显示的可能为过期数值（已用「—」标注，不把过期值当正常数据）。'],
+    ['③ 下一步', '检查驱动连接；恢复后自动刷新，无需操作。']],
+    actions:[['打开诊断', 'btn-primary', 'diag']]},
+  dirty: {tone:'warning', title:'未落盘数据超过 500 MB', parts:[
+    ['① 发生了什么', '回写模式下有较多数据还没写进磁盘。'],
+    ['② 影响与风险', '掉电或异常退出可能丢失这部分未落盘数据。'],
+    ['③ 下一步', '点「立即回写」落盘，或把回写周期改短；核对丢失量请到应急页。']],
+    actions:[['前往应急页', 'btn-primary', 'emergency'], ['查看收益', 'btn-ghost', 'earnings']]},
+};
+const state = {
+  page: 'status', demo: 'normal',
+  connected: true, accessDenied: false, protocolMismatch: false,
+  panic: false, healing: false, safeMode: false, reconnecting: false, statsDegraded: false,
+  boundCount: 3, attachedCount: 2, backCount: 1,
+  dirtyBytes: 128 * MB, lostDirtyBytes: 0, dirtyBase: 128 * MB,
+  avgHit: 74.8, servedBytes: 40.5 * GB,
+  cacheUsedBytes: (620 + 2140) * MB, cacheCapBytes: (2048 + 4096) * MB,
+  vols: [], ui: VIEW.through, risk: 'none',
+  /* V10.6 演示字段（F1 场景预设 / F5 许可 / F3 电源快照 / F2 冷热对比） */
+  presetTier: 'balanced', presetBase: 'balanced', presetOverrides: {}, presetApplying: false,
+  presetLoading: false, presetError: false,
+  licenseState: 'trial', licenseDays: 23, licenseType: '专业版', licenseLoading: false,
+  powerState: 'desktop', powerLoading: false,
+  bench: {phase:'idle', file:null, pass:1, pct:0, result:null, degrade:false},
+};
+const DEMOS = {
+  'normal':       {},
+  'panic-healing':{panic:true, healing:true, reconnecting:false, statsDegraded:false, risk:'panic'},
+  'panic-settled':{panic:true, healing:false, risk:'panic'},
+  'safe-mode':    {safeMode:true, risk:'safe'},
+  'dirty-warn':   {dirtyBytes:640 * MB, risk:'dirty'},
+  'offline':      {connected:false, reconnecting:true, statsDegraded:true, risk:'none'},
+  'degraded':     {statsDegraded:true, risk:'none'},
+  'empty':        {boundCount:0, attachedCount:0, backCount:0, emptyMode:true, risk:'none'},
+  /* V10.6 新增（A-11 演示态扩展 · 第一批：preset-applying / license-trial 落地，anticheat / benchmark 占位） */
+  'preset-applying': {presetTier:'custom', presetBase:'balanced', presetApplying:true,
+                      presetOverrides:{'每卷写模式':'回写', '每卷预读窗口':'32 块（≈128KB）'}},
+  'license-trial':   {licenseState:'trial', licenseDays:23},
+  'anticheat':       {},
+  'benchmark':       {},
+};
+function baseVols(){
+  return [
+    {key:'C', label:'本地磁盘', system:true,  st:'unmounted', mode:'through', quotaMB:512,  usedMB:0,    ra:16, hit:0,    read:0,     write:0,    served:null, seed:11},
+    {key:'D', label:'Games',   system:false, st:'through',  mode:'through', quotaMB:2048, usedMB:620,  ra:16, hit:78.4, read:412.6, write:96.3, served:28.4 * GB, seed:22},
+    {key:'E', label:'Work',    system:false, st:'back',     mode:'back',    quotaMB:4096, usedMB:2140, ra:32, hit:71.2, read:168.2, write:240.8, served:12.1 * GB, seed:33},
+    {key:'F', label:'Media',   system:false, st:'ready',    mode:'through', quotaMB:1024, usedMB:0,    ra:8,  hit:0,    read:0,     write:0,    served:null, seed:44},
+  ].map(v => (v.readBase = v.read, v.writeBase = v.write, v.hitBase = v.hit, v.usedBase = v.usedMB, v));
+}
+function derive(){
+  const s = state;
+  if(!s.connected) s.ui = s.accessDenied ? VIEW.denied : VIEW.notConn;
+  else if(s.protocolMismatch) s.ui = VIEW.denied;
+  else if(s.panic) s.ui = s.healing ? VIEW.healing : VIEW.settled;
+  else if(s.safeMode) s.ui = VIEW.safe;
+  else if(s.attachedCount > 0) s.ui = s.backCount > 0 ? VIEW.back : VIEW.through;
+  else if(s.boundCount > 0) s.ui = VIEW.ready;
+  else s.ui = VIEW.bound;
+  s.risk = s.panic ? 'panic' : s.safeMode ? 'safe' : (s.dirtyBytes > DIRTY_THRESHOLD ? 'dirty' : 'none');
+  s.issueCount = (s.panic ? 1 : 0) + (s.safeMode ? 1 : 0) + (s.dirtyBytes > DIRTY_THRESHOLD ? 1 : 0) + (!s.connected ? 1 : 0);
+}
+function applyDemo(key){
+  closeDialog();                                                // P2-6：切演示态即关闭残留对话框（如 C-5），避免跨态残留
+  if(cwTimer){ clearInterval(cwTimer); cwTimer = null; }        // 切演示态即中止进行中的对比
+  const preset = DEMOS[key] || {};
+  Object.assign(state, {
+    demo: key, connected: true, accessDenied: false, protocolMismatch: false,
+    panic: false, healing: false, safeMode: false, reconnecting: false, statsDegraded: false,
+    dirtyBytes: 128 * MB, dirtyBase: 128 * MB, lostDirtyBytes: 0,
+    boundCount: 3, attachedCount: 2, backCount: 1, emptyMode: false,
+    presetTier: 'balanced', presetBase: 'balanced', presetOverrides: {}, presetApplying: false,
+    presetLoading: false, presetError: false,
+    licenseState: 'trial', licenseDays: 23, licenseLoading: false,
+    powerState: 'desktop', powerLoading: false,
+    bench: {phase:'idle', file:null, pass:1, pct:0, result:null, degrade:false},
+  }, preset);
+  state.vols = baseVols();
+  if(preset.emptyMode) state.vols = state.vols.filter(v => v.system);
+  derive();
+  if(!preset.presetTier && !preset.presetApplying) derivePresetFromVols();   // 未脚本化预设态：按卷实况推导（E: 回写 = 偏离均衡）
+  renderAll(true);
+  if(key === 'preset-applying'){ go('settings'); runPresetApplyingDemo(); }
+  else if(key === 'license-trial'){ go('settings'); }
+  else if(key === 'anticheat'){ openAnticheatDialog(); }
+  else if(key === 'benchmark'){
+    state.bench.phase = 'result';
+    state.bench.file = 'E:\\Downloads\\game_installer.iso';
+    state.bench.result = BENCH_RESULT;
+    go('earnings');
+    renderColdWarm(); cwGrowBars();
+    toast('对比完成：第二遍快 10.2×', 'ok');
+  }
+}
+
+/* ─── 4. 渲染 ─── */
+function srcTag(id, tip){ return `<span class="src-tag" title="${tip}">${id}</span>`; }
+function renderStatusbar(){
+  const s = state, seg = (id, cls, val, pulse) => {
+    const el = $('#seg-' + id), dot = $('#dot-' + id);
+    el.className = 'seg clickable ' + cls;
+    dot.classList.toggle('pulse', !!pulse);
+    $('#val-' + id).textContent = val;
+  };
+  // 驱动段
+  if(!s.connected) seg('driver', s.reconnecting ? 'neutral' : 'neutral', s.reconnecting ? '正在重连…' : '未连接', s.reconnecting);
+  else if(s.accessDenied) seg('driver', 'danger', '无权限');
+  else if(s.protocolMismatch) seg('driver', 'danger', '版本不匹配');
+  else seg('driver', 'ok', '已连接 ' + DRIVER_VER);
+  // 挂栈段
+  seg('stack', s.connected ? 'info' : 'neutral', s.connected ? `已挂 ${s.boundCount} 卷` : '—');
+  // 加速段
+  let aCls = 'success', aVal = '—';
+  if(!s.connected || s.statsDegraded && false){ aCls = 'neutral'; }
+  if(s.panic){ aCls = 'danger'; aVal = s.healing ? '熔断 · 自愈中' : '熔断暂停'; }
+  else if(s.safeMode){ aCls = 'warning'; aVal = '安全模式 · 强制直写'; }
+  else if(!s.connected){ aCls = 'neutral'; aVal = '—'; }
+  else if(s.attachedCount > 0){
+    aVal = s.backCount > 0 ? `${s.attachedCount} 卷 · ${s.attachedCount - s.backCount} 直写 / ${s.backCount} 回写` : `${s.attachedCount} 卷 · 直写`;
+  }
+  else if(s.boundCount > 0){ aCls = 'info'; aVal = '未加速'; }
+  else { aCls = 'info'; aVal = '未挂栈'; }
+  seg('accel', aCls, aVal, s.panic && s.healing);
+  // 风险段
+  let rCls = 'success', rVal = '无', rPulse = false;
+  if(s.panic){ rCls = 'danger'; rVal = s.healing ? '熔断 · 自愈中' : '熔断中'; rPulse = s.healing; }
+  else if(s.safeMode){ rCls = 'warning'; rVal = '安全模式'; }
+  else if(s.dirtyBytes > DIRTY_THRESHOLD){ rCls = 'warning'; rVal = '未落盘 ' + fmtBytes(s.dirtyBytes); }
+  seg('risk', rCls, rVal, rPulse);
+}
+function renderBanner(){
+  const s = state, b = $('#banner');
+  let text = '', cls = 'warning', link = '前往处置', page = 'emergency';
+  if(s.panic && s.healing){ text = '缓存已熔断，正在自愈：所有读写直接到盘，暂不可解除。'; cls = 'danger'; }
+  else if(s.panic){ text = '缓存已熔断：所有读写直接到盘，缓存暂停。'; cls = 'danger'; }
+  else if(s.safeMode){ text = '上次未正常退出，已进入安全模式（强制直写保护数据）。'; page = 'emergency'; }
+  else if(!s.connected){ text = '未连接到缓存驱动：界面数值可能过期，请检查驱动。'; cls = 'danger'; page = 'diag'; }
+  else if(s.statsDegraded){ text = '统计暂不可用：界面显示的可能为过期数值，请检查驱动连接。'; page = 'diag'; }
+  else if(s.dirtyBytes > DIRTY_THRESHOLD){ text = '未落盘数据超过 500 MB：掉电或异常退出可能丢失这部分数据。'; }
+  else { b.hidden = true; return; }
+  b.hidden = false; b.className = 'banner' + (cls === 'danger' ? ' danger' : '');
+  $('#banner-text').textContent = text;
+  $('#banner-link').textContent = link;
+  $('#banner-link').onclick = () => go(page);
+}
+function renderNav(){
+  $$('#nav .nav-item').forEach(n => n.classList.toggle('active', n.dataset.page === state.page));
+  const em = $('#nav .nav-item[data-page="emergency"]');
+  em.classList.toggle('alert', state.issueCount > 0);
+  em.classList.toggle('warn', state.issueCount > 0 && !state.panic);
+  const badge = $('#nav-emergency-badge');
+  badge.textContent = state.issueCount;
+  badge.style.display = state.issueCount > 0 ? 'inline-flex' : 'none';
+  $('#poll-state').textContent = '统计采样：每秒（对齐 1s 轮询）';
+}
+function kpiCard(label, valHtml, sub, src){
+  return `<div class="card hoverable">
+    <div class="row"><span class="kpi-label">${label}</span>${src || ''}</div>
+    <div class="row mt8" style="align-items:flex-end">${valHtml}</div>
+    <div class="kpi-sub">${sub}</div>
+  </div>`;
+}
+function dashVal(){ return `<span class="kpi-dash">—</span>`; }
+function renderStatusPage(){
+  const s = state, body = $('#status-body');
+  const live = s.connected && !s.statsDegraded;
+  // KPI bento：命中率 / 省下磁盘读 / 缓存占用环
+  const hitVal = live
+    ? `<span class="kpi-val" id="kpi-hit" data-roll="${s.avgHit.toFixed(1)}" data-dec="1" data-cur="${s.avgHit.toFixed(1)}">${s.avgHit.toFixed(1)}</span><span class="kpi-unit">%</span>`
+    : dashVal();
+  const kpis = `<div class="grid grid-3">
+    ${kpiCard('平均命中率', hitVal, live ? '已加速卷平均 · 每秒刷新' : '统计暂不可用（驱动无回应）', srcTag('A1', '[A1] StatsService 秒级采样 → DriveItemViewModel.HitPct（瞬时值）；缺 60×5s 历史环形缓冲'))}
+    ${kpiCard('本次开机省下磁盘读', live
+      ? `<span class="kpi-val" id="kpi-served" data-roll="${(s.servedBytes / GB).toFixed(1)}" data-dec="1" data-cur="${(s.servedBytes / GB).toFixed(1)}">${(s.servedBytes / GB).toFixed(1)}</span><span class="kpi-unit">GB</span>`
+      : dashVal(), live ? '缓存读取量累计（本次开机）' : '统计暂不可用（驱动无回应）', srcTag('A6', '[A6] DriveItemViewModel.ServedText（本次开机缓存读取量，BUG3 已落地）；缺结构化属性 + 呈现接线'))}
+    <div class="card hoverable">
+      <div class="row"><span class="kpi-label">缓存占用与上限</span>${srcTag('A3', '[A3] DriveItemViewModel.CacheUsedBytes/CacheBytesTotal（每卷）；缺全局 used/total 结构化属性（拆 CacheText）')}</div>
+      <div class="row mt8" style="gap:16px;align-items:center">
+        ${live ? ringSvg(120, 10, s.cacheUsedBytes / s.cacheCapBytes) : dashVal()}
+        ${live ? `<div class="stack gap4"><span class="t-mono-stat num">${fmtBytes(s.cacheUsedBytes)}</span>
+          <span class="t-micro">/ 上限 ${fmtBytes(s.cacheCapBytes)}</span>
+          <span class="t-micro">已用 ${(s.cacheUsedBytes / s.cacheCapBytes * 100).toFixed(0)}%</span></div>` : ''}
+      </div>
+      <div class="kpi-sub">${live ? '各卷配额合计 · 每秒刷新' : '统计暂不可用（驱动无回应）'}</div>
+    </div>
+  </div>`;
+  body.innerHTML = kpis;
+  // 异常卡（仅异常时出现）/ 空态信息卡
+  if(!s.connected || s.statsDegraded || s.panic || s.safeMode || s.dirtyBytes > DIRTY_THRESHOLD){
+    const key = s.panic ? (s.healing ? 'healing' : 'settled')
+      : s.safeMode ? 'safe'
+      : !s.connected ? 'notConn'
+      : s.statsDegraded ? 'degraded' : 'dirty';
+    body.insertAdjacentHTML('beforeend', exceptionCard(EXCEPTIONS[key]));
+  }
+  if(s.boundCount === 0 && s.connected){
+    body.insertAdjacentHTML('beforeend', `<div class="card info">
+      <div class="row" style="align-items:flex-start;gap:12px">
+        <svg class="ic ic-20" style="color:var(--rbc-info-fg);margin-top:4px"><use href="#i-info"/></svg>
+        <div style="flex:1">
+          <div class="t-h3">驱动已就绪，尚未挂到任何卷</div>
+          <div class="t-small dim mt4">运行首次向导，一分钟完成挂栈与加速选择；系统盘默认不加速。</div>
+        </div>
+        <button class="btn btn-primary" onclick="window.__proto.go('wizard')">运行首次向导</button>
+      </div>
+    </div>`);
+  }
+  // 每卷一行状态徽标卡
+  const rows = s.vols.map(v => {
+    const b = volBadge(v);
+    return `<div class="card hoverable volrow" data-key="${v.key}">
+      <span class="drive num">${v.key}:</span>
+      <span class="vlabel">${v.label}</span>
+      <span class="badge ${b.cls}"><span class="dot"></span>${b.text}${b.corner ? `<span class="corner">· ${b.corner}</span>` : ''}</span>
+      <span class="sentence">${volSentence(v)}</span>
+      <button class="btn btn-ghost btn-sm" onclick="window.__proto.go('${volActionPage(v)}')">${volAction(v)}</button>
+    </div>`;
+  }).join('');
+  body.insertAdjacentHTML('beforeend',
+    `<div class="stack gap8"><div class="t-h3">各卷状态</div>${rows || '<div class="card"><div class="t-small dim" style="padding:8px">尚未枚举到任何卷。</div></div>'}</div>`);
+  bindRollers();
+}
+function exceptionCard(ex){
+  const acts = (ex.actions || []).map(a => `<button class="btn ${a[1]}" onclick="window.__proto.go('${a[2]}')">${a[0]}</button>`).join('');
+  return `<div class="card exception ${ex.tone}">
+    <div class="row" style="gap:8px;margin-bottom:8px">
+      <svg class="ic ic-14" style="color:var(--rbc-${ex.tone}-fg)"><use href="#i-alert"/></svg>
+      <span class="t-h3" style="color:var(--rbc-text-primary)">${ex.title}</span>
+    </div>
+    <div class="stack gap4">${ex.parts.map(p => `<div class="t-small"><b style="color:var(--rbc-text-primary)">${p[0]}</b>　<span class="dim">${p[1]}</span></div>`).join('')}</div>
+    <div class="row gap8 mt12">${acts}</div>
+  </div>`;
+}
+function volBadge(v){
+  const s = state;
+  if(!s.connected) return {cls:'neutral', text:'未连接'};
+  if(s.panic) return {cls:'danger', text: s.healing ? '熔断 · 自愈中' : '熔断'};
+  if(s.safeMode) return {cls:'warning', text:'安全模式'};
+  if(v.system && v.st === 'unmounted') return {cls:'neutral', text:'未挂载'};
+  if(v.st === 'back') return {cls:'success', text:'加速 · 回写', corner:'有未落盘数据'};
+  if(v.st === 'through') return {cls:'success', text:'加速 · 直写'};
+  if(v.st === 'ready') return {cls:'info', text:'就绪'};
+  return {cls:'neutral', text:'未挂载'};
+}
+function volSentence(v){
+  const s = state;
+  if(!s.connected) return '驱动未连接，卷状态未知。';
+  if(s.panic) return s.healing ? '所有读写直接到盘，未落盘数据正在写盘。' : '所有读写直接到盘，缓存暂停。';
+  if(s.safeMode) return '上次未正常退出，已强制直写保护数据。';
+  if(s.statsDegraded) return '统计暂不可用，界面数值可能过期。';
+  if(v.st === 'back') return '回写模式：更快，异常退出可能丢未落盘数据。';
+  if(v.st === 'through') return '直写模式：缓存正常工作（最安全）。';
+  if(v.st === 'ready') return '已挂栈，未开启加速。';
+  if(v.system) return '系统卷默认不加速（安全第一）。';
+  return '未挂载。';
+}
+function volAction(v){
+  const s = state;
+  if(s.panic) return '前往应急页';
+  if(v.st === 'back') return '查看未落盘量';
+  if(v.st === 'through') return '查看收益';
+  if(v.st === 'ready') return '开启加速';
+  return '去加速页';
+}
+function volActionPage(v){
+  const s = state;
+  if(s.panic) return 'emergency';
+  if(v.st === 'back') return 'emergency';
+  if(v.st === 'through') return 'earnings';
+  return 'accel';
+}
+function writeBlocked(){
+  return !state.connected || state.panic || state.protocolMismatch;
+}
+function blockReason(){
+  if(!state.connected) return '驱动未连接，无法操作';
+  if(state.panic) return '熔断中：写操作已禁用（所有读写直接到盘）';
+  if(state.protocolMismatch) return '协议不匹配，已禁用写操作';
+  return '';
+}
+function renderAccelPage(){
+  const body = $('#accel-body');
+  const live = state.connected && !state.statsDegraded;
+  const cards = state.vols.map(v => {
+    const b = volBadge(v), blocked = writeBlocked();
+    const metrics = live
+      ? `<span>读 <b id="m-read-${v.key}">${v.read ? v.read.toFixed(1) : '—'}</b> MB/s</span><span>写 <b id="m-write-${v.key}">${v.write ? v.write.toFixed(1) : '—'}</b> MB/s</span><span>命中 <b id="m-hit-${v.key}">${v.hit ? v.hit.toFixed(1) : '—'}</b>%</span>`
+      : `<span>读 <b id="m-read-${v.key}">—</b></span><span>写 <b id="m-write-${v.key}">—</b></span><span>命中 <b id="m-hit-${v.key}">—</b></span>`;
+    const served = live && v.served ? `本次开机缓存读取 ${fmtBytes(v.served)}` : '本次开机缓存读取 —';
+    const usedTxt = live ? `已用 ${fmtBytes(v.usedMB * MB)} / 配额 ${fmtBytes(v.quotaMB * MB)}` : '占用统计暂不可用';
+    const pct = live ? clamp(v.usedMB / v.quotaMB * 100, 0, 100) : 0;
+    const swDisabled = blocked || v.system;
+    const swReason = v.system ? '系统卷默认不加速（安全第一）' : (blocked ? blockReason() : '');
+    return `<div class="card hoverable volcard" data-key="${v.key}">
+      <div class="volcard-head">
+        <div class="volcard-id">
+          <div class="drive num">${v.key}:</div>
+          <div class="vlabel">${v.label}</div>
+          ${v.system ? '<div class="sys-tag">系统卷 · 默认不加速</div>' : ''}
+        </div>
+        <button class="source-chip" data-preset-src="${v.key}" title="预设来源：点击前往设置页 · 场景预设">${presetChipText()}</button>
+      </div>
+      <div class="stack gap8">
+        <div class="row gap8"><span class="badge ${b.cls}"><span class="dot"></span>${b.text}${b.corner ? `<span class="corner">· ${b.corner}</span>` : ''}</span></div>
+        <div class="t-micro">${v.st === 'through' ? '缓存已启用 · 直写' : v.st === 'back' ? '缓存已启用 · 回写' : v.st === 'ready' ? '已挂栈 · 未开启加速' : v.system ? '系统卷默认不加速' : '未挂载'}</div>
+        <div class="t-micro num" id="m-used-${v.key}">${usedTxt}</div>
+        <div class="progress"><div class="bar" id="m-bar-${v.key}" style="transform:scaleX(${(pct / 100).toFixed(3)})"></div></div>
+        <div class="row gap8">
+          <span class="t-micro" style="width:36px">配额</span>
+          <input type="range" class="slider" min="64" max="4096" step="64" value="${v.quotaMB}" ${blocked ? 'disabled' : ''} data-quota="${v.key}" style="max-width:180px">
+          <span class="t-micro num" style="width:64px">${fmtBytes(v.quotaMB * MB)}</span>
+          ${srcTag('D1', '[D1] 每卷写模式/配额持久化：当前重启后恢复默认（settings.json 无每卷键），随 W2-3 配置面产品化')}
+        </div>
+      </div>
+      <div class="stack gap4">
+        <div id="spark-${v.key}">${sparklineSvg(v.seed, live && v.st !== 'ready' && v.st !== 'unmounted')}</div>
+        <div class="vol-metrics">${metrics}</div>
+        <div class="t-micro">${served} ${srcTag('A6', '[A6] ServedText 结构化属性 + 呈现接线')}</div>
+      </div>
+      <div class="ctl-col">
+        <div class="row gap4"><span class="t-micro" style="width:52px">写模式</span>
+          <select class="select" data-mode="${v.key}" ${blocked ? 'disabled' : ''}>
+            <option value="through" ${v.mode === 'through' ? 'selected' : ''}>直写（最安全）</option>
+            <option value="back" ${v.mode === 'back' ? 'selected' : ''}>回写（更快·有风险）</option>
+            <option value="global">跟随全局设置</option>
+          </select></div>
+        <div class="row gap4"><span class="t-micro" style="width:52px">预读</span>
+          <select class="select" data-ra="${v.key}" ${blocked ? 'disabled' : ''}>
+            ${[['关闭', 0], ['8 MB', 8], ['16 MB', 16], ['32 MB', 32], ['64 MB', 64]].map(o =>
+              `<option value="${o[1]}" ${v.ra === o[1] ? 'selected' : ''}>${o[0]}</option>`).join('')}
+          </select>${srcTag('C5', '[C5] IPrefetchGate：预取激活前置条件门（已验证加速卷/非系统卷/温度正常），启用前校验')}</div>
+        <div class="row gap8">
+          <label class="switch ${swDisabled ? 'disabled' : ''}">
+            <input type="checkbox" data-sw="${v.key}" ${v.st === 'through' || v.st === 'back' ? 'checked' : ''} ${swDisabled ? 'disabled' : ''}>
+            <span class="track"><span class="knob"></span></span>
+            <span class="sw-label">加速</span>
+          </label>
+          ${v.system ? `<button class="btn btn-secondary btn-sm" data-optin="C">手动开启</button>` : ''}
+        </div>
+        ${swReason ? `<div class="ctl-reason">${swReason}</div>` : ''}
+        <div class="row gap4">
+          <button class="btn btn-secondary btn-sm" data-act="unmount" data-key="${v.key}" ${blocked || v.st === 'unmounted' || v.st === 'ready' ? 'disabled' : ''} style="flex:1">卸载</button>
+          <button class="btn btn-secondary btn-sm" data-act="flush" data-key="${v.key}" ${blocked || v.st === 'unmounted' || v.st === 'ready' ? 'disabled' : ''} style="flex:1">立即回写</button>${srcTag('C1', '[C1] IOperationProgress：卸载/回写/自愈等 >1s 动作的进度可见（UX §7.7：超 1 秒必须有进度或「正在…」文案）')}
+        </div>
+        ${v.system ? srcTag('C4', '[C4] ISystemVolumeOptIn：系统卷 opt-in 确认流（W3-5），加速页 C: 卡片 opt-in 入口') : ''}
+      </div>
+    </div>`;
+  }).join('');
+  body.innerHTML = cards + (state.vols.length ? '' : '<div class="card info"><div class="t-small dim">尚未枚举到任何卷。</div></div>');
+  bindAccelEvents();
+}
+function renderEarningsKpis(){
+  const s = state, live = s.connected && !s.statsDegraded;
+  const k = (label, id, val, unit, sub, src, dec) => `<div class="card hoverable">
+    <div class="row"><span class="kpi-label">${label}</span>${src}</div>
+    <div class="row mt8" style="align-items:flex-end">${live
+      ? `<span class="t-mono-stat num" id="${id}" style="color:var(--rbc-accent)" data-roll="${val}" data-dec="${dec}" data-cur="${val}">${val}</span><span class="kpi-unit">${unit}</span>`
+      : dashVal()}</div>
+    <div class="kpi-sub">${sub}</div></div>`;
+  $('#earnings-kpis').innerHTML =
+    k('平均命中率', 'ek-hit', s.avgHit.toFixed(1), '%', '已加速卷平均', srcTag('A1', '[A1] 历史环形缓冲 60×5s 缺 · mock 序列'), 1) +
+    k('本次开机省下磁盘读', 'ek-served', (s.servedBytes / GB).toFixed(1), 'GB', '缓存读取量累计', srcTag('A6', '[A6] ServedText 结构化属性缺 · mock 合计'), 1) +
+    k('缓存占用', 'ek-cache', fmtBytes(s.cacheUsedBytes), '/ ' + fmtBytes(s.cacheCapBytes), '各卷配额合计', srcTag('A3', '[A3] 全局 used/total 结构化属性缺 · mock 合计'), 0);
+}
+function renderEarningsDetails(){
+  const live = state.connected && !state.statsDegraded;
+  const rows = [
+    ['L2 持久缓存', '本次开机：L2 写入 1,204 次 · 命中 8,942 次 · 未命中 1,318 次', 'C2', '[C2] IL2RecoveryReporter：L2 掉电恢复重建事件 UI 可见（W2-4 验收项）'],
+    ['顺序读预取', '本次开机：发出预读 12,480 次 · 成功填充 11,906 次', 'C5', '[C5] 预取激活前置条件门'],
+    ['温度护栏', '温度护栏暂停预取累计：3 次', 'FR-PF-03', '温度护栏可观测（驱动统计）'],
+    ['进程准入', '已被排除进程拒绝的 I/O 累计：56,210 次', 'FR-BL-03', '准入排除统计（驱动统计）'],
+    ['平均延迟对比', live ? '缓存读 0.04 ms · 直读 0.62 ms（mock）' : '—', 'B3', '[B3] 延迟类统计字段：02b 标注可选，无则不阻塞'],
+  ];
+  $('#earnings-details-body').innerHTML = rows.map(r =>
+    `<div class="row gap12" style="padding:8px 0;border-bottom:1px solid var(--rbc-border)">
+      <span class="t-small" style="width:110px;flex:none">${r[0]}</span>
+      <span class="t-small dim num" style="flex:1">${r[1]}</span>${srcTag(r[2], r[3])}
+    </div>`).join('');
+}
+function renderEmergencyPage(){
+  const s = state, body = $('#emergency-body');
+  const panicBtnDisabled = s.panic;
+  const clearDisabled = !s.panic || s.healing;
+  const clearReason = !s.panic ? '当前未熔断' : s.healing ? '自愈未完成：驱动正在把未落盘数据写完，完成后自动可解' : '';
+  const safeDisabled = !s.safeMode;
+  const safeReason = s.safeMode ? '' : '当前不在安全模式';
+  // 顶部态势卡
+  let head;
+  if(s.issueCount === 0){
+    head = `<div class="card info"><div class="row" style="gap:12px;align-items:flex-start">
+      <svg class="ic ic-20" style="color:var(--rbc-info-fg);margin-top:4px"><use href="#i-shield"/></svg>
+      <div style="flex:1"><div class="t-h3">当前无异常</div>
+      <div class="t-small dim mt4">无需应急操作。异常出现时，顶部状态条「风险」段会变色并一键回到本页。</div></div>
+    </div></div>`;
+  } else {
+    const key = s.panic ? (s.healing ? 'healing' : 'settled')
+      : s.safeMode ? 'safe'
+      : !s.connected ? 'notConn'
+      : s.statsDegraded ? 'degraded' : 'dirty';
+    head = exceptionCard(EXCEPTIONS[key]);
+  }
+  body.innerHTML = head + `
+  <!-- 危险操作收口 -->
+  <div class="danger-zone">
+    <div class="dz-head"><svg class="ic ic-14"><use href="#i-alert"/></svg>危险操作（均带三段式确认，不做默认焦点）${srcTag('D4', '[D4] 应急页整页随 W1-2 交付：熔断护栏/解除熔断置灰/退出安全模式/丢失量核对/回滚指引/救援卡导出')}</div>
+    <div class="t-small dim" style="margin-bottom:12px">盘面异常（磁盘报错、数据可疑）时先熔断保数据；解除熔断必须等自愈完成。</div>
+    <div class="row gap12" style="flex-wrap:wrap;align-items:flex-start">
+      <div class="stack gap4" style="flex:1;min-width:200px">
+        <button class="btn btn-danger" id="btn-panic" ${panicBtnDisabled ? 'disabled' : ''}><svg class="ic ic-14"><use href="#i-power"/></svg>一键熔断</button>
+        <div class="ctl-reason">${s.panic ? '已处于熔断状态' : '所有读写直接到盘，缓存暂停'}</div>
+      </div>
+      <div class="stack gap4" style="flex:1;min-width:200px">
+        <button class="btn btn-primary" id="btn-panic-clear" ${clearDisabled ? 'disabled' : ''}>解除熔断</button>
+        <div class="ctl-reason">${clearReason || '驱动确认自愈完成后恢复缓存'}</div>
+      </div>
+      <div class="stack gap4" style="flex:1;min-width:200px">
+        <button class="btn btn-secondary" id="btn-exit-safe" ${safeDisabled ? 'disabled' : ''}>退出安全模式</button>
+        <div class="ctl-reason">${safeReason || '确认数据无误后退出，恢复正常写模式'}</div>
+      </div>
+    </div>
+  </div>
+  <!-- 未落盘与丢失量核对 -->
+  <div class="card">
+    <div class="chart-head" style="margin-bottom:12px">
+      <div class="t-h3">未落盘与丢失量核对</div>${srcTag('B2', '[B2] LostDirtyBytes（已确认丢失）字段存在性待确认；DirtyBytes 已有，StateBar 消费')}
+      ${s.backCount > 0
+        ? (s.powerLoading
+            ? `<span class="sk sk-chip" style="margin-left:auto"></span>${srcTag('A-12', '[A-12] 电源状态 chip（C-7）：有回写卷时常驻显示，与 F3 对话框结论同源同口径')}`
+            : `<span class="state-pill ${(POWER_STATES[s.powerState] || POWER_STATES.unknown).cls}" style="margin-left:auto" title="${(POWER_STATES[s.powerState] || POWER_STATES.unknown).tip}">${(POWER_STATES[s.powerState] || POWER_STATES.unknown).html}</span>${srcTag('A-12', '[A-12] 电源状态 chip（C-7）：有回写卷时常驻显示，与 F3 对话框结论同源同口径')}`)
+        : ''}
+    </div>
+    <div id="emergency-dirty"></div>
+    <div class="row gap12 mt12" style="flex-wrap:wrap">
+      <div class="t-small dim" style="flex:1;min-width:220px" id="dirty-detail"></div>
+      <button class="btn btn-ghost btn-sm" id="btn-disk-check">打开磁盘错误检查</button>
+      <button class="btn btn-ghost btn-sm" id="btn-flush-now">立即回写全部</button>${srcTag('D5', '[D5] Toast 命令反馈面随 W1-2 按 02b §B 重建（进 180ms / 出 120ms）；U-01 整套删除后零调用点')}
+    </div>
+  </div>
+  <!-- 回滚指引三步图 -->
+  <div class="card">
+    <div class="t-h3" style="margin-bottom:12px">回滚指引（出问题时的完整退路）</div>
+    <div class="rollback">
+      <div class="step"><div class="n">1</div><div class="t-h3">一键熔断</div>
+        <div class="t-small dim mt4">读写直接到盘，缓存暂停；未落盘数据由驱动继续写盘。任何盘面异常的第一步。</div></div>
+      <div class="arrow"><svg class="ic ic-20"><use href="#i-arrow-right"/></svg></div>
+      <div class="step"><div class="n">2</div><div class="t-h3">卸载缓存卷</div>
+        <div class="t-small dim mt4">在加速页逐卷卸载，驱动自动回写脏数据后再摘除；卸载中请勿直接拔盘或强关。</div></div>
+      <div class="arrow"><svg class="ic ic-20"><use href="#i-arrow-right"/></svg></div>
+      <div class="step"><div class="n">3</div><div class="t-h3">重启后按需重开</div>
+        <div class="t-small dim mt4">重启后从设置页卸载或重跑首次向导；每卷配置会恢复默认（D1：持久化随 W2-3 落地）。</div></div>
+    </div>
+  </div>
+  <!-- 导出救援卡 -->
+  <div class="card">
+    <div class="row" style="align-items:flex-start;gap:12px">
+      <svg class="ic ic-20" style="color:var(--rbc-accent);margin-top:4px"><use href="#i-folder"/></svg>
+      <div style="flex:1">
+        <div class="t-h3">导出救援卡</div>
+        <div class="t-small dim mt4">把当前状态、版本、自检结果、日志打包成一个文件，找人帮忙时直接发它。</div>
+      </div>
+      <button class="btn btn-secondary" id="btn-rescue">导出救援卡</button>
+    </div>
+  </div>`;
+  // 未落盘堆叠条（图 #5）
+  renderDirtyChart($('#emergency-dirty'), true);
+  const lostTxt = s.lostDirtyBytes > 0 ? `已确认丢失 ${fmtBytes(s.lostDirtyBytes)}` : '已确认丢失 0（无丢失记录）';
+  $('#dirty-detail').innerHTML = `未落盘数据 <b class="num">${fmtBytes(s.dirtyBytes)}</b>（阈值 ${fmtBytes(DIRTY_THRESHOLD)}）· ${lostTxt} · 占缓存上限 ${(s.dirtyBytes / s.cacheCapBytes * 100).toFixed(1)}%`;
+  bindEmergencyEvents();
+}
+function renderSettingsDynamic(){
+  const s = state;
+  $('#admit-rejects').textContent = s.statsDegraded ? '已被排除进程拒绝的 I/O 累计：—（统计暂不可用）' : '已被排除进程拒绝的 I/O 累计：56,210';
+  $('#l2-counters').textContent = '本次开机：L2 写入 1,204 次 · 命中 8,942 次 · 未命中 1,318 次';
+  $('#prefetch-counters').textContent = '本次开机：发出预读 12,480 次 · 成功填充 11,906 次';
+  $('#thermal-counters').textContent = '温度护栏暂停预取累计：3 次';
+}
+
+/* ─── V10.6 新增：场景预设（06 §2 C-1 · 05 §2-F1 · A-9/B-3）─── */
+const PRESET_TIERS = {
+  safe:     {name:'安全 · 只读', short:'安全', desc:'只加速读取，写入直连磁盘；适合存放重要数据的仓库盘'},
+  balanced: {name:'均衡 · 读写', short:'均衡', desc:'读取加速 + 写入直连磁盘；适合大多数日常使用场景（推荐）'},
+  perf:     {name:'性能 · 回写', short:'性能', desc:'读取加速 + 写入先入缓存；适合下载、编译等可重新生成的目录，开启前需确认回写风险'},
+  custom:   {name:'自定义',       short:'自定义', desc:'当前参数与任一预设不同'},
+};
+/* 受管参数 7 行（05 §2-F1 三档参数表原文采信，展示层不覆写值；
+   「全局内存预算」带协议待确认后缀——B4 未确认前预设不覆写该项） */
+const PRESET_PARAMS = [
+  {name:'每卷写模式',   safe:'直写',                      balanced:'直写',                    perf:'回写'},
+  {name:'读预取总开关', safe:'关',                        balanced:'开',                      perf:'开'},
+  {name:'每卷预读窗口', safe:'8 块（≈32KB）',             balanced:'16 块（≈64KB）',          perf:'32 块（≈128KB）'},
+  {name:'L2 持久缓存',  safe:'关',                        balanced:'关（用户自选开）',         perf:'开'},
+  {name:'回写周期',     safe:'不适用（直写无脏数据）',     balanced:'60 秒',                   perf:'60 秒（提供 30 秒「更稳」选项）'},
+  {name:'进程准入排除', safe:'内置名单开 + 建议补备份类',  balanced:'内置名单开',               perf:'内置名单开，不建议再扩大（扩大缓存覆盖）'},
+  {name:'全局内存预算', safe:'预留 4 GB / AutoUsePct 50%', balanced:'预留 2 GB / 75%',         perf:'预留 1 GB / 90%', pending:true},
+];
+/* 每卷写模式为卷实况派生参数：任一卷回写即偏离均衡/安全标称值 → 自定义（F1 Custom 正交标志） */
+function currentWriteMode(){ return state.vols.some(v => !v.system && v.mode === 'back') ? '回写' : '直写'; }
+function presetValueOf(p, tier){
+  if(tier === 'custom'){
+    if(p.name === '每卷写模式') return currentWriteMode();
+    return state.presetOverrides[p.name] != null ? state.presetOverrides[p.name] : p[state.presetBase];
+  }
+  return p[tier];
+}
+/* 卷实况 ↔ 预设档位一致性推导（init / applyDemo / applyPresetCore / 手改后调用） */
+function derivePresetFromVols(){
+  const s = state;
+  if(s.presetApplying) return;
+  const wm = currentWriteMode(), baseWm = PRESET_PARAMS[0][s.presetBase];
+  if(wm !== baseWm) s.presetTier = 'custom';
+  else if(s.presetTier === 'custom' && !Object.keys(s.presetOverrides || {}).length) s.presetTier = s.presetBase;
+}
+function presetChipText(){
+  const s = state;
+  return s.presetTier === 'custom'
+    ? '自定义（基于：' + PRESET_TIERS[s.presetBase].short + '）'
+    : '当前：' + PRESET_TIERS[s.presetTier].short + '预设';
+}
+function presetSummaryRows(){
+  const s = state;
+  return PRESET_PARAMS.map(p => {
+    const v = presetValueOf(p, s.presetTier);
+    return `<div class="preset-summary-row"><span class="psr-k">${p.name}</span><span class="psr-v">${v}</span>` +
+           (p.pending ? '<span class="psr-note">（协议待确认，暂不管理）</span>' : '') + '</div>';
+  }).join('');
+}
+function presetDiffRows(){
+  const s = state;
+  return PRESET_PARAMS.map(p => {
+    const base = p[s.presetBase], cur = presetValueOf(p, 'custom');
+    if(cur === base) return '';
+    return `<div class="preset-diff-row"><span class="pd-k">${p.name}：</span>` +
+           `<span class="pd-v">${base} → <span class="pd-cur">${cur}</span></span></div>`;
+  }).join('');
+}
+function presetDiffCount(){
+  const s = state;
+  return PRESET_PARAMS.filter(p => presetValueOf(p, 'custom') !== p[s.presetBase]).length;
+}
+function buildPresetCard(){
+  const pc = $('#preset-card'); if(!pc) return;
+  pc.innerHTML = `
+    <div class="row" style="margin-bottom:12px">
+      <div class="t-h3">场景预设</div>
+      ${srcTag('A-9', '[A-9] F1 预设菜单前端（ComboBox + 差异清单 + 恢复默认）；ApplyPreset 原子编排 + GetPresetDiff 移交后端（B-3，退化方案 = 逐字段 SET_CONFIG）')}
+    </div>
+    <div id="preset-main">
+      <div class="t-body dim" style="margin-bottom:12px">按使用场景一键配置缓存参数，之后仍可手动微调</div>
+      <div class="row gap8">
+        <select class="select" id="preset-select" style="width:220px" aria-label="场景预设档位">
+          <option value="safe">安全 · 只读</option>
+          <option value="balanced">均衡 · 读写</option>
+          <option value="perf">性能 · 回写</option>
+          <option value="custom">自定义</option>
+        </select>
+        <button class="btn btn-secondary btn-sm" id="btn-preset-restore">恢复默认</button>
+      </div>
+      <div class="t-small dim" id="preset-restore-desc" style="margin-top:4px"></div>
+      <div class="t-body dim" id="preset-tier-desc" style="margin-top:12px"></div>
+      <div id="preset-diff"></div>
+      <details class="preset-summary" id="preset-summary">
+        <summary>受管参数（7）</summary>
+        <div id="preset-summary-rows"></div>
+      </details>
+      <div id="preset-applying" hidden>
+        <div class="progress indeterminate mt12"><div class="bar"></div></div>
+        <div class="t-small dim" style="margin-top:8px">正在应用预设…</div>
+      </div>
+    </div>
+    <div id="preset-state-slot"></div>
+    <details class="cw-demo-toggle"><summary>演示开关</summary>
+      <label class="check mt8"><input type="checkbox" id="preset-loading-cb"><span>模拟读取中（骨架屏）</span></label>
+      <label class="check mt8"><input type="checkbox" id="preset-error-cb"><span>模拟读取失败（空态 + 重试）</span></label>
+    </details>`;
+  $('#preset-select').onchange = e => applyPreset(e.target.value);
+  $('#btn-preset-restore').onclick = openRestoreConfirm;
+  $('#preset-loading-cb').onchange = e => {
+    state.presetLoading = e.target.checked;
+    if(e.target.checked) state.presetError = false;
+    renderAll(false);
+  };
+  $('#preset-error-cb').onchange = e => {
+    state.presetError = e.target.checked;
+    if(e.target.checked) state.presetLoading = false;
+    renderAll(false);
+  };
+}
+function renderPresetDiffZone(){
+  const s = state, box = $('#preset-diff'); if(!box) return;
+  if(s.presetTier !== 'custom'){ box.innerHTML = ''; return; }
+  box.innerHTML = `
+    <div class="preset-diff-bar">
+      <span>已偏离『${PRESET_TIERS[s.presetBase].name}』预设：${presetDiffCount()} 项不同</span>
+      <button class="btn btn-ghost btn-sm" id="btn-preset-diff-toggle"><svg class="ic ic-14" id="preset-diff-caret"><use href="#i-chevron-down"/></svg>查看差异</button>
+    </div>
+    <div class="preset-diff-rows" id="preset-diff-rows" hidden>${presetDiffRows()}</div>`;
+  const btn = $('#btn-preset-diff-toggle'), rows = $('#preset-diff-rows'), caret = $('#preset-diff-caret');
+  btn.onclick = () => {
+    const open = rows.hidden;
+    rows.hidden = !open;
+    btn.lastChild.textContent = open ? '收起差异' : '查看差异';
+    caret.style.transform = open ? 'rotate(180deg)' : '';
+  };
+}
+function applyPresetCore(tier){
+  const s = state;
+  s.presetTier = tier; s.presetBase = tier; s.presetOverrides = {};
+  // 演示联动：受管参数落到既有控件与卷状态（每卷配额 / 挂栈状态 / 自定义排除名单永不被预设覆写——F1）
+  const pf = $('#set-prefetch'); if(pf) pf.checked = tier !== 'safe';
+  s.vols.forEach(v => {
+    if(v.system) return;
+    v.mode = tier === 'perf' ? 'back' : 'through';
+    if(v.st === 'back' && v.mode === 'through') v.st = 'through';
+    if(v.st === 'through' && v.mode === 'back') v.st = 'back';
+  });
+  s.attachedCount = s.vols.filter(v => v.st === 'through' || v.st === 'back').length;
+  s.backCount = s.vols.filter(v => v.st === 'back').length;
+  derivePresetFromVols();
+}
+function applyPreset(tier){
+  if(tier === 'custom'){
+    const s = state;
+    if(!Object.keys(s.presetOverrides).length){
+      // 演示种子：与基准档的偏离（C-1.7 差异清单示例行；每卷写模式为派生参数不在此列）
+      s.presetOverrides = {'每卷预读窗口':'32 块（≈128KB）'};
+    }
+    s.presetTier = 'custom';
+    renderAll(false);
+    toast('已切换到自定义：与『' + PRESET_TIERS[s.presetBase].name + '』的差异见下方清单', 'ok');
+    return;
+  }
+  const s = state, t = PRESET_TIERS[tier];
+  if(tier === 'perf'){
+    // F3：性能档含回写开启 → 逐卷引导对话框（C-4）；确认才落盘，取消整档回滚（原子性 D-2）
+    const snapshot = {tier: s.presetTier, base: s.presetBase, overrides: Object.assign({}, s.presetOverrides),
+                      vols: s.vols.map(v => ({key: v.key, mode: v.mode, st: v.st}))};
+    applyPresetCore('perf');
+    renderAll(false);
+    const affected = s.vols.filter(v => !v.system && v.st !== 'unmounted');
+    openGuide(affected.map(v => v.key), {
+      silent: true,                                   // 成功/取消 Toast 走预设专属白名单文案
+      onConfirmed: () => { renderAll(false); toast('已应用『性能 · 回写』预设', 'ok'); },
+      onCancelled: () => {
+        s.presetTier = snapshot.tier; s.presetBase = snapshot.base; s.presetOverrides = snapshot.overrides;
+        snapshot.vols.forEach(m => { const v = s.vols.find(x => x.key === m.key); if(v){ v.mode = m.mode; v.st = m.st; } });
+        s.backCount = s.vols.filter(v => v.st === 'back').length;
+        renderAll(false);
+        toast('已取消回写开启，『性能 · 回写』预设未应用', 'warn');
+      },
+    });
+    return;
+  }
+  applyPresetCore(tier);
+  renderAll(false);
+  toast('已应用『' + t.name + '』预设', 'ok');
+}
+function restorePresetDefault(){
+  const s = state, t = PRESET_TIERS[s.presetBase];
+  applyPresetCore(s.presetBase);
+  renderAll(false);
+  toast('已恢复『' + t.name + '』标称值', 'ok');
+}
+/* C-1.4 Restoring：轻确认（次级两段式小浮层：恢复说明 + [取消][恢复]）→ Applying → Applied */
+function openRestoreConfirm(){
+  const t = PRESET_TIERS[state.presetBase];
+  openDialog(`
+    <div class="dlg-title">恢复默认</div>
+    <div class="g-sec-b" style="margin-bottom:4px">将把受管参数恢复为『${t.name}』标称值。</div>
+    <div class="g-why">每卷配额、挂栈状态与自定义排除名单不受影响。</div>
+    <div class="dlg-actions" style="gap:12px">
+      <button class="btn btn-secondary" id="dlg-cancel">取消</button>
+      <button class="btn btn-primary" id="dlg-ok">恢复</button>
+    </div>`, {sm:true});
+  $('#dlg-cancel').onclick = closeDialog;
+  $('#dlg-ok').onclick = () => { closeDialog(); restorePresetDefault(); };
+}
+/* 用户手改任一受管字段 → 自定义（正交标志，记录 basePreset；改回标称值则销号） */
+function markPresetCustom(param, cur, rerender){
+  const s = state;
+  if(param === '每卷写模式'){ derivePresetFromVols(); if(rerender !== false) renderAll(false); return; }   // 派生参数：由卷实况推导，不入 override
+  const p = PRESET_PARAMS.find(x => x.name === param); if(!p) return;
+  const base = p[s.presetBase];
+  s.presetOverrides = s.presetOverrides || {};
+  if(cur === base) delete s.presetOverrides[param];
+  else s.presetOverrides[param] = cur;
+  derivePresetFromVols();
+  if(rerender !== false) renderAll(false);
+}
+/* 演示态 preset-applying：Applying（不确定进度）→ 摘要表逐行高亮（N-1 阶梯）→ Applied（均衡）
+   → 再应用性能档并弹 C-4 引导对话框（F3 第二触发点） */
+function runPresetApplyingDemo(){
+  setTimeout(() => {
+    if(state.demo !== 'preset-applying') return;
+    $$('#preset-summary-rows .preset-summary-row').forEach((row, i) => {
+      setTimeout(() => row.classList.add('hl'), i * DUR.stagger);   // N-1：24ms 阶梯（reduced 下直显无过渡）
+    });
+  }, 600);
+  setTimeout(() => {
+    if(state.demo !== 'preset-applying') return;
+    state.presetApplying = false;
+    applyPresetCore('balanced');
+    renderAll(false);
+    toast('已应用『均衡 · 读写』预设', 'ok');
+    // 追加：应用性能档 → 弹 C-4（取消则回滚均衡）
+    setTimeout(() => {
+      if(state.demo !== 'preset-applying') return;
+      applyPresetCore('perf');
+      renderAll(false);
+      const affected = state.vols.filter(v => !v.system && v.st !== 'unmounted');
+      openGuide(affected.map(v => v.key), {
+        silent: true,
+        onConfirmed: () => { renderAll(false); },
+        onCancelled: () => {
+          applyPresetCore('balanced');
+          renderAll(false);
+          toast('已取消回写开启，『性能 · 回写』预设未应用', 'warn');
+        },
+      });
+    }, 900);
+  }, 1500);
+}
+
+/* ─── V10.6 新增：许可卡（06 §2 C-6 · 05 §2-F5 五态 · B-14）─── */
+const LICENSE_STATES = {
+  trial:    {badge:'首发限免试用中', cls:'neutral', desc:'试用期自安装日起 30 天，功能不阻塞', label:'剩余', foot:'试用期内所有功能可正常使用'},
+  expiring: {badge:'试用即将到期', cls:'warning', desc:'到期后需激活许可', label:'剩余', foot:'到期后需激活许可'},
+  active:   {badge:'已激活', cls:'success', desc:'激活于 <span class="mono">2026-09-21</span>', label:'许可类型', foot:'许可信息由安装器写入，与激活渠道保持一致'},
+  expired:  {badge:'试用已过期', cls:'warning', desc:'试用已过期：新增加速需激活，已加速卷不受影响', label:'剩余', foot:'影响口径待产品确认（开放项 D-5）'},
+  unknown:  {badge:'许可状态未知', cls:'neutral', desc:'许可状态读取失败（不影响使用）', label:'剩余', foot:'诊断页可见降级原因'},
+};
+function renderLicense(){
+  const s = state, box = $('#license-body'); if(!box) return;
+  if(s.licenseLoading){          // Loading：三槽 shimmer 骨架（06 C-6.5 · 演示开关可控）
+    box.innerHTML = `
+      <div class="row gap8" style="margin-bottom:12px"><span class="sk sk-chip"></span></div>
+      <div class="row gap16" style="align-items:flex-end">
+        <div class="stack gap8" style="flex:1"><div class="sk sk-line" style="width:48px"></div><div class="sk sk-big"></div></div>
+        <div class="sk sk-btn"></div>
+      </div>
+      <div class="row gap8 mt12"><label class="check"><input type="checkbox" id="license-loading-cb" checked><span>演示开关：模拟许可数据读取中</span></label></div>`;
+    $('#license-loading-cb').onchange = e => { s.licenseLoading = e.target.checked; renderAll(false); };
+    return;
+  }
+  const st = LICENSE_STATES[s.licenseState] || LICENSE_STATES.unknown;
+  const numeric = s.licenseState === 'trial' || s.licenseState === 'expiring';
+  const bigHtml = numeric
+    ? `<span class="license-big">${s.licenseDays}</span><span class="license-unit">天</span>`
+    : s.licenseState === 'active'
+      ? `<span class="license-big-text">${s.licenseType || '专业版'}</span>`
+      : `<span class="license-big" style="color:var(--rbc-text-secondary)">—</span>`;
+  box.innerHTML = `
+    <div class="row gap8" style="margin-bottom:12px">
+      <span class="state-pill ${st.cls}">${st.badge}</span>
+      <span class="t-body dim">${st.desc}</span>
+    </div>
+    <div class="row gap16" style="align-items:flex-end">
+      <div class="stack gap4" style="flex:1">
+        <span class="t-body dim">${st.label}</span>
+        <div class="row gap8" style="align-items:baseline">${bigHtml}</div>
+      </div>
+      <button class="btn btn-secondary btn-sm" id="btn-license-activate">输入许可密钥</button>
+    </div>
+    <div class="t-small dim" style="margin-top:12px">${st.foot}</div>
+    <div class="row mt12"><label class="check"><input type="checkbox" id="license-loading-cb"><span>演示开关：模拟许可数据读取中</span></label></div>`;
+  $('#license-loading-cb').onchange = e => { s.licenseLoading = e.target.checked; renderAll(false); };
+  $('#btn-license-activate').onclick = () => {
+    if(s.licenseState === 'active'){ toast('您已激活：' + (s.licenseType || '专业版'), 'ok'); return; }
+    openActivateDialog();     // 06 C-6.5：激活占位说明对话框（360px），非 Toast
+  };
+}
+/* C-6 激活占位对话框（06 C-6.3：宽 360 · 标题「激活通道」+ 正文 13 secondary + 单按钮[知道了]） */
+function openActivateDialog(){
+  openDialog(`
+    <div class="dlg-title">激活通道</div>
+    <div class="g-sec-b" style="margin-bottom:12px">激活向导随正式版发布提供；试用期内可在安装器中输入许可密钥。</div>
+    <div class="dlg-actions"><button class="btn btn-secondary" id="dlg-ok">知道了</button></div>
+    <div class="row gap8 mt12">${srcTag('B-14', '[B-14] LicenseStatus 契约：安装器写入、服务读取（B 类移交）；激活端点随渠道周交付')}</div>`,
+    {xs:true, focus:'#dlg-ok'});
+  $('#dlg-ok').onclick = closeDialog;
+}
+
+/* ─── V10.6 新增：电源 chip（06 §2 C-7 · 05 §2-F3 电源三态 + WMI 失败未知态 · A-12）─── */
+const POWER_STATES = {
+  desktop: {cls:'neutral', html:'台式机 · 无电池', tip:''},
+  laptop:  {cls:'info',    html:'笔记本 · 电池 <span class="mono">87%</span>', tip:''},
+  low:     {cls:'warning', html:'电池电量低', tip:'回写确认将被禁用'},
+  unknown: {cls:'neutral', html:'电源状态未知', tip:'无法检测电源状态，按保守策略处理'},
+};
+function renderPowerChip(){
+  const el = $('#power-chip'); if(!el) return;
+  if(state.powerLoading){            // Loading：96×20 pill 骨架（06 C-7.6）
+    el.className = 'sk sk-chip'; el.innerHTML = ''; el.title = '';
+    return;
+  }
+  const p = POWER_STATES[state.powerState] || POWER_STATES.unknown;
+  el.className = 'state-pill power-chip ' + p.cls;
+  el.innerHTML = p.html;
+  el.title = p.tip;
+}
+
+/* ─── V10.6 第二批：冷热二遍读对比卡（06 §2 C-3 · 05 §2-F2 · B-4/B-5）─── */
+const BENCH_RESULT = {
+  p1: {mbps: 312,  sec: 1.9,  bytes: 593},   // 第一遍 · 磁盘直读（mock）
+  p2: {mbps: 3180, sec: 0.19, bytes: 593},   // 第二遍 · 缓存读取（mock）
+  hit: 99.1, gain: 10.2,
+};
+const CW_FOOT = `<div class="cw-foot">
+  <div class="t-micro">第一遍读磁盘，第二遍读缓存 · 同一文件同样读法 · 绕过系统缓存 · 与 ramboostctl stats 同口径（误差 <2%）</div>
+  <div class="t-micro">结果随文件大小与磁盘状态变化，建议多跑几次取稳定值</div>
+  <details class="cw-demo-toggle"><summary>演示开关</summary>
+    <label class="check mt8"><input type="checkbox" id="cw-degrade-cb"><span>模拟「缓存范围刷新能力不可用」（降级横幅）</span></label>
+    <label class="check mt8"><input type="checkbox" id="cw-skeleton-cb"><span>模拟首开加载中（骨架屏）</span></label>
+  </details>
+</div>`;
+function cwDegradeBanner(){
+  return state.bench.degrade
+    ? `<div class="cw-degrade"><svg class="ic ic-14"><use href="#i-alert"/></svg>缓存范围刷新能力不可用，第一遍可能不是冷读，结果仅供参考</div>` : '';
+}
+function cwGrowBars(){
+  // 双条形纵向生长（scaleY 0→1 · Dur480 · reduced 下过渡 .01ms 直显全高）
+  $$('#coldwarm-body .cw-bar').forEach(bar => {
+    bar.style.transform = 'scaleY(0)';
+    requestAnimationFrame(() => requestAnimationFrame(() => { bar.style.transform = 'scaleY(1)'; }));
+  });
+}
+function renderColdWarm(){
+  const box = $('#coldwarm-body'); if(!box) return;
+  const b = state.bench;
+  if(b.phase === 'loading'){          // 首开骨架（06 C-3.5 加载态 · 演示开关可控）
+    box.innerHTML = `
+      <div class="sk sk-title" style="width:60%"></div>
+      <div class="row gap8 mt12"><div class="sk sk-btn"></div><div class="sk sk-line" style="width:40%"></div></div>
+      <div class="sk sk-line mt12"></div><div class="sk sk-line"></div><div class="sk sk-line"></div>
+      ${cwDegradeBanner()}${CW_FOOT}`;
+    bindCwFoot();
+    return;
+  }
+  if(b.phase === 'running'){
+    box.innerHTML = `
+      <div class="cw-stage" id="cw-stage">${b.pass === 1 ? '第一遍：磁盘读取中…' : '第二遍：缓存读取中…'}</div>
+      <div class="progress"><div class="bar" id="cw-bar" style="transform:scaleX(${b.pct.toFixed(3)})"></div></div>
+      <div class="cw-stat" id="cw-stat">0.00 / 593 MB · 0 MB/s</div>
+      <div class="row gap8 mt12"><button class="btn btn-secondary btn-sm" id="cw-cancel">取消</button></div>
+      ${cwDegradeBanner()}${CW_FOOT}`;
+    $('#cw-cancel').onclick = () => {
+      if(cwTimer){ clearInterval(cwTimer); cwTimer = null; }
+      b.phase = 'ready'; b.pass = 1; b.pct = 0;         // 06 C-3.4：Cancelled → 回 FileReady
+      renderAll(false);
+      toast('已取消，统计口径不受影响', 'warn');
+    };
+    bindCwFoot();
+    return;
+  }
+  if(b.phase === 'validating'){       // Validating（06 C-3.4）
+    box.innerHTML = `
+      <div class="cw-file-row row gap8"><span class="cw-path">${b.file || ''}</span></div>
+      <div class="row gap8 mt12" style="align-items:center">
+        <span class="t-small dim">正在校验文件…</span>
+        <button class="btn btn-primary btn-sm" id="cw-start" disabled>开始对比</button>
+      </div>
+      ${cwDegradeBanner()}${CW_FOOT}`;
+    bindCwFoot();
+    return;
+  }
+  if(b.phase === 'ready'){            // FileReady（06 C-3.4）
+    box.innerHTML = `
+      <div class="cw-file-row row gap8"><span class="cw-path">${b.file || ''}</span>
+        <button class="btn btn-secondary btn-sm" id="cw-repick" style="flex:none">重新选择文件</button></div>
+      <div class="t-small dim mt8">593 MB · 所在卷已加速</div>
+      <div class="row gap8 mt12">
+        <button class="btn btn-primary btn-sm" id="cw-start">开始对比</button>
+        <span class="t-small dim">第一遍读磁盘，第二遍读缓存</span>
+      </div>
+      ${cwDegradeBanner()}${CW_FOOT}`;
+    $('#cw-repick').onclick = openFilePickDialog;
+    $('#cw-start').onclick = () => {
+      b.phase = 'running'; b.pass = 1; b.pct = 0;
+      renderAll(false);
+      runBenchmarkPass();
+    };
+    bindCwFoot();
+    return;
+  }
+  if(b.phase === 'result' && b.result){
+    const r = b.result, mx = Math.ceil(Math.max(r.p1.mbps, r.p2.mbps) / 100) * 100;
+    const h1 = (r.p1.mbps / mx * 100).toFixed(1) + '%', h2 = (r.p2.mbps / mx * 100).toFixed(1) + '%';
+    const secSave = Math.round((1 - r.p2.sec / r.p1.sec) * 100);
+    box.innerHTML = `
+      <div class="cw-file-row row gap8"><span class="cw-path">${b.file || '（未选择）'}</span>
+        <button class="btn btn-secondary btn-sm" id="cw-repick" style="flex:none">重新选择文件</button></div>
+      <div class="cw-table">
+        <div class="cw-row head"><span>遍次</span><span>速度</span><span class="cw-num">耗时</span><span class="cw-num">读取量</span><span class="cw-num">命中率</span></div>
+        <div class="cw-row"><span class="cw-label">第一遍 · 盘速</span>
+          <span><span class="cw-big">${r.p1.mbps}</span><span class="cw-unit">MB/s</span></span>
+          <span class="cw-num">${r.p1.sec} 秒</span><span class="cw-num">${r.p1.bytes} MB</span><span class="cw-num">—</span></div>
+        <div class="cw-row"><span class="cw-label">第二遍 · 缓存速</span>
+          <span><span class="cw-big accent">${r.p2.mbps.toLocaleString('zh-CN')}</span><span class="cw-unit">MB/s</span></span>
+          <span class="cw-num">${r.p2.sec} 秒</span><span class="cw-num">${r.p2.bytes} MB</span><span class="cw-num">${r.hit}%</span></div>
+      </div>
+      <div class="row gap8 mt12"><span class="cw-gain">提升<span class="mono">${r.gain}×</span></span>
+        <span class="t-small dim">耗时 -${secSave}%</span></div>
+      <div class="cw-bars">
+        <div class="cw-scale">0 — ${mx.toLocaleString('zh-CN')} MB/s（两遍同尺度）</div>
+        <div class="cw-bar-col"><span class="cw-bar-val">${r.p1.mbps}</span>
+          <div class="cw-bar-slot"><div class="cw-bar" style="height:${h1};transform:scaleY(1)"></div></div></div>
+        <div class="cw-bar-col"><span class="cw-bar-val">${r.p2.mbps.toLocaleString('zh-CN')}</span>
+          <div class="cw-bar-slot"><div class="cw-bar p2" style="height:${h2};transform:scaleY(1)"></div></div></div>
+      </div>
+      <div class="cw-bar-cap"><span>第一遍 · 盘速</span><span>第二遍 · 缓存速</span></div>
+      ${cwDegradeBanner()}${CW_FOOT}`;
+    $('#cw-repick').onclick = openFilePickDialog;
+    bindCwFoot();
+    return;
+  }
+  // 空态（06 C-3.5：24px 线性图标 + 引导句 + 约束 + 「开始对比」disabled 主按钮）
+  box.innerHTML = `
+    <div class="row gap8"><svg class="ic ic-24" style="color:var(--rbc-text-secondary)"><use href="#i-gauge"/></svg>
+      <div class="t-body dim">选择文件，对比磁盘读取与缓存读取的速度</div></div>
+    <div class="row gap8 mt12" style="flex-wrap:wrap">
+      <button class="btn btn-secondary btn-sm" id="cw-pick" style="flex:none">选择文件</button>
+      <button class="btn btn-primary btn-sm" id="cw-start" disabled style="flex:none">开始对比</button>
+      <span class="t-small dim">建议选择 512 MB 以上的文件，且所在卷已加速</span>
+    </div>
+    ${cwDegradeBanner()}${CW_FOOT}`;
+  $('#cw-pick').onclick = openFilePickDialog;
+  bindCwFoot();
+}
+/* 卡底演示开关（降级横幅 / 首开骨架）与口径脚绑定 */
+function bindCwFoot(){
+  const cb = $('#cw-degrade-cb'), sk = $('#cw-skeleton-cb');
+  if(cb){ cb.checked = state.bench.degrade; cb.onchange = () => { state.bench.degrade = cb.checked; renderColdWarm(); }; }
+  if(sk){ sk.checked = state.bench.phase === 'loading'; sk.onchange = () => { state.bench.phase = sk.checked ? 'loading' : 'idle'; renderColdWarm(); }; }
+}
+function openFilePickDialog(){
+  openDialog(`
+    <div class="dlg-title">选择对比文件</div>
+    <div class="g-sec-b" style="margin-bottom:8px">输入要对比的文件路径（演示用，默认已填一个 593 MB 的示例文件）</div>
+    <input class="input" id="cw-file-input" value="E:\\Downloads\\game_installer.iso" spellcheck="false" aria-label="文件路径">
+    <div class="g-why" id="cw-file-why"></div>
+    <div class="dlg-actions">
+      <button class="btn btn-secondary" id="dlg-cancel">取消</button>
+      <button class="btn btn-primary" id="dlg-ok">确定</button>
+    </div>`, {focus:'#cw-file-input'});
+  $('#dlg-cancel').onclick = closeDialog;
+  $('#dlg-ok').onclick = () => {
+    const p = $('#cw-file-input').value.trim(), why = $('#cw-file-why');
+    if(!p){ why.textContent = '请填写文件路径'; return; }
+    if(/^[cC]:[\\/]/.test(p)){ why.textContent = '所在卷尚未挂栈加速，请先在加速页挂栈'; return; }
+    closeDialog();
+    startBenchmark(p);
+  };
+}
+function startBenchmark(path){
+  const b = state.bench;
+  // Validating（06 C-3.4）：校验大小/卷加速状态/可读性 → FileReady（演示 300ms）
+  b.phase = 'validating'; b.pass = 1; b.pct = 0; b.file = path; b.result = null;
+  renderAll(false);
+  setTimeout(() => {
+    if(state.bench !== b || b.phase !== 'validating') return;
+    b.phase = 'ready';
+    renderColdWarm();
+  }, 300);
+}
+let cwTimer = null;
+function runBenchmarkPass(){
+  const b = state.bench;                                  // 捕获引用：切演示态即中止
+  const total = 593, dur = b.pass === 1 ? 1600 : 800;     // 第一段慢 1.6s · 第二段快 0.8s
+  const mbps = b.pass === 1 ? BENCH_RESULT.p1.mbps : BENCH_RESULT.p2.mbps;
+  const stg = $('#cw-stage'); if(stg) stg.textContent = b.pass === 1 ? '第一遍：磁盘读取中…' : '第二遍：缓存读取中…';
+  const t0 = performance.now();
+  cwTimer = setInterval(() => {
+    if(state.bench !== b || state.bench.phase !== 'running'){ clearInterval(cwTimer); cwTimer = null; return; }
+    const p = Math.min(1, (performance.now() - t0) / dur);
+    b.pct = p;
+    const bar = $('#cw-bar'); if(bar) bar.style.transform = `scaleX(${p.toFixed(3)})`;
+    const st = $('#cw-stat');
+    if(st) st.textContent = `${(total * p).toFixed(2)} / ${total} MB · ${Math.round(mbps * (0.9 + Math.random() * 0.2))} MB/s`;   // ≤4 次/秒（R-7）
+    if(p >= 1){
+      clearInterval(cwTimer); cwTimer = null;
+      if(b.pass === 1){ b.pass = 2; b.pct = 0; setTimeout(runBenchmarkPass, 120); }
+      else {
+        b.phase = 'result'; b.result = BENCH_RESULT;
+        renderAll(false); cwGrowBars();
+        toast('对比完成：第二遍快 10.2×', 'ok');
+      }
+    }
+  }, 250);                                                // R-7：已读/瞬时速度刷新 ≤4 次/秒
+}
+
+/* ─── V10.6 第二批：F3 回写开启引导对话框（06 §2 C-4 · 480 宽 .dialog-md · 三触发点收敛于此）─── */
+const POWER_DESC = {
+  desktop: '台式机没有电池备用，意外断电可能丢失未落盘数据',
+  laptop:  '检测到笔记本电池（当前 87%，未充电）',
+  low:     '电池电量低，回写风险升高',
+  unknown: '无法检测电源状态，按最保守情况评估（等同台式机）',
+};
+function openGuide(volKeys, opts){
+  opts = opts || {};
+  const keys = Array.isArray(volKeys) ? volKeys : [volKeys];
+  const vols = keys.map(k => state.vols.find(v => v.key === k)).filter(Boolean);
+  const names = vols.length ? vols.map(v => `${v.key}（${v.label}）`).join('、') : '所选卷';
+  const pw = POWER_STATES[state.powerState] || POWER_STATES.unknown;
+  const lowBattery = state.powerState === 'low';
+  let settled = false;      // 完成标志位：Applying 后（或已确认）任何关闭路径都不再触发回滚
+  // 取消语义收敛函数：取消按钮 / Esc / 点遮罩 全走此路（06 C-4.1：Esc/遮罩 = 取消，与取消按钮同口径）
+  const onCancel = () => {
+    if(settled) return;
+    settled = true;
+    if(!opts.silent) toast('未开启回写', 'warn');   // silent：调用方有专属取消文案（如预设流）
+    opts.onCancelled && opts.onCancelled();
+  };
+  openDialog(`
+    <div class="dlg-title">开启回写前，确认三件事</div>
+    <div class="g-sec first">
+      <div class="g-sec-t">① 将发生什么</div>
+      <div class="g-sec-b">回写模式下，缓存先收下写请求再定时写入磁盘，写性能更好；但意外断电可能丢失尚未落盘的数据。</div>
+    </div>
+    <div class="g-sec">
+      <div class="g-sec-t">② 影响与风险</div>
+      <div class="row gap8" style="margin-top:4px"><span class="g-sec-b" style="flex:none">电源状态：</span><span class="state-pill ${pw.cls}" id="g-power-chip">${pw.html}</span></div>
+      <div class="g-sec-b" id="g-power-desc" style="margin-top:4px">正在检测电源状态…</div>
+      <div class="g-sec-b" style="margin-top:8px">场景适配：</div>
+      <div class="g-advice">
+        <div class="g-adv ok">
+          <div class="g-adv-t"><svg class="ic ic-14"><use href="#i-check"/></svg>推荐开启</div>
+          <div class="g-adv-i"><svg class="ic ic-14"><use href="#i-check"/></svg>下载目录</div>
+          <div class="g-adv-i"><svg class="ic ic-14"><use href="#i-check"/></svg>编译输出</div>
+          <div class="g-adv-i"><svg class="ic ic-14"><use href="#i-check"/></svg>临时目录</div>
+        </div>
+        <div class="g-adv no">
+          <div class="g-adv-t"><svg class="ic ic-14"><use href="#i-close"/></svg>不建议</div>
+          <div class="g-adv-i"><svg class="ic ic-14"><use href="#i-close"/></svg>数据库文件</div>
+          <div class="g-adv-i"><svg class="ic ic-14"><use href="#i-close"/></svg>备份镜像</div>
+          <div class="g-adv-i"><svg class="ic ic-14"><use href="#i-close"/></svg>虚拟机磁盘</div>
+        </div>
+      </div>
+      <div class="g-sec-b" style="margin-top:8px">当前卷：<span class="mono">${names}</span></div>
+    </div>
+    <div class="g-sec">
+      <div class="g-sec-t">③ 如何撤销</div>
+      <div class="g-sec-b">随时切回直写；卸载或关机会自动回写脏数据。</div>
+    </div>
+    <div class="g-risk"><svg class="ic ic-14"><use href="#i-alert"/></svg>回写模式下，未落盘数据在掉电时可能丢失</div>
+    <label class="check g-ack"><input type="checkbox" id="g-ack-cb"><span>我已知悉上述风险</span></label>
+    <div class="g-why" id="g-why">请先勾选『我已知悉上述风险』</div>
+    <div class="dlg-actions" style="gap:12px">
+      <button class="btn btn-secondary" id="dlg-cancel" disabled>取消</button>
+      <button class="btn btn-danger" id="dlg-ok" disabled>开启回写</button>
+    </div>
+    <div class="row gap8 mt12">${srcTag('FR-PF-04', '[F3] 回写引导：电源检测（WMI 纯前端）+ 场景清单 + 知情确认（无协议依赖）')}</div>
+  `, {md:true, onClose: onCancel});
+  const ok = $('#dlg-ok'), cb = $('#g-ack-cb'), why = $('#g-why');
+  const syncOk = () => {
+    if(lowBattery){ ok.disabled = true; why.textContent = '请接通电源后再开启回写'; }   // 低电量：环境阻塞优先于流程条件
+    else { ok.disabled = !cb.checked; why.textContent = cb.checked ? '' : '请先勾选『我已知悉上述风险』'; }
+  };
+  // DetectingPower → ShowingAdvisory（WMI 百毫秒级：演示 400ms；chip 位先出 96×20 骨架）
+  const chip = $('#g-power-chip');
+  if(chip){ chip.className = 'sk sk-chip'; chip.innerHTML = ''; }
+  setTimeout(() => {
+    const d = $('#g-power-desc'), c = $('#dlg-cancel'), ch = $('#g-power-chip');
+    if(!d) return;                      // 对话框可能已关
+    if(ch){ ch.className = 'state-pill ' + pw.cls; ch.innerHTML = pw.html; }
+    d.textContent = POWER_DESC[state.powerState] || POWER_DESC.unknown;
+    if(c) c.disabled = false;
+    syncOk();
+  }, 400);
+  cb.onchange = syncOk;
+  // 取消按钮：只关对话框，回滚逻辑由 onClose（onCancel）统一执行，防双触发
+  $('#dlg-cancel').onclick = closeDialog;
+  $('#dlg-ok').onclick = () => {
+    settled = true;                     // Applying 起：后续任何关闭都不回滚（SET_CONFIG 已下发）
+    ok.disabled = true; ok.textContent = '开启中…'; $('#dlg-cancel').disabled = true;
+    setTimeout(() => {
+      closeDialog();
+      if(!opts.silent) toast('已开启回写：' + (vols.length ? vols.map(v => v.key).join('、') : '所选卷'), 'ok');
+      opts.onConfirmed && opts.onConfirmed();
+    }, 300);
+  };
+}
+window.__proto = window.__proto || {};
+window.__proto.openGuide = openGuide;
+
+/* ─── V10.6 第二批：反作弊警示对话框（06 §2 C-5 · 440 宽 · 测试签名版一次性警示）─── */
+function openAnticheatDialog(){
+  openDialog(`
+    <div class="dlg-title">反作弊环境提醒</div>
+    <div class="g-sec first">
+      <div class="g-sec-t">① 发生了什么</div>
+      <div class="g-sec-b">检测到反作弊服务 <span style="color:var(--rbc-text-primary)">VALORANT · Vanguard</span>（<span class="mono">vgk</span>）正在运行；当前 RAMBlockCache 驱动为测试签名版。</div>
+    </div>
+    <div class="g-sec">
+      <div class="g-sec-t">② 影响与风险</div>
+      <div class="g-sec-b">部分反作弊系统可能拦截测试签名版驱动，可能导致相关游戏无法启动，或驱动被强制卸载。正式签名版不受影响。</div>
+    </div>
+    <div class="g-sec">
+      <div class="g-sec-t">③ 怎么办</div>
+      <div class="g-sec-b">安装正式签名（EV）版驱动即可正常游戏。</div>
+    </div>
+    <label class="check g-ack"><input type="checkbox" id="ac-noshow"><span>不再提示</span></label>
+    <div class="g-why">勾选后，后续启动不再显示本对话框；检测结果仍可在诊断页查看。</div>
+    <div class="dlg-actions">
+      <button class="btn btn-secondary" id="dlg-ok">了解 EV 版</button>
+    </div>
+    <div class="row gap8 mt12">${srcTag('B-6', '[F4] 驱动签名态暴露（B 类移交）；取不到按测试签名保守处理')}</div>
+  `, {sm:true, focus:'#dlg-ok'});
+  $('#dlg-ok').onclick = () => { closeDialog(); toast('正式签名版下载页随官网发布提供', 'ok'); };
+}
+
+/* 设置页动态区（V10.6：预设卡 / 许可卡 / 电源 chip 按 state 渲染） */
+function renderSettings(){
+  const s = state;
+  const pc = $('#preset-card');
+  if(pc){
+    const main = $('#preset-main'), slot = $('#preset-state-slot');
+    if(s.presetLoading || s.presetError){
+      // 加载 / 空态降级（06 C-1.5）：骨架 shimmer 或 图标 + 原因 + 重试
+      if(main) main.hidden = true;
+      if(slot){
+        slot.innerHTML = s.presetError
+          ? `<div class="row gap8"><svg class="ic ic-24" style="color:var(--rbc-text-secondary)"><use href="#i-alert"/></svg>
+               <div class="t-body dim">预设状态不可用，请检查服务连接</div></div>
+             <div class="row mt12"><button class="btn btn-secondary btn-sm" id="preset-retry">重试</button></div>`
+          : `<div class="sk sk-title" style="width:30%"></div>
+             <div class="row gap8 mt12"><div class="sk" style="width:220px;height:28px"></div><div class="sk sk-btn"></div></div>
+             <div class="sk sk-line mt12"></div><div class="sk sk-line"></div><div class="sk sk-line"></div>`;
+        const retry = $('#preset-retry');
+        if(retry) retry.onclick = () => { s.presetError = false; renderAll(false); toast('预设状态已重读', 'ok'); };
+      }
+    } else {
+      if(main) main.hidden = false;
+      if(slot) slot.innerHTML = '';
+      pc.dataset.tier = s.presetTier;
+      const sel = $('#preset-select');
+      if(sel){ sel.value = s.presetTier; sel.disabled = !!s.presetApplying; }
+      $('#preset-tier-desc').textContent = PRESET_TIERS[s.presetTier].desc;
+      $('#preset-restore-desc').textContent = '将把受管参数恢复为『' + PRESET_TIERS[s.presetBase].name + '』标称值；每卷配额、挂栈状态与自定义排除名单不受影响';
+      $('#preset-summary-rows').innerHTML = presetSummaryRows();
+      renderPresetDiffZone();
+      const sum = $('#preset-summary');
+      if(sum && s.presetApplying) sum.open = true;   // Applying 演示：展开摘要表，逐行高亮可见
+      $('#btn-preset-restore').disabled = s.presetTier !== 'custom';   // 无差异时 disabled（C-1.4 Idle）
+      $('#preset-applying').hidden = !s.presetApplying;
+    }
+  }
+  renderLicense();
+  renderPowerChip();
+}
+function renderAll(flip){
+  derive();
+  renderStatusbar(); renderBanner(); renderNav();
+  renderStatusPage();
+  if(flip) flipRender($('#accel-body'), renderAccelPage); else renderAccelPage();
+  renderEarningsKpis(); renderEarningsDetails();
+  renderEarningsCharts(false);
+  renderEmergencyPage();
+  renderSettingsDynamic();
+  renderSettings();
+  renderColdWarm();
+  renderSelfCheck();
+}
+
+/* ─── 5. 图表（内联 SVG 手绘 · 不用图表库 · 2 色系纪律） ─── */
+function animateDraw(svg){
+  if(!svg) return;
+  $$('path.draw', svg).forEach(p => {
+    if(typeof p.getTotalLength !== 'function'){ p.style.strokeDashoffset = '0'; return; }
+    const len = p.getTotalLength();
+    if(isReduced()){ p.style.strokeDasharray = 'none'; p.style.strokeDashoffset = '0'; return; }
+    p.style.strokeDasharray = len; p.style.strokeDashoffset = len;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      p.style.transition = `stroke-dashoffset ${DUR.slower}ms ${EASE.out}`;
+      p.style.strokeDashoffset = '0';
+    }));
+  });
+}
+function lineChart(container, opts){
+  // opts: {series:[{name,color,data:[v|null]}], area:bool, w,h, yTicks, yMax, xLabels, unit}
+  const W = opts.w || 610, H = opts.h || 190;
+  const padL = 36, padR = 10, padT = 10, padB = 22;
+  const pw = W - padL - padR, ph = H - padT - padB;
+  const n = 60;
+  const yMax = opts.yMax != null ? opts.yMax : 100;
+  const X = i => padL + i / (n - 1) * pw;
+  const Y = v => padT + (1 - v / yMax) * ph;
+  let g = '';
+  (opts.yTicks || [0, 50, 100]).forEach(t => {
+    g += `<line x1="${padL}" y1="${Y(t)}" x2="${W - padR}" y2="${Y(t)}" stroke="var(--rbc-chart-grid)" stroke-width="1"/>` +
+         `<text x="${padL - 6}" y="${Y(t) + 3.5}" text-anchor="end" font-size="11" fill="var(--rbc-chart-axis-text)" font-family="var(--rbc-font-mono)">${t}${opts.unit || ''}</text>`;
+  });
+  if(opts.xLabels){
+    g += `<text x="${padL}" y="${H - 6}" font-size="11" fill="var(--rbc-chart-axis-text)">${opts.xLabels[0]}</text>` +
+         `<text x="${W - padR}" y="${H - 6}" text-anchor="end" font-size="11" fill="var(--rbc-chart-axis-text)">${opts.xLabels[1]}</text>`;
+  }
+  let paths = '';
+  opts.series.forEach((s, si) => {
+    // 断线留缺口：按 null 切分为连续段
+    const runs = []; let cur = [];
+    s.data.forEach((v, i) => { if(v == null){ if(cur.length) runs.push(cur); cur = []; } else cur.push([i, v]); });
+    if(cur.length) runs.push(cur);
+    runs.forEach(run => {
+      const d = run.map((p, j) => (j ? 'L' : 'M') + X(p[0]).toFixed(1) + ' ' + Y(p[1]).toFixed(1)).join(' ');
+      paths += `<path class="draw" d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`;
+      if(opts.area && si === 0 && run.length > 1){
+        const area = d + ` L${X(run[run.length - 1][0]).toFixed(1)} ${Y(0)} L${X(run[0][0]).toFixed(1)} ${Y(0)} Z`;
+        paths += `<path d="${area}" fill="var(--rbc-chart-area-fill)" stroke="none"/>`;
+      }
+    });
+    // 断点空心圈标示
+    for(let i = 1; i < s.data.length - 1; i++){
+      if(s.data[i] == null && s.data[i - 1] != null)
+        paths += `<circle cx="${X(i - 1)}" cy="${Y(s.data[i - 1])}" r="3" fill="var(--rbc-bg-app)" stroke="${s.color}" stroke-width="1.5"/>`;
+      if(s.data[i] == null && s.data[i + 1] != null)
+        paths += `<circle cx="${X(i + 1)}" cy="${Y(s.data[i + 1])}" r="3" fill="var(--rbc-bg-app)" stroke="${s.color}" stroke-width="1.5"/>`;
+    }
+  });
+  container.innerHTML = `<svg class="chart-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="${opts.aria || ''}">${g}${paths}</svg>`;
+  animateDraw($('svg', container));
+}
+function chartEmpty(container, reason){
+  container.innerHTML = `<div class="chart-empty">统计暂不可用（${reason}）<br><span class="t-micro">不画归零线，不把过期值当正常数据</span></div>`;
+}
+function ringSvg(size, sw, pct, over){
+  const r = (size - sw) / 2, c = 2 * Math.PI * r;
+  return `<div class="ring ${over ? 'over' : ''}" style="width:${size}px;height:${size}px">
+    <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+      <circle class="ring-track" cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke-width="${sw}"/>
+      <circle class="ring-fill" cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke-width="${sw}"
+        stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${(c * (1 - clamp(pct, 0, 1))).toFixed(1)}"/>
+    </svg></div>`;
+}
+function sparklineSvg(seed, live){
+  if(!live) return `<div class="t-micro" style="height:28px;line-height:28px">—</div>`;
+  const vals = genSeries(seed, 30, 55, 40, 2, 100);
+  const W = 200, H = 28, min = Math.min(...vals), max = Math.max(...vals), span = (max - min) || 1;
+  const X = i => i / (vals.length - 1) * (W - 8) + 4, Y = v => H - 4 - (v - min) / span * (H - 8);
+  const d = vals.map((v, i) => (i ? 'L' : 'M') + X(i).toFixed(1) + ' ' + Y(v).toFixed(1)).join(' ');
+  // 02b §A.3：趋势向好 ok / 下行 warn / 中性 chart-1
+  const last = vals[vals.length - 1], first = vals[0];
+  const color = last < first * 0.9 ? 'var(--rbc-warning-fg)' : last > first * 1.1 ? 'var(--rbc-success-fg)' : 'var(--rbc-chart-1)';
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" aria-label="迷你趋势">
+    <path d="${d}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="${X(vals.length - 1)}" cy="${Y(last)}" r="1.5" fill="${color}"/></svg>`;
+}
+function hbar(container, segs, opts){
+  // 堆叠/分段水平条（div + scaleX 范式 · 与进度条同机制；WPF 侧 Rectangle scaleX）
+  const total = segs.reduce((a, s) => a + s.value, 0) || 1;
+  const cap = (opts && opts.cap) || total;
+  const html = segs.filter(s => s.value > 0).map(s =>
+    `<div class="sg" style="width:${(s.value / cap * 100).toFixed(2)}%;background:${s.color};transform-origin:left center"></div>`).join('');
+  container.innerHTML = `<div class="stacked ${opts && opts.alert ? 'alert' : ''}" style="${opts && opts.height ? `height:${opts.height}px` : ''}">${html}</div>`;
+}
+function renderEarningsCharts(animate){
+  const s = state, live = s.connected && !s.statsDegraded;
+  const hasVols = s.attachedCount > 0;
+  // 图 #1 命中率趋势
+  if(live && hasVols){
+    const hitData = genSeries(7, 60, 75, 16, 35, 99);
+    hitData[31] = hitData[32] = hitData[33] = null;     // 演示断线留缺口
+    lineChart($('#chart-hitrate'), {series:[{color:'var(--rbc-chart-1)', data:hitData}], area:true, yMax:100, yTicks:[0, 50, 100], xLabels:['5 分钟前', '现在'], unit:'%', aria:'读命中率趋势'});
+  } else chartEmpty($('#chart-hitrate'), live ? '尚无加速卷' : '驱动无回应');
+  // 图 #3 读写吞吐双线
+  if(live && hasVols){
+    const rd = genSeries(8, 60, 380, 240, 10, 900), wr = genSeries(9, 60, 150, 130, 0, 700);
+    const mx = Math.ceil(Math.max(...rd, ...wr) / 100) * 100;
+    lineChart($('#chart-throughput'), {w:610, h:170, series:[{color:'var(--rbc-chart-1)', data:rd}, {color:'var(--rbc-chart-2)', data:wr}], yMax:mx, yTicks:[0, mx / 2, mx], unit:'', aria:'读写吞吐'});
+  } else chartEmpty($('#chart-throughput'), live ? '尚无加速卷' : '驱动无回应');
+  // 图 #2 缓存占用环
+  if(live){
+    const pct = s.cacheUsedBytes / s.cacheCapBytes;
+    const r = (160 - 10) / 2, c = 2 * Math.PI * r;
+    $('#chart-ring').innerHTML = `<div class="ring-wrap"><div class="ring ${pct > 1 ? 'over' : ''}" style="width:160px;height:160px">
+      <svg width="160" height="160" viewBox="0 0 160 160">
+        <circle class="ring-track" cx="80" cy="80" r="${r}" fill="none" stroke-width="10"/>
+        <circle class="ring-fill" id="earnings-ring-fill" cx="80" cy="80" r="${r}" fill="none" stroke-width="10"
+          stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${(c * (1 - clamp(pct, 0, 1))).toFixed(1)}"/>
+      </svg>
+      <div class="ring-center"><span class="t-mono-stat num" id="earnings-ring-val">${fmtBytes(s.cacheUsedBytes)}</span>
+      <span class="t-micro">/ ${fmtBytes(s.cacheCapBytes)} 上限</span></div></div>
+      <span class="badge ${pct > 1 ? 'warning' : 'info'}" id="earnings-ring-badge"><span class="dot"></span>${pct > 1 ? '已超限' : '已用 ' + (pct * 100).toFixed(0) + '%'}</span></div>`;
+    $('#ring-foot').textContent = '环轨道 = 各卷配额合计；超限时环变琥珀并标注「已超限」';
+  } else {
+    $('#chart-ring').innerHTML = `<div class="ring-wrap">${ringSvg(160, 10, 0)}<div class="ring-center"><span class="kpi-dash" style="font-size:22px;color:var(--rbc-text-secondary)">—</span></div>
+      <span class="t-micro">统计暂不可用（驱动无回应）</span></div>`;
+    $('#ring-foot').textContent = '空态：环轨道全灰 + 中心「—」，不画归零环';
+  }
+  // 图 #7 写模式构成
+  if(live && hasVols){
+    const tw = s.vols.filter(v => v.st === 'through').length, bw = s.vols.filter(v => v.st === 'back').length;
+    const total = tw + bw || 1;
+    hbar($('#chart-writemode'), [
+      {value: tw, color: 'var(--rbc-success-fg)'},
+      {value: bw, color: 'var(--rbc-warning-fg)'},
+    ], {height: 10});
+    $('#chart-writemode').insertAdjacentHTML('beforeend', `<div class="stack gap4 mt12">
+      <div class="row gap8"><span style="width:10px;height:10px;border-radius:2px;background:var(--rbc-success-fg)"></span><span class="t-small dim">直写 ${tw} 卷（${(tw / total * 100).toFixed(0)}%）</span></div>
+      <div class="row gap8"><span style="width:10px;height:10px;border-radius:2px;background:var(--rbc-warning-fg)"></span><span class="t-small dim">回写 ${bw} 卷（${(bw / total * 100).toFixed(0)}%）</span>${bw ? '<span class="badge warning" style="padding:0 8px"><span class="dot"></span>更快·有风险</span>' : ''}</div>
+    </div>`);
+  } else {
+    hbar($('#chart-writemode'), [], {height: 10});
+    $('#chart-writemode').insertAdjacentHTML('beforeend',
+      `<div class="t-micro mt12">${live ? '尚未加速任何卷' : '统计暂不可用（驱动无回应）'}</div>`);
+  }
+  // 图 #4 64 分片热力
+  const heatBox = $('#chart-heat');
+  if(live && hasVols){
+    const rnd = mulberry32(64), vals = [];
+    for(let i = 0; i < 64; i++){
+      let v = 20 + rnd() * 60;
+      if(i >= 22 && i <= 26) v += 120;                 // 热点簇
+      if(i === 41) v = 0;                              // 异常格：值为 0 且有压力
+      vals.push(Math.round(v));
+    }
+    const mx = Math.max(...vals);
+    const cells = vals.map((v, i) => {
+      const q = v / mx;
+      const color = v === 0 ? 'var(--rbc-chart-track)' : q > .66 ? 'var(--rbc-chart-heat-3)' : q > .33 ? 'var(--rbc-chart-heat-2)' : 'var(--rbc-chart-heat-1)';
+      return `<rect x="${i * 6}" y="1" width="4" height="24" rx="1" fill="${color}" ${i === 41 ? 'stroke="var(--rbc-danger-fg)" stroke-width="1"' : ''}/>`;
+    }).join('');
+    heatBox.innerHTML = `<svg class="chart-svg" viewBox="0 0 382 26" style="height:26px" role="img" aria-label="64 分片吞吐热力">${cells}</svg>
+      <div class="chart-legend mt8"><span>低</span><span style="width:40px;height:6px;border-radius:3px;background:linear-gradient(90deg,var(--rbc-chart-heat-1),var(--rbc-chart-heat-2),var(--rbc-chart-heat-3))"></span><span>高</span>
+      <span style="margin-left:auto"><i style="display:inline-block;width:8px;height:8px;border:1px solid var(--rbc-danger-fg);vertical-align:-1px"></i>红描边 = 单格异常</span></div>`;
+  } else {
+    heatBox.innerHTML = `<div class="heat">${Array.from({length: 64}, () => '<div class="cell" style="background:var(--rbc-bg-skeleton)"></div>').join('')}</div>
+      <div class="chart-foot">${live ? '全格置灰：尚无加速卷，无分片数据' : '统计暂不可用（驱动无回应）：全格置灰，不画归零热力'}</div>`;
+  }
+  // 图 #5 未落盘堆叠条
+  renderDirtyChart($('#chart-dirty'), false);
+}
+function renderDirtyChart(container, inEmergency){
+  const s = state;
+  const cap = s.cacheCapBytes;
+  const segs = [
+    {value: s.dirtyBytes, color: 'var(--rbc-warning-fg)'},
+    {value: s.lostDirtyBytes, color: 'var(--rbc-danger-fg)'},
+  ];
+  hbar(container, segs, {cap, alert: s.lostDirtyBytes > 0});
+  container.insertAdjacentHTML('beforeend', `<div class="stack gap4 mt12">
+      <div class="row gap8"><span style="width:10px;height:10px;border-radius:2px;background:var(--rbc-warning-fg)"></span><span class="t-small dim">未落盘数据 <b class="num">${fmtBytes(s.dirtyBytes)}</b>（阈值 ${fmtBytes(DIRTY_THRESHOLD)}）</span></div>
+      <div class="row gap8"><span style="width:10px;height:10px;border-radius:2px;background:var(--rbc-danger-fg)"></span><span class="t-small dim">已确认丢失 <b class="num">${s.lostDirtyBytes > 0 ? fmtBytes(s.lostDirtyBytes) : '0'}</b>${s.lostDirtyBytes > 0 ? '' : '（无丢失记录，不画 0 长度红段）'}</span></div>
+    </div>`);
+  if(!inEmergency) $('#dirty-foot').textContent = '相对缓存上限的百分比 + 绝对值；已确认丢失量 > 0 时红段出现 + 琥珀描边';
+}
+
+/* ─── 诊断页：自检 / 日志自动拉取 / IOCTL 点阵 ─── */
+const IOCTL_ITEMS = [
+  ['GET_STATS', .8], ['SET_CONFIG', 1.4], ['FLUSH', 6.2], ['GET_CONFIG', .7],
+  ['EXIT_SAFE_MODE', 2.1], ['SET_VOLUME', 1.9], ['GET_VOLUMES', 1.1], ['GET_LOG', 3.4],
+  ['NEGOTIATE', 2.8], ['STATS2', 1.2], ['VOLSTATUS', 1.0], ['REFRESH', 2.5],
+];
+function renderSelfCheck(){
+  const s = state, box = $('#diag-selfcheck');
+  const rows = [
+    ['驱动连接', s.connected ? 'ok' : (s.reconnecting ? 'warn' : 'danger'),
+      s.connected ? `已连接 · 驱动内部版本 ${DRIVER_VER}` : s.reconnecting ? '正在重连…' : '未连接（Win32 2：驱动未安装或未启动）'],
+    ['协议版本对比', s.protocolMismatch ? 'danger' : 'ok',
+      s.protocolMismatch ? '控制台 Protocol 9 ≠ 驱动 Protocol 8（示例）' : '控制台 Protocol 9 = 驱动 Protocol 9'],
+    ['版本单轨', 'ok', 'V10.4.3 Build 19（10.3.4.19）· version.h 单一事实源'],
+    ['UpperFilters 实际值', s.connected ? 'ok' : 'neutral',
+      s.connected ? '已挂栈：UpperFilters 含 RAMBlockCache，第三方过滤驱动项保留' : '无法读取（驱动未连接）'],
+    ['安全模式', s.safeMode ? 'warn' : 'ok', s.safeMode ? '安全模式生效中（上次未正常退出，强制直写）' : '未进入'],
+    ['熔断状态', s.panic ? 'danger' : 'ok', s.panic ? (s.healing ? '熔断中 · 自愈中（PANIC_CLEAR 曾被拒）' : '熔断中 · 已结算（可解除）') : '未熔断'],
+  ];
+  box.innerHTML = rows.map(r =>
+    `<div class="check-row"><span class="st ${r[1]}"></span><span class="cr-name">${r[0]}</span><span class="cr-ev">${r[2]}</span></div>`).join('')
+    + `<div class="check-row"><span class="st ok"></span><span class="cr-name">重复盘符枚举 ${srcTag('C3', '[C3] IDriveDisplayPolicy：重复盘符枚举显示策略（W1-3③ 未决：隐藏过期字母项 vs 升 8 项上限），RefreshDrives 枚举显示')}</span><span class="cr-ev">未发现重复盘符（当前策略：隐藏过期字母项）</span></div>`
+    + `<div class="chart-foot mt8">术语说明：Bound = 已挂栈 · Attached = 正在加速 · Panic = 熔断 · DirtyBytes = 未落盘数据 · UpperFilters = 卷过滤链配置（仅诊断页允许出现）。</div>`;
+  // IOCTL 点阵（图 #6）
+  const grid = $('#ioctl-grid');
+  grid.innerHTML = IOCTL_ITEMS.map(it => {
+    let cls = 'ok', lat = it[1], val = it[1].toFixed(1) + ' ms';
+    if(!s.connected){ cls = 'neutral'; lat = 0; val = '—'; }
+    else if(s.statsDegraded && it[1] > 3){ cls = 'warn'; }
+    else if(it[0] === 'EXIT_SAFE_MODE' && s.safeMode){ cls = 'warn'; }
+    const w = cls === 'neutral' ? 0 : clamp(lat / 8 * 24, 2, 24);
+    return `<div class="ioctl-cell ${cls}"><span class="dot"></span><span class="lat"><i style="width:${w}px"></i></span><span>${it[0].replace(/_/g, ' ')}</span><span class="num">${val}</span></div>`;
+  }).join('');
+  $('#diag-note').textContent = s.connected
+    ? '进页自动拉取驱动日志（GET_LOG）；日志按来源标签分屏对照，导出诊断包一次带走。'
+    : '驱动未连接：自检与点阵按降级呈现，导出诊断包仍可执行（含本屏信息）。';
+}
+const DRIVER_LOG = [
+  ['10:24:31.812', 'INFO', 'attach D: bound=1 mode=0 (write-through)'],
+  ['10:24:33.004', 'INFO', 'attach E: bound=1 mode=1 (write-back)'],
+  ['10:24:35.118', 'WARN', 'E: flush deferred, interval 60000ms, dirty=134217728'],
+  ['10:24:41.776', 'ERR ', 'ioctl 0x222044 timeout, retry 1/3 (GET_LOG)'],
+  ['10:24:42.201', 'INFO', 'ioctl 0x222044 ok after retry'],
+  ['10:25:02.331', 'WARN', 'stats window reset: 60 slots re-armed'],
+  ['10:25:31.664', 'INFO', 'stripe heat snapshot: hot cluster at 22-26'],
+];
+const UI_LOG = [
+  ['10:24:30.102', '驱动握手成功：Protocol 9，Build 19'],
+  ['10:24:31.940', 'D: 挂载完成（直写）'],
+  ['10:24:33.118', 'E: 挂载完成（回写）'],
+  ['10:24:33.220', '统计采样已启动（1s 轮询）'],
+  ['10:24:41.790', '驱动命令重试：GET_LOG（第一次超时）'],
+  ['10:25:02.360', '统计降级 watchdog：连续 3 轮全部卷采样失败 → Banner'],
+];
+let diagPullTimer = null;
+function pullDiagLogs(){
+  const dp = $('#log-driver'), up = $('#log-ui');
+  const sk = n => Array.from({length: n}, () => '<div class="sk sk-line" style="height:14px"></div>').join('');
+  dp.innerHTML = sk(7); up.innerHTML = sk(6);
+  clearTimeout(diagPullTimer);
+  diagPullTimer = setTimeout(() => {
+    const s = state;
+    dp.innerHTML = DRIVER_LOG.map(l =>
+      `<div class="log-line ${l[1] === 'ERR ' ? 'err' : l[1] === 'WARN' ? 'warn' : ''}"><span class="src-tag" title="来源：驱动环形日志（GET_LOG 自动拉取）">驱动</span>[${l[0]}] ${l[1]} ${l[2]}</div>`).join('');
+    up.innerHTML = UI_LOG.map(l =>
+      `<div class="log-line"><span class="src-tag" title="来源：控制台日志（LogService）">UI</span>[${l[0]}] ${l[1]}</div>`).join('')
+      + (s.connected ? '' : '<div class="log-line err"><span class="src-tag">UI</span>驱动未连接：以下日志为断开前最后拉取内容</div>');
+  }, isReduced() ? 0 : 900);
+}
+
+/* ─── 6. 交互 ─── */
+function go(page){
+  if(page === 'wizard'){ openWizard(); return; }
+  state.page = page;
+  $$('#nav .nav-item').forEach(n => n.classList.toggle('active', n.dataset.page === page));
+  $$('.page').forEach(p => p.classList.remove('active'));
+  const el = $('#page-' + page);
+  el.classList.add('active');
+  el.style.animation = 'none'; void el.offsetHeight; el.style.animation = '';
+  if(page === 'diag') pullDiagLogs();
+}
+function flipRender(container, renderFn){
+  const before = new Map();
+  $$('[data-key]', container).forEach(el => before.set(el.dataset.key, el.getBoundingClientRect().top));
+  renderFn();
+  if(isReduced()) return;
+  $$('[data-key]', container).forEach(el => {
+    const key = el.dataset.key;
+    if(!before.has(key)) return;
+    const dy = before.get(key) - el.getBoundingClientRect().top;
+    if(!dy) return;
+    el.style.transform = `translateY(${dy}px)`;
+    el.style.transition = 'none';
+    requestAnimationFrame(() => {
+      el.style.transition = `transform ${DUR.base}ms ${EASE.standard}`;
+      el.style.transform = '';
+      setTimeout(() => { el.style.transition = ''; el.style.transform = ''; }, DUR.base + 40);
+    });
+  });
+}
+function bindRollers(){
+  // 数字滚动 320ms（新第六档 · NumberRoller 专用；reduced 直显）
+  $$('[data-roll]').forEach(el => {
+    const to = parseFloat(el.dataset.roll), d = parseInt(el.dataset.dec || '1', 10);
+    const from = parseFloat(el.dataset.cur || '0');
+    if(isReduced()){ el.textContent = to.toFixed(d); el.dataset.cur = to; return; }
+    const t0 = performance.now();
+    (function frame(t){
+      if(!isFinite(t)) t = performance.now();
+      const p = Math.max(0, Math.min(1, (t - t0) / DUR.roll));   // 双向钳制：时间戳异常不外溢
+      const e = 1 - Math.pow(1 - p, 3);
+      el.textContent = (from + (to - from) * e).toFixed(d);
+      if(p < 1) requestAnimationFrame(frame); else el.dataset.cur = to;
+    })(t0);
+  });
+}
+function rollValue(el, to, dec){
+  el.dataset.roll = to; el.dataset.dec = dec; el.dataset.cur = el.dataset.cur || '0';
+  bindRollers();
+}
+function toast(msg, kind){
+  const wrap = $('#toast-wrap');
+  const icon = kind === 'danger' ? 'i-alert' : kind === 'warn' ? 'i-info' : 'i-check';
+  const t = document.createElement('div');
+  t.className = 'toast ' + (kind || '');
+  t.innerHTML = `<svg class="ic ic-14"><use href="#${icon}"/></svg><span>${msg}</span>`;
+  wrap.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('show'));
+  setTimeout(() => { t.classList.add('leaving'); t.classList.remove('show'); }, 2600);
+  setTimeout(() => t.remove(), 2900);
+}
+let modalOnClose = null;
+/* ─── V10.6 第二批：对话框基座（06 §2 C-4.1 · C-4 回写引导 / C-5 反作弊 / 文件选择框共用）─── */
+function openDialog(html, opts){
+  opts = opts || {};
+  const dlg = $('#dlg');
+  dlg.className = 'dialog' + (opts.md ? ' dialog-md' : '') + (opts.sm ? ' dialog-sm' : '') + (opts.xs ? ' dialog-xs' : '') + (opts.danger ? ' danger' : '');
+  dlg.innerHTML = html;
+  const layer = $('#dialog-layer');
+  layer.hidden = false;
+  layer.classList.remove('closing');
+  requestAnimationFrame(() => layer.classList.add('show'));
+  // 焦点策略：落取消/关闭类按钮（危险按钮不做默认焦点）；可由 opts.focus 指定
+  const focusEl = (opts.focus && $(opts.focus)) || $('#dlg-cancel') || $('#dlg-close') || $('.dlg-actions .btn');
+  if(focusEl) focusEl.focus();
+  modalOnClose = opts.onClose || null;
+  layer.onclick = e => { if(e.target === layer) closeDialog(); };
+}
+function closeDialog(){
+  const layer = $('#dialog-layer');
+  if(layer.hidden) return;
+  layer.classList.remove('show');
+  layer.classList.add('closing');
+  setTimeout(() => { layer.hidden = true; layer.classList.remove('closing'); }, isReduced() ? 0 : DUR.fast);
+  if(modalOnClose){ const fn = modalOnClose; modalOnClose = null; fn(); }
+}
+/* 三段式确认弹窗（V2 既有用法）迁到新基座，行为不变 */
+function openModal(o){
+  openDialog(`
+    <div class="dlg-title">${o.icon ? `<svg class="ic ic-14"><use href="#${o.icon}"/></svg>` : ''}${o.title}</div>
+    ${o.parts.map(p => `<div class="dlg-part"><div class="dp-k">${p[0]}</div><div class="dp-v">${p[1]}</div></div>`).join('')}
+    <div class="dlg-actions">
+      <button class="btn btn-secondary" id="dlg-cancel">${o.cancelText || '取消'}</button>
+      <button class="btn ${o.danger ? 'btn-danger' : 'btn-primary'}" id="dlg-ok">${o.confirmText || '确定'}</button>
+    </div>`, {onClose: o.onClose});
+  $('#dlg-cancel').onclick = closeDialog;
+  $('#dlg-ok').onclick = () => { closeDialog(); o.onConfirm && o.onConfirm(); };
+}
+document.addEventListener('keydown', e => {
+  if(e.key === 'Escape' && !$('#dialog-layer').hidden) closeDialog();
+});
+/* 向导（五步：认识/环境自检/选卷/选预设/完成 · F1 第三入口） */
+const WZ_STEPS = ['① 认识', '② 环境自检', '③ 选卷', '④ 选预设', '⑤ 完成'];
+const WZ_PRESET_DESC = {
+  safe:     '只读加速，写入直接落盘，最稳',
+  balanced: '读加速 + 直写，推荐大多数数据盘',
+  perf:     '读加速 + 回写，需确认掉电风险',
+};
+let wzStep = 0, wzVols = [], wzPreset = 'balanced';
+function openWizard(){
+  wzStep = 0;
+  wzPreset = 'balanced';
+  wzVols = state.vols.filter(v => !v.system).map(v => ({key: v.key, label: v.label, sel: true}));
+  const layer = $('#wizard-layer');
+  layer.hidden = false;
+  requestAnimationFrame(() => layer.classList.add('show'));
+  renderWizard();
+}
+function closeWizard(){
+  const layer = $('#wizard-layer');
+  layer.classList.remove('show');
+  setTimeout(() => { layer.hidden = true; }, DUR.base);
+}
+function renderWizard(){
+  const w = $('#wizard');
+  const steps = WZ_STEPS.map((s, i) =>
+    `<span class="${i === wzStep ? 'cur' : ''}">${s}</span>${i < WZ_STEPS.length - 1 ? '<span>→</span>' : ''}`).join('');
+  let body = '';
+  if(wzStep === 0){
+    body = `<div class="t-h1" style="margin-bottom:8px">RAMBlockCache 用内存给你的数据盘加速</div>
+      <div class="t-body dim">系统盘默认不加速（安全第一）；数据盘的选择权在你。五步之后就能看到效果。</div>
+      <div class="card mt16" style="background:var(--rbc-bg-surface)">
+        <div class="t-h3" style="color:var(--rbc-warning-fg);margin-bottom:8px">适用 / 不适用</div>
+        <div class="t-small dim">适用：数据盘的随机读写、游戏/软件二次加载、大文件顺序读——通常明显更快。<br>
+        不适用：NVMe 系统盘收益有限（盘本身已快）；持续大写场景建议保持直写。</div>
+      </div>
+      <div class="row gap8 mt16">${srcTag('D6', '[D6] 首次向导零术语重写 + 环境自检步骤（UX J1）；RerunWizard 随 W1-4 落地')}<span class="t-micro">全程零术语：只讲"加速、直写、回写、熔断"四个词</span></div>`;
+  } else if(wzStep === 1){
+    body = `<div class="t-h3" style="margin-bottom:8px">先检查一下环境</div>
+      <div class="t-small dim" style="margin-bottom:12px">检查驱动连接、权限与协议版本；系统卷会被自动识别为默认不加速。</div>
+      <div id="wz-selfcheck" class="stack gap4"></div>
+      <div class="progress indeterminate mt16" id="wz-progress"><div class="bar"></div></div>`;
+  } else if(wzStep === 2){
+    body = `<div class="t-h3" style="margin-bottom:8px">选择要加速的数据卷</div>
+      <div class="t-small dim" style="margin-bottom:12px">默认已勾选；系统盘默认不加速，之后可在加速页手动开启。</div>
+      <div class="stack gap4">${state.vols.map(v => `
+        <div class="wz-vol">
+          <label class="check" style="flex:1">
+            <input type="checkbox" ${v.system ? 'disabled' : 'checked'} data-wz-vol="${v.key}">
+            <span class="wz-letter num">${v.key}:</span>
+            <span class="wz-label">${v.label}</span>
+            <span class="wz-cap">${v.system ? '系统卷' : '固定卷'}</span>
+            ${v.system ? '<span class="badge warning" style="padding:0 8px"><span class="dot"></span>默认不加速</span>' : ''}
+          </label>
+        </div>`).join('')}</div>
+      <label class="check mt16"><input type="checkbox" checked><span>以后开机自动挂载这些卷</span></label>`;
+  } else if(wzStep === 3){
+    body = `<div class="t-h3" style="margin-bottom:8px">选一个档位</div>
+      <div class="t-small dim" style="margin-bottom:12px">之后可随时在设置页更改。</div>
+      <div class="stack gap8">${['safe', 'balanced', 'perf'].map(t => `
+        <button class="wz-preset ${wzPreset === t ? 'sel' : ''}" data-tier="${t}" data-wz-preset="${t}">
+          <span class="wz-preset-check">${wzPreset === t ? '<svg class="ic ic-14"><use href="#i-check"/></svg>' : ''}</span>
+          <span class="stack gap4" style="align-items:flex-start">
+            <span class="t-body" style="font-weight:600">${PRESET_TIERS[t].name}</span>
+            <span class="t-small dim">${WZ_PRESET_DESC[t]}</span>
+          </span>
+        </button>`).join('')}</div>
+      <div class="row gap8 mt16">${srcTag('A-9', '[A-9] F1 预设第三入口：向导选卷步后并入预设选择（一步完成「选哪些卷 + 用什么档位」）')}</div>`;
+  } else {
+    const sel = wzVols.filter(v => v.sel).map(v => v.key).join('、') || '（未选择）';
+    const modeTxt = wzPreset === 'perf' ? '回写（已确认掉电风险）' : '直写（写同时落盘，最安全）';
+    body = `<div class="t-h1" style="margin-bottom:12px">准备好了</div>
+      <div class="t-body dim">将加速：${sel}。系统盘未勾选（默认不加速）。已选档位：${PRESET_TIERS[wzPreset].name}。</div>
+      <div class="card mt16" style="background:var(--rbc-success-bg);border-color:var(--rbc-success-border)">
+        <div class="t-small" style="color:var(--rbc-success-fg)">写模式为${modeTxt}；之后可在加速页卷卡上随时更改。加速效果可在收益页查看，冷热对比可自证。</div>
+      </div>
+      <div class="t-micro mt16">提示：随时可以在设置页重跑本向导；熔断与回滚指引在应急页。</div>`;
+  }
+  const nextTxt = wzStep === 4 ? '完成' : '下一步';
+  w.innerHTML = `
+    <div class="wz-head"><div class="wz-steps">${steps}</div></div>
+    <div class="wz-body">${body}</div>
+    <div class="wz-foot">
+      <span class="t-micro">可随时在设置页重跑本向导</span>
+      <span class="spacer"></span>
+      ${wzStep > 0 ? '<button class="btn btn-secondary" id="wz-back">上一步</button>' : ''}
+      <button class="btn btn-primary" id="wz-next">${nextTxt}</button>
+    </div>`;
+  $('#wz-back') && ($('#wz-back').onclick = () => { wzStep--; renderWizard(); });
+  $('#wz-next').onclick = () => {
+    if(wzStep < 4){
+      if(wzStep === 3 && wzPreset === 'perf'){
+        // F3 触发点③：向导选性能档 → C-4 引导对话框；确认才进完成步，取消回预设步
+        const sel = wzVols.filter(v => v.sel).map(v => v.key);
+        openGuide(sel.length ? sel : state.vols.filter(v => !v.system).map(v => v.key), {
+          onConfirmed: () => { wzStep++; renderWizard(); },
+          onCancelled: () => { renderWizard(); },
+        });
+        return;
+      }
+      wzStep++; renderWizard(); if(wzStep === 1) runSelfCheck();
+    }
+    else {
+      applyPresetCore(wzPreset);          // F1 第三入口落地：向导所选档位即应用
+      renderAll(false);
+      closeWizard(); toast('向导完成：已按选择挂载并加速（mock）', 'ok'); go('status');
+    }
+  };
+  $$('[data-wz-vol]').forEach(cb => cb.onchange = () => {
+    const v = wzVols.find(x => x.key === cb.dataset.wzVol); if(v) v.sel = cb.checked;
+  });
+  $$('[data-wz-preset]').forEach(b => b.onclick = () => { wzPreset = b.dataset.wzPreset; renderWizard(); });
+}
+function runSelfCheck(){
+  const box = $('#wz-selfcheck');
+  const items = [
+    ['缓存驱动连接', '已连接 · ' + DRIVER_VER],
+    ['管理员权限', '已授权（控制设备仅允许管理员访问）'],
+    ['协议版本', '控制台 Protocol 9 = 驱动 Protocol 9'],
+    ['系统卷识别', 'C: 识别为系统卷 · 默认不加速'],
+  ];
+  box.innerHTML = items.map((it, i) =>
+    `<div class="selfcheck-row" id="scr-${i}"><span class="scr-st"><svg class="ic ic-14"><use href="#i-clock"/></svg></span><span>${it[0]}</span><span class="scr-ev">检查中…</span></div>`).join('');
+  items.forEach((it, i) => setTimeout(() => {
+    const row = $('#scr-' + i); if(!row) return;
+    row.classList.add('ok');
+    row.querySelector('.scr-st').innerHTML = '<svg class="ic ic-14"><use href="#i-check"/></svg>';
+    row.querySelector('.scr-ev').textContent = it[1];
+  }, isReduced() ? 0 : 350 * (i + 1)));
+  setTimeout(() => { const p = $('#wz-progress'); if(p) p.style.display = 'none'; }, isReduced() ? 0 : 350 * items.length + 200);
+}
+/* 应急页交互 */
+function bindEmergencyEvents(){
+  $('#btn-panic').onclick = () => openModal({
+    title: '确认一键熔断？', icon: 'i-alert', danger: true,
+    parts: [
+      ['将发生什么', '所有读写直接到盘，缓存暂停；未落盘数据由驱动继续写盘（自愈）。'],
+      ['影响与风险', '性能回落到无缓存水平；解除熔断必须等自愈完成，期间不可恢复。'],
+      ['如何撤销', '自愈完成后，点「解除熔断」即可恢复缓存；无需重启。'],
+    ],
+    confirmText: '确认熔断',
+    onConfirm: () => { $('#demo-select').value = 'panic-healing'; applyDemo('panic-healing'); toast('已熔断：所有读写直接到盘', 'danger'); },
+  });
+  $('#btn-panic-clear').onclick = () => {
+    $('#demo-select').value = 'normal'; applyDemo('normal');
+    toast('已解除熔断，缓存恢复中', 'ok');
+  };
+  $('#btn-exit-safe').onclick = () => openModal({
+    title: '确认退出安全模式？', icon: 'i-info',
+    parts: [
+      ['将发生什么', '解除强制直写，恢复你选择的写模式。'],
+      ['影响与风险', '若数据实际已受损，退出后不会再有强制直写保护。'],
+      ['如何撤销', '再次异常退出后会自动回到安全模式；也可手动一键熔断。'],
+    ],
+    confirmText: '退出安全模式',
+    onConfirm: () => { $('#demo-select').value = 'normal'; applyDemo('normal'); toast('已退出安全模式', 'ok'); },
+  });
+  $('#btn-disk-check').onclick = () => toast('（mock）已打开磁盘错误检查：chkdsk 需在重启后执行', 'warn');
+  $('#btn-flush-now').onclick = () => {
+    toast('正在回写未落盘数据…', 'warn');
+    setTimeout(() => { state.dirtyBytes = Math.max(0, state.dirtyBytes - 128 * MB); state.dirtyBase = state.dirtyBytes; renderAll(false); toast('回写完成：未落盘数据 0', 'ok'); }, 1600);
+  };
+  $('#btn-rescue').onclick = () => toast('（mock）救援卡已导出：状态 + 版本 + 自检 + 日志', 'ok');
+}
+/* 加速页交互 */
+function bindAccelEvents(){
+  $$('[data-sw]').forEach(sw => sw.onchange = () => {
+    const v = state.vols.find(x => x.key === sw.dataset.sw); if(!v) return;
+    if(sw.checked){
+      v.st = v.mode === 'back' ? 'back' : 'through';
+      state.attachedCount = state.vols.filter(x => x.st === 'through' || x.st === 'back').length;
+      state.backCount = state.vols.filter(x => x.st === 'back').length;
+      state.boundCount = Math.max(state.boundCount, state.attachedCount);
+      toast(`${v.key}: 已开启加速（${v.mode === 'back' ? '回写' : '直写'}）`, 'ok');
+    } else {
+      v.st = 'ready'; v.usedMB = 0;
+      state.attachedCount = state.vols.filter(x => x.st === 'through' || x.st === 'back').length;
+      state.backCount = state.vols.filter(x => x.st === 'back').length;
+      toast(`${v.key}: 已关闭加速（卷仍挂栈）`, 'warn');
+    }
+    renderAll(false);
+  });
+  $$('[data-optin]').forEach(b => b.onclick = () => openModal({
+    title: '手动开启系统卷加速？', icon: 'i-info',
+    parts: [
+      ['将发生什么', '系统盘 C: 也会进入缓存（默认不加速是安全第一的默认值）。'],
+      ['影响与风险', '系统盘缓存异常时可能影响系统稳定性；回写模式下未落盘数据有丢失风险。'],
+      ['如何撤销', '在加速页卷卡关闭「加速」开关即可，随时可退。'],
+    ],
+    confirmText: '开启系统卷加速',
+    onConfirm: () => {
+      const v = state.vols.find(x => x.key === 'C');
+      v.st = 'through'; v.quotaMB = 1024; v.usedMB = 210; v.hit = 61.5; v.read = 96.4; v.write = 42.1; v.served = 4.2 * GB;
+      state.attachedCount = state.vols.filter(x => x.st === 'through' || x.st === 'back').length;
+      state.boundCount = 4;
+      renderAll(false); toast('C: 已手动开启加速（直写）', 'warn');
+    },
+  }));
+  $$('[data-mode]').forEach(s => s.onchange = () => {
+    const v = state.vols.find(x => x.key === s.dataset.mode); if(!v) return;
+    const val = s.value;
+    if(val === 'back'){
+      // F3 触发点①：切「回写」→ C-4 引导对话框；确认才落盘，取消则下拉回退直写
+      openGuide([v.key], {
+        onConfirmed: () => {
+          v.mode = 'back'; if(v.st === 'through') v.st = 'back';
+          state.backCount = state.vols.filter(x => x.st === 'back').length;
+          derivePresetFromVols();
+          renderAll(false);
+          // 成功 Toast 由 openGuide 统一发（「已开启回写：{盘符}」success 语义）
+        },
+        onCancelled: () => { renderAll(false); },   // v.mode 未改，重渲染即回退直写
+      });
+      return;
+    }
+    if(val !== 'global'){
+      v.mode = val;
+      if(v.st === 'back' && v.mode === 'through') v.st = 'through';
+      if(v.st === 'through' && v.mode === 'back') v.st = 'back';
+    }
+    state.backCount = state.vols.filter(x => x.st === 'back').length;
+    derivePresetFromVols();
+    renderAll(false);
+    toast(`${v.key}: 写模式 → ${val === 'through' ? '直写（最安全）' : '跟随全局设置'}`, 'ok');
+  });
+  $$('[data-quota]').forEach(s => s.oninput = () => {
+    const v = state.vols.find(x => x.key === s.dataset.quota); if(!v) return;
+    v.quotaMB = parseInt(s.value, 10);
+    s.parentElement.querySelector('.num').textContent = fmtBytes(v.quotaMB * MB);
+  });
+  $$('[data-ra]').forEach(s => s.onchange = () => {
+    const v = state.vols.find(x => x.key === s.dataset.ra); if(!v) return;
+    v.ra = parseInt(s.value, 10);
+    markPresetCustom('每卷预读窗口', s.value === '0' ? '关闭' : s.value + ' MB');   // 手改受管项 → 自定义（单位口径见开放决策 D-7）
+    toast(`${v.key}: 预读窗口 → ${s.value === '0' ? '关闭' : s.value + ' MB'}`, 'ok');
+  });
+  $$('[data-act]').forEach(b => b.onclick = () => {
+    const v = state.vols.find(x => x.key === b.dataset.key); if(!v) return;
+    if(b.dataset.act === 'flush'){
+      toast(`${v.key}: 正在回写未落盘数据…`, 'warn');
+      setTimeout(() => { state.dirtyBytes = Math.max(0, state.dirtyBytes - 64 * MB); state.dirtyBase = state.dirtyBytes; renderAll(false); toast(`${v.key}: 回写完成`, 'ok'); }, 1400);
+    } else {
+      v.st = 'ready'; v.usedMB = 0;
+      state.attachedCount = state.vols.filter(x => x.st === 'through' || x.st === 'back').length;
+      state.backCount = state.vols.filter(x => x.st === 'back').length;
+      renderAll(false); toast(`${v.key}: 已卸载（脏数据已回写）`, 'ok');
+    }
+  });
+  $('#btn-refresh-drives').onclick = () => { flipRender($('#accel-body'), renderAccelPage); toast('卷列表已刷新', 'ok'); };
+  /* V10.6：预设来源 chip（C-2）→ 跳设置页 + 预设 ComboBox 获键盘焦点（06 C-2.4：不做高亮闪烁动画） */
+  $$('[data-preset-src]').forEach(c => c.onclick = () => {
+    go('settings');
+    const sel = $('#preset-select');
+    if(sel) sel.focus();
+  });
+}
+/* 设置页交互 */
+function bindSettingsEvents(){
+  $('#set-motion').onchange = e => { reduceMode = e.target.value; applyMotionMode(); toast('动效设置已当期生效（对应 WPF Motion.IsReducedMotion 实时求值）', 'ok'); };
+  $('#set-telemetry').onchange = e => {
+    $('#telemetry-status').textContent = e.target.checked
+      ? '已开启意愿记录；采集实现随 W1-1 波次上线（上线前不会有任何数据离开本机）'
+      : '关闭（默认）：不采集、不上传任何数据';
+  };
+  $('#set-autostart').onchange = e => toast(`开机自动随卷挂载 → ${e.target.checked ? '开' : '关'}（settings.json 已保存）`, 'ok');
+  $('#set-launchonboot').onchange = e => toast(`随 Windows 启动本控制台 → ${e.target.checked ? '开' : '关'}（Run 键已更新）`, 'ok');
+  $('#set-prefetch').onchange = e => { markPresetCustom('读预取总开关', e.target.checked ? '开' : '关'); toast(`顺序读预取 → ${e.target.checked ? '开' : '关'}（写注册表并 REFRESH，启用前经 C5 前置校验）`, e.target.checked ? 'warn' : 'ok'); };
+  $('#set-defaultexcl').onchange = e => toast(`内置排除名单 → ${e.target.checked ? '开' : '关'}`, 'ok');
+  /* C-7 电源五态演示开关（05 F3 验收#1：台式机/笔记本/低电量/未知/读取中可构造） */
+  $('#power-demo-select').onchange = e => {
+    const val = e.target.value;
+    state.powerLoading = val === 'loading';
+    if(val !== 'loading') state.powerState = val;
+    renderAll(false);
+    toast('电源演示态 → ' + e.target.options[e.target.selectedIndex].text, 'ok');
+  };
+  $('#btn-l2-enable').onclick = () => openModal({
+    title: '启用 L2 持久缓存？', icon: 'i-info',
+    parts: [
+      ['将发生什么', `将在 ${$('#l2-letter').value} 创建 RAMBoostL2.bin（${$('#l2-size-val').textContent}），该空间被缓存专用。`],
+      ['影响与风险', '删除缓存 = 删除该文件；容器空间不可逆。'],
+      ['如何撤销', '点「关闭 L2」停止写入新数据，已写入内容由驱动保存索引。'],
+    ],
+    confirmText: '启用 L2',
+    onConfirm: () => { $('#l2-state-badge').innerHTML = '<span class="dot"></span>已启用'; $('#l2-state-badge').className = 'badge success'; markPresetCustom('L2 持久缓存', '开'); toast('L2 配置已生效，容器由驱动在首次 I/O 时创建', 'ok'); },
+  });
+  $('#btn-l2-disable').onclick = () => { $('#l2-state-badge').innerHTML = '<span class="dot"></span>已关闭'; $('#l2-state-badge').className = 'badge neutral'; markPresetCustom('L2 持久缓存', '关'); toast('L2 已关闭：停止写入新数据，容器文件保留', 'warn'); };
+  $('#l2-size').oninput = e => { $('#l2-size-val').textContent = e.target.value + ' GB'; };
+  $('#set-flush').onchange = e => {
+    const descs = ['每 10 秒自动回写', '每 30 秒自动回写', '每 60 秒自动回写', '每 5 分钟自动回写', '无限（仅立即回写/卸载/关机落盘）'];
+    $('#flush-desc').textContent = descs[e.target.selectedIndex];
+    markPresetCustom('回写周期', e.target.value.replace('（默认）', ''));
+    toast('回写周期已下发（SET_CONFIG 回读校正）', 'ok');
+  };
+  $('#btn-save-exclude').onclick = () => toast('排除名单已保存（MULTI_SZ 已更新）', 'ok');
+}
+/* 数据来源图例 */
+const SRC_LEGEND = [
+  ['A', '已有数据地基，缺 UI 接线', [
+    ['A1', '命中率趋势图：StatsService 秒级采样 → HitPct（瞬时）；缺 60×5s 历史环形缓冲'],
+    ['A2', '读写吞吐双线：ReadMbps/WriteMbps（瞬时）；缺序列缓冲 + 图表接线'],
+    ['A3', '缓存占用环（全局）：每卷 CacheUsedBytes/CacheBytesTotal；缺全局 used/total 结构化属性（拆 CacheText）'],
+    ['A4', '写模式构成分段条：Drives 集合 Mode 字段 · 纯 UI 派生'],
+    ['A5', 'IOCTL 通道健康点阵：DriverService 调用点；缺统一调用记录点（消息号/结果/耗时/时间戳）'],
+    ['A6', '省下磁盘读：ServedText（BUG3 已落地）；缺结构化属性 + 呈现接线'],
+  ]],
+  ['B', '缺字段/协议面，需与驱动侧核对', [
+    ['B1', '64 分片吞吐热力：Stripe[64].Throughput；RB_STATS 是否已有未知，无则新协议面'],
+    ['B2', '未落盘/已确认丢失堆叠条：DirtyBytes 已有；LostDirtyBytes 存在性待确认'],
+    ['B3', '平均延迟对比（收益页"若可得"）：延迟类统计字段，可选'],
+    ['B4', '全局内存预算控件（AutoUsePct/MemReserveMB）：GET_CONFIG 暴露待确认'],
+  ]],
+  ['C', '缺接口（随消费方一起重建）', [
+    ['C1', 'IOperationProgress：卸载/回写/自愈 >1s 动作的进度可见'],
+    ['C2', 'IL2RecoveryReporter：L2 掉电恢复重建事件 UI 可见'],
+    ['C3', 'IDriveDisplayPolicy：重复盘符枚举显示策略（未决）'],
+    ['C4', 'ISystemVolumeOptIn：系统卷 opt-in 确认流'],
+    ['C5', 'IPrefetchGate：预取激活前置条件门'],
+  ]],
+  ['D', '缺整块实现面', [
+    ['D1', '每卷写模式/配额持久化（settings.json 无每卷键，重启重置）'],
+    ['D2', '诊断页整页（自检 + 版本单轨 + 导出诊断包）'],
+    ['D3', '卸载入口（停止加速→回写→移 UpperFilters→提示重启）'],
+    ['D4', '应急页整页（熔断护栏/解除置灰/丢失核对/回滚/救援卡）'],
+    ['D5', 'Toast 命令反馈面（进 180ms / 出 120ms 重建）'],
+    ['D6', '首次向导零术语重写 + 环境自检步骤'],
+  ]],
+];
+function openLegend(){
+  const parts = SRC_LEGEND.map(g =>
+    `<div class="dlg-part"><div class="dp-k">${g[0]} 类 · ${g[1]}</div><div class="dp-v" style="font-size:12px;line-height:1.8">${g[2].map(i => `<span class="src-tag" style="margin-right:4px">${i[0]}</span>${i[1]}<br>`).join('')}</div></div>`).join('');
+  openModal({title: '数据来源图例（21 项接口缺口 · 前端等什么后端）', icon: 'i-info', parts,
+    confirmText: '知道了', cancelText: '关闭',
+    onConfirm: () => {}, onClose: () => {}});
+}
+/* ─── 7. 初始化 ─── */
+function init(){
+  applyMotionMode();
+  mq.addEventListener && mq.addEventListener('change', () => { if(reduceMode === 'auto') applyMotionMode(); });
+  state.vols = baseVols();
+  derive();
+  derivePresetFromVols();   // V2 基底数据 E: 为回写 → 默认即偏离均衡（F1：手改受管项 → 自定义）
+  buildPresetCard();          // V10.6：场景预设卡骨架（C-1）先建，再进 renderAll → renderSettings
+  renderAll(true);
+  go('status');
+  // 状态条段点击路由（T3.5 新映射：驱动→诊断、挂栈→加速、加速→状态、风险→应急）
+  $$('.seg.clickable').forEach(s => s.onclick = () => go(s.dataset.goto));
+  // 导航
+  $$('#nav .nav-item').forEach(n => n.onclick = () => go(n.dataset.page));
+  $('#btn-legend').onclick = openLegend;
+  $('#btn-export-diag').onclick = () => toast('（mock）诊断包已导出：状态 + 版本 + 自检 + 双来源日志', 'ok');
+  $('#btn-rerun-wizard').onclick = openWizard;
+  $('#btn-uninstall').onclick = () => openModal({
+    title: '确认卸载 RAMBlockCache？', icon: 'i-alert', danger: true,
+    parts: [
+      ['将发生什么', '停止全部加速 → 回写脏数据 → 移除本程序的卷过滤链配置（保留第三方过滤驱动）→ 提示重启。'],
+      ['影响与风险', '卸载过程中请勿强制关机；其他软件的过滤驱动项会被保留，不误删。'],
+      ['如何撤销', '重新运行同一版本安装包即可恢复；缓存内容随卸载清空。'],
+    ],
+    confirmText: '开始卸载',
+    onConfirm: () => toast('（mock）卸载向导随 D3 波次交付', 'warn'),
+  });
+  $('#demo-select').onchange = e => { applyDemo(e.target.value); };
+  bindSettingsEvents();
+  // 1s 轮询（对齐 StatsService 采样节奏）：轻量抖动 + 数字滚动 + 目标化更新
+  // 图表重绘限流 ≤1 次/秒：tick 内不重绘大图，只更新文本/进度/环形偏移/sparkline 由用户操作触发
+  setInterval(() => {
+    const s = state;
+    if(!s.connected || s.statsDegraded) return;
+    const rnd = mulberry32(Date.now() & 0xffff);
+    s.vols.forEach(v => {
+      if(v.st === 'through' || v.st === 'back'){
+        // 围绕基准值抖动（均值回复，有界）：不随机游走，避免长时间运行漂移
+        v.read = clamp(v.readBase * (0.92 + rnd() * 0.16), 8, 1200);
+        v.write = clamp(v.writeBase * (0.92 + rnd() * 0.16), 0, 900);
+        v.hit = clamp(v.hitBase + (rnd() - .5) * 1.2, 30, 99);
+        v.usedMB = clamp(v.usedBase + (rnd() - .5) * 16, 1, v.quotaMB);
+      }
+    });
+    const att = s.vols.filter(v => v.st === 'through' || v.st === 'back');
+    s.avgHit = att.length ? att.reduce((a, v) => a + v.hit, 0) / att.length : 0;
+    s.servedBytes += rnd() * 2 * MB;
+    s.cacheUsedBytes = att.reduce((a, v) => a + v.usedMB * MB, 0);
+    s.cacheCapBytes = s.vols.reduce((a, v) => a + v.quotaMB * MB, 0);
+    if(s.vols.some(v => v.st === 'back')) s.dirtyBytes = clamp(s.dirtyBase + (rnd() - .5) * 32 * MB, 0, 2 * GB);
+    derive();
+    renderStatusbar(); renderBanner(); renderNav();
+    // 状态页：数字滚动（320ms 专用档）+ 卷行不动（避免每秒 FLIP）
+    if(s.page === 'status'){
+      const hit = $('#kpi-hit'); if(hit) rollValue(hit, s.avgHit, 1);
+      const sv = $('#kpi-served'); if(sv) rollValue(sv, s.servedBytes / GB, 1);
+    }
+    // 加速页：目标化更新指标文本与进度条（scaleX 过渡 180ms）
+    if(s.page === 'accel'){
+      s.vols.forEach(v => {
+        const r = $('#m-read-' + v.key), w = $('#m-write-' + v.key), h = $('#m-hit-' + v.key);
+        if(r) r.textContent = v.read ? v.read.toFixed(1) : '—';
+        if(w) w.textContent = v.write ? v.write.toFixed(1) : '—';
+        if(h) h.textContent = v.hit ? v.hit.toFixed(1) : '—';
+        const u = $('#m-used-' + v.key);
+        if(u) u.textContent = `已用 ${fmtBytes(v.usedMB * MB)} / 配额 ${fmtBytes(v.quotaMB * MB)}`;
+        const bar = $('#m-bar-' + v.key);
+        if(bar) bar.style.transform = `scaleX(${clamp(v.usedMB / v.quotaMB, 0, 1).toFixed(3)})`;
+      });
+    }
+    // 收益页：一级数字 + 环形偏移
+    if(s.page === 'earnings'){
+      const eh = $('#ek-hit'); if(eh) rollValue(eh, s.avgHit, 1);
+      const es = $('#ek-served'); if(es) rollValue(es, s.servedBytes / GB, 1);
+      const ec = $('#ek-cache'); if(ec) ec.textContent = fmtBytes(s.cacheUsedBytes);
+      const rf = $('#earnings-ring-fill');
+      if(rf){ const c = 2 * Math.PI * 75; rf.style.strokeDashoffset = (c * (1 - clamp(s.cacheUsedBytes / s.cacheCapBytes, 0, 1))).toFixed(1); }
+      const rv = $('#earnings-ring-val'); if(rv) rv.textContent = fmtBytes(s.cacheUsedBytes);
+      const rb = $('#earnings-ring-badge'); if(rb) rb.textContent = '已用 ' + (s.cacheUsedBytes / s.cacheCapBytes * 100).toFixed(0) + '%';
+    }
+  }, 1000);
+}
+document.addEventListener('DOMContentLoaded', init);
+window.__proto = Object.assign(window.__proto || {}, {go, toast, openModal, openGuide, openWizard, applyDemo});
+})();
+</script>
+</body>
+</html>

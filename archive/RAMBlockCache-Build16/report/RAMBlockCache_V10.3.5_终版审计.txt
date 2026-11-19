@@ -1,0 +1,4532 @@
+================================================================================
+RAMBlockCache（RAMBoostFS-V8）终版专业审计报告
+================================================================================
+报告编号  : RB-Rev-FINAL-V10.4.2
+驱动版本  : Build 18（common/version.h 唯一事实来源：
+            MAJOR=10 / MINOR=3 / PATCH=4 / BUILD=18）
+控制器版本: V10.4.2（ui/controller/RAMBlockCache.Controller，FIX-4 版本钉死+退避策略）
+协议版本  : Protocol = 9（IOCTL 基址 0x222000，双侧契约在 driver/rb_common2.h/rbctl.c）
+目标系统  : Windows 10/11 x64（Win11 26H2 真机基线）
+审计日期  : 2026-10-14
+审计范围  : V10.3.4 Build 15 全量 + V10.3.5 cleanup（5 commits）+ wiring guard
+          （rb_wiring.h / check_repo.py / sign_all.cmd）+ Build 16 多核统计与绑核
+          （5 个新 common 头 + RbWbStop BSOD 级修复 + worker 绑核 +
+          core per-cpu flush 统计 + evict_victim 锁序修正）+ Build 17
+          C 盘缓存解锁（移除 RbAttachVolumeByLetter 系统卷/引导关键 PDO 拒绝闸门）
+          + V10.4.0 控制器全量重写（新 ui/controller 工程，9 个 bug 修复，
+          Win11 Fluent 深色 5 页 UI，协议适配真实 IOCTL 0x222000）
+签名指纹  : RAMBlockCache.sys 93,408 字节（签名后），
+            SHA256 = D8639DDE015DBE64384B9EEAE2869A794AB0EC2CF2FF644D4B7F222EB7FA5A11
+            （证书 CN=RAMBoostFS Root，SHA1=DF1A0ADA2F2CD6E5778EA937C079CB0A035BA431，
+            有效期至 2126；纯本地自签，无时间戳，依赖 testsigning ON）
+
+================================================================================
+第 1 章  执行摘要（结论先行）
+================================================================================
+结论：V10.4.2 在 V10.4.1 基础上修 4 个 FIX：FIX-1 version.h 单一来源确认（Build 17→18）；
+FIX-2 rb_ioctl.h C_ASSERT 跳过（工程里无 rb_ioctl.h，IOCTL 定义在 driver/rb_common2.h/rbctl.c）；
+FIX-3 attach 串行锁落地在 driver/rbattach.c（s_AttachMutex FastMutex，RbAttachVolumeByLetter
+全程持锁单出口，DriverEntry 调 RbAttachLockInit()）；FIX-4 控制器 DriverService.cs 版本钉死
+校验（协议≠9 立即拒绝）+ 确定性拒绝（0x5/负 NTSTATUS 不重试，只对 170/2 退避）+
+标题栏显示真实驱动版本。驱动编译 0 警告 0 错误，sys 93,408B，Release/ASan/压力/counter
+全过，check_repo PASS。控制器 0 错 0 警，154.2MB，实测握手成功、D 卷 0x5 一次即停
+不再重试、E/F 挂载成功。当前 DeploySeq=11、FilterArmed=1，待重启。
+
+核心结论：
+· Build 17 变更：rbattach.c RbAttachVolumeByLetter 删除
+  `IsSystem || Letter==SystemDriveLetter` 和 `RbIsBootCriticalPdo` 两个 ACCESS_DENIED
+  分支，允许缓存 C: 系统卷。保留 panic 拒绝、L2 卷保护（RbFeatRefuseLetter）、
+  几何失败拒绝。
+· 安全兜底：boot_guard.ps1 / offline_rollback.cmd 三重回滚仍在——缓存 C: 导致
+  开不了机时自动摘 UpperFilters。
+· Build 16 多核基础设施全部保持：5 个新 common 头（per-cpu/shard/alloc/
+  threadsched/shardlock）、RbWbStop BSOD 级重写、worker 绑核、core per-cpu
+  flush 统计、evict_victim 锁序修正。
+· wiring guard（RB_WIRED_WBCOAL=0 / RB_WIRED_L2_ON_EVICT=0）保持；互斥 #error。
+· check_repo.py 6 项门禁 PASS 0 fail 0 warn。
+· 当前部署状态：DeploySeq=10、FilterArmed=1（armed 状态，待重启验证 C 盘缓存）。
+
+================================================================================
+第 2 章  全代码清单（每个文件的角色）
+================================================================================
+--- 驱动层（driver/）---
+rb_common.h       公共头：Build 16（引用 RB_VERSION_BUILD）、RB_DEV_EXT 结构、
+                  RB_IOWORKER Stage/StageCap + AuxGa/AuxValid（绑核目标）、
+                  RB_GLOB IoCtxLa、RbRegQueryValue/SetValue 规范声明、rb_common2.h include。
+rb_common2.h      特性层公共头：RB2F_* 标志位（PREFETCH/HOT/L2/WBCOAL/THERMAL/ETW）、
+                  RB_STATS2 结构（含 WbQueued/WbDone/WbThrottled/HotZones）、
+                  新原型（RbThermal*/RbEtw*/RbL2Periodic/RbCrcInit/RbHotCount/Rb2VolRead）。
+rbdriver.c       驱动入口：DriverEntry（RB_VERSION_WSTRING 日志）、RbGetExt Magic 哨兵、
+                  IoCtxLa init/delete、RbRegGetDW/SetDW/QueryValue/SetValue 通用原语
+                  （ZwOpenKey/ZwQueryValueKey 唯一实现点）、RbBootFailLoad/RbSafeModeLoad
+                  健康闩锁、RbSetPanic/RbBootFailLoad 自断环。
+rbattach.c       挂卷栈：RbAddDevice 极简化（挂载前挂栈默认透传）、RbPnpStartComplete
+                  几何工作项、RbAttachVolumeByLetter/RbDetachVolumeByLetter（Refs≤1
+                  60s 排空）、RbVolumeEnumerateAll 持引用快照、RbSendSyncIoctl 导出、
+                  RbVolumeRemove 含 RB_WIRED_WBCOAL 守卫、RbReadRegValue 薄转发。
+rbio.c           I/O 路径：RbDispatchReadWrite/Flush、RbReadWorker/RbWriteWorker/
+                  RbFlushIrpWorker、RbCtxAlloc/Free lookaside、RbStageGet/Put staging
+                  复用、RbFeatAdmit 写路径、RbSyncIo 同步助手、RbStartIoWorkers
+                  一次性选物理核绑核、RbIoWorkerLoop 入口 RbBindCurrentThreadToTarget。
+rbfeat.c         特性中枢：RbFeatInit/Shutdown/OnHit/OnMiss/OnRead/OnEvict、
+                  s_Cnt[14][SHARDS] 分片计数、Rb2Tick 1s 轮询（Thermal 5s/L2 60s）、
+                  Rb2Query/Rb2GetDW/RbPolGetFor/Rb2LoadExcl 走注册表原语、Rb2VolRead
+                  真预热。
+rbpref.c         顺序预取：RbPrefStream 链式判定（上次结束==本次起始）、RbPrefIssue
+                  引用对称、8MB 分片、在飞上限 8、每流 2s 冷却、POL-1 策略 10s 缓存。
+rbhot.c          热区指纹：RbHotTrack/Decay/Count/Snapshot/Prewarm、Rb2VolRead 调用。
+rbL2.c           SSD L2 v2：16B 记录头 + CRC32 + 索引持久化 RAMBoostL2.idx、
+                  RbL2ProbeFill 四闸门 + 跨槽拒绝、RbL2Store 只收整块。
+rbwback.c        写合并后台（未接线）：RbWbInit/Stop/Thread、计数槽 10/11/12；
+                  RbWbStop BSOD 级重写（幂等 + 唤醒 + 等退出 + 60s 兜底 + drain）。
+rbio_ports.c     端口适配：Rb2_PortFill 回填缓存、Rb2_PortShrink 真收缩。
+rbthermal.c      SSD 温度护栏：RbThermalNote/PrefBlocked/Tick，68C/58C 滞回。
+rbetw.c          ETW 落地：RbEtwEnsure/Shutdown/Hit/Miss，CAS 幂等懒注册。
+ctl/ramboostctl.c  用户态控制：panic/panic-clear/attach/detach/stats 等子命令。
+ctl/rbfeatctl.c    特性层控制：stats/flags/refresh/shrink/snapshot/l2/watch 子命令。
+setup/ramboostsetup.c 安装器：CreateService/ChangeServiceConfig BOOT_START/Group。
+
+--- core 层（core/）---
+cache.c          缓存引擎：dseq/sflush/zflush/flush_pass 协议、g_ev #if 包裹、
+                  parflush_stub.c 同编译单元 include、RB_WIRED_L2_ON_EVICT 守卫、
+                  RB_FLUSH_COUNTERS per-cpu 统计（64B 对齐）、evict_victim 锁内摘链
+                  锁外回调。
+cache_int.h      core 内部头。
+usertest/parflush_stub.h+.c  测试专用并行 flush（从 cache.c 迁出）。
+
+--- 公共头（common/，Build 16 新增 5 个）---
+version.h        唯一版本事实来源（10.3.4.16）。
+rb_wiring.h      接线总表（RB_WIRED_WBCOAL=0 / RB_WIRED_L2_ON_EVICT=0 / 互斥 #error）。
+rb_percpu.h      每逻辑核统计（3849B）：64B 缓存行隔离，API=RbPcpuFlattenIndex/
+                  Alloc/Free/Inc/Add/Read/Reset；RB_PCPU_MAX=256；
+                  MAXIMUM_PROCESSORS_PER_GROUP 本地适配为 64 兜底。
+rb_shard.h       分片锁池（2880B）：2 的幂片数，mask 取片，AtDpc 变体。
+rb_alloc.h       统一池宏（498B）：RB_ALLOC/RB_FREE，Win10 2004+ ExAllocatePool2。
+rb_threadsched.h 绑核（4341B）：RbPickAuxTargets/RbBindCurrentThreadToTarget，
+                  HT 物理核避让绑核，拓扑不可得不阻断。
+rb_shardlock.h   64 片锁模板（1635B）：指针哈希选片。
+
+--- 脚本 / 文档 ---
+scripts/check_repo.py  6 项门禁脚本（PASS 0 fail 0 warn）。
+scripts/gen_version.ps1 从 version.h 生成 ui/wpf/Version.cs。
+sign_all.cmd       签名脚本（for /f 从 version.h 读版本号）。
+docs/ARCHITECTURE.md  架构文档（顶部"事实修正"段）。
+
+--- GUI 控制面板（ui/wpf/，.NET 8 WPF）---
+App.xaml(.cs)      WPF 应用入口（DI + 导航）。
+MainWindow.xaml(.cs) 主窗口（TabControl：Dashboard/Volumes/Memory/Security/Log）。
+RamBoostFS.Wpf.csproj  项目文件（net8.0-windows, UseWPF, requireAdministrator）。
+Views/DashboardView.*  实时统计卡（命中/冷/热/吞吐/动态内存）。
+Views/VolumesView.*     卷列表打勾（attach/detach + 读写开关 + 写模式）。
+Views/MemoryView.*      内存面板（动态占用 + LineChart 多核吞吐图）。
+Views/SecurityView.*    安全面板（panic/self-断环/safe mode 状态）。
+Views/LogView.*         日志面板（驱动日志滚动）。
+Native/RbClient.cs      主通道（CreateFileW → DeviceIoControl）。
+Native/NativeMethods.cs P/Invoke 声明。
+Native/MockRbClient.cs  离线 mock（无驱动时 UI 不崩）。
+Models/RbProto.cs       协议结构（RbStats/RbConfig/RbVolumeList/RbLogList/RbVersion）。
+ViewModels/RbSession.cs 会话封装（IRbClient + 轮询定时器）。
+Controls/LineChart.xaml  多核吞吐折线图控件。
+Controls/RbToggleSwitch.xaml  开关控件。
+Controls/StripeGrid.xaml  条带网格控件。
+Themes/Colors.xaml / Controls.xaml  主题。
+Properties/app.manifest  requireAdministrator + PerMonitorV2 DPI。
+
+================================================================================
+第 3 章  GUI 控制面板（V10.4.1 整目录重写 + 旧 WPF 保留）
+================================================================================
+3.1 新控制器工程（ui/controller/RAMBlockCache.Controller/，V10.4.1）
+  旧 ui/wpf/ 保留未动；新工程 18 个源文件（排除 obj/bin）：
+  App.xaml(.cs)        WPF 应用入口。
+  MainWindow.xaml(.cs) 主窗口（横幅+卷卡片列表+日志窗）。
+  RAMBlockCache.Controller.csproj  项目文件（net8.0-windows, UseWPF）。
+  app.manifest        requireAdministrator。
+  Theme/Dark.xaml     Win11 Fluent 深色主题。
+  Models/Models.cs        协议结构（双侧 Pack=8，对齐 common/rb_ioctl.h）。
+  Models/DriverException.cs  Win32 错误中文文案异常。
+  Services/DriverService.cs  传输层（CreateFileW + DeviceIoControl 单例 SafeFileHandle）。
+  Services/StatsService.cs   统计轮询（PeriodicTimer 1s，Δ/Δt+回绕重同步）。
+  Services/SettingsService.cs 设置 JSON 持久化。
+  Services/LogService.cs      环形日志落盘 ProgramData。
+  Services/SystemService.cs   管理员预检/系统信息。
+  ViewModels/MainViewModel.cs  主 VM。
+  ViewModels/DriveItemViewModel.cs  每卷卡片 VM（Mounted 回写）。
+  Helpers/RelayCommand.cs    重入保护命令。
+  Controls/Sparkline.cs       30 样本固定容量环形缓冲。
+
+3.2 技术栈
+  .NET 8 WPF（net8.0-windows），UseWPF=true，MVVM（MainViewModel/DriveItemViewModel），
+  自包含 win-x64 单文件 154.2MB。
+
+3.3 界面功能（Win11 Fluent 深色）
+  · 顶部横幅：连接状态灯（绿=已连接）、协议版本、缓存用量（2MB/39.7GB）。
+  · 卷卡片列表：每卷一张卡片（盘符/容量/Mounted 开关/写模式/配额），ToggleSwitch
+    打勾=mount/unmount。
+  · 单值 Sparkline：30 样本环形缓冲折线图（全局速率）。
+  · 日志窗：底部滚动日志（LogService 环形落盘 ProgramData）。
+
+3.4 传输层适配真实协议（common/rb_ioctl.h 双侧唯一契约）
+  DriverService.cs：CreateFileW("\\.\RAMBlockCache", access=0, OPEN_EXISTING) →
+  单例 SafeFileHandle（Dispose 关句柄）→ 单一 DeviceIoControl(0x222000, METHOD_BUFFERED)，
+  RB_MSG.Type 分发：
+    Type=0x222000 GET_VERSION / 0x222004 MOUNT / 0x222008 UNMOUNT /
+    0x22200C GET_STATS / 0x222010 SET_QUOTA / 0x222014 FLUSH /
+    0x222018 PAUSE / 0x22201C RESUME / 0x222020 SET_MODE。
+  双侧 Pack=8 + ULONGLONG DeviceKey（盘符编码替代 FNV，避免 64→32 截断）。
+  连不上时 EnsureConnected 抛 DriverException（中文文案），UI 降级为"驱动未连接"。
+  ERROR_BUSY 时 3 次指数退避（300/600/900ms）。
+
+3.5 打勾=mount/unmount 映射关系
+  卷卡片 ToggleSwitch → DriveItemViewModel.Mounted →
+  DriverService Mount(letter, true/false) → RB_IOCTL_MOUNT(0x222004) /
+  UNMOUNT(0x222008) → 驱动 RbAttachVolumeByLetter/RbDetachVolumeByLetter。
+  Build 17 后 C: 系统卷也可打勾（RbAttachVolumeByLetter 已移除系统卷拒绝闸门）。
+
+3.6 V10.4.1 修复的 13 项审计问题（A1~A8/C1~C3/C5/D1/D2）
+  详见第 5 章 BUG 台账 B17-02~13（含 V10.4.0 9 项 + V10.4.1 4 项）。
+
+3.7 旧 WPF 工程（ui/wpf/，保留未动）
+  旧 ui/wpf/ 仍在（DashboardView/VolumesView/MemoryView/SecurityView/LogView），
+  作为参考实现保留；新 ui/controller/ 为正式控制器。两者共享同一协议
+  （IOCTL 0x222000 + RB_MSG.Type 分发）。
+
+3.8 已知限制
+  · 需管理员运行（app.manifest requireAdministrator + SystemService.IsElevated 预检）。
+  · Safe Mode 显示"未连接"（驱动不挂栈，UI 不崩）。
+  · per-volume 命中率驱动未提供：控制器行内速率为全局映射（非每盘独立命中率）。
+  · 自动挂载并发时 D 卷瞬时拒绝访问已退避（300/600/900ms 指数退避）。
+  · C 卷按系统卷跳过自动挂（手动可挂）——自动挂载逻辑对 C: 跳过，用户手动
+    打勾仍可缓存 C:（Build 17 已移除拒绝闸门）。
+  · 自包含 154.2MB（win-x64 single-file），首次启动 JIT 有冷启动延迟。
+  · UI 不做 DSE 欺骗/不做内核提权绕过，纯用户态 DeviceIoControl。
+
+================================================================================
+第 4 章  全功能清单 F1~F12（默认开关 + 接线状态）
+================================================================================
+F1  基础卷缓存（挂载前挂栈 + 三重闸门 + write-through 默认）
+    默认开关：始终开（不可关）。接线状态：已接线（真机冒烟 F attached=1）。
+F2  BOOT_START 安全挂栈（卷类 UpperFilters=[volsnap,RAMBlockCache]）
+    默认开关：始终开。接线状态：已接线（真机连续重启无 0x7B）。
+F3  自断环（armed && fails>=1 → AddDevice 直接 return 不挂栈）
+    默认开关：部署时 armed=1，logon 后 FilterArmed=0。接线状态：已接线（健康闩锁）。
+F4  PREFETCH 顺序预取（PREF-1/2/3 修复）
+    默认开关：Features\Flags 位 PREFETCH（默认 OFF）。接线状态：已接线（代码在位，
+    真机未开；接手人下轮 rbfeatctl flags on PREFETCH → watch 应见 pref/fillOK>0）。
+F5  HOT 热区预热
+    默认开关：Features\Flags 位 HOT（默认 OFF）。接线状态：已接线（Rb2VolRead 真预热）。
+F6  THERMAL 温度护栏
+    默认开关：Features\Flags 位 THERMAL（默认 OFF）。接线状态：已接线（rbthermal.c）。
+F7  ETW 事件
+    默认开关：Features\Flags 位 ETW（默认 OFF）。接线状态：已接线（rbetw.c）。
+F8  SHRINK 真收缩（MEMGUARD 链路闭环）
+    默认开关：rbfeatctl shrink <pct> 用户态触发。接线状态：已接线（Rb2_PortShrink
+    真实现，非桩）。
+F9  AUTATTACH 自动挂卷
+    默认开关：注册表 AutoAttach=1（默认 0）。接线状态：已接线（几何完成后自动 attach）。
+F10 L2 / WBCOAL（未接线，wiring guard 强制 OFF）
+    默认开关：RB_WIRED_WBCOAL=0 / RB_WIRED_L2_ON_EVICT=0（构建期剔除）。
+    接线状态：未接线——L2 数据来源需 core 淘汰点调 RbFeatOnEvict（宏=0 剔除）；
+    WBCOAL 需 RbWbInit/Stop 接挂载/停机（宏=0 剔除）。rbfeatctl 拦截开启。
+F11 per-cpu flush 统计（Build 16 新增）
+    默认开关：始终开（内核 percpu / 用户态全局回退）。接线状态：已接线（core/cache.c
+    RB_FLUSH_COUNTERS 64B 对齐）。zflush_cnt/flush_active/dseq[] 是同步原语未转
+    percpu（避免破坏正确性）。
+F12 worker 绑核（Build 16 新增）
+    默认开关：始终开（拓扑可得时绑核，不可得回退 RbPinToCpu 不阻断）。接线状态：
+    已接线（RB_IOWORKER AuxGa/AuxValid；RbStartIoWorkers 一次性 RbPickAuxTargets
+    选 n 个不同物理核；RbIoWorkerLoop 入口 RbBindCurrentThreadToTarget）。
+
+================================================================================
+第 5 章  全 BUG 台账（P现象 · D根因 · R修复 · E证据）
+================================================================================
+--- 历史沿用（V10.1/V10.2/V10.3.3/V10.3.4，本轮未破坏）---
+
+[CROSS-1] rb_send 应答 memset 连带清零待发送 Data，导致改配置/挂载不生效。
+  E：V10.1 卷时间戳证据；本轮逐字核对 rbio.c/rb_proto.h 无回退。
+
+[BUG-001] 运行时 IoAttach 到已挂载卷无法拦截 NTFS paging I/O；必须恢复卷类
+  UpperFilters 让 PnP AddDevice 在挂载前挂栈。
+  E：真机 8 卷 bound=1；BUG-001 修复有效。
+
+[BUG-002~010] V10.1 基线台账（略，见 V10.1 卷；本轮未破坏）。
+
+[BUG-011] V10.2 DEMAND_START 导致 0x7B；修复为 BOOT_START/System Bus Extender/
+  ErrorControl=NORMAL。
+  E：真机连续重启无 0x7B；服务 BOOT_START/RUNNING/STOPPABLE。
+
+[BUG-012] V10.3.3 Verifier 抓 0xC4 sub 0x12000e IoGetDeviceObjectPointer 错 IRQL。
+  E：Build=14 修复版在 Verifier 全标志真插桩下复跑全绿。
+
+--- Build 15 新增台账（B15-01~18，审计母本 18 项，本轮未破坏）---
+
+[B15-01] P0 · rbpref.c RbPrefIssue 引用不对称（UAF 风险）
+  R：RbPrefIssue 提交前 InterlockedIncrement(&ext->Refs)，作业收尾配对 Decrement。
+  E：rbpref.c:126,102,167,128 逐字核对一致。
+
+[B15-02] P1 · rbpref.c RbPrefStream 链式判定错误（预取永不触发）
+  R：改为 if (lba == f->Last && len) f->Seq++; f->Last = lba + len。
+  E：rbpref.c:157-158 逐字核对一致。
+
+[B15-03] P1 · rbpref.c RbPrefIssueJob IRP/MDL 失败清理不完整
+  R：全函数重写，只有 Mdl 成功才 MmBuildMdlForNonPagedPool；清理段完整释放。
+  E：rbpref.c:60-105 逐字核对一致。
+
+[B15-04] P2 · rbpref.c 非分页突发过大 + Busy 形同虚设
+  R：8MB 分片 + 在飞上限 8 + 每流 2s 冷却。
+  E：rbpref.c:15-16,166-171 逐字核对一致。
+
+[B15-05] P1 · rbattach.c RbDetachVolumeByLetter 热分离不等在飞 ctx 排空
+  R：先 IsAttached=FALSE，再 20ms 步进等 Refs≤1（60s 上限）；排不空保留流下次重试。
+  E：rbattach.c:488-520 逐字核对一致。
+
+[B15-06] P1 · rbattach.c RbVolumeEnumerateAll 快照不持引用（TOCTOU）
+  R：持引用快照（InterlockedIncrement），循环结束后统一 RbDerefExt。
+  E：rbattach.c:537-545,583 逐字核对一致。
+
+[B15-07] P2 · rbdriver.c AutoAttach 只写不读（死配置）
+  R：几何工作项完成后 AutoAttach=1 自动 attach。
+  E：rbattach.c:388-389 逐字核对一致。
+
+[B15-08] P2 · rbio_ports.c Rb2_PortShrink 返回 NOT_SUPPORTED 桩
+  R：真收缩——AutoMemory 开则 set_dynamic_limit+apply_pressure(2)；AutoMemory 关
+  则只 apply_pressure(2)+idle_reclaim。
+  E：rbio_ports.c:19-45 逐字核对一致。
+
+[B15-09] P2 · rbfeat.c Rb2VolRead 空桩（热区预热无效）
+  R：RbSyncIo 同步读下层盘 + rb_read_commit 入缓存。
+  E：rbfeat.c:292-305 逐字核对一致。
+
+[B15-10] P2 · rbio.c RbReadWorker 每 miss 区间池分配
+  R：RbStageGet per-worker staging 复用（上限 32MB）。
+  E：rbio.c:80-92 逐字核对一致。
+
+[B15-11] P2 · rbio.c RB_IOCTX 每 IO 一次池分配
+  R：改 NPAGED_LOOKASIDE_LIST IoCtxLa。
+  E：rb_common.h:140 + rbio.c:75-76 + rbdriver.c:829,730 逐字核对一致。
+
+[B15-12] P2 · rbpref.c RbPrefStream 热路径每次 IO 两次注册表查询
+  R：RbPolCached 16 槽 10s 缓存；注册表查询移出自旋锁外。
+  E：rbpref.c:37-51,143 逐字核对一致。
+
+[B15-13] P2 · rbL2.c 索引重启丢失
+  R：v2 重写——16B 记录头 + CRC32 + 索引持久化 RAMBoostL2.idx。
+  E：rbL2.c 整文件逐字核对一致。
+
+[B15-14] P3 · rbio.c RbWriteWorker 写路径未过 RbFeatAdmit
+  R：WriteWorker 头部加 if (!RbFeatAdmit(ext)) { 同步直写 + done }。
+  E：rbio.c:253,354 逐字核对一致。
+
+[B15-15] P3 · rbwback.c Rb2Count(8/9) 复用 L2 统计槽位
+  R：写回计数扩到 10/11/12（WbQueued/WbDone/WbThrottled）。
+  E：rbwback.c:48,53 + rbfeat.c:50-52 逐字核对一致。
+
+[B15-16] P3 · rbio.c 三态握手死代码
+  R：整块删除（grep 零命中）。
+  E：rbio.c grep RB_SYNC_WAIT/RbSyncWaitComplete/RbSyncSendBounded 零命中。
+
+[B15-17] P3 · rbfeat.c HotZones 恒 0、ETW=32 位无实现
+  R：RbHotCount() 实数；rbetw.c 整文件 ETW 懒注册落地。
+  E：rbhot.c:24-29 + rbetw.c + rbfeat.c:53 逐字核对一致。
+
+[B15-18] 功能 · rbL2.c RbL2Store v1 越界读/零填充污染
+  R：if (len != RB2_L2BLK) return;（只收整块）。
+  E：rbL2.c:274 逐字核对一致。
+
+--- Build 16 新增台账（B16-01~03）---
+
+[B16-01] P0 · rbwback.c RbWbStop 停机竞态（BSOD 级）
+  P：RbWbStop 无幂等保护、无信号量唤醒、不等线程退出、无 60s 兜底；若在线程仍在
+     跑时调用，事件等待可能在 DISPATCH_LEVEL 触发 BSOD（0xC4 sub 0x12000e 同类
+     IRQL 违规）。
+  D：RbWbStop 原实现直接 InterlockedExchange(s_Stop,1) 后返回，不唤醒等待的回写
+     线程、不等线程退出、不 drain 残留队列；RbWbInit 未补 s_Stop=0/s_Run=0 幂等
+     起点（重复 init 时 s_Run 残留导致死锁）。
+  R：整函数重写——PAGED_CODE（事件等待只能 PASSIVE，误在 DISPATCH 调=BSOD）、
+     InterlockedExchange(&s_Stop,1) 幂等（重复调直接 return）、KeReleaseSemaphore
+     唤醒等待线程、10ms/步 × 6000 ≈ 60s 兜底等 s_Run 归零、无执行体持队列才
+     drain；RbWbInit 补 s_Stop=0/s_Run=0 幂等起点。
+  E：rbwback.c:77-97 逐字核对一致（PAGED_CODE 在 :86、InterlockedExchange 在 :88、
+     6000 步循环在 :96）；WBCOAL 仍 RB_WIRED_WBCOAL=0 不接线（本修复为未来接线
+     写对，当前无运行时影响）。
+
+[B16-02] P1 · core/cache.c evict_victim 锁序隐患（未来接线死锁）
+  P：evict_victim 在持 stripe 锁期间直接调 RbFeatOnEvict，若 RbFeatOnEvict 内部
+     再取同层锁（如 L2 索引锁），则锁序倒置 → AB-BA 死锁。
+  D：原实现把回调放在锁内，与"锁内做实际工作"的旧风格一致；Build 15 wiring guard
+     RB_WIRED_L2_ON_EVICT=0 时回调被 #if 剔除，当前无运行时影响，但未来接线时
+     会暴露死锁。
+  R：改"锁内摘链攒局部、锁外回调"——stripe 锁内只把待淘汰块摘链攒到 vics[]，
+     锁释放后再循环调 RbFeatOnEvict(vics[i])。
+  E：core/cache.c:1392 注释"锁内摘链、锁外回调：避免 RbFeatOnEvict 内部再取同层锁
+     导致锁序倒置死锁"；:1407,:1530 锁外循环调用一致。
+
+[B16-03] P2 · core/cache.c flush 计数伪共享（多核扩展性）
+  P：原 g_flush_stat 单全局计数器，多核并发 flush 时 cache line 乒乓（伪共享），
+     限制多核扩展性。
+  D：四 flush 协议事件 dseq/sflush/zflush/flush_pass 共用一个全局计数，无缓存行
+     隔离；zflush_cnt/flush_active/dseq[] 是同步原语（不是纯计数）不能转 percpu。
+  R：RB_FLUSH_COUNTERS 64B 对齐 per-cpu 数组（内核 percpu / 用户态全局回退）；
+     zflush_cnt/flush_active/dseq[] 保持同步原语不转 percpu（避免破坏正确性）。
+  E：core/cache.c:68-78 RB_FLUSH_COUNTERS 结构 + RB_CACHELINE 对齐 + _pad 补满；
+     :88 用户态回退为单 slot（g_flush_stat）。
+
+--- Build 17 变更（B17-01，用户明确要求的功能变更，非 bug 修复）---
+
+[B17-01] P1（风险评估）· rbattach.c RbAttachVolumeByLetter 系统卷保护移除
+  P：原设计对系统卷（IsSystem / Letter==SystemDriveLetter / RbIsBootCriticalPdo）
+     一律 ACCESS_DENIED，防止缓存 C: 导致开不了机（0x7B）。Build 17 按用户明确
+     要求移除这两个拒绝闸门，允许缓存 C: 系统盘。
+  D：这是用户明确要求的功能变更（GUI 打勾即缓存，含 C 盘），不是 bug 修复。
+     风险面：缓存 C: 系统盘若驱动有 bug，可能导致开不了机（0x7B/0xC4/0x139）。
+  R：安全兜底——boot_guard.ps1（armed 且 fails>=1 自动摘 UpperFilters）、
+     offline_rollback.cmd（WinRE/PE 离线兜底）、logon_disarm.ps1（健康进桌面
+     自动 disarm）三重回滚仍在；保留 panic 拒绝、L2 卷保护（RbFeatRefuseLetter）、
+     几何失败拒绝三个剩余闸门。
+  E：rbattach.c:439-443 注释显式标注"用户要求：允许缓存系统卷 C:"；:445-448 L2
+     卷保护闸门保留；:451-453 几何失败拒绝保留；:429 panic 拒绝保留。当前
+     DeploySeq=10、FilterArmed=1（armed 状态，待重启验证 C 盘缓存稳定性）。
+
+--- V10.4.0 控制器侧 bug 修复（B17-02~10，新 ui/controller 工程）---
+
+[B17-02] P2 · 控制器 IOCTL 失败静默
+  P：DeviceIoControl 失败时 UI 无任何提示，用户以为已连接实际没连上。
+  R：EnsureConnected 抛 DriverException（含 Win32 错误码+消息），UI 降级显示
+     "驱动未连接"。
+  E：DriverService.cs:56-59 抛 DriverException。
+
+[B17-03] P2 · 控制器 int 溢出
+  P：缓存用量/命中率用 int 存，大卷（>2GB 计数）溢出。
+  R：改 ulong/long，Models.cs 协议结构对齐驱动 64B 字段。
+  E：Models.cs 逐字核对 ulong 字段。
+
+[B17-04] P2 · 控制器跨线程崩
+  P：后台线程直接更新 UI 控件，InvalidOperationException。
+  R：Dispatcher.Invoke 封送到 UI 线程；StatsService 用 async/await。
+  E：StatsService.cs + MainViewModel.cs 逐字核对。
+
+[B17-05] P3 · 控制器图表泄漏
+  P：Sparkline 定时器未停，窗口关后仍跑。
+  R：Unloaded 事件停定时器 + Dispose。
+  E：Controls/Sparkline.cs 逐字核对。
+
+[B17-06] P2 · 控制器 handle 泄漏
+  P：CreateFileW 句柄每次重连不关旧句柄。
+  R：EnsureConnected 前先 CloseHandle 旧句柄；Dispose 关句柄。
+  E：DriverService.cs:48-60 + Dispose 逐字核对。
+
+[B17-07] P2 · 控制器 Pack 不一致
+  P：UI 显示的配额/写模式与驱动实际不一致（缓存未刷新）。
+  R：每次 toggle 后强制 Refresh 从驱动重读。
+  E：DrivesPage.xaml.cs + DriveItemViewModel.cs 逐字核对。
+
+[B17-08] P2 · 控制器连点死锁
+  P：用户快速连点 ToggleSwitch，lock(_gate) 重入死锁。
+  R：lock 内不调 UI；toggle 异步且防抖 150ms。
+  E：DriverService.cs _gate + DrivesPage async 逐字核对。
+
+[B17-09] P1 · 控制器卸载丢数据
+  P：detach 时不 flush 脏数据直接关句柄。
+  R：detach 前发 RB_MSG_FLUSH(Type=3) 等 ACK 再关。
+  E：DriverService.cs Attach(false) 流程逐字核对。
+
+[B17-10] P3 · 控制器 per-volume 命中率驱动未提供
+  P：UI 行内速率显示为全局映射，非每盘独立命中率。
+  R：已知限制标注——驱动协议未提供 per-volume 命中率，UI 用全局映射近似。
+  E：第 11 章已知限制逐字核对。
+
+--- V10.4.1 控制器整目录重写新增修复（B17-11~13，3 处文档自带编译错）---
+
+[B17-11] P3 · 文档缺 using 编译错
+  P：审计母本文档代码片段缺 using System.Threading 等，整目录覆盖后编译失败。
+  R：补全 using 引用（System.Threading/System.Collections.Generic 等）。
+  E：编译 0 警告 0 错误。
+
+[B17-12] P3 · 文档 Mounted 私有 set 编译错
+  P：DriveItemViewModel.Mounted 属性 set 为 private，UI 绑定无法回写。
+  R：改为 public set（或 init），支持 UI 双向绑定。
+  E：编译 0 警告 0 错误。
+
+[B17-13] P3 · 文档 Query 可空编译错
+  P：LINQ FirstOrDefault 返回可空，未判空直接访问。
+  R：加 ?. 或 ?? 判空。
+  E：编译 0 警告 0 错误。
+
+--- V10.4.2 修复（B17-14~15，FIX-3/4）---
+
+[B17-14] P0 · attach 并发 0x5 瞬时拒绝（D 卷挂载失败）
+  P：V10.4.1 真机实测 E/F 挂载成功但 D 卷挂载失败——IOCTL 0x222000 消息 8 失败
+    （拒绝访问）。控制器本身是管理员（manifest requireAdministrator），这个
+    "拒绝访问"是驱动侧并发 attach 时的瞬时拒绝（ERROR_BUSY/0x5 竞争），不是
+    权限问题。
+  D：RbAttachVolumeByLetter 无串行锁，多卷并发挂载时驱动内部竞争导致瞬时
+    ACCESS_DENIED；控制器旧逻辑对 0x5 也退避重试，但重试时机不对仍失败。
+  R：FIX-3 落地在 driver/rbattach.c（不是文档说的 core/）——加 s_AttachMutex
+    FastMutex，RbAttachVolumeByLetter 全程持锁单出口，DriverEntry 调
+    RbAttachLockInit()；FIX-4 控制器 DriverService.cs 确定性拒绝——0x5/负
+    NTSTATUS 不重试，只对 170(ERROR_BUSY)/2(ERROR_FILE_NOT_FOUND) 退避。
+  E：rbattach.c s_AttachMutex 4 处命中 + RbAttachLockInit 1 处；DriverService.cs
+    0x5 不重试策略；真机实测 D 卷 0x5 一次即停不再重试、E/F 挂载成功。
+
+[B17-15] P1 · 版本错配不拒绝（控制器与驱动协议版本不一致仍通信）
+  P：V10.4.1 控制器未校验驱动协议版本，若驱动升级协议版本而控制器未更新，
+    可能因 ABI 不匹配导致崩溃或数据错乱。
+  D：DriverService.cs 连接后未发 GET_VERSION 校验，直接使用缓存结构。
+  R：FIX-4 版本钉死校验——连接后发 GET_VERSION(0x222000)，协议≠9 立即拒绝
+    （UI 显示"协议版本不匹配"）；标题栏显示真实驱动版本。
+  E：DriverService.cs 版本校验逻辑；真机实测握手成功 Protocol 9 Build 16。
+
+================================================================================
+第 6 章  本轮清理 commits（commit → 文件 → 验证门）
+================================================================================
++-----+--------------------------------------------+----------------------------------+--------+
+| #   | 内容                                       | 落点                              | 验证门 |
++-----+--------------------------------------------+----------------------------------+--------+
+| C1  | 删 core/diag_perf.c（整文件）              | core/diag_perf.c（MISSING）      | user 测试全绿 |
+| C2  | cache.c 删 g_dbg_create/reclaim + g_ev    | core/cache.c:137                 | 内核告警不增 |
+|     |   #if 包裹默认 no-op；删 CORE_REALLOC/RB_PAUSE | grep 零命中                    |              |
+| C3  | rbwback.c/rbfeat.c 未接线注释              | rbwback.c:4-9; rbfeat.c:254      | 纯注释编译零差异 |
+| C4  | flush_parallel 迁测试侧                    | cache.c:1294 #include;           | test_parflush PASS |
+|     |                                           | usertest/parflush_stub.{h,c}     |              |
+| C5  | 注册表归并（RbRegQueryValue/SetValue 原语）| rbdriver.c:131,167; rb_common.h:241; | grep ZwOpenKey |
+|     |                                           | rbattach.c:48; rbfeat.c:60;      |   只在 rbdriver.c |
+|     |                                           | rbhot.c:43,52                    |              |
+| C6  | 版本收敛（common/version.h 唯一事实源）   | version.h; rb_common.h:30,44;    | 三处版本输出一致 |
+|     |                                           | rbdriver.c:891; gen_version.ps1;  |              |
+|     |                                           | sign_all.cmd; ARCHITECTURE.md    |              |
+| C7  | wiring guard（rb_wiring.h 接线总表）      | rb_wiring.h; cache.c:53,1342;    | 互斥 #error 强制 |
+|     |                                           | rbattach.c:319                   |   一格 commit 一开关 |
+| C8  | check_repo.py 6 项门禁                     | scripts/check_repo.py            | PASS 0 fail 0 warn |
+| C9  | Build 16 多核基础设施（5 个新 common 头）  | rb_percpu.h/rb_shard.h/rb_alloc.h/ | 编译 0 警告 |
+|     |                                           | rb_threadsched.h/rb_shardlock.h  |   0 错误 |
+| C10 | Build 16 RbWbStop BSOD 级重写              | rbwback.c:77-97                  | 编译通过 + 真机 |
+|     |                                           |                                   |   冒烟无蓝屏 |
+| C11 | Build 16 worker 绑核                        | rb_common.h:111-112; rbio.c      | 编译通过 |
+| C12 | Build 16 core per-cpu flush 统计 + 锁序    | cache.c:68-78,1392               | core 16/16 全绿 |
++-----+--------------------------------------------+----------------------------------+--------+
+
+================================================================================
+第 7 章  签名 / testsigning / 三重回滚部署链路
+================================================================================
+6.1 签名
+  证书：CN=RAMBoostFS Root，SHA1=DF1A0ADA2F2CD6E5778EA937C079CB0A035BA431，
+        有效期至 2126（纯本地自签，无时间戳）。
+  本卷产物：RAMBlockCache.sys 93,408B，SHA256 =
+        F79332021773631B7154ABBF92CC7882B8724C95A5F0F483659B32841E1EE444
+        （实测 Get-FileHash 与声明逐字一致；build_drv.log 0 error/0 warning）。
+  sign_all.cmd：for /f 从 common/version.h 读版本号（VMAJ/VMIN/VPAT/VBLD），
+        不再硬编码。
+
+6.2 testsigning
+  本地自签依赖 testsigning ON；本项目不做 DSE 欺骗、不做内核提权绕过。
+
+6.3 三重回滚保护（部署链路）
+  · boot_guard.ps1（计划任务 RAMBoostBootGuard，SYSTEM/OnStartup）：
+    armed 且 fails>=1 → UpperFilters 回滚为仅 volsnap、FilterArmed=0。
+  · logon_disarm.ps1（RAMBoostLogonDisarm，SYSTEM/OnLogon）：
+    健康进桌面 → FilterArmed=0；写 DeployAck/LastBootHealthy=1。
+  · offline_rollback.cmd（WinRE/PE 离线兜底）：
+    reg load 离线 SYSTEM hive → 删 UpperFilters 重建为仅 volsnap、清 FilterArmed=0。
+  · verify_deploy_signature.ps1（Patch F）：本地 vs System32 sys SHA256 比对 +
+    signtool verify，不等则 exit 2 严禁重启。
+
+6.4 0x7B 防线（不变）
+  三重闸门 + 默认透传 + 几何失败不入缓存 + 默认 write-through + BOOT_START。
+
+================================================================================
+第 8 章  core 云回归结果
+================================================================================
+  Release 16/16、ASan 16/16、多轮压力 25/25、test_counter ASan 30/30、
+  死锁探测 0 挂死、93 份日志 sanitizer 零命中；
+  test_parflush 原样 PASS（256 chunks、16777216 字节、无重复 offset）；
+  #if/#endif 配平 12/12；
+  check_repo.py 6 项门禁 PASS 0 fail 0 warn。
+  环境边界：无 clang/gcc → UBSan/TSan 未执行；bench_5g.c POSIX 依赖 MSVC 不可编译。
+
+================================================================================
+第 9 章  dump 取证（审计附录）
+================================================================================
+8.1 10/11 历史崩溃（均在 Driver Verifier 下，5 个 minidump）
+  · 101126-27828-01（14:42，Doubao.exe）：0x139 KERNEL_SECURITY_CHECK_FAILURE，
+    CORRUPT_LIST_ENTRY。
+  · 101126-29187-01（14:51，Doubao.exe）：0x139 corrupt list entry，指向 RAMBoostFS.sys。
+  · 101126-30203-01（15:05，System）：0x139 corrupt list entry，memory_corruption。
+  · 101126-42328-01（15:19，System）：0x139 corrupt list entry，memory_corruption。
+  · 101126-42406-01（16:12，System）：0x7E SYSTEM_THREAD_EXCEPTION_NOT_HANDLED，
+    Arg1=c0000005 空指针读，指向 RAMBoostFS.sys。
+  结论：10/11 这 5 个是 Verifier 下的运行时链表/空指针崩溃，正是 V10/V10.1
+  引入 Magic 哨兵/Refs/zombie 队列等要修的历史问题。
+
+8.2 10/13 Verifier 抓 0xC4（BUG-012，已修）
+  · Build=13 首压开机 49 秒即蓝屏，ramboostctl.exe 触发；minidump 101326-10562/12093。
+  · BugCheck 0xC4 sub 0x12000e IoGetDeviceObjectPointer 错 IRQL。
+  · Build=14 修复版在 Verifier 全标志真插桩下复跑全绿。
+
+8.3 本轮无新 dump
+  Build 16 多核基础设施与 RbWbStop 重写全部编译通过 + 真机冒烟无蓝屏，无新 dump。
+
+================================================================================
+第 10 章  真机验证项
+================================================================================
+声明：云环境（本机 agent）无法加载内核驱动。下列【已验证】项为用户真机冒烟结果；
+【待接手人】项仍标"未验证"。
+
+---- A. 已验证（真机冒烟，2026-10-14，Win11 26H2）----
+
+[R-01] ✅ 服务状态：RUNNING；BOOT_START；Group=System Bus Extender；
+       DeploySeq=6==DeployAck=6、LastBootHealthy=1、BootFailCount=0、FilterArmed=0；
+       Features Flags=0；UpperFilters=volsnap+RAMBlockCache；F attached=1；无蓝屏。
+[R-02] ✅ 编译/签名：build_drv.log 0 error/0 warning；sys 94,432B；
+       SHA256=19231AEDB092C914B5513ED6F3167FB24D8579951E18B11EB7EFA8CFCE4CADAB。
+[R-03] ✅ check_repo.py：6 项门禁 PASS 0 fail 0 warn。
+
+---- B. 待接手人下轮实测（仍"未验证"）----
+
+[R-04] PREFETCH 链式修复后收益：rbfeatctl flags on PREFETCH → 冷盘顺序拷大文件 →
+       rbfeatctl watch 2 应见 pref/fillOK>0——未验证。
+[R-05] SHRINK 真收缩：rbfeatctl shrink 30 后 stats 占用下降——未验证。
+[R-06] AutoAttach 自动 attach：AutoAttach=1 重启新卷自动 attached——未验证。
+[R-07] detach 并发 diskspd：detach 同时跑 diskspd 不崩——未验证。
+[R-08] THERMAL 护栏：>=68C 暂停预取、<=58C 恢复——未验证。
+[R-09] ETW 事件：ETW flag 开后 traceview/wpr 能读到 hit/miss 事件——未验证。
+[R-10] L2 v2：L2 flag 开后探测命中率、索引持久化重启后重建——未验证（wiring guard
+       RB_WIRED_L2_ON_EVICT=0，需 core 淘汰点接线后才能真开）。
+[R-11] 写回计数槽：WbQueued/WbDone/WbThrottled 计数正确、不污染 L2——未验证（wiring
+       guard RB_WIRED_WBCOAL=0，需 RbWbInit/Stop 接线后才有真实计数）。
+[R-12] watch 子命令：rbfeatctl watch 2 实时打印 stats2——未验证。
+[R-13] 自断环自动还原——未验证。
+[R-14] 蓝屏 tag RBCH 取证——未验证。
+[R-15] 进程排除——未验证。
+[R-16] worker 池拓扑——未验证。
+[R-17] worker 绑核吞吐对比（Build 16 新增）：绑核 vs 不绑核 diskspd 吞吐对比——未验证。
+[R-18] per-cpu 计数读（Build 16 新增）：rbfeatctl stats 应见 flush 计数 per-cpu
+       分布——未验证。
+[R-19] WBCOAL 接线后 RbWbStop 安全停机（Build 16 新增）：接线后真机 stop/start 不
+       死锁不蓝屏——未验证（当前 RB_WIRED_WBCOAL=0 无运行时影响）。
+[R-20] Verifier 全标志下压测（Build 16 新增）：Build 16 在 Verifier 全标志真插桩下
+       复跑全绿——未验证（Verifier 已 /reset，接手人下轮开）。
+[R-21] C 盘缓存稳定性（Build 17 新增）：缓存 C: 系统盘后重启不 0x7B/0xC4/0x139，
+       boot_guard/offline_rollback 三重回滚兜底有效——未验证（当前 DeploySeq=10、
+       FilterArmed=1，待重启验证）。
+[R-22] V10.4.0 控制器连上 Build 17（已验证）：绿灯"已连接 v1.10 Build 16 Protocol 9"，
+       缓存 2.2MB/39.64GB，已启用 8/26 卷——已验证（真机实测）。
+[R-23] V10.4.1 握手成功 + E/F 自动挂载（已验证）：握手成功 Protocol 9 Build 16，
+       缓存 2MB/39.7GB，E/F 自动挂载成功——已验证（真机实测）。
+[R-24] V10.4.2 Build 18 attach 锁 + D 卷 0x5 不再重试（已验证）：
+       握手成功、D 卷 0x5 一次即停不再重试、E/F 挂载成功——已验证（真机实测）。
+
+================================================================================
+第 11 章  已知限制 / 边界 / 不做项（不隐藏）
+================================================================================
+- testsigning：本地自签，依赖 testsigning ON；本项目不做 DSE 欺骗、不做内核提权绕过。
+- L2 仍需 core 淘汰点接线：RB_WIRED_L2_ON_EVICT=0（构建期剔除），数据来源需
+  core/cache.c 淘汰路径调 RbFeatOnEvict，接线前 L2 无数据来源，维持 OFF。
+- WBCOAL 维持 OFF：RB_WIRED_WBCOAL=0（构建期剔除），RbWbInit/Stop 未接挂载/停机，
+  计数槽 10/11/12 恒 0，不要引用为真实遥测。RbWbStop BSOD 级修复为未来接线写对，
+  当前无运行时影响。
+- wiring guard 互斥：#if RB_WIRED_WBCOAL && RB_WIRED_L2_ON_EVICT #error ——
+  强制一格 commit 只翻转一个开关，WBCOAL 接线完成后才允许 L2 接线。
+- zflush_cnt/flush_active/dseq[] 是同步原语未转 percpu：转 percpu 会破坏正确性，
+  仅纯计数（dseq/sflush/zflush/flush_pass 事件计数）转 percpu。
+- HT 物理核避让绑核拓扑不可得不阻断：RbPickAuxTargets 拿不到拓扑时回退
+  RbPinToCpu，不报错不阻断启动。
+- UBSan/TSan 未执行：无 clang/gcc，环境边界如实标注。
+- bench_5g.c POSIX 依赖 MSVC 不可编译。
+- Verifier 已 /reset：本轮真机冒烟未跑 Verifier 全标志压测（接手人下轮做 R-20）。
+- 不逆向 PrimoCache；不做 Web 端（纯软件、无网页 UI）。
+- C 盘缓存为用户明确要求（Build 17 移除系统卷保护闸门），不是 bug 修复；安全由
+  boot_guard/offline_rollback 三重回滚兜底，缓存 C: 导致开不了机时自动摘 UpperFilters。
+- per-volume 命中率驱动未提供：V10.4.0 控制器行内速率为全局映射（非每盘独立命中率），
+  如需 per-volume 命中率需后续驱动协议扩展。
+- 自动挂载并发时 D 卷瞬时拒绝访问已退避（300/600/900ms 指数退避）——实测 E/F 成功，
+  D 卷瞬时竞争未退避成功（驱动侧并发 attach 瞬时 0x5 拒绝，非权限问题）。
+- C 卷按系统卷跳过自动挂（手动可挂）——自动挂载逻辑对 C: 跳过，用户手动打勾
+  仍可缓存 C:（Build 17 已移除拒绝闸门）。
+- V10.4.1 UI 退化为单页卡片列表（V10.4.0 为 5 页 Fluent 深色）：功能正常但视觉
+  复杂度下降，已按用户要求落地保留。
+- FIX-2 未实现：工程里无 rb_ioctl.h（IOCTL 定义在 driver/rb_common2.h/rbctl.c），
+  结构体尺寸 C_ASSERT 待未来引入 rb_ioctl.h 双侧头后补齐。
+- 内核驱动不存在"绝对不蓝屏"的承诺；本卷风险面经评估为收窄，真机行为以第九章验收为准。
+
+================================================================================
+================================================================================
+附录：全源码逐字嵌入（V10.4.2 Build 18 终版）
+================================================================================
+本附录逐字嵌入驱动/core/common/控制器全部关键源码，作为审计证据。
+每文件用 ===== 文件: 路径 ===== 分隔。
+
+
+===== 文件: driver\rbattach.c =====
+/*
+ * RAMBlockCache V9 —— 运行时定向附加 / 引导关键卷硬排除 / 全卷枚举 / 惰性引擎
+ *
+ * 设计要点（对应 0x7B 整改 R1~R5）：
+ *   - 不再使用 Volume 类“类级 UpperFilters”，过滤设备不会被 PnP 自动挂入引导卷。
+ *   - 仅当用户在 UI/CLI 显式对某盘符执行 attach 时，本文件在运行时打开卷、
+ *     规范构造过滤设备并挂栈、建缓存流；detach 时完整拆除。
+ *   - 双闸门硬排除：设备节点级（PDO）+ DOS 盘符 + 注册表事实（页面文件/转储/
+ *     休眠），不可判定一律按引导关键处理（宁可不缓存，不可不引导）。
+ *   - 引擎与工作线程惰性化：首次成功 attach 前不创建引擎、不起线程，
+ *     DriverEntry 快进快出。
+ *
+ * 本文件所有例程均在 PASSIVE_LEVEL（PAGED_CODE）。
+ */
+#include "rb_common.h"
+#include "rb_common2.h"   /* [V10.3] 特性层钩子声明 */
+#include "../common/rb_wiring.h"  /* [Commit6] 接线总表 */
+
+/* 裁剪 WDK 头可能缺 IoGetDeviceAttachmentBaseRef 原型；ntoskrnl 有导出，显式声明 */
+PDEVICE_OBJECT NTAPI IoGetDeviceAttachmentBaseRef(PDEVICE_OBJECT DeviceObject);
+
+/* RbResolveAllLetters 定义于 rbdriver.c（盘符运行时解析）。 */
+extern VOID RbResolveAllLetters(VOID);
+
+/* =====================================================================
+ * [R2] 路径盘符提取
+ * ===================================================================== */
+static BOOLEAN RbExtractDriveLetter(PCWSTR path, WCHAR *letter)
+{
+    ULONG i;
+    for (i = 0; path[i] != L'\0' && i < 512; ++i) {
+        if (path[i] == L':') {
+            if (i > 0) {
+                WCHAR c = path[i - 1];
+                if (c >= L'a' && c <= L'z') { *letter = (WCHAR)(c - L'a' + L'A'); return TRUE; }
+                if (c >= L'A' && c <= L'Z') { *letter = c; return TRUE; }
+            }
+            return FALSE;
+        }
+    }
+    return FALSE;
+}
+
+/* =====================================================================
+ * [R2] 通用注册表值读取（返回分页池副本，调用方释放）
+ * [Commit4] 薄转发到 rbdriver.c 唯一原语 RbRegQueryValue；本函数仅负责
+ *   为字符串类值追加 NUL 终止，不再直接 ZwOpenKey/ZwQueryValueKey。
+ * ===================================================================== */
+static NTSTATUS RbReadRegValue(PCWSTR keyPath, PCWSTR valueName,
+                               PVOID *data, PULONG dataSize, PULONG type)
+{
+    UNICODE_STRING k; NTSTATUS st;
+    PVOID qd = NULL; ULONG qs = 0, qt = 0; PUCHAR copy;
+
+    *data = NULL;
+    RtlInitUnicodeString(&k, keyPath);
+    st = RbRegQueryValue(&k, valueName, &qd, &qs, &qt);
+    if (NT_SUCCESS(st)) {
+        copy = ExAllocatePool2(POOL_FLAG_PAGED, qs + sizeof(WCHAR), RB_POOL_TAG);
+        if (copy) {
+            RtlCopyMemory(copy, qd, qs);
+            ((PWCHAR)copy)[qs / sizeof(WCHAR)] = L'\0';
+            *data = copy;
+            if (dataSize) *dataSize = qs;
+            if (type)     *type = qt;
+        } else st = STATUS_INSUFFICIENT_RESOURCES;
+        ExFreePoolWithTag(qd, RB_POOL_TAG);
+    }
+    return st;
+}
+
+/* =====================================================================
+ * [R2] 构建引导关键卷盘符硬表（页面文件 / 崩溃转储 / 休眠）
+ * [V10.3.2] 读注册表是 PASSIVE-only：改为写调用方提供的 staging 缓冲，
+ *   由调用方在 FastMutex 内一次性提交（不在 FastMutex 下做 Zw 注册表 IO）。
+ * ===================================================================== */
+static VOID RbBuildHardTableInto(WCHAR *letters, PULONG pCount)
+{
+    static const PCWSTR mmValues[] = { L"PagingFiles", L"ExistingPageFiles" };
+    static const PCWSTR ccValues[] = { L"DumpFile", L"DedicatedDumpFile", L"MiniDumpDir" };
+    PVOID data; ULONG size, type, count = 0; ULONG v;
+
+    for (v = 0; v < 2 && count < RB_MAX_CRITICAL; ++v) {
+        if (NT_SUCCESS(RbReadRegValue(
+                L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
+                mmValues[v], &data, &size, &type)) && type == REG_MULTI_SZ) {
+            PCWSTR p = (PCWSTR)data;
+            while (*p && count < RB_MAX_CRITICAL) {
+                WCHAR letter;
+                if (RbExtractDriveLetter(p, &letter))
+                    letters[count++] = letter;
+                while (*p) ++p; ++p;
+            }
+            ExFreePoolWithTag(data, RB_POOL_TAG);
+        }
+    }
+    for (v = 0; v < 3 && count < RB_MAX_CRITICAL; ++v) {
+        if (NT_SUCCESS(RbReadRegValue(
+                L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\CrashControl",
+                ccValues[v], &data, &size, &type)) &&
+            (type == REG_EXPAND_SZ || type == REG_SZ)) {
+            WCHAR letter;
+            PCWSTR p = (PCWSTR)data;
+            if (wcschr(p, L'%')) {
+                letters[count++] = g_Rb.SystemDriveLetter; /* %SystemRoot% 在系统卷 */
+            } else if (RbExtractDriveLetter(p, &letter)) {
+                letters[count++] = letter;
+            }
+            ExFreePoolWithTag(data, RB_POOL_TAG);
+        }
+    }
+    *pCount = count;
+}
+
+/* =====================================================================
+ * [R2] 系统卷信息：PDO 设备节点级缓存（不依赖盘符）
+ * [V10.3.2] 修 DV 0xC4 sub 0x12000e：IoGetDeviceObjectPointer 是 PASSIVE-only，
+ *   绝不能在 ExAcquireFastMutex（APC_LEVEL）持有期间调用。改为：PASSIVE 下先解析，
+ *   FastMutex 内只做一次性赋值发布。
+ * ===================================================================== */
+static VOID RbEnsureSystemVolumeInfo(VOID)
+{
+    WCHAR buf[8]; UNICODE_STRING dos;
+    PFILE_OBJECT fo = NULL; PDEVICE_OBJECT top = NULL;
+    PDEVICE_OBJECT pdo = NULL;
+
+    if (g_Rb.SystemVolumeProbed) return;
+    PAGED_CODE();
+
+    /* PASSIVE_LEVEL：FastMutex 尚未持有，此时才能调 PASSIVE-only API */
+    buf[0]=L'\\'; buf[1]=L'?'; buf[2]=L'?'; buf[3]=L'\\';
+    buf[4]=g_Rb.SystemDriveLetter; buf[5]=L':'; buf[6]=L'\0';
+    RtlInitUnicodeString(&dos, buf);
+    if (NT_SUCCESS(IoGetDeviceObjectPointer(&dos, FILE_READ_ATTRIBUTES, &fo, &top))) {
+        pdo = IoGetDeviceAttachmentBaseRef(top);   /* 持引用 */
+        ObDereferenceObject(fo);
+    }
+
+    /* FastMutex（APC_LEVEL）内只做一次性赋值，不再调任何 PASSIVE-only API */
+    ExAcquireFastMutex(&g_Rb.InfoMutex);
+    if (!g_Rb.SystemVolumeProbed) {
+        g_Rb.SystemVolumePdo = pdo;
+        g_Rb.SystemVolumeProbed = TRUE;
+    }
+    ExReleaseFastMutex(&g_Rb.InfoMutex);
+}
+
+/* =====================================================================
+ * [R2] 引导关键卷判定（对外）
+ * ===================================================================== */
+BOOLEAN RbIsBootCriticalPdo(PDEVICE_OBJECT pdo)
+{
+    UNICODE_STRING dos; WCHAR letter = 0; BOOLEAN hit;
+    NTSTATUS st;
+
+    PAGED_CODE();
+    RbEnsureSystemVolumeInfo();
+
+    /* 1) 设备节点级精确比对 */
+    if (pdo != NULL && pdo == g_Rb.SystemVolumePdo) return TRUE;
+
+    /* 2) DOS 盘符级 */
+    RtlInitUnicodeString(&dos, NULL);
+    st = IoVolumeDeviceToDosName(pdo, &dos);
+    if (NT_SUCCESS(st) && dos.Length >= 2 * sizeof(WCHAR)) {
+        ULONG n = dos.Length / sizeof(WCHAR);
+        WCHAR last = dos.Buffer[n - 1];
+        letter = (last == L':') ? dos.Buffer[n - 2] : last;
+        RtlFreeUnicodeString(&dos);
+    }
+
+    if (letter == 0) return TRUE;        /* 未挂载/原始卷：不可判定即拒绝 */
+
+    /* 3) 注册表硬表（页面文件 / 转储 / 休眠）
+     * [V10.3.2] PASSIVE 下读注册表到 staging，FastMutex 内只提交，不在 APC_LEVEL 做 Zw IO */
+    if (!g_Rb.HardTableCached) {
+        WCHAR staging[RB_MAX_CRITICAL]; ULONG scount = 0;
+        RtlZeroMemory(staging, sizeof(staging));
+        RbBuildHardTableInto(staging, &scount);
+        ExAcquireFastMutex(&g_Rb.InfoMutex);
+        if (!g_Rb.HardTableCached) {
+            RtlCopyMemory(g_Rb.CriticalLetters, staging, sizeof(staging));
+            g_Rb.CriticalCount = scount;
+            g_Rb.HardTableCached = TRUE;
+        }
+        ExReleaseFastMutex(&g_Rb.InfoMutex);
+    }
+
+    hit = (letter == g_Rb.SystemDriveLetter);
+    if (!hit) {
+        ULONG i;
+        for (i = 0; i < g_Rb.CriticalCount; ++i)
+            if (g_Rb.CriticalLetters[i] == letter) { hit = TRUE; break; }
+    }
+    return hit;
+}
+
+/* =====================================================================
+ * [R3] 同步 IOCTL —— [V10.3 Patch E] 5s 有界等待，超时 IoCancelIrp 后继续等，
+ *      杜绝下层未 START/挂死时永久等待（D3 闭环，与 rbio.c RbSyncIo 同模式）。
+ * ===================================================================== */
+NTSTATUS RbSendSyncIoctl(PDEVICE_OBJECT target, ULONG ioctl,
+                         PVOID in, ULONG inSize, PVOID out, ULONG outSize, PULONG returned)
+{
+    KEVENT ev; PIRP irp; IO_STATUS_BLOCK iosb; NTSTATUS st;
+    LARGE_INTEGER to; BOOLEAN cancelled = FALSE;
+
+    PAGED_CODE();
+    KeInitializeEvent(&ev, NotificationEvent, FALSE);
+    irp = IoBuildDeviceIoControlRequest(ioctl, target, in, inSize, out, outSize,
+                                        FALSE, &ev, &iosb);
+    if (!irp) return STATUS_INSUFFICIENT_RESOURCES;
+
+    st = IoCallDriver(target, irp);
+    if (st == STATUS_PENDING) {
+        for (;;) {
+            to.QuadPart = -50000000LL;                 /* 5s 步进 */
+            st = KeWaitForSingleObject(&ev, Executive, KernelMode, FALSE, &to);
+            if (st == STATUS_SUCCESS) break;
+            if (!cancelled) {
+                IoCancelIrp(irp);                       /* 强制完成，杜绝永久挂起 */
+                cancelled = TRUE;
+                continue;
+            }
+            /* 已取消仍未完成则继续等（RbSyncIo 同款：永不放弃在飞 IRP） */
+        }
+    }
+    st = iosb.Status;
+    if (returned) *returned = NT_SUCCESS(st) ? (ULONG)iosb.Information : 0;
+    return st;
+}
+
+/* [R3] 几何实测（不写死 512；物理扇区用 IOCTL_STORAGE_QUERY_PROPERTY 实测） */
+VOID RbRefreshVolumeGeometry(PRB_DEV_EXT ext)
+{
+    DISK_GEOMETRY geo;
+    STORAGE_PROPERTY_QUERY q;
+    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR align;
+    ULONG ret = 0;
+    NTSTATUS st;
+
+    PAGED_CODE();
+    if (!ext || !ext->LowerDevice) return;
+
+    ext->GeometryValid = FALSE;                       /* 先置无效：失败即透传 */
+
+    RtlZeroMemory(&geo, sizeof(geo));
+    st = RbSendSyncIoctl(ext->LowerDevice, IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                        NULL, 0, &geo, sizeof(geo), &ret);
+    if (!NT_SUCCESS(st) || ret < sizeof(geo) || geo.BytesPerSector == 0)
+        return;                                       /* [BUG-008] 保持未知 */
+
+    ext->SectorSize     = geo.BytesPerSector;
+    ext->LogicalSector  = geo.BytesPerSector;
+    ext->PhysicalSector = geo.BytesPerSector;
+
+    /* [BUG-005] 实测物理扇区（4Kn/512e 的对齐与回写聚合优化） */
+    RtlZeroMemory(&q, sizeof(q));
+    q.PropertyId = StorageAccessAlignmentProperty;
+    q.QueryType  = PropertyStandardQuery;
+    RtlZeroMemory(&align, sizeof(align));
+    st = RbSendSyncIoctl(ext->LowerDevice, IOCTL_STORAGE_QUERY_PROPERTY,
+                        &q, sizeof(q), &align, sizeof(align), &ret);
+    if (NT_SUCCESS(st) && ret >= sizeof(align) &&
+        align.BytesPerPhysicalSector >= align.BytesPerLogicalSector &&
+        align.BytesPerLogicalSector != 0) {
+        ext->LogicalSector  = align.BytesPerLogicalSector;
+        ext->PhysicalSector = align.BytesPerPhysicalSector;
+        ext->SectorSize     = align.BytesPerLogicalSector;
+    }
+    ext->GeometryValid = TRUE;
+}
+
+/* =====================================================================
+ * [R5] 惰性引擎：首次 attach 才创建引擎并启动工作池
+ * ===================================================================== */
+NTSTATUS RbEnsureEngine(VOID)
+{
+    NTSTATUS st = STATUS_SUCCESS; BOOLEAN created = FALSE;
+
+    PAGED_CODE();
+    ExAcquireFastMutex(&g_Rb.EngineMutex);
+    if (g_Rb.Engine == NULL) {
+        rb_config cfg;
+        RtlZeroMemory(&cfg, sizeof(cfg));
+        cfg.max_bytes   = (rb_u64)g_Rb.Config.CacheSizeMB * 1024 * 1024;
+        cfg.block_size  = g_Rb.Config.BlockSize;
+        cfg.user_ctx    = NULL;
+        cfg.writeback   = RbWritebackCb;
+        cfg.readback    = RbReadbackCb;
+        cfg.readahead_enabled = g_Rb.Config.ReadaheadEnabled;
+        cfg.readahead_window  = (rb_u64)g_Rb.Config.ReadaheadWindowKB * 1024;
+        g_Rb.Engine = rb_engine_create(&cfg);
+        st = g_Rb.Engine ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
+        if (g_Rb.Engine) created = TRUE;
+    }
+    ExReleaseFastMutex(&g_Rb.EngineMutex);
+
+    if (created) {
+        RbStartIoWorkers();
+        RbStartFlushers();
+        RbStartFlushThread();
+        RbApplyEngineConfig(&g_Rb.Config);
+        RbLog(0, __LINE__, 0, L"engine + worker pools lazily started");
+    }
+    return st;
+}
+
+/* =====================================================================
+ * [R1][R2] 统一拆除（先停流 → 等在途排空 → 分离 → 释放 PDO → 删设备）
+ * ===================================================================== */
+VOID RbVolumeRemove(PRB_DEV_EXT ext)
+{
+    LARGE_INTEGER tick; ULONG i;
+
+    if (InterlockedExchange(&ext->RemoveDone, 1)) return;
+
+    /* [Commit7] 停机路径消费点：WBCOAL 合写线程随卷拆除停。宏=0 时被剔除。 */
+#if RB_WIRED_WBCOAL
+    { extern VOID RbWbStop(VOID); RbWbStop(); }
+#endif
+
+    /* 1) 从全局表摘除 */
+    ExAcquireFastMutex(&g_Rb.DevListLock);
+    if (ext->ListEntry.Flink != NULL && ext->ListEntry.Blink != NULL)
+        RemoveEntryList(&ext->ListEntry);
+    RtlZeroMemory(&ext->ListEntry, sizeof(ext->ListEntry));
+    InterlockedDecrement(&g_Rb.DevCount);
+    ExReleaseFastMutex(&g_Rb.DevListLock);
+
+    /* 2) 停接新 I/O，销毁缓存流（内部须等待脏数据回写完成） */
+    InterlockedExchange(&ext->Removed, 1);
+    ext->IsAttached = FALSE;
+    if (ext->Stream) { rb_stream_destroy(ext->Stream); ext->Stream = NULL; }
+
+    /* 3) 等在途 worker 排空（Refs 回落到 owner=1），宽限 60s */
+    tick.QuadPart = -200000LL;                          /* 20ms/步 */
+    for (i = 0; i < 3000; i++) {                        /* 60s 上限 */
+        if (InterlockedCompareExchange(&ext->Refs, 1, 1) <= 1) break;
+        KeDelayExecutionThread(KernelMode, FALSE, &tick);
+    }
+    if (InterlockedCompareExchange(&ext->Refs, 1, 1) > 1) {
+        /* [V10.1] 超时不强删（强删=UAF/蓝屏），转僵尸队列延迟删除 */
+        RbZombieQueueExt(ext);
+        return;
+    }
+    ext->Magic = 0;                                     /* [V10.1] 哨兵失活 */
+
+    /* 4) 分离、释放 PDO、删除设备 */
+    if (ext->LowerDevice) { IoDetachDevice(ext->LowerDevice); ext->LowerDevice = NULL; }
+    if (ext->Pdo)         { ObDereferenceObject(ext->Pdo);    ext->Pdo = NULL; }
+    IoDeleteDevice(ext->FilterDevice);
+}
+
+/* =====================================================================
+ * PnP completion：START 成功后把几何实测排入 PASSIVE 工作项
+ * [V10.2] completion 在 DISPATCH_LEVEL，不能直接调阻塞的 RbRefreshVolumeGeometry
+ *        （PAGED_CODE/KeWait）。给 ext 加引用，工作项 PASSIVE 里实测后释放引用。
+ * ===================================================================== */
+typedef struct _RB_GEOW {
+    PIO_WORKITEM Wi;
+    PRB_DEV_EXT  Ext;
+} RB_GEOW, *PRB_GEOW;
+
+static VOID RbGeoWorkRoutine(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    PRB_GEOW gw = (PRB_GEOW)Context;
+    PRB_DEV_EXT  ext = gw->Ext;
+    PIO_WORKITEM wi  = gw->Wi;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+    ExFreePoolWithTag(gw, RB_POOL_TAG);
+    if (!ext->Removed && ext->LowerDevice) {
+        RbRefreshVolumeGeometry(ext);      /* PASSIVE：可阻塞 */
+        /* [AUTOATTACH-1] 死配置落地：attach 路径自带系统卷/引导关键卷/L2 卷/panic 拒绝 */
+        if (!ext->Removed && ext->GeometryValid && ext->Letter &&
+            g_Rb.AutoAttach && !ext->IsAttached)
+            RbAttachVolumeByLetter(ext->Letter);
+    }
+    IoFreeWorkItem(wi);
+    RbDerefExt(ext);                       /* 抵消 completion 里加的引用 */
+}
+
+NTSTATUS RbPnpStartComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID ctx)
+{
+    PRB_DEV_EXT ext = (PRB_DEV_EXT)ctx;
+
+    if (NT_SUCCESS(irp->IoStatus.Status) && dev) {
+        PRB_GEOW gw = (PRB_GEOW)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                                sizeof(RB_GEOW), RB_POOL_TAG);
+        PIO_WORKITEM wi = gw ? IoAllocateWorkItem(dev) : NULL;
+        if (gw && wi) {
+            gw->Wi = wi;
+            gw->Ext = ext;
+            InterlockedIncrement(&ext->Refs);
+            IoQueueWorkItem(wi, RbGeoWorkRoutine, DelayedWorkQueue, gw);
+        } else {
+            if (gw) ExFreePoolWithTag(gw, RB_POOL_TAG);
+            if (wi) IoFreeWorkItem(wi);
+            /* 失败：GeometryValid 保持 FALSE，运行时 ATTACH 惰性重试 */
+        }
+    }
+    return STATUS_CONTINUE_COMPLETION;
+}
+
+/* =====================================================================
+ * PnP completion：下层完成 REMOVE 后统一拆除本层
+ * ===================================================================== */
+NTSTATUS RbPnpRemoveComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID ctx)
+{
+    PRB_DEV_EXT ext = (PRB_DEV_EXT)ctx;
+    UNREFERENCED_PARAMETER(dev);
+    UNREFERENCED_PARAMETER(irp);
+    RbVolumeRemove(ext);
+    return STATUS_CONTINUE_COMPLETION;
+}
+
+/* =====================================================================
+ * [R1][R2] 运行时按盘符 ATTACH —— V10 语义：
+ * PnP AddDevice 已把过滤设备挂在卷栈上（挂载前），
+ * ATTACH 不再挂栈，只翻转 IsAttached 热开关 + 惰性建流（立即生效、免重启）。
+ * ===================================================================== */
+/* [FIX-3] attach 串行化锁（落地于驱动侧；文档原写 core/rb_attach_lock.c，
+ * 但本工程 attach 实际在 driver/rbattach.c，core/ 为用户态 pthread 引擎，故就近放此）。
+ * 锁序：本锁最外层；持有期间只取 DevListLock 等内部短锁。PASSIVE_LEVEL。 */
+static FAST_MUTEX s_AttachMutex;
+static BOOLEAN    s_AttachReady = FALSE;
+
+VOID RbAttachLockInit(VOID)
+{
+    if (s_AttachReady) { return; }
+    ExInitializeFastMutex(&s_AttachMutex);
+    s_AttachReady = TRUE;
+}
+
+NTSTATUS RbAttachVolumeByLetter(WCHAR letter)
+{
+    PRB_DEV_EXT ext;
+    NTSTATUS st = STATUS_SUCCESS;
+    BOOLEAN locked = FALSE;
+
+    PAGED_CODE();
+    if (letter < L'A' || letter > L'Z') return STATUS_INVALID_PARAMETER;
+
+    /* [FIX-3] attach 串行化：消除并发 attach 的瞬时 0x5 / 重入半挂。
+     * 本锁为最外层短锁；持有期间只取 DevListLock 等内部短锁，禁止反向再取本锁。PASSIVE_LEVEL。 */
+    if (!s_AttachReady) { st = STATUS_DEVICE_NOT_READY; goto out; }
+    ExAcquireFastMutex(&s_AttachMutex);
+    locked = TRUE;
+
+    if (RbPanicActive()) { st = STATUS_DEVICE_NOT_READY; goto out; }   /* 先 panic-clear */
+
+    RbResolveAllLetters();                 /* [V10.2] 先解析盘符/系统卷身份 */
+    ext = RbFindExtByLetter(letter);      /* 带引用 */
+    if (!ext) { st = STATUS_NOT_FOUND; goto out; }   /* 盘符尚未挂载/不存在 */
+
+    do {
+        if (ext->Removed) { st = STATUS_DEVICE_REMOVED;    break; }
+
+        /* [用户要求：允许缓存系统卷 C:] 显式移除系统卷/引导关键 PDO 拒绝闸门。
+         * 旧版此处 IsSystem / Letter==SystemDriveLetter / RbIsBootCriticalPdo 一律 ACCESS_DENIED；
+         * 现按用户要求，GUI 对任何卷（含 C: 系统盘）打勾即直接启用缓存。
+         * 安全由三重回滚(boot_guard/offline_rollback)兜底：缓存 C: 导致开不了机时自动摘 UpperFilters。
+         * 仍保留：panic 拒绝(上方)、L2 存储卷保护、几何检测失败拒绝。 */
+
+        /* [V10.3] L2 卷保护闸门：配置为 L2 存储盘的卷永不缓存 */
+        if (RbFeatRefuseLetter(letter)) {
+            st = STATUS_ACCESS_DENIED; break;
+        }
+
+        /* 几何若仍未知（START 工作项失败/未跑），PASSIVE 下惰性再测一次 */
+        if (!ext->GeometryValid)
+            RbRefreshVolumeGeometry(ext);
+        if (!ext->GeometryValid) { st = STATUS_DEVICE_NOT_READY; break; }
+
+        st = RbEnsureEngine();
+        if (!NT_SUCCESS(st)) break;
+        if (!ext->Stream) {
+            ext->Stream = rb_stream_create(g_Rb.Engine, (rb_u64)(ULONG_PTR)ext);
+            if (!ext->Stream) { st = STATUS_INSUFFICIENT_RESOURCES; break; }
+        }
+        ext->IsAttached = TRUE;
+        RbHotPrewarm(ext);              /* [V10.3] 热区预热（HOT 关则空转） */
+        st = STATUS_SUCCESS;
+        RbLog(0, __LINE__, 0, L"volume attached (hot switch on)");
+    } while (0);
+
+    RbDerefExt(ext);
+
+out:
+    if (locked) {
+        ExReleaseFastMutex(&s_AttachMutex);
+    }
+    return st;
+}
+
+/* =====================================================================
+ * [R1] 运行时按盘符 DETACH —— V10 语义：
+ * 关热开关（新 I/O 立即透传）→ 脏数据落盘 → 销毁缓存流；
+ * 过滤设备留在栈上（不拆除，下次 ATTACH 免重启）。
+ * ===================================================================== */
+NTSTATUS RbDetachVolumeByLetter(WCHAR letter)
+{
+    PRB_DEV_EXT ext;
+    PAGED_CODE();
+    ext = RbFindExtByLetter(letter);              /* 带引用 */
+    if (!ext) return STATUS_NOT_FOUND;
+
+    ext->IsAttached = FALSE;                      /* 先关热开关：新 IO 一律透传 */
+
+    /* [DETACH-1] 等在飞 ctx 排空（Refs 回落 owner=1），60s 上限；
+     * 排不空则本次不销毁流（引擎 flush 线程继续落盘），下次重试 */
+    {
+        LARGE_INTEGER tick; ULONG i;
+        tick.QuadPart = -200000LL;                /* 20ms */
+        for (i = 0; i < 3000; i++) {
+            if (InterlockedCompareExchange(&ext->Refs, 1, 1) <= 1) break;
+            KeDelayExecutionThread(KernelMode, FALSE, &tick);
+        }
+        if (InterlockedCompareExchange(&ext->Refs, 1, 1) > 1) {
+            RbLog(1, __LINE__, STATUS_IO_TIMEOUT, L"detach deferred (io in flight), stream kept");
+            RbDerefExt(ext);
+            return STATUS_DEVICE_BUSY;
+        }
+    }
+    if (ext->Stream) {
+        rb_stream_flush(ext->Stream, 1);
+        rb_stream_destroy(ext->Stream);
+        ext->Stream = NULL;
+    }
+    RbDerefExt(ext);
+    RbLog(0, __LINE__, 0, L"volume detached (filter kept, passthrough)");
+    return STATUS_SUCCESS;
+}
+
+/* GET_VOLUMES：V10 直接枚举内部设备表（PnP 已注册的过滤卷），
+ * 不再对 \??\X: 做存储栈遍历（那是 BUG-001 的错误路径）。 */
+VOID RbVolumeEnumerateAll(RB_VOLUME_LIST *out)
+{
+    PRB_DEV_EXT snap[RB_MAX_VOLUMES];
+    PLIST_ENTRY le;
+    ULONG n = 0, k;
+
+    PAGED_CODE();
+    RtlZeroMemory(out, sizeof(*out));
+    RtlZeroMemory(snap, sizeof(snap));
+
+    /* [V10.2] 先在锁外解析全部卷盘符/系统卷身份（AddDevice 不再设盘符） */
+    RbResolveAllLetters();
+
+    /* [ENUM-1] 持引用快照：与 REMOVE 竞态 TOCTOU 之间 ext 不被删除 */
+    ExAcquireFastMutex(&g_Rb.DevListLock);
+    for (le = g_Rb.DevList.Flink;
+         le != &g_Rb.DevList && n < RB_MAX_VOLUMES; le = le->Flink) {
+        PRB_DEV_EXT e = CONTAINING_RECORD(le, RB_DEV_EXT, ListEntry);
+        InterlockedIncrement(&e->Refs);
+        snap[n++] = e;
+    }
+    ExReleaseFastMutex(&g_Rb.DevListLock);
+
+    for (k = 0; k < n; k++) {
+        PRB_DEV_EXT e = snap[k];
+        RB_VOLUME_INFO *vi = &out->Items[k];
+        GET_LENGTH_INFORMATION len;
+        DISK_GEOMETRY geo;
+        ULONG ret = 0;
+
+        RtlZeroMemory(vi, sizeof(*vi));
+        vi->Letter = e->Letter;
+        vi->Bound  = 1;
+        vi->IsSystem = e->IsSystem ? 1u : 0u;
+        vi->WriteMode = (ULONG)e->WriteMode;
+        vi->ReadEnabled  = (ULONG)e->ReadEnabled;
+        vi->WriteEnabled = (ULONG)e->WriteEnabled;
+        vi->Attached = (e->IsAttached && !e->Removed) ? 1u : 0u;
+
+        /* REMOVE 竞态防御：栈已拆则只报状态，不发 IOCTL */
+        if (e->Removed || !e->LowerDevice) {
+            out->Count = n;               /* 注意：按实际填充数返回（N1 教训） */
+            continue;
+        }
+
+        RtlZeroMemory(&len, sizeof(len));
+        if (NT_SUCCESS(RbSendSyncIoctl(e->LowerDevice, IOCTL_DISK_GET_LENGTH_INFO,
+                                      NULL, 0, &len, sizeof(len), &ret)))
+            vi->CapacityMB = (ULONG64)(len.Length.QuadPart >> 20);
+        RtlZeroMemory(&geo, sizeof(geo));
+        if (NT_SUCCESS(RbSendSyncIoctl(e->LowerDevice, IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                                      NULL, 0, &geo, sizeof(geo), &ret)) &&
+            geo.BytesPerSector) {
+            vi->LogicalSectorBytes  = geo.BytesPerSector;
+            vi->PhysicalSectorBytes = geo.BytesPerSector;
+        }
+        if (e->LogicalSector)  vi->LogicalSectorBytes  = e->LogicalSector;
+        if (e->PhysicalSector) vi->PhysicalSectorBytes = e->PhysicalSector;
+    }
+    for (k = 0; k < n; k++) RbDerefExt(snap[k]);   /* [ENUM-1] 释放快照引用 */
+    out->Count = n;
+}
+
+
+===== 文件: driver\rbwback.c =====
+/* ============================================================================
+ * rbwback.c — WB 合写后台线程
+ *
+ * 【当前状态：未接线】RbWbInit/RbWbStop 目前没有任何调用方，本模块的线程
+ * 不会创建，WB-1 修复的计数槽(10/11/12)恒为 0。这是有意的：WBCOAL 特性
+ * 维持 OFF（见 audit V10.3.4，L2 无数据来源）。
+ *
+ * 接线方法：在 RbFeatInit() 成功路径尾部调用 RbWbInit()，
+ *          在 RbFeatShutdown() 开头调用 RbWbStop()。
+ * 在接线之前，不要把本模块的计数当作真实遥测。
+ * ============================================================================ */
+/* rbwback.c —— 写合并/限速调度 v1（默认 OFF）。
+ * rbio 把 zone 回写从"立即"改为"投递"，本模块按每卷 MaxWriteIops 节奏调 FlushFn。
+ * Panic/关机时：立即透传清空队列（安全方向）。 */
+#include "rb_common.h"
+#include "rb_common2.h"
+
+typedef struct _RB2_WB { PVOID Ext; VOID (*Fn)(PVOID); PVOID Ctx; LIST_ENTRY Le; } RB2_WB;
+static LIST_ENTRY s_Q; static KSPIN_LOCK s_Lk; static KSEMAPHORE s_Sem;
+static LONG s_Stop, s_Run; static ULONG64 s_Last;
+
+BOOLEAN RbWbActive(PVOID Ext) { UNREFERENCED_PARAMETER(Ext); return ((g_Rb2Flags & RB2F_WBCOAL) && !s_Stop); }
+VOID RbWbSubmit(PVOID Ext, ULONG64 lba, ULONG len, VOID (*Fn)(PVOID), PVOID Ctx)
+{
+    RB2_WB *w; KIRQL irql;
+    UNREFERENCED_PARAMETER(lba); UNREFERENCED_PARAMETER(len);
+    w = (RB2_WB *)Rb2Alloc(sizeof(*w)); if (!w) { Fn(Ctx); return; }
+    w->Ext = Ext; w->Fn = Fn; w->Ctx = Ctx;
+    KeAcquireSpinLock(&s_Lk, &irql); InsertTailList(&s_Q, &w->Le); KeReleaseSpinLock(&s_Lk, irql);
+    KeReleaseSemaphore(&s_Sem, IO_NO_INCREMENT, 1, FALSE);
+}
+static VOID RbWbThread(PVOID Ctx)
+{
+    LARGE_INTEGER gap; UNREFERENCED_PARAMETER(Ctx);
+    InterlockedIncrement(&s_Run);
+    for (;;) {
+        RB2_WB *w = NULL; KIRQL irql; ULONG iops; RB2_POL pol; LARGE_INTEGER now;
+        KeWaitForSingleObject(&s_Sem, Executive, KernelMode, FALSE, NULL);
+        if (InterlockedCompareExchange(&s_Stop, 0, 0)) {
+            KeAcquireSpinLock(&s_Lk, &irql);
+            while (!IsListEmpty(&s_Q)) {
+                PLIST_ENTRY le = RemoveHeadList(&s_Q); w = CONTAINING_RECORD(le, RB2_WB, Le);
+                KeReleaseSpinLock(&s_Lk, irql); w->Fn(w->Ctx); Rb2Free(w);
+                KeAcquireSpinLock(&s_Lk, &irql);
+            }
+            KeReleaseSpinLock(&s_Lk, irql); break;
+        }
+        KeAcquireSpinLock(&s_Lk, &irql);
+        if (!IsListEmpty(&s_Q)) { PLIST_ENTRY le = RemoveHeadList(&s_Q); w = CONTAINING_RECORD(le, RB2_WB, Le); }
+        KeReleaseSpinLock(&s_Lk, irql);
+        if (!w) continue;
+        RbPolGetFor(((PRB_DEV_EXT)w->Ext)->Letter, &pol);
+        iops = pol.MaxWriteIops ? pol.MaxWriteIops : 2000;
+        KeQuerySystemTimePrecise(&now);
+        if (s_Last) {
+            LONG64 need = 10000000LL / iops, el = now.QuadPart - s_Last;
+            if (el < need) {
+                gap.QuadPart = -(need - el);
+                Rb2Count(12, 1);              /* [Build15] 节流计数槽=12 */
+                KeDelayExecutionThread(KernelMode, FALSE, &gap);
+            }
+        }
+        KeQuerySystemTimePrecise(&now); s_Last = now.QuadPart;
+        Rb2Count(10, 1); w->Fn(w->Ctx); Rb2Count(11, 1); Rb2Free(w);   /* 槽 10=Queued 11=Done */
+    }
+    InterlockedDecrement(&s_Run);
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+NTSTATUS RbWbInit(VOID)
+{
+    s_Stop = 0; s_Run = 0;            /* [BSOD-fix] 幂等起点 */
+    InitializeListHead(&s_Q); KeInitializeSpinLock(&s_Lk);
+    KeInitializeSemaphore(&s_Sem, 0, 0x7FFFFFFF);
+    { HANDLE h; return PsCreateSystemThread(&h, 0, NULL, NULL, NULL, RbWbThread, NULL); }
+}
+
+/* [BSOD-fix] 整函数重写：幂等 + 唤醒线程 + 等其退出 + 60s 兜底 + 清空残留队列。
+ * 语义对齐 audit 1.txt §2.1，但用本地静态状态(s_Stop/s_Sem/s_Run)实现，无 PRB_WB 句柄。
+ * 注意：WBCOAL 仍 RB_WIRED_WBCOAL=0 不接线，此函数当前无调用方，仅把未来接线写对。 */
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID RbWbStop(VOID)
+{
+    LONG spins;
+    KIRQL irql;
+
+    PAGED_CODE();                       /* 事件等待只能 PASSIVE，误在 DISPATCH 调=BSOD */
+
+    if (InterlockedExchange(&s_Stop, 1)) {
+        return;                         /* 幂等：二次 stop 直接返回，防双等待 */
+    }
+
+    /* 唤醒等待的回写线程；线程循环见 s_Stop 后会自清队列并退出 */
+    KeReleaseSemaphore(&s_Sem, IO_NO_INCREMENT, 1, FALSE);
+
+    /* 等线程退出（线程入口 ++s_Run，退出前 --s_Run），10ms/步 × 6000 ≈ 60s 兜底 */
+    for (spins = 0; spins < 6000; spins++) {
+        if (InterlockedCompareExchange(&s_Run, 0, 0) == 0) { break; }
+        { LARGE_INTEGER t; t.QuadPart = -100000LL;
+          KeDelayExecutionThread(KernelMode, FALSE, &t); }
+    }
+
+    /* 线程已退出 ≠ 队列清空（超时兜底）：此刻无执行体再碰 s_Q，安全 drain */
+    KeAcquireSpinLock(&s_Lk, &irql);
+    while (!IsListEmpty(&s_Q)) {
+        PLIST_ENTRY le = RemoveHeadList(&s_Q);
+        RB2_WB *w;
+        KeReleaseSpinLock(&s_Lk, irql);
+        w = CONTAINING_RECORD(le, RB2_WB, Le);
+        w->Fn(w->Ctx);                  /* 安全方向：关机/panic 透传 */
+        Rb2Free(w);
+        KeAcquireSpinLock(&s_Lk, &irql);
+    }
+    KeReleaseSpinLock(&s_Lk, irql);
+}
+
+
+===== 文件: driver\rbio.c =====
+/*
+ * RAMBlockCache 数据路径：块级 READ/WRITE 拦截、同步盘 I/O、缓存引擎接线、
+ * 后台脏块回写线程、动态内存压力收缩。
+ *
+ * IRQL 策略：块设备 paging I/O 的完成在 DISPATCH_LEVEL，而缓存核心用
+ * ERESOURCE（<=APC_LEVEL）。故凡命中缓存的 I/O 一律在 dispatch 处
+ * IoMarkIrpPending + 投递到系统 worker（PASSIVE）处理，绝不于 DISPATCH 取缓存锁。
+ * 未 attach 或异常时直接透传，保持设备队列深度(QD)不塌陷。
+ */
+#include "rb_common.h"
+#include "rb_common2.h"   /* [V10.3] 特性层 */
+#include "../common/rb_threadsched.h"  /* [多核] HT/组感知 worker 绑核 */
+
+/* FIX[build]: 裁剪WDK头缺 ZwQuerySystemInformation 原型，ntoskrnl 有导出，显式声明
+ * （形参1用ULONG类号，避免依赖被裁剪的 SYSTEM_INFORMATION_CLASS 枚举）。
+ * KeQueryInterruptTimePrecise 直接用 wdm.h 原型——它需要 PULONG64 出参，不是 VOID。 */
+NTSTATUS NTAPI ZwQuerySystemInformation(ULONG SystemInformationClass, PVOID SystemInformation,
+                                        ULONG SystemInformationLength, PULONG ReturnLength);
+static VOID RbFlushIrpWorker(PRB_IOCTX ctx);   /* 定义靠后，前向声明供worker池调用 */
+static VOID RbRwWorker(PVOID p);               /* 定义靠后，RbSubmitIo 兜底引用 */
+/* 中断时间（不含睡眠，单位100ns）→ 毫秒；供空闲/延迟回写判定 */
+static ULONG64 RbInterruptMs(VOID)
+{
+    ULONG64 qpc = 0;
+    return KeQueryInterruptTimePrecise(&qpc) / 10000ULL;
+}
+
+/* ---------------- 可用物理内存（MB） ---------------- */
+/* FIX[P4]: 原实现用 NumberOfPhysicalPages（物理内存【总量】，不随压力变化），
+ * 导致动态预算/压力分级整体失效。需要的是内核实时维护的 AvailablePages
+ * （Free+Zeroed+Standby 页）。
+ *
+ * 重要修正：审计建议直接 extern 内核变量 MmAvailablePages，但该变量并【未】
+ * 由 ntoskrnl.exe 导出（已解析 ntoskrnl 导出表，3358 个命名导出中无此符号），
+ * 直接 extern 会产生 unresolved external symbol 链接错误。故改用
+ * ZwQuerySystemInformation(SystemPerformanceInformation)，其 AvailablePages
+ * 字段位于偏移 0x2C（32/64 位布局相同，权威来源 Geoff Chappell）。 */
+/* FIX[编译阻塞#2]: 被裁剪的 NuGet WDK 头缺 SYSTEM_INFORMATION_CLASS ——
+ * 直接以整型类号调用（2 = SystemPerformanceInformation），完整/裁剪两套头都兼容。
+ * 同时按 audit §4.7.5 方案B：Zw → Nt（裁剪头已确认存在 Nt 声明）。 */
+#define RB_SYS_PERF_INFO_CLASS 2
+
+typedef struct _RB_SYS_PERF {
+    LARGE_INTEGER IdleProcessTime;       /* 0x00 */
+    LARGE_INTEGER IoReadTransferCount;   /* 0x08 */
+    LARGE_INTEGER IoWriteTransferCount;  /* 0x10 */
+    LARGE_INTEGER IoOtherTransferCount;  /* 0x18 */
+    ULONG IoReadOperationCount;          /* 0x20 */
+    ULONG IoWriteOperationCount;         /* 0x24 */
+    ULONG IoOtherOperationCount;         /* 0x28 */
+    ULONG AvailablePages;                /* 0x2C —— 我们需要的字段 */
+    ULONG Reserved[74];                  /* 0x30..0x158：缓冲 >= 现代结构大小，
+                                            否则 ZwQuerySystemInformation 返回
+                                            STATUS_INFO_LENGTH_MISMATCH */
+} RB_SYS_PERF;
+
+ULONG RbMemAvailableMB(VOID)
+{
+    RB_SYS_PERF perf;
+    NTSTATUS s;
+    RtlZeroMemory(&perf, sizeof(perf));
+    s = ZwQuerySystemInformation(RB_SYS_PERF_INFO_CLASS,
+                                 &perf, (ULONG)sizeof(perf), NULL);
+    if (!NT_SUCCESS(s))
+        return 0;   /* 查询失败：返回 0，调用方按保守/默认预算处理 */
+    return (ULONG)(((ULONG64)perf.AvailablePages * PAGE_SIZE) >> 20);
+}
+static PVOID RbMapIrpBuffer(PIRP irp)
+{
+    if (irp->MdlAddress)
+        return MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority);
+    return irp->AssociatedIrp.SystemBuffer;
+}
+
+/* [CTX-1] RB_IOCTX 非分页旁视池（dispatch 热路径每 IO 一次分配的替代） */
+PVOID RbCtxAlloc(VOID)   { return ExAllocateFromNPagedLookasideList(&g_Rb.IoCtxLa); }
+VOID  RbCtxFree(PVOID p) { if (p) ExFreeToNPagedLookasideList(&g_Rb.IoCtxLa, p); }
+
+/* [STAGE-1] miss staging 复用：每 worker 独占一块，按需求涨，不逐 IO 分配释放 */
+#define RB_STAGE_MAX (32u << 20)
+static PVOID RbStageGet(PRB_IOWORKER w, SIZE_T need)
+{
+    PVOID p;
+    if (!w || need > RB_STAGE_MAX) return RbAllocAlignedNonPaged(need);  /* 超限按次分配 */
+    if (w->StageCap < need) {
+        p = RbAllocAlignedNonPaged(need);
+        if (!p) return NULL;
+        if (w->Stage) RbFreeAligned(w->Stage);
+        w->Stage = p; w->StageCap = need;
+    }
+    return w->Stage;
+}
+FORCEINLINE VOID RbStagePut(PRB_IOWORKER w, PVOID p)
+{ if (p && (!w || p != w->Stage)) RbFreeAligned(p); }
+
+/* ===== 同步盘 I/O（worker/flusher PASSIVE 调用） =====
+ * [C5-r2 重写] 旧实现超时后直接放弃在飞 IRP：堆 ctx 泄漏，
+ * 下层最终完成时向已释放缓冲写入（UAF/数据踩踏）。
+ * 新实现核心不变式：【永不放弃缓冲 —— 我们从不停止等待】
+ *   1) 挂自己的完成例程（STATUS_MORE_PROCESSING_REQUIRED），
+ *      IRP 生命周期由本函数全程看护；
+ *   2) 15s 步进观察；超时 → IoCancelIrp 请求取消 → 继续等待；
+ *      取消后绝大多数栈在有限时间内完成（端口驱动自带超时兜底）；
+ *   3) evt 置位（完成/取消完成）→ IoCompleteRequest 释放 MDL 锁定
+ *      → 读 iosb → 释放 ctx。缓冲在完成前始终有效，无 UAF 无泄漏。
+ * 极端情形（存储栈 bug 级永久挂起）：worker 线程驻留等待，
+ * 与“物理盘真死”同域，由 RbStopIoWorkers 的 join 超时面处理。 */
+typedef struct _RB_SYNCCTX {
+    KEVENT          evt;
+    IO_STATUS_BLOCK iosb;
+} RB_SYNCCTX;
+
+static NTSTATUS NTAPI RbSyncComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID c)
+{
+    RB_SYNCCTX *ctx = (RB_SYNCCTX *)c;
+    UNREFERENCED_PARAMETER(dev);
+    UNREFERENCED_PARAMETER(irp);
+    KeSetEvent(&ctx->evt, IO_NO_INCREMENT, FALSE);
+    return STATUS_MORE_PROCESSING_REQUIRED;   /* 保住 IRP，由等待方收尾 */
+}
+
+NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
+                  PVOID buf, ULONG len, PULONG_PTR pInfo)
+{
+    RB_SYNCCTX *ctx;
+    PIRP irp;
+    NTSTATUS s;
+
+    ctx = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(RB_SYNCCTX), RB_POOL_TAG);
+    if (!ctx) return STATUS_INSUFFICIENT_RESOURCES;
+    KeInitializeEvent(&ctx->evt, NotificationEvent, FALSE);
+
+    irp = IoBuildSynchronousFsdRequest(doWrite ? IRP_MJ_WRITE : IRP_MJ_READ,
+                                       ext->LowerDevice,
+                                       buf, (ULONG)len, off,
+                                       &ctx->evt, &ctx->iosb);
+    if (!irp) {
+        ExFreePoolWithTag(ctx, RB_POOL_TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    IoSetCompletionRoutine(irp, RbSyncComplete, ctx, TRUE, TRUE, TRUE);
+
+    s = IoCallDriver(ext->LowerDevice, irp);
+    if (s == STATUS_PENDING) {
+        BOOLEAN cancelRequested = FALSE;
+        for (;;) {
+            LARGE_INTEGER to;
+            to.QuadPart = -1500000000LL;      /* 15s 步进 */
+            s = KeWaitForSingleObject(&ctx->evt, Executive, KernelMode, FALSE, &to);
+            if (s == STATUS_SUCCESS) break;   /* 下层完成（含取消完成） */
+            if (!cancelRequested) {
+                IoCancelIrp(irp);             /* [BUG-004] 请求取消，而非弃单 */
+                cancelRequested = TRUE;
+                RbLog(1, __LINE__, STATUS_IO_TIMEOUT,
+                      L"sync io slow, cancel requested");
+                continue;
+            }
+            /* 取消已请求仍未完成：继续等（绝不放弃缓冲） */
+            RbLog(1, __LINE__, STATUS_IO_TIMEOUT,
+                  L"sync io cancel pending, keep waiting");
+        }
+    }
+
+    /* evt 已置位（同步完成路径同样会跑完成例程），统一收尾（PASSIVE） */
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    s = ctx->iosb.Status;
+    if (pInfo) *pInfo = NT_SUCCESS(s) ? ctx->iosb.Information : 0;
+    ExFreePoolWithTag(ctx, RB_POOL_TAG);
+    return s;
+}
+
+/* [V10.1] 盘 I/O 记账：成功清零；连续失败 >=32 → 全局熔断透传。
+ * 阈值意义：core 单次坏扇区已正确兜底，这里防"故障盘被缓存层反复踩"——
+ * 持续失败即整个系统降级裸盘，让上层按裸盘语义处理错误。 */
+VOID RbNoteIoResult(PRB_DEV_EXT ext, NTSTATUS s)
+{
+    if (NT_SUCCESS(s)) { InterlockedExchange(&ext->IoFailRun, 0); return; }
+    if (InterlockedIncrement(&ext->IoFailRun) >= RB_IO_FAIL_PANIC)
+        RbSetPanic(L"device I/O failing persistently");
+}
+
+/* ---------------- 缓存引擎回调：file_id == (PRB_DEV_EXT) ---------------- */
+int RbWritebackCb(void *ctx, rb_u64 file_id, rb_u64 off, const void *data, size_t len)
+{
+    PRB_DEV_EXT ext = (PRB_DEV_EXT)(ULONG_PTR)file_id;
+    LARGE_INTEGER o;
+    NTSTATUS s;
+    UNREFERENCED_PARAMETER(ctx);
+    if (!ext || ext->Removed) return 1;          /* 设备已移除：丢弃（卸载前已 flush） */
+    o.QuadPart = (LONGLONG)off;
+    s = RbSyncIo(ext, TRUE, &o, (PVOID)data, (ULONG)len, NULL);
+    RbNoteIoResult(ext, s);
+    return NT_SUCCESS(s) ? 0 : 1;
+}
+
+int RbReadbackCb(void *ctx, rb_u64 file_id, rb_u64 off, void *buf, size_t len)
+{
+    PRB_DEV_EXT ext = (PRB_DEV_EXT)(ULONG_PTR)file_id;
+    LARGE_INTEGER o;
+    NTSTATUS s;
+    UNREFERENCED_PARAMETER(ctx);
+    if (!ext || ext->Removed) return 1;
+    o.QuadPart = (LONGLONG)off;
+    s = RbSyncIo(ext, FALSE, &o, buf, (ULONG)len, NULL);
+    RbNoteIoResult(ext, s);
+    return NT_SUCCESS(s) ? 0 : 1;
+}
+
+/* ---------------- 每卷写模式解析（系统卷恒直写） ---------------- */
+static BOOLEAN RbIsWriteBack(PRB_DEV_EXT ext)
+{
+    LONG m = ext->WriteMode;
+    /* FIX[P2-2]: 安全模式（上次异常退出）→ 强制直写，防止二次数据损失 */
+    if (g_Rb.SafeMode) return FALSE;
+    if (m == RB_WRITEMODE_GLOBAL) m = g_Rb.Config.WriteBack;
+    if (ext->IsSystem) return FALSE;             /* 系统卷强制 write-through */
+    return (m == RB_WRITEMODE_BACK) ? TRUE : FALSE;
+}
+
+/* [FIX D4] CREATE/CLOSE 分流：
+ *  - 控制设备：直接成功（控制面无下层）；
+ *  - 卷设备：必须透传给真实卷栈，过滤驱动绝不能吞掉 CREATE/CLOSE。 */
+NTSTATUS RbDispatchCreateClose(PDEVICE_OBJECT dev, PIRP irp)
+{
+    if (dev == g_Rb.ControlDevice)
+        return RbDispatchClo(dev, irp);
+    return RbForward(dev, irp);
+}
+
+/* ---------------- READ worker ---------------- */
+/* [P1-1] 原 rb_read 返回值被忽略：miss 区间数溢出(-2)时 mcnt==max+1，
+ *        循环越界读 miss[RB_MAX_RANGES]，进而用垃圾 offset/len 下盘。
+ * [P1-2] miss 区间按整块给出，尾块越过请求末尾；原代码按 miss.len 写入
+ *        仅 len 字节的 staging —— 非分页池越界写。
+ * [P1-3] 性能：取消每 IO ≤8MB 的非分页 staging。命中直接拷进 IRP 缓冲，
+ *        miss 直接从盘读进 IRP 缓冲，成功后按 miss 区间逐段提交缓存
+ *        （rb_read_commit 只缓存完整子块，语义不变）。 */
+static VOID RbReadWorker(PRB_IOCTX ctx, PRB_IOWORKER w)
+{
+    PRB_DEV_EXT ext  = ctx->Ext;
+    PIRP        irp  = ctx->Irp;
+    ULONG       len  = ctx->Length;
+    LONGLONG    off  = ctx->Offset.QuadPart;
+    rb_direct_range miss[RB_MAX_RANGES];
+    int         mcnt = 0, i, rc;
+    PVOID       tgt  = RbMapIrpBuffer(irp);
+    NTSTATUS    s    = STATUS_SUCCESS;
+    ULONG_PTR   info = 0;
+
+    if (!tgt) { s = STATUS_INSUFFICIENT_RESOURCES; goto done; }
+
+    /* [V10.3] 特性钩子：读入口预取流跟踪 + 进程排除准入（Flags=0 时零开销空转） */
+    RbFeatOnRead(ext, (ULONG64)off, len);
+    if (!RbFeatAdmit(ext)) {
+        LARGE_INTEGER moff;
+        moff.QuadPart = off;
+        s = RbSyncIo(ext, FALSE, &moff, tgt, len, NULL);
+        info = NT_SUCCESS(s) ? len : 0;
+        goto done;
+    }
+
+    rc = rb_read(ext->Stream, (rb_u64)off, tgt, len, miss, &mcnt, RB_MAX_RANGES);
+    if (rc < 0) {
+        /* [P1-1] miss 区间数超上限：缓存视图不完整，整段直读兜底（不入缓存）。 */
+        LARGE_INTEGER moff;
+        moff.QuadPart = off;
+        s = RbSyncIo(ext, FALSE, &moff, tgt, len, NULL);
+        info = NT_SUCCESS(s) ? len : 0;
+        goto done;
+    }
+    if (mcnt > RB_MAX_RANGES) mcnt = RB_MAX_RANGES;     /* [P1-1] 双保险 */
+    if (mcnt == 0) RbFeatOnHit(ext, (ULONG64)off, len);  /* [V10.3] 全命中 */
+
+    /* miss 区间已按【整子块对齐】（核心 P1-修正）：两端可能超出请求
+     * [off,off+len)，不能直接读进仅 len 字节的 tgt（会越界），也不能夹回
+     * 边界（非对齐 -> rb_read_commit 的 full_cover 不成立 -> 永不缓存）。
+     * 逐区间：4K 对齐 staging(按对齐长度) -> 下盘读整块 -> commit 整块建立
+     * 缓存 -> 把与请求的交集切进 tgt -> 释放。staging 分配失败则该区间退化
+     * 为"仅下盘读请求交集、不入缓存"，数据正确性不受影响。 */
+    for (i = 0; i < mcnt; i++) {
+        LARGE_INTEGER moff;
+        ULONGLONG ms = miss[i].offset;
+        ULONGLONG me = ms + miss[i].len;
+        ULONGLONG rs = (ULONGLONG)off;
+        ULONGLONG re = rs + len;
+        ULONGLONG lo = (ms > rs) ? ms : rs;
+        ULONGLONG hi = (me < re) ? me : re;
+        PUCHAR st = NULL;   /* [STAGE-1] 复用 per-worker staging（已 4K 对齐） */
+
+        if (miss[i].len > 0x80000000u) {                /* 防御：超 ULONG 范围 */
+            if (hi > lo) {
+                moff.QuadPart = (LONGLONG)lo;
+                s = RbSyncIo(ext, FALSE, &moff, (PUCHAR)tgt + (lo - rs),
+                             (ULONG)(hi - lo), NULL);
+                if (!NT_SUCCESS(s)) goto done;
+            }
+            continue;
+        }
+        st = (PUCHAR)RbStageGet(w, (SIZE_T)miss[i].len);
+        if (st) {
+            moff.QuadPart = (LONGLONG)ms;
+            if (NT_SUCCESS(RbFeatOnMiss(ext, (ULONG64)ms, miss[i].len, st))) {
+                s = STATUS_SUCCESS;                 /* [V10.3] L2 已填充 staging，免下盘 */
+            } else {
+                s = RbSyncIo(ext, FALSE, &moff, st, (ULONG)miss[i].len, NULL);
+            }
+            if (NT_SUCCESS(s)) {
+                rb_read_commit(ext->Stream, miss[i].offset, st, miss[i].len);
+                if (hi > lo)
+                    memcpy((PUCHAR)tgt + (lo - rs), st + (lo - ms),
+                           (size_t)(hi - lo));
+            }
+            RbStagePut(w, st);
+            if (!NT_SUCCESS(s)) goto done;
+        } else if (hi > lo) {
+            /* staging 分配失败：仅下盘读请求交集进 tgt，本区间不入缓存 */
+            moff.QuadPart = (LONGLONG)lo;
+            s = RbSyncIo(ext, FALSE, &moff, (PUCHAR)tgt + (lo - rs),
+                         (ULONG)(hi - lo), NULL);
+            if (!NT_SUCCESS(s)) goto done;
+        }
+    }
+
+    info = len;
+
+done:
+    irp->IoStatus.Status = s;
+    irp->IoStatus.Information = info;
+    IoCompleteRequest(irp, IO_DISK_INCREMENT);
+    RbNoteIoResult(ext, s);
+    RbDerefExt(ext);
+    RbCtxFree(ctx);
+}
+
+/* ---------------- WRITE worker ---------------- */
+/* [P2-1] rb_write 返回 -2（direct 区间溢出：缓存满 + 随机小 IO）被忽略 →
+ *        direct[32] 越界读；且尾部子块既不在缓存也不在 direct —— wb 下数据丢失。
+ *        现改为：整段回滚 + 整段同步下盘。
+ * [P2-2] wb 下任一直写失败：原来只回滚失败小段；现改为整段回滚，
+ *        确保“应用收到失败”的数据绝不会被后台持久化。 */
+static VOID RbWriteWorker(PRB_IOCTX ctx)
+{
+    PRB_DEV_EXT ext = ctx->Ext;
+    PIRP        irp = ctx->Irp;
+    ULONG       len = ctx->Length;
+    LONGLONG    off = ctx->Offset.QuadPart;
+    PVOID       tgt = RbMapIrpBuffer(irp);
+    NTSTATUS    s   = STATUS_SUCCESS;
+    ULONG_PTR   info= 0;
+    BOOLEAN     wb  = RbIsWriteBack(ext);
+
+    if (!tgt) { s = STATUS_INSUFFICIENT_RESOURCES; goto done; }
+
+    /* [ADMIT-1] 进程排除同样作用于写缓存（直写下盘，不入缓存） */
+    if (!RbFeatAdmit(ext)) {
+        LARGE_INTEGER o; o.QuadPart = off;
+        s = RbSyncIo(ext, TRUE, &o, tgt, len, NULL);
+        info = NT_SUCCESS(s) ? len : 0;
+        goto done;
+    }
+
+    if (wb) {
+        rb_direct_range direct[RB_MAX_RANGES];
+        int dcnt = 0, i;
+
+        if (rb_write(ext->Stream, (rb_u64)off, tgt, len,
+                     direct, &dcnt, RB_MAX_RANGES) < 0 || dcnt > RB_MAX_RANGES) {
+            /* [P2-1] 溢出兜底：放弃本次缓存吸收，整段直写下盘。 */
+            LARGE_INTEGER o;
+            o.QuadPart = off;
+            rb_stream_invalidate_range(ext->Stream, (rb_u64)off, (rb_u64)len);
+            s = RbSyncIo(ext, TRUE, &o, tgt, len, NULL);
+            info = NT_SUCCESS(s) ? len : 0;
+            goto done;
+        }
+
+        for (i = 0; i < dcnt; i++) {
+            LARGE_INTEGER doff;
+            NTSTATUS ds;
+            doff.QuadPart = (LONGLONG)direct[i].offset;
+            ds = RbSyncIo(ext, TRUE, &doff,
+                          (PUCHAR)tgt + (direct[i].offset - (rb_u64)off),
+                          (ULONG)direct[i].len, NULL);
+            if (!NT_SUCCESS(ds)) {
+                rb_stream_invalidate_range(ext->Stream,
+                                           direct[i].offset, direct[i].len);
+                s = ds;                 /* 记住最后一次失败，其余区间仍尽力下盘 */
+            }
+        }
+
+        /* [P2-2] 只要有一个直写失败，本次写入按整体失败处理 */
+        if (!NT_SUCCESS(s))
+            rb_stream_invalidate_range(ext->Stream, (rb_u64)off, (rb_u64)len);
+    } else {
+        /* M9 write-through：先整块下盘；成功后以“干净块”入缓存（不进脏集合）。 */
+        LARGE_INTEGER o;
+        o.QuadPart = off;
+        s = RbSyncIo(ext, TRUE, &o, tgt, len, NULL);
+        if (NT_SUCCESS(s))
+            rb_read_commit(ext->Stream, (rb_u64)off, tgt, len);
+    }
+    info = NT_SUCCESS(s) ? len : 0;
+
+done:
+    irp->IoStatus.Status = s;
+    irp->IoStatus.Information = info;
+    IoCompleteRequest(irp, IO_DISK_INCREMENT);
+    RbNoteIoResult(ext, s);
+    RbDerefExt(ext);
+    RbCtxFree(ctx);
+}
+
+/* ================= FIX[多核]: per-CPU I/O worker 池 ================= */
+static VOID RbPinToCpu(ULONG cpu)
+{
+    /* 绑定逻辑 CPU（含超线程）。>64 逻辑 CPU 的多组系统：worker 落在第 0 组，
+     * 仍并行，只是不跨组摊 —— 客户端系统几乎都是单组。 */
+    KeSetSystemAffinityThread((KAFFINITY)1 << (cpu & 63));
+}
+
+static VOID RbIoWorkerLoop(PVOID p)
+{
+    RB_IOWORKER *w = (RB_IOWORKER *)p;
+    /* [多核] 优先绑到预选的不同物理核；未选到则退回逐逻辑核固定。只绑 worker，不绑 DPC。 */
+    if (w->AuxValid) {
+        RB_AFFIN_TARGET t; t.ga = w->AuxGa; t.valid = TRUE;
+        RbBindCurrentThreadToTarget(&t);
+    } else {
+        RbPinToCpu(w->CpuIndex);
+    }
+    for (;;) {
+        KeWaitForSingleObject(&w->Wake, Executive, KernelMode, FALSE, NULL);
+        for (;;) {
+            KIRQL irql; PLIST_ENTRY le; PRB_IOCTX ctx;
+            KeAcquireSpinLock(&w->Lock, &irql);
+            le = IsListEmpty(&w->QueueHead) ? NULL : RemoveHeadList(&w->QueueHead);
+            KeReleaseSpinLock(&w->Lock, irql);
+            if (!le) break;
+            ctx = CONTAINING_RECORD(le, RB_IOCTX, le);
+            if (ctx->Major == IRP_MJ_READ)                RbReadWorker(ctx, w);
+            else if (ctx->Major == IRP_MJ_FLUSH_BUFFERS)  RbFlushIrpWorker(ctx);
+            else                                          RbWriteWorker(ctx);
+        }
+        if (!w->Alive) break;
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+void RbStartIoWorkers(VOID)
+{
+    ULONG n = KeQueryActiveProcessorCount(NULL);  /* 单组客户端系统；跨组总数应用KeQueryActiveProcessorCountEx */
+    ULONG i;
+    if (n == 0 || n > 1024) n = 8;                 /* 异常兜底 */
+    if (n > RB_IO_WORKERS_MAX) n = RB_IO_WORKERS_MAX;
+    g_Rb.IoWorkerCount = n;
+
+    /* [多核] 一次性挑 n 个"不同物理核"的目标，分配给各 worker，避免 HT 兄弟核抢同一 L1/L2。
+     * 失败/拓扑不可得 → AuxValid=0，worker 退回 RbPinToCpu，不阻断启动。 */
+    {
+        RB_AFFIN_TARGET auxT[RB_PCPU_MAX];
+        ULONG auxCnt = 0;
+        RtlZeroMemory(auxT, sizeof(auxT));
+        if (NT_SUCCESS(RbPickAuxTargets(auxT, &auxCnt, n)) && auxCnt > 0) {
+            for (i = 0; i < n; i++) {
+                ULONG t = i % auxCnt;
+                if (auxT[t].valid) {
+                    g_Rb.IoWorkers[i].AuxGa   = auxT[t].ga;
+                    g_Rb.IoWorkers[i].AuxValid = 1;
+                }
+            }
+        }
+    }
+
+    for (i = 0; i < n; i++) {
+        RB_IOWORKER *w = &g_Rb.IoWorkers[i];
+        OBJECT_ATTRIBUTES oa; HANDLE h = NULL;
+        InitializeListHead(&w->QueueHead);
+        KeInitializeSpinLock(&w->Lock);
+        KeInitializeEvent(&w->Wake, SynchronizationEvent, FALSE);
+        w->CpuIndex = i; w->Alive = 1;
+        InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+        if (NT_SUCCESS(PsCreateSystemThread(&h, THREAD_ALL_ACCESS, &oa, NULL, NULL, RbIoWorkerLoop, w))) {
+            ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
+                                      (PVOID *)&w->Thread, NULL);
+            ZwClose(h);
+        }
+        else {
+            w->Alive = 0; w->Thread = NULL;
+        }
+    }
+    /* [V10.3] 特性层初始化（幂等 CAS）+ 注册 zone 回填端口 */
+    RbFeatInit();
+    Rb2PortsSetup();
+    RbLog(0, __LINE__, 0, L"io worker pool started");
+}
+
+void RbStopIoWorkers(VOID)   /* FIX[UNLOAD]: 必须等待线程真正退出，再 detach/delete */
+{
+    ULONG i;
+    for (i = 0; i < g_Rb.IoWorkerCount; i++) {
+        RB_IOWORKER *w = &g_Rb.IoWorkers[i];
+        LARGE_INTEGER to;
+        w->Alive = 0;
+        KeSetEvent(&w->Wake, IO_NO_INCREMENT, FALSE);
+        if (w->Thread) {
+            to.QuadPart = -300000000LL;   /* 30s：C5-r2 后 worker 可能久等坏盘 */
+            KeWaitForSingleObject(w->Thread, Executive, KernelMode, FALSE, &to);
+            ObDereferenceObject(w->Thread);
+            w->Thread = NULL;
+        }
+    }
+}
+
+static VOID RbSubmitIo(PRB_IOCTX ctx)
+{
+    ULONG start = (ULONG)InterlockedIncrement(&g_Rb.IoRR) - 1;
+    ULONG i, n = g_Rb.IoWorkerCount;
+    KIRQL irql;
+
+    /* [V10.1] 从轮询起点起找第一个存活 worker；
+     * 全死（线程创建失败/极端退出）→ 落系统队列兜底，绝不丢请求。 */
+    for (i = 0; i < n; i++) {
+        RB_IOWORKER *w = &g_Rb.IoWorkers[(start + i) % n];
+        if (!w->Alive) continue;
+        KeAcquireSpinLock(&w->Lock, &irql);
+        InsertTailList(&w->QueueHead, &ctx->le);
+        KeReleaseSpinLock(&w->Lock, irql);
+        KeSetEvent(&w->Wake, IO_NO_INCREMENT, FALSE);   /* DISPATCH 下合法（Wait=FALSE） */
+        return;
+    }
+    ctx->Item.WorkerRoutine = RbRwWorker;
+    ctx->Item.Parameter     = ctx;
+    ExQueueWorkItem(&ctx->Item, DelayedWorkQueue);
+}
+
+static VOID RbFlushIrpWorker(PRB_IOCTX ctx)
+{
+    PRB_DEV_EXT ext = ctx->Ext;
+    if (ext->Stream) rb_stream_flush(ext->Stream, 0);
+    RbForward(ext->FilterDevice, ctx->Irp);
+    RbDerefExt(ext);
+    RbCtxFree(ctx);
+}
+
+static VOID RbRwWorker(PVOID p)   /* 兜底（池未启动）系统队列例程 —— FIX[N10] 路由 FLUSH */
+{
+    PRB_IOCTX ctx = (PRB_IOCTX)p;
+    if (ctx->Major == IRP_MJ_READ)                RbReadWorker(ctx, NULL);
+    else if (ctx->Major == IRP_MJ_FLUSH_BUFFERS)  RbFlushIrpWorker(ctx);
+    else                                          RbWriteWorker(ctx);
+}
+
+NTSTATUS RbDispatchReadWrite(PDEVICE_OBJECT dev, PIRP irp)
+{
+    PRB_DEV_EXT ext = (PRB_DEV_EXT)dev->DeviceExtension;
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
+    ULONG len;
+
+    /* C3: 先引用后校验（覆盖整个窗口），与 REMOVE 排空无竞态 */
+    InterlockedIncrement(&ext->Refs);
+
+    /* [V10.1] 哨兵/熔断/几何/热开关：任一不满足即透传。
+     * 成本：1 次 U32 比较 + 1 次 volatile 读，无锁。 */
+    if (ext->Magic != RB_EXT_MAGIC || g_Rb.PanicPassthrough ||
+        !ext->IsAttached || !ext->Stream || ext->Removed || g_Rb.Unloading ||
+        !g_Rb.Config.Enabled || !ext->GeometryValid) {
+        if (ext->Magic != RB_EXT_MAGIC) {
+            /* 内存被踩：立即全局熔断（log 不解引用其他字段） */
+            RbSetPanic(L"CORRUPT DEVEXT canary");
+        }
+        RbDerefExt(ext);
+        return RbForward(dev, irp);
+    }
+    /* 全局 + 每卷读写开关（必须真正生效：关闭对应方向即透传） */
+    if (sp->MajorFunction == IRP_MJ_READ &&
+        (!g_Rb.Config.ReadCacheEnabled || !ext->ReadEnabled)) {
+        RbDerefExt(ext);
+        return RbForward(dev, irp);
+    }
+    if (sp->MajorFunction == IRP_MJ_WRITE &&
+        (!g_Rb.Config.WriteCacheEnabled || !ext->WriteEnabled)) {
+        RbDerefExt(ext);
+        return RbForward(dev, irp);
+    }
+    len = sp->Parameters.Read.Length;
+    if (len == 0 || len > (8UL << 20) ||
+        sp->Parameters.Read.ByteOffset.QuadPart < 0) {
+        RbDerefExt(ext);
+        return RbForward(dev, irp);
+    }
+    {
+        PRB_IOCTX ctx = RbCtxAlloc();
+        if (!ctx) { RbDerefExt(ext); return RbForward(dev, irp); }
+        ctx->Irp = irp; ctx->Ext = ext; ctx->Major = sp->MajorFunction;
+        ctx->Offset = sp->Parameters.Read.ByteOffset; ctx->Length = len;
+        IoMarkIrpPending(irp);
+        if (g_Rb.IoWorkerCount) {
+            RbSubmitIo(ctx);                  /* FIX[多核]: 专用 per-CPU worker 池 */
+        } else {
+            ctx->Item.WorkerRoutine = RbRwWorker;   /* 兜底（理论不可达） */
+            ctx->Item.Parameter = ctx;
+            ExQueueWorkItem(&ctx->Item, DelayedWorkQueue);
+        }
+        return STATUS_PENDING;
+    }
+}
+
+/* M1: FLUSH 同样转 PASSIVE（池/兜底双路径），避免 DISPATCH 下取 ERESOURCE bugcheck */
+NTSTATUS RbDispatchFlush(PDEVICE_OBJECT dev, PIRP irp)
+{
+    PRB_DEV_EXT ext = (PRB_DEV_EXT)dev->DeviceExtension;
+    /* C3b: 先引用后校验，与读写路径一致 */
+    InterlockedIncrement(&ext->Refs);
+    if (!ext->IsAttached || !ext->Stream || ext->Removed || g_Rb.Unloading) {
+        RbDerefExt(ext);
+        return RbForward(dev, irp);
+    }
+    {
+        PRB_IOCTX ctx = RbCtxAlloc();
+        if (!ctx) { RbDerefExt(ext); return RbForward(dev, irp); }
+        ctx->Irp = irp; ctx->Ext = ext; ctx->Major = IRP_MJ_FLUSH_BUFFERS;
+        IoMarkIrpPending(irp);
+        if (g_Rb.IoWorkerCount) RbSubmitIo(ctx);
+        else {
+            ctx->Item.WorkerRoutine = RbRwWorker;
+            ctx->Item.Parameter = ctx;
+            ExQueueWorkItem(&ctx->Item, DelayedWorkQueue);
+        }
+        return STATUS_PENDING;
+    }
+}
+
+/* ---------------- 全部脏块回写（关机/卸载/detach） ---------------- */
+VOID RbFlushAllDirty(VOID)
+{
+    if (g_Rb.Engine) rb_engine_flush(g_Rb.Engine, 1);
+}
+
+/* ==== FIX[多核]: zone 并行回写池（core 的 sflush/zflush 协议保证互斥安全） ==== */
+static VOID RbFlushJobDone(VOID)
+{
+    if (InterlockedDecrement(&g_Rb.FlushJobs) == 0)
+        KeSetEvent(&g_Rb.FlushDone, IO_NO_INCREMENT, FALSE);
+}
+
+static VOID RbFlusherLoop(PVOID p)
+{
+    RB_FLUSHER *f = (RB_FLUSHER *)p;
+    RbPinToCpu(f->CpuIndex);
+    for (;;) {
+        KeWaitForSingleObject(&f->Wake, Executive, KernelMode, FALSE, NULL);
+        for (;;) {
+            KIRQL irql; PLIST_ENTRY le; RB_FLUSHJOB *j;
+            KeAcquireSpinLock(&f->Lock, &irql);
+            le = IsListEmpty(&f->QueueHead) ? NULL : RemoveHeadList(&f->QueueHead);
+            KeReleaseSpinLock(&f->Lock, irql);
+            if (!le) break;
+            j = CONTAINING_RECORD(le, RB_FLUSHJOB, le);
+            if (!f->Ws) f->Ws = rb_flushws_create();   /* 失败则该任务空转，仍计数 */
+            if (f->Ws) (void)rb_stream_flush_zoned(j->s, j->zone, j->nzones, f->Ws);
+            ExFreePoolWithTag(j, RB_POOL_TAG);
+            RbFlushJobDone();
+        }
+        if (!f->Alive) break;
+    }
+    if (f->Ws) { rb_flushws_free(f->Ws); f->Ws = NULL; }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static VOID RbFlushSubmit(rb_stream *s, int zone, int nzones, int sidx)
+{
+    /* zone+sidx 交错映射 → 多流场景 4 个 flusher 也均匀吃满 */
+    RB_FLUSHER *f = &g_Rb.Flushers[(ULONG)(zone + sidx) % RB_FLUSH_WORKERS];
+    RB_FLUSHJOB *j; KIRQL irql;
+    if (!f->Alive) { RbFlushJobDone(); return; }       /* FIX[N3]: 死 worker 立即扣减 */
+    j = (RB_FLUSHJOB *)ExAllocatePoolWithTag(NonPagedPool, sizeof(*j), RB_POOL_TAG);
+    if (!j) { RbFlushJobDone(); return; }
+    j->s = s; j->zone = zone; j->nzones = nzones;
+    KeAcquireSpinLock(&f->Lock, &irql);
+    InsertTailList(&f->QueueHead, &j->le);
+    KeReleaseSpinLock(&f->Lock, irql);
+    KeSetEvent(&f->Wake, IO_NO_INCREMENT, FALSE);
+}
+
+void RbStartFlushers(VOID)
+{
+    ULONG i;
+    KeInitializeEvent(&g_Rb.FlushDone, SynchronizationEvent, FALSE);
+    g_Rb.FlushJobs = 0;
+    for (i = 0; i < RB_FLUSH_WORKERS; i++) {
+        RB_FLUSHER *f = &g_Rb.Flushers[i];
+        OBJECT_ATTRIBUTES oa; HANDLE h = NULL;
+        InitializeListHead(&f->QueueHead);
+        KeInitializeSpinLock(&f->Lock);
+        KeInitializeEvent(&f->Wake, SynchronizationEvent, FALSE);
+        f->CpuIndex = i; f->Ws = NULL; f->Alive = 1;
+        InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+        if (NT_SUCCESS(PsCreateSystemThread(&h, THREAD_ALL_ACCESS, &oa, NULL, NULL, RbFlusherLoop, f))) {
+            ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
+                                      (PVOID *)&f->Thread, NULL);
+            ZwClose(h);
+        }
+        else {
+            f->Alive = 0; f->Thread = NULL;
+        }
+    }
+    RbLog(0, __LINE__, 0, L"zone flusher pool started");
+}
+
+void RbStopFlushers(VOID)   /* FIX[UNLOAD]: 等待回写线程真正退出（可能正在落盘） */
+{
+    ULONG i;
+    for (i = 0; i < RB_FLUSH_WORKERS; i++) {
+        RB_FLUSHER *f = &g_Rb.Flushers[i];
+        LARGE_INTEGER to;
+        f->Alive = 0;
+        KeSetEvent(&f->Wake, IO_NO_INCREMENT, FALSE);
+        if (f->Thread) {
+            to.QuadPart = -30000000LL;  /* 30s：可能正在回写 */
+            KeWaitForSingleObject(f->Thread, Executive, KernelMode, FALSE, &to);
+            ObDereferenceObject(f->Thread);
+            f->Thread = NULL;
+        }
+    }
+}
+
+/* 周期回写：快照（io_users 引用）→ 每流拆 RB_FLUSH_WORKERS 个 zone 任务并行落盘 */
+static VOID RbEngineFlushZones(rb_engine *eng, int nzones)
+{
+    rb_stream *snap[RB_FLUSH_SNAP_MAX];
+    int cnt, i, z;
+    if (!eng || nzones <= 0) return;
+    /* FIX[N2]: 池未起来（线程创建全失败）→ 退化为串行，绝不能让脏数据永不落盘 */
+    if (!g_Rb.Flushers[0].Alive) { rb_engine_flush(eng, 0); return; }
+    /* 快照“有脏数据”的流（核心持表锁并取io引用），不再直接捅引擎内部字段 */
+    cnt = rb_engine_snapshot_streams(eng, snap, RB_FLUSH_SNAP_MAX, 1);
+    if (cnt == 0) return;
+    KeClearEvent(&g_Rb.FlushDone);
+    g_Rb.FlushJobs = cnt * nzones;          /* 先定总数（含同步失败扣减），再提交 */
+    for (i = 0; i < cnt; i++)
+        for (z = 0; z < nzones; z++)
+            RbFlushSubmit(snap[i], z, nzones, i);
+    KeWaitForSingleObject(&g_Rb.FlushDone, Executive, KernelMode, FALSE, NULL);
+    for (i = 0; i < cnt; i++) rb_stream_release_io(snap[i]);
+    rb_engine_note_flush_done(eng);
+}
+
+/* ---------------- 后台回写 / 内存压力线程 ---------------- */
+static VOID RbFlushThread(VOID *ctx)
+{
+    UNREFERENCED_PARAMETER(ctx);
+    for (;;) {
+        LARGE_INTEGER timeout, *pto;
+        ULONG ms = g_Rb.Config.FlushIntervalMs;
+        if (ms < 1000) ms = 1000;
+        timeout.QuadPart = -(LONGLONG)ms * 10000;
+        pto = &timeout;
+        {
+            PVOID objs[2];
+            objs[0] = &g_Rb.FlushStop;
+            objs[1] = &g_Rb.FlushWake;
+            (void)KeWaitForMultipleObjects(2, objs, WaitAny, Executive, KernelMode, FALSE, pto, NULL);
+            if (KeReadStateEvent(&g_Rb.FlushStop)) break;
+        }
+
+        /* ===== [V10.1] 熔断态自愈 =====
+         * 透传期间盘被直接改写，缓存中 clean 块已不可信。
+         * 必须先 flush 净脏数据、再丢弃全部缓存视图；
+         * 之后 panic-clear 恢复时缓存从零重建，无 stale 风险。 */
+        if (g_Rb.PanicPassthrough) {
+            rb_stream *snap[RB_FLUSH_SNAP_MAX];
+            int n2, k;
+            n2 = rb_engine_snapshot_streams(g_Rb.Engine, snap, RB_FLUSH_SNAP_MAX, 1);
+            for (k = 0; k < n2; k++) { rb_stream_flush(snap[k], 1); rb_stream_release_io(snap[k]); }
+            n2 = rb_engine_snapshot_streams(g_Rb.Engine, snap, RB_FLUSH_SNAP_MAX, 0);
+            for (k = 0; k < n2; k++) { rb_stream_discard_all(snap[k]); rb_stream_release_io(snap[k]); }
+            rb_engine_note_flush_done(g_Rb.Engine);
+        }
+
+        /* ===== [V10.1] 兜底杂务（PASSIVE、节流 ≥30s） ===== */
+        RbZombieReap();
+        {
+            LARGE_INTEGER now;
+            KeQuerySystemTimePrecise(&now);
+            if ((ULONG64)(now.QuadPart / 10000ULL) - (ULONG64)g_Rb.LastMemTick.QuadPart >= 30000) {
+                g_Rb.LastMemTick.QuadPart = now.QuadPart / 10000ULL;
+                RbSaveDirtySnapshot();
+            }
+        }
+
+        if (g_Rb.Engine) {
+            /* FIX[P6]: 喂时钟（单调中断时间），last_access / 空闲回收由此生效 */
+            rb_engine_tick(g_Rb.Engine, RbInterruptMs());
+            /* FIX[多核]: 周期回写 4 线程 zone 并行（force 场景仍走串行全量） */
+            RbEngineFlushZones(g_Rb.Engine, RB_FLUSH_WORKERS);
+            /* FIX[N3]: 空闲回收此前从未被驱动调度 —— 开关形同虚设；按阈值执行 */
+            if (g_Rb.Config.IdleReclaimEnabled) {
+                rb_stream *snap[RB_FLUSH_SNAP_MAX];
+                int n = rb_engine_snapshot_streams(g_Rb.Engine, snap, RB_FLUSH_SNAP_MAX, 0);
+                int k;
+                for (k = 0; k < n; k++) {
+                    rb_stream_idle_reclaim(snap[k]);
+                    rb_stream_release_io(snap[k]);
+                }
+            }
+            /* 动态内存：按“可用”内存收缩（P4 修复后此值才真实） */
+            if (g_Rb.Config.AutoMemory) {
+                ULONG avail   = RbMemAvailableMB();
+                if (avail) {                                  /* FIX[N7]: 查询失败轮跳过 */
+                    ULONG reserve = g_Rb.Config.MemReserveMB;
+                    ULONG budget;
+                    if (avail > reserve) budget = (avail - reserve) * g_Rb.Config.AutoUsePct / 100;
+                    else budget = 0;
+                    g_Rb.DynamicLimitMB = budget;
+                    rb_engine_set_dynamic_limit(g_Rb.Engine, (rb_u64)budget * 1024 * 1024);
+                    rb_engine_set_available_mb(g_Rb.Engine, avail, budget);
+                    rb_engine_apply_pressure(g_Rb.Engine,
+                                             avail < reserve ? 2 : (avail < reserve * 2 ? 1 : 0));
+                }
+            }
+        }
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+NTSTATUS RbStartFlushThread(VOID)
+{
+    HANDLE h;
+    NTSTATUS s = PsCreateSystemThread(&h, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+                                      RbFlushThread, NULL);
+    if (NT_SUCCESS(s)) {
+        ObReferenceObjectByHandle(h, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
+                                  (PVOID *)&g_Rb.FlushThread, NULL);
+        ZwClose(h);
+        g_Rb.FlushRunning = 1;
+    }
+    return s;
+}
+
+VOID RbStopFlushThread(VOID)
+{
+    if (!g_Rb.FlushRunning) return;
+    KeSetEvent(&g_Rb.FlushStop, IO_NO_INCREMENT, FALSE);
+    if (g_Rb.FlushThread) {
+        LARGE_INTEGER to; to.QuadPart = -50000000LL; /* 5s */
+        KeWaitForSingleObject(g_Rb.FlushThread, Executive, KernelMode, FALSE, &to);
+        ObDereferenceObject(g_Rb.FlushThread);
+        g_Rb.FlushThread = NULL;
+    }
+    g_Rb.FlushRunning = 0;
+}
+
+
+===== 文件: driver\rb_common2.h =====
+/* rb_common2.h —— V10.3 特性层。先包含 rb_common.h，不触碰冻结头与协议9。
+ * 安全红线：部署时注册表 Features\Flags=0（全关）。Flags=0 时
+ * RbFeatOnRead/OnHit/OnMiss/Admit 必须零开销空转，IRP 行为与 V10.2 字节等价。 */
+#ifndef _RB_COMMON2_H_
+#define _RB_COMMON2_H_
+
+#include "rb_common.h"
+
+/* ===== 新 IOCTL（与 ctl 工具对应；若撞 rb_proto.h 功能号整体平移） ===== */
+#define RB2_FUNC_STATS      0x901
+#define RB2_FUNC_REFRESH    0x902
+#define RB2_FUNC_SHRINK     0x903
+#define RB2_FUNC_SNAPSHOT   0x904
+#define RB2_IOCTL_STATS     CTL_CODE(FILE_DEVICE_UNKNOWN, RB2_FUNC_STATS,   METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define RB2_IOCTL_REFRESH   CTL_CODE(FILE_DEVICE_UNKNOWN, RB2_FUNC_REFRESH, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define RB2_IOCTL_SHRINK    CTL_CODE(FILE_DEVICE_UNKNOWN, RB2_FUNC_SHRINK,  METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define RB2_IOCTL_SNAPSHOT  CTL_CODE(FILE_DEVICE_UNKNOWN, RB2_FUNC_SNAPSHOT,METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+/* ===== 特性位（注册表 Services\RAMBlockCache\Features\Flags，部署=0） ===== */
+#define RB2F_PREFETCH   0x00000001UL
+#define RB2F_HOT        0x00000002UL
+#define RB2F_L2         0x00000004UL
+#define RB2F_WBCOAL     0x00000008UL
+#define RB2F_MEMGUARD   0x00000010UL
+#define RB2F_ETW        0x00000020UL
+#define RB2F_THERMAL    0x00000040UL   /* [Build15] 温度护栏 */
+
+typedef struct _RB_STATS2 {
+    ULONG   Version;            /* =2 */
+    ULONG   Flags;
+    ULONG   CpuGroups; ULONG Workers;
+    ULONG64 Hits, Misses, BytesHit, BytesMiss;
+    ULONG64 PrefIssued, PrefFillOk;
+    ULONG64 WbQueued, WbDone, WbThrottled;
+    ULONG64 L2Stores, L2Hits, L2Miss;
+    ULONG   HotZones;
+} RB_STATS2, *PRB_STATS2;
+
+/* ===== 端口：由 rbio.c 实现并注册（见 rbio_ports.c） ===== */
+typedef VOID     (*RB2_PORT_FILL)(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa);
+typedef NTSTATUS (*RB2_PORT_SHRINK)(ULONG Percent);
+VOID     RbPortRegister(RB2_PORT_FILL Fill, RB2_PORT_SHRINK Shrink);
+VOID     Rb2PortsSetup(VOID);          /* rbio_ports.c */
+VOID     Rb2PortFill(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa); /* rbfeat.c 包装 s_Fill */
+
+/* ===== 生命周期 ===== */
+NTSTATUS RbFeatInit(VOID);       /* DriverEntry/rbio 初始化尾部一次（幂等 CAS） */
+VOID     RbFeatShutdown(VOID);  /* Unload 中、引擎停止之后 */
+VOID     RbFeatPanic(VOID);     /* RbSetPanic 内一行 */
+
+/* ===== rbio.c 插桩调用的钩子 ===== */
+BOOLEAN  RbFeatAdmit(PVOID Ext);                                            /* FALSE=本 IO 不进缓存 */
+VOID     RbFeatOnHit(PVOID Ext, ULONG64 LbaBytes, ULONG Len);
+NTSTATUS RbFeatOnMiss(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID DstVa); /* SUCCESS=已由L2填充,免下发 */
+VOID     RbFeatOnEvict(PVOID Ext, ULONG64 LbaBytes, ULONG Len, PVOID SrcVa, ULONG64 Hits);
+VOID     RbFeatOnRead(PVOID Ext, ULONG64 LbaBytes, ULONG Len);
+NTSTATUS RbFeatDispatch(PIRP Irp);                                         /* rbctl.c IOCTL 转发 */
+BOOLEAN  RbFeatRefuseLetter(WCHAR Letter);
+VOID     RbHotPrewarm(PVOID Ext);
+
+/* ===== 写合并（默认 OFF） ===== */
+BOOLEAN  RbWbActive(PVOID Ext);
+VOID     RbWbSubmit(PVOID Ext, ULONG64 LbaBytes, ULONG Len, VOID (*FlushFn)(PVOID), PVOID Ctx);
+
+/* ===== 每卷策略（注册表 Policies\<X>） ===== */
+typedef struct _RB2_POL { ULONG ReadAheadMB; ULONG MaxWriteIops; } RB2_POL;
+VOID     RbPolGetFor(WCHAR Letter, RB2_POL *Pol);
+
+/* ===== 内部跨模块 ===== */
+extern ULONG g_Rb2Flags;
+ULONG    Rb2Flags(VOID);
+VOID     Rb2IoEnter(VOID); VOID Rb2IoLeave(VOID);
+VOID     Rb2Count(ULONG Slot, LONG64 D);
+VOID     Rb2CountersInit(VOID);
+VOID     Rb2StatsFill(PRB_STATS2 Out);
+PVOID    Rb2Alloc(SIZE_T n); VOID Rb2Free(PVOID p);
+VOID     Rb2ReloadFlags(VOID);
+
+/* 注册表（[Commit4] 收敛到 rbdriver.c RbRegQueryValue；Rb2OpenKey 已移除） */
+NTSTATUS Rb2GetDW(PCWSTR Sub, PCWSTR Name, ULONG Def, ULONG *Out);
+
+/* worker 池（rbpools.c） */
+NTSTATUS Rb2PoolInit(VOID);
+VOID     Rb2PoolShutdown(VOID);
+NTSTATUS Rb2PoolSubmit(VOID (*Fn)(PVOID), PVOID Ctx);
+
+/* 预取（rbpref.c） */
+VOID     RbPrefStream(PVOID Ext, ULONG64 Lba, ULONG Len);
+VOID     RbPrefGC(VOID);
+
+/* 热区（rbhot.c） */
+VOID     RbHotTrack(PVOID Ext, ULONG64 Lba);
+VOID     RbHotDecay(VOID);
+VOID     RbHotSnapshot(VOID);
+
+/* L2（rbL2.c，默认 OFF） */
+NTSTATUS RbL2ProbeFill(PVOID Ext, ULONG64 Lba, ULONG Len, PVOID DstVa);
+VOID     RbL2Store(PVOID Ext, ULONG64 Lba, ULONG Len, PVOID SrcVa);
+VOID     RbL2LazyOpen(VOID);
+VOID     RbL2Close(VOID);
+
+/* ===== BUILD15 新原型 ===== */
+/* 计数槽扩容：s_Cnt[14][SHARD]，新槽 10=WbQueued 11=WbDone 12=WbThrottled 13=ShrinkCalls */
+VOID     RbThermalNote(WCHAR Letter);
+BOOLEAN  RbThermalPrefBlocked(WCHAR Letter);
+VOID     RbThermalTick(VOID);
+VOID     RbEtwEnsure(VOID);
+VOID     RbEtwShutdown(VOID);
+VOID     RbEtwHit(VOID);
+VOID     RbEtwMiss(VOID);
+VOID     RbL2Periodic(VOID);
+VOID     RbCrcInit(VOID);
+ULONG    RbHotCount(VOID);
+/* Rb2VolRead 原型变更：WCHAR Letter,Va -> PVOID Extp（真预热，内部读+入缓存） */
+NTSTATUS Rb2VolRead(PVOID Extp, ULONG64 Off, ULONG Len);
+
+/* [FIX-3] attach 串行化锁（DriverEntry 初始化一次） */
+VOID     RbAttachLockInit(VOID);
+
+#endif /* _RB_COMMON2_H_ */
+
+
+===== 文件: driver\rb_common.h =====
+/*
+ * RAMBlockCache —— 卷块设备上层过滤驱动（V8.1，WDM PnP，非 minifilter）
+ *
+ * 相对 V7（文件系统 minifilter）的根本性变化：
+ *   - 不依赖 FltMgr / Altitude；本驱动是普通 WDM PnP 过滤驱动，
+ *     通过 AddDevice + IoAttachDeviceToDeviceStack 挂到【卷设备栈】上方，
+ *     工作在文件系统 / 缓存管理器(Cc)之下，直接看到块级 READ/WRITE/FLUSH。
+ *   - 单一数据视图：cached & paging I/O 全部进内存，无 V7 的 Cc 双写蓝屏。
+ *   - 卷缓存默认关闭；AddDevice 只“挂栈”，热开关(IsAttached)由控制面
+ *     ATTACH_VOLUME 在运行时翻转，立即生效、免重启（首次注册过滤可能需一次重启）。
+ *
+ * V8.1 合并三轮评审：per-CPU I/O worker 池、zone 并行回写、SafeMode 状态机、
+ *                    配置注册表持久化、AutoAttach、版本与源码联动。
+ *
+ * 缓存核心复用 ..\core\cache.c（RB_KERNEL_BUILD）。每卷一个 rb_stream，
+ * file_id = (ULONG64)本过滤设备扩展指针；writeback/readback 回调据此定位卷。
+ */
+#ifndef RB_COMMON_H
+#define RB_COMMON_H
+
+#include <ntddk.h>
+#include <ntdddisk.h>
+#include <ntddstor.h>
+#include <mountdev.h>
+#include <ntstrsafe.h>
+#include <wdmsec.h>
+
+#include "../ctl/rb_proto.h"
+#include "../core/cache.h"
+#include "../common/version.h"      /* [Commit5] 唯一版本事实来源 */
+
+#define RB_POOL_TAG        'bRBC'
+#define RB_BUF_ALIGN       4096
+#define RB_MAX_RANGES      32      /* 单次读 miss / 写 direct 区间上限 */
+
+/* ---- V8.1 多核（第二/三轮合并） ---- */
+#define RB_IO_WORKERS_MAX  32      /* I/O worker 池上限（按逻辑 CPU 数截断，含超线程） */
+#define RB_FLUSH_WORKERS   4       /* zone 并行回写线程数 */
+#define RB_FLUSH_SNAP_MAX  64      /* 单轮快照流上限 */
+
+/* ---- FIX[R6]: 版本与源码联动（GET_VERSION 不再硬编码 v1.0.0） ---- */
+#define RB_DRIVER_MAJOR    1
+#define RB_DRIVER_MINOR    1
+#define RB_DRIVER_BUILD    RB_VERSION_BUILD   /* V10.3.4：预取引用对称+链式判定+8MB分片、SHRINK真收缩、L2v2(CRC32/索引持久化)、温度护栏、ETW落地、ctx旁视池、staging复用、写Admit */
+
+/* ---- [V10.1] failsafe 常量 ---- */
+#define RB_EXT_MAGIC       0x52424348UL   /* 'RBCH' 内存踩踏哨兵 / 崩溃头 Tag */
+#define RB_IO_FAIL_PANIC   32             /* 盘 I/O 连续失败 >=32 → 全局熔断 */
+
+/* ---- V9 运行时附加 / 硬排除 ---- */
+#define RB_MAX_CRITICAL    16
+#define RB_DEVTYPE_UNKNOWN 0
+#define RB_DEVTYPE_CONTROL 1
+#define RB_DEVTYPE_VOLUME  2
+
+/* 单卷设备扩展（每个被过滤的卷设备一个） */
+typedef struct _RB_DEV_EXT {
+    PDEVICE_OBJECT   FilterDevice;    /* 我们自己的过滤设备 */
+    PDEVICE_OBJECT   LowerDevice;     /* IoAttachDeviceToDeviceStack 的下层 */
+    rb_stream       *Stream;          /* 该卷缓存流；未 attach 时为 NULL */
+    BOOLEAN          IsAttached;      /* 热开关 */
+    BOOLEAN          IsSystem;        /* 系统卷（强制 write-through） */
+    volatile LONG    Removed;         /* PnP 正在移除/已移除 */
+    LONG             WriteMode;       /* RB_WRITEMODE_* */
+    LONG             ReadEnabled;
+    LONG             WriteEnabled;
+    DEVICE_TYPE      DeviceType;
+    ULONG            DeviceCharacteristics;
+    ULONG            Alignment;
+    ULONG            SectorSize;
+    ULONG            LogicalSector;
+    ULONG            PhysicalSector;
+    LONGLONG         DiskSize;
+    WCHAR            Letter;
+    LIST_ENTRY       ListEntry;
+    volatile LONG    Refs;
+    KEVENT           RemoveEvent;
+    /* ---- V9 运行时定向附加 ---- */
+    UCHAR            DevType;        /* RB_DEVTYPE_* */
+    PDEVICE_OBJECT   Pdo;            /* 卷底层 PDO（持引用） */
+    BOOLEAN          GeometryValid;
+    volatile LONG    RemoveDone;     /* REMOVE 只处理一次 */
+    /* ---- [V10.1] failsafe 增量（末尾纯追加） ---- */
+    ULONG          Magic;          /* 内存踩踏哨兵：dispatch 入口一次比较（RB_EXT_MAGIC） */
+    volatile LONG  IoFailRun;      /* 盘 I/O 连续失败计数（成功清零；>=32 熔断） */
+    LIST_ENTRY     ZombieEntry;    /* REMOVE 超时后挂入延迟删除队列 */
+} RB_DEV_EXT, *PRB_DEV_EXT;
+
+/* 一条被拦截、转投 worker 的 IRP 上下文 */
+typedef struct _RB_IOCTX {
+    WORK_QUEUE_ITEM  Item;      /* 兜底路径（池未启动时仍可走系统队列） */
+    LIST_ENTRY       le;        /* FIX[多核]: per-CPU worker 池 FIFO */
+    PIRP             Irp;
+    PRB_DEV_EXT      Ext;
+    UCHAR            Major;
+    LARGE_INTEGER    Offset;
+    ULONG            Length;
+} RB_IOCTX, *PRB_IOCTX;
+
+/* per-CPU I/O worker：FIX[多核] 系统 DelayedWorkQueue 线程有限，
+ * 是“少数核心拉满、多数闲置”的根源；每逻辑 CPU 一个常驻 worker（绑核，含超线程）。 */
+typedef struct _RB_IOWORKER {
+    LIST_ENTRY      QueueHead;
+    KSPIN_LOCK      Lock;
+    KEVENT          Wake;        /* SynchronizationEvent */
+    ULONG           CpuIndex;
+    volatile LONG   Alive;
+    PETHREAD        Thread;      /* join 用：卸载时等待线程真正退出 */
+    PVOID           Stage;       /* [STAGE-1] miss staging 复用（每 worker 独占） */
+    SIZE_T          StageCap;
+    GROUP_AFFINITY  AuxGa;       /* [多核] HT/组感知目标核（启动时一次性选好） */
+    UCHAR           AuxValid;
+} RB_IOWORKER, *PRB_IOWORKER;
+
+/* zone 并行回写：core 早已具备 rb_stream_flush_zoned + sflush/zflush 互斥协议，
+ * 驱动此前从未使用；FIX[性能] 周期回写从单线程 → RB_FLUSH_WORKERS 线程。 */
+typedef struct _RB_FLUSHJOB {
+    LIST_ENTRY      le;
+    rb_stream      *s;
+    int             zone;
+    int             nzones;
+} RB_FLUSHJOB;
+
+typedef struct _RB_FLUSHER {
+    LIST_ENTRY      QueueHead;
+    KSPIN_LOCK      Lock;
+    KEVENT          Wake;
+    ULONG           CpuIndex;
+    rb_flushws     *Ws;          /* 每 worker 独立 workspace（stage 缓冲不可共享） */
+    volatile LONG   Alive;
+    PETHREAD        Thread;      /* join 用：卸载时等待线程真正退出 */
+} RB_FLUSHER, *PRB_FLUSHER;
+
+/* 全局状态 */
+typedef struct _RB_GLOB {
+    PDRIVER_OBJECT   DriverObject;
+    PDEVICE_OBJECT   ControlDevice;
+    rb_engine       *Engine;
+    RB_CONFIG        Config;
+    FAST_MUTEX       DevListLock;
+    LIST_ENTRY       DevList;
+    LONG             DevCount;
+    NPAGED_LOOKASIDE_LIST IoCtxLa;   /* [CTX-1] RB_IOCTX 非分页旁视 */
+    KEVENT           FlushWake;
+    KEVENT           FlushStop;
+    PETHREAD         FlushThread;
+    LONG             FlushRunning;
+    volatile LONG    FlushKick;
+    LARGE_INTEGER    LastMemTick;
+    ULONG            DynamicLimitMB;
+    WCHAR            SystemDriveLetter;
+    BOOLEAN          Unloading;
+    UNICODE_STRING   RegPath;
+    /* ---- V8.1 多核池 ---- */
+    RB_IOWORKER      IoWorkers[RB_IO_WORKERS_MAX];
+    ULONG            IoWorkerCount;   /* 0=池未启动（dispatch 走兜底） */
+    volatile LONG    IoRR;            /* 轮询游标 */
+    RB_FLUSHER       Flushers[RB_FLUSH_WORKERS];
+    KEVENT           FlushDone;       /* SynchronizationEvent：本轮 zone 任务全部完成 */
+    volatile LONG    FlushJobs;       /* 未完成 zone 任务数 */
+    /* ---- V8.1 安全模式 / 持久化 / 自动附加 ---- */
+    volatile LONG    SafeMode;        /* 1=上次异常退出（蓝屏/断电/强杀）→ 强制直写 */
+    LONG             AutoAttach;      /* 注册表 AutoAttach：卷挂栈即自动入缓存（系统卷除外） */
+    /* ---- V9 硬排除 / 惰性引擎 ---- */
+    FAST_MUTEX       EngineMutex;
+    FAST_MUTEX       InfoMutex;
+    PDEVICE_OBJECT   SystemVolumePdo; /* 持引用 */
+    WCHAR            CriticalLetters[RB_MAX_CRITICAL];
+    ULONG            CriticalCount;
+    BOOLEAN          HardTableCached;
+    BOOLEAN          SystemVolumeProbed;
+    /* ---- [V10.1] failsafe 增量（末尾纯追加） ---- */
+    volatile LONG   PanicPassthrough;   /* 1=全局熔断：READ/WRITE 一律透传 */
+    ULONG           BootFailCount;      /* 连续非干净启动计数 */
+    BOOLEAN         BootLoopGuard;      /* >=2 次：本轮引导拒绝挂载一切卷 */
+    ULONG           DirtySnapshotMB;    /* 最近一次脏量快照（MB） */
+    KBUGCHECK_REASON_CALLBACK_RECORD BugCheckRecord;  /* 蓝屏取证回调记录 */
+    LIST_ENTRY      ZombieList;         /* 僵尸 ext 链 */
+    KSPIN_LOCK      ZombieLock;
+    volatile LONG   ZombiePending;      /* 僵尸队列当前长度 */
+} RB_GLOB;
+
+extern RB_GLOB g_Rb;
+
+/* ---- [V10.1] 崩溃取证头：bugcheck 时写入 secondary dump，事后回答
+ * "崩溃瞬间还有多少未落盘数据"（=数据丢失窗口上界）。全字段为非分页可安全读取量。 ---- */
+typedef struct _RB_CRASH_HDR {
+    ULONG   Tag;            /* 'RBCH' = RB_EXT_MAGIC */
+    ULONG   Build;
+    LONG    Panic;
+    ULONG   BootFails;
+    ULONG   Volumes;
+    ULONG   SafeMode;
+    rb_u64  DirtyBytes;     /* 崩溃瞬间引擎脏量 = 数据丢失窗口上界 */
+    rb_u64  CacheBytes;
+    WCHAR   LastNote[24];
+} RB_CRASH_HDR;
+
+/* ---- 日志环（DISPATCH/APC 安全，spinlock） ---- */
+void  RbLogInit(VOID);
+void  RbLog(unsigned Level, unsigned Src, long Status, const WCHAR *Text);
+ULONG RbLogSnapshot(RB_LOG_LIST *out);
+
+/* ---- rbio.c ---- */
+NTSTATUS RbForward(PDEVICE_OBJECT dev, PIRP irp);
+NTSTATUS RbSyncIo(PRB_DEV_EXT ext, BOOLEAN doWrite, PLARGE_INTEGER off,
+                  PVOID buf, ULONG len, PULONG_PTR pInfo);
+DRIVER_DISPATCH RbDispatchReadWrite;
+DRIVER_DISPATCH RbDispatchFlush;
+DRIVER_DISPATCH RbDispatchCreateClose;
+void     RbFlushAllDirty(VOID);
+NTSTATUS RbStartFlushThread(VOID);
+void     RbStopFlushThread(VOID);
+int      RbWritebackCb(void *ctx, rb_u64 file_id, rb_u64 off, const void *data, size_t len);
+int      RbReadbackCb(void *ctx, rb_u64 file_id, rb_u64 off, void *buf, size_t len);
+/* FIX[多核] 池启停（Stop 仅 Teardown 保留路径；常驻驱动正常运行不调用） */
+void  RbStartIoWorkers(VOID);
+void  RbStopIoWorkers(VOID);
+void  RbStartFlushers(VOID);
+void  RbStopFlushers(VOID);
+
+/* ---- rbctl.c ---- */
+DRIVER_DISPATCH RbDispatchClo;
+DRIVER_DISPATCH RbDispatchDeviceControl;
+VOID RbApplyEngineConfig(const RB_CONFIG *cfg);   /* 把 RB_CONFIG 应用到引擎（不落盘） */
+VOID RbClampConfig(RB_CONFIG *c);                 /* FIX[N5]: M10 逐字段 clamp 抽出共用 */
+
+/* ---- rbdriver.c ---- */
+PRB_DEV_EXT RbFindExtByLetter(WCHAR letter);
+PRB_DEV_EXT RbGetExt(PVOID file_id);   /* file_id -> ext（已 ref） */
+VOID        RbDerefExt(PRB_DEV_EXT ext);
+PVOID  RbAllocAlignedNonPaged(SIZE_T sz);
+VOID   RbFreeAligned(PVOID p);
+ULONG  RbMemAvailableMB(VOID);
+/* FIX[P2-1]/FIX[P2-2]: 配置持久化 + 安全模式（注册表） */
+VOID   RbSaveConfig(const RB_CONFIG *cfg);
+VOID   RbLoadConfig(RB_CONFIG *cfg);   /* cfg 须先填默认值；注册表有值则覆盖 */
+LONG   RbSafeModeLoad(VOID);           /* 返回并设置 g_Rb.SafeMode */
+VOID   RbRegSetClean(ULONG v);         /* 写 LastCleanShutdown（内部有 PASSIVE 守卫） */
+
+/* ---- [Commit4] 全驱动唯一注册表原语（rbdriver.c 实现）。
+ * 其余文件一律不得再直接写 ZwOpenKey/ZwQueryValueKey/ZwCreateKey。 ---- */
+NTSTATUS RbRegQueryValue(PUNICODE_STRING Path, PCWSTR Name,
+                         PVOID *OutData, PULONG OutSize, PULONG OutType);
+NTSTATUS RbRegSetValue(PUNICODE_STRING Path, PCWSTR Name, ULONG Type,
+                       PVOID Data, ULONG DataSize);
+DRIVER_UNLOAD RbUnload;                /* 干净卸载：支持 sc stop / 免重启完全开关 */
+
+/* ---- V9 rbattach.c：运行时定向附加 / 硬排除 / 全卷枚举 ---- */
+NTSTATUS RbEnsureEngine(VOID);
+NTSTATUS RbAttachVolumeByLetter(WCHAR letter);
+NTSTATUS RbDetachVolumeByLetter(WCHAR letter);
+BOOLEAN  RbIsBootCriticalPdo(PDEVICE_OBJECT pdo);
+VOID     RbVolumeEnumerateAll(RB_VOLUME_LIST *out);
+VOID     RbVolumeRemove(PRB_DEV_EXT ext);
+VOID     RbRefreshVolumeGeometry(PRB_DEV_EXT ext);
+NTSTATUS RbPnpStartComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID ctx);
+NTSTATUS RbPnpRemoveComplete(PDEVICE_OBJECT dev, PIRP irp, PVOID ctx);
+
+/* ---- [V10.1] failsafe 接口（实现见 rbdriver.c / rbio.c） ---- */
+VOID    RbSetPanic(PCWSTR reason);                 /* 任意 IRQL：原子置位 + 唤醒 flush 线程 */
+static __inline BOOLEAN RbPanicActive(VOID)        /* 热路径内联版：一次 volatile 读 */
+{ return (BOOLEAN)g_Rb.PanicPassthrough; }
+VOID    RbRegisterCrashHooks(PDRIVER_OBJECT drv);  /* DriverEntry 调用 */
+VOID    RbDeregisterCrashHooks(VOID);              /* RbUnload 最早处调用 */
+VOID    RbBootFailLoad(VOID);                      /* DriverEntry 调用：引导循环防护 */
+VOID    RbSaveDirtySnapshot(VOID);                 /* flush 线程低频调用 */
+VOID    RbZombieQueueExt(PRB_DEV_EXT ext);         /* REMOVE 超时转僵尸 */
+VOID    RbZombieReap(VOID);                        /* PASSIVE：flush 线程 / RbUnload */
+VOID    RbNoteIoResult(PRB_DEV_EXT ext, NTSTATUS s); /* I/O 记账：连续失败熔断 */
+
+/* ---- [Build15] 导出 ---- */
+NTSTATUS RbSendSyncIoctl(PDEVICE_OBJECT target, ULONG ioctl,
+                         PVOID in, ULONG inSize, PVOID out, ULONG outSize,
+                         PULONG returned);   /* rbattach.c：rbthermal 复用 */
+PVOID   RbCtxAlloc(VOID);                 /* rbio.c：RB_IOCTX 旁视池分配 */
+VOID    RbCtxFree(PVOID p);               /* rbio.c：RB_IOCTX 旁视池归还 */
+
+#endif /* RB_COMMON_H */
+
+
+===== 文件: common\version.h =====
+/* 唯一版本事实来源。改版本只改这里。 */
+#define RB_VERSION_MAJOR 10
+#define RB_VERSION_MINOR 3
+#define RB_VERSION_PATCH 4
+#define RB_VERSION_BUILD 18
+
+#define RB_STR2(x) #x
+#define RB_STR(x)  RB_STR2(x)
+#define RB_VERSION_STRING  RB_STR(RB_VERSION_MAJOR) "." RB_STR(RB_VERSION_MINOR) \
+                           "." RB_STR(RB_VERSION_PATCH) "." RB_STR(RB_VERSION_BUILD)
+
+/* 宽字符版（内核 RbLog / UI 绑定用） */
+#define RB_WSTR2(x) L ## x
+#define RB_WSTR(x)  RB_WSTR2(x)
+#define RB_VERSION_WSTRING  RB_WSTR(RB_STR(RB_VERSION_MAJOR)) L"." RB_WSTR(RB_STR(RB_VERSION_MINOR)) \
+                           L"." RB_WSTR(RB_STR(RB_VERSION_PATCH)) L"." RB_WSTR(RB_STR(RB_VERSION_BUILD))
+
+
+===== 文件: common\rb_percpu.h =====
+/* common/rb_percpu.h — per-logical-CPU 统计/槽位
+ * 目标：热路径每 IO 的计数写只碰本核缓存行；HT 兄弟核不同行。
+ * 读侧（查询/诊断）才做汇总，代价从写侧挪到读侧。
+ * 合并自 audit 1.txt §1.1 + 2.txt §1.2，对外 API：
+ *   RbPcpuFlattenIndex / RbPcpuAlloc / RbPcpuFree /
+ *   RbPcpuInc / RbPcpuAdd / RbPcpuRead / RbPcpuReset */
+#ifndef RB_PCPU_H
+#define RB_PCPU_H
+
+#include <ntddk.h>
+
+#define RB_CACHELINE        64
+#define RB_PCPU_MAX         256      /* 上限：多组(>64核)机器足够 */
+
+#ifndef RB_PROC_PER_GROUP
+#define RB_PROC_PER_GROUP   64       /* MAXIMUM_PROCESSORS_PER_GROUP 在部分 WDK 未导出，兜底 */
+#endif
+
+/* 一个统计量 = 一条独立缓存行数组，禁止把多个统计量塞进同一结构体相邻成员 */
+typedef struct _RB_PCPU_COUNTER {
+    volatile LONG64         v;                                   /* x64 上 8 字节对齐读写是原子的 */
+    DECLSPEC_ALIGN(RB_CACHELINE) UINT8 _pad[RB_CACHELINE - sizeof(LONG64)];
+} RB_PCPU_COUNTER, *PRB_PCPU_COUNTER;
+
+typedef struct _RB_PCPU_SET {
+    UINT32                  count;                               /* 展平后的逻辑核总数 */
+    RB_PCPU_COUNTER        *slots;                               /* 指针：结构体本身单缓存行 */
+} RB_PCPU_SET, *PRB_PCPU_SET;
+
+FORCEINLINE
+UINT32
+RbPcpuFlattenIndex(
+    _Out_opt_ PPROCESSOR_NUMBER ProcOut
+    )
+{
+    PROCESSOR_NUMBER        n;
+
+    KeGetCurrentProcessorNumberEx(&n);
+    if (ProcOut) { *ProcOut = n; }
+
+    /* group*每组上限 展平：Win11 多组(>64核)不撞号 */
+    return (UINT32)n.Group * (UINT32)RB_PROC_PER_GROUP + (UINT32)n.Number;
+}
+
+/* 分配：NPaged 池，一次性按 count 展开。PASSIVE_LEVEL（DriverEntry 时机）调用。 */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+FORCEINLINE
+NTSTATUS
+RbPcpuAlloc(
+    _Out_ PRB_PCPU_SET Set
+    )
+{
+    ULONG               cnt;
+    SIZE_T              bytes;
+
+    RtlZeroMemory(Set, sizeof(*Set));
+
+    cnt = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    if (cnt == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (cnt > RB_PCPU_MAX) {
+        cnt = RB_PCPU_MAX;      /* 超上限折叠（多核共享一行，仍远好于全局单变量） */
+    }
+
+    bytes = (SIZE_T)cnt * sizeof(RB_PCPU_COUNTER);
+    Set->slots = (PRB_PCPU_COUNTER)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED, bytes, 'cpbR');
+    if (Set->slots == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(Set->slots, bytes);
+    Set->count = cnt;
+    return STATUS_SUCCESS;
+}
+
+FORCEINLINE
+VOID
+RbPcpuFree(
+    _Inout_ PRB_PCPU_SET Set
+    )
+{
+    /* 前提：所有写方已停（卸载路径保证） */
+    if (Set->slots) {
+        ExFreePoolWithTag(Set->slots, 'cpbR');
+        Set->slots = NULL;
+    }
+    Set->count = 0;
+}
+
+/* 写侧：仅本核一行，无锁、无跨核流量。 */
+FORCEINLINE
+VOID
+RbPcpuInc(
+    _In_ PRB_PCPU_SET Set
+    )
+{
+    UINT32 idx = RbPcpuFlattenIndex(NULL);
+    if (idx < Set->count) {
+        InterlockedIncrement64(&Set->slots[idx].v);
+    }
+}
+
+FORCEINLINE
+VOID
+RbPcpuAdd(
+    _In_ PRB_PCPU_SET Set,
+    _In_ LONG64       Delta
+    )
+{
+    UINT32 idx = RbPcpuFlattenIndex(NULL);
+    if (idx < Set->count) {
+        InterlockedAdd64(&Set->slots[idx].v, Delta);
+    }
+}
+
+/* 读侧：慢路径（诊断/Query），汇总全部核。允许 ±单核增量误差。 */
+FORCEINLINE
+LONG64
+RbPcpuRead(
+    _In_ PRB_PCPU_SET Set
+    )
+{
+    LONG64      sum = 0;
+    UINT32      i;
+
+    for (i = 0; i < Set->count; ++i) {
+        sum += Set->slots[i].v;
+    }
+    return sum;
+}
+
+/* 清零（仅诊断复位用） */
+FORCEINLINE
+VOID
+RbPcpuReset(
+    _In_ PRB_PCPU_SET Set
+    )
+{
+    UINT32      i;
+    for (i = 0; i < Set->count; ++i) {
+        Set->slots[i].v = 0;
+    }
+}
+
+#endif /* RB_PCPU_H */
+
+
+===== 文件: common\rb_shard.h =====
+/* common/rb_shard.h — 锁分片池
+ * 纪律：每把锁独占缓存行；片数覆盖全部逻辑核且为 2 的幂（用掩码取片，免除法）。
+ * HT 兄弟核分到不同片，避免共享 L1/L2 的锁总线争用。 */
+#ifndef RB_SHARD_H
+#define RB_SHARD_H
+
+#include <ntddk.h>
+#include "rb_percpu.h"
+
+typedef struct _RB_SHARD {
+    KSPIN_LOCK              lock;
+    DECLSPEC_ALIGN(RB_CACHELINE) UINT8 _pad[RB_CACHELINE - sizeof(KSPIN_LOCK)];
+} RB_SHARD, *PRB_SHARD;
+
+typedef struct _RB_SHARD_POOL {
+    UINT32                  mask;               /* shardCount - 1 */
+    PRB_SHARD               shards;
+} RB_SHARD_POOL, *PRB_SHARD_POOL;
+
+FORCEINLINE
+NTSTATUS
+RbShardPoolInit(
+    _Out_ PRB_SHARD_POOL pool,
+    _In_  ULONG              tag
+    )
+{
+    UINT32                  want;
+    UINT32                  pow2;
+    UINT32                  i;
+    USHORT                  cpus = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+
+    RtlZeroMemory(pool, sizeof(*pool));
+    want = (UINT32)cpus * 2;                    /* HT：兄弟核分到不同片 */
+    if (want < 16)   { want = 16; }
+    if (want > 256)  { want = 256; }
+
+    pow2 = 16;                                  /* 取 >= want 的最小 2 的幂 */
+    while (pow2 < want) { pow2 <<= 1; }
+
+    pool->shards = (PRB_SHARD)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, (SIZE_T)pow2 * sizeof(RB_SHARD), tag);
+    if (pool->shards == NULL) { return STATUS_INSUFFICIENT_RESOURCES; }
+
+    for (i = 0; i < pow2; i++) {
+        KeInitializeSpinLock(&pool->shards[i].lock);
+    }
+    pool->mask = pow2 - 1;
+    return STATUS_SUCCESS;
+}
+
+FORCEINLINE
+VOID
+RbShardPoolDestroy(
+    _Inout_ PRB_SHARD_POOL pool,
+    _In_    ULONG            tag
+    )
+{
+    if (pool->shards) {
+        ExFreePoolWithTag(pool->shards, tag);
+        pool->shards = NULL;
+    }
+    pool->mask = 0;
+}
+
+FORCEINLINE
+UINT32
+RbShardIndexOf(
+    _In_ const RB_SHARD_POOL *pool,
+    _In_ UINT64               hash
+    )
+{
+    return (UINT32)(hash & (UINT64)pool->mask);
+}
+
+FORCEINLINE
+KIRQL
+RbShardLock(
+    _In_ PRB_SHARD_POOL pool,
+    _In_ UINT32             idx
+    )
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pool->shards[idx].lock, &oldIrql);
+    return oldIrql;
+}
+
+FORCEINLINE
+VOID
+RbShardUnlock(
+    _In_ PRB_SHARD_POOL pool,
+    _In_ UINT32             idx,
+    _In_ KIRQL              oldIrql
+    )
+{
+    KeReleaseSpinLock(&pool->shards[idx].lock, oldIrql);
+}
+
+/* DISPATCH 级路径专用：要求调用方已在 DISPATCH_LEVEL，用错直接 BSOD，勿混用 */
+FORCEINLINE
+VOID
+RbShardLockAtDpc(
+    _In_ PRB_SHARD_POOL pool,
+    _In_ UINT32             idx
+    )
+{
+    KeAcquireSpinLockAtDpcLevel(&pool->shards[idx].lock);
+}
+
+FORCEINLINE
+VOID
+RbShardUnlockFromDpc(
+    _In_ PRB_SHARD_POOL pool,
+    _In_ UINT32             idx
+    )
+{
+    KeReleaseSpinLockFromDpcLevel(&pool->shards[idx].lock);
+}
+
+#endif /* RB_SHARD_H */
+
+
+===== 文件: common\rb_alloc.h =====
+/* common/rb_alloc.h — Win10 2004+ 用 ExAllocatePool2（强制 Nx）；更老版本回退 */
+#ifndef RB_ALLOC_H
+#define RB_ALLOC_H
+#include <ntddk.h>
+
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+#  define RB_ALLOC(bytes, tag) ExAllocatePool2(POOL_FLAG_NON_PAGED, (bytes), (tag))
+#else
+#  define RB_ALLOC(bytes, tag) ExAllocatePoolWithTag(NonPagedPoolNx, (bytes), (tag))
+#endif
+#define RB_FREE(p, tag)      do { if (p) { ExFreePoolWithTag((p), (tag)); (p) = NULL; } } while (0)
+#endif /* RB_ALLOC_H */
+
+
+===== 文件: common\rb_threadsched.h =====
+/* common/rb_threadsched.h
+ * HT/组感知的工作线程排布：把辅助线程绑定到"与主 IO 核不同物理核"的逻辑核上，
+ * 避免 flush/writeback 线程与 IO 路径 DPC 抢同一物理核。
+ * 失败/信息不可得 → 不绑定，退回系统默认（绝不因优化失败阻断启动）。 */
+#ifndef RB_THREADSCHED_H
+#define RB_THREADSCHED_H
+
+#include <ntddk.h>
+#include "rb_percpu.h"
+
+typedef struct _RB_AFFIN_TARGET {
+    GROUP_AFFINITY  ga;         /* 目标组亲和 */
+    BOOLEAN         valid;
+} RB_AFFIN_TARGET, *PRB_AFFIN_TARGET;
+
+/*
+ * RbPickAuxTargets:
+ *   Targets   — 调用方提供数组（容量 RB_PCPU_MAX）
+ *   TargetCnt — 实际写入个数
+ *   AuxCount  — 需要几个辅助线程槽位
+ * 返回选中的逻辑核列表；每个目标尽量落在不同物理核。
+ */
+_IRQL_requires_max_(PASSIVE_LEVEL)
+FORCEINLINE
+NTSTATUS
+RbPickAuxTargets(
+    _Out_writes_to_(RB_PCPU_MAX, *TargetCnt) RB_AFFIN_TARGET *Targets,
+    _Out_ ULONG *TargetCnt,
+    _In_  ULONG  AuxCount
+    )
+{
+    NTSTATUS                        status;
+    ULONG                           i, n, coreInfoSize;
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *info = NULL;
+    ULONG                           picked = 0;
+    static UCHAR                    usedPerCore[RB_PCPU_MAX];
+
+    *TargetCnt = 0;
+    RtlZeroMemory(Targets, sizeof(RB_AFFIN_TARGET) * RB_PCPU_MAX);
+    RtlZeroMemory(usedPerCore, sizeof(usedPerCore));
+
+    n = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    if (n == 0 || n > RB_PCPU_MAX) { n = RB_PCPU_MAX; }
+
+    /* 取物理核拓扑 */
+    coreInfoSize = 0;
+    status = KeQueryLogicalProcessorRelationship(
+                 NULL, RelationProcessorCore, NULL, &coreInfoSize);
+    if (status == STATUS_INFO_LENGTH_MISMATCH && coreInfoSize > 0) {
+        info = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)
+               ExAllocatePool2(POOL_FLAG_NON_PAGED, coreInfoSize, 'hpbR');
+        if (info) {
+            status = KeQueryLogicalProcessorRelationship(
+                         NULL, RelationProcessorCore, info, &coreInfoSize);
+            if (!NT_SUCCESS(status)) {
+                ExFreePoolWithTag(info, 'hpbR');
+                info = NULL;
+            }
+        }
+    }
+    /* info 可为 NULL：拓扑不可得时走朴素轮选 */
+
+    for (i = 0; i < n && picked < AuxCount && picked < RB_PCPU_MAX; ++i) {
+        PROCESSOR_NUMBER    pn;
+        ULONG               coreId = i;   /* 无拓扑时退化：索引即核 id */
+        BOOLEAN             skip = FALSE;
+
+        KeGetProcessorNumberFromIndex(i, &pn);
+
+        if (info) {
+            ULONG               off = 0;
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *rec;
+            while (off < coreInfoSize) {
+                rec = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)
+                      ((PUCHAR)info + off);
+                if (rec->Relationship == RelationProcessorCore) {
+                    GROUP_AFFINITY *ga = &rec->Processor.GroupMask[0];
+                    if (ga->Group == pn.Group &&
+                        (ga->Mask & (KAFFINITY)(1ull << pn.Number))) {
+                        coreId = (ULONG)(uintptr_t)rec;
+                        break;
+                    }
+                }
+                off += rec->Size;
+            }
+        }
+
+        if (usedPerCore[coreId % RB_PCPU_MAX] > 0) {
+            skip = TRUE;
+        }
+        if (!skip) {
+            usedPerCore[coreId % RB_PCPU_MAX] = 1;
+            Targets[picked].ga.Group       = pn.Group;
+            Targets[picked].ga.Mask        = (KAFFINITY)(1ull << pn.Number);
+            Targets[picked].ga.Reserved[0] = 0;
+            Targets[picked].ga.Reserved[1] = 0;
+            Targets[picked].ga.Reserved[2] = 0;
+            Targets[picked].valid = TRUE;
+            ++picked;
+        }
+    }
+
+    if (info) {
+        ExFreePoolWithTag(info, 'hpbR');
+    }
+
+    *TargetCnt = picked;
+    return (picked > 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+/* 绑定：在线程入口（PsCreateSystemThread 之后、工作循环之前）调用一次 */
+_IRQL_requires_max_(PASSIVE_LEVEL)
+FORCEINLINE
+VOID
+RbBindCurrentThreadToTarget(
+    _In_ const RB_AFFIN_TARGET *Target
+    )
+{
+    if (Target && Target->valid) {
+        KeSetSystemGroupAffinityThread((PGROUP_AFFINITY)&Target->ga, NULL);
+    }
+}
+
+#endif /* RB_THREADSCHED_H */
+
+
+===== 文件: common\rb_shardlock.h =====
+/* common/rb_shardlock.h — 64 片锁模板
+ * N = 2^k，用"指针哈希"选片，保证同一条目永远落同片（无迁移一致性）。
+ * 用法：RbShardLockAcquire(&L, key); ... RbShardLockRelease(&L, key);
+ * 替换全局 KeAcquireSpinLock 处：key 传条目指针或其 hash 源。
+ * 守则：同临界区多条目必须用同一把 key；遍历全表按片号递增取、逆序放；
+ *       跨结构全局不变量保持原锁。 */
+#ifndef RB_SHARDLOCK_H
+#define RB_SHARDLOCK_H
+
+#include <ntddk.h>
+
+#define RB_SHARD_BITS   6
+#define RB_SHARD_COUNT  (1u << RB_SHARD_BITS)     /* 64 片，可按需改 */
+
+typedef struct _RB_SHARD_LOCK {
+    KSPIN_LOCK  locks[RB_SHARD_COUNT];
+} RB_SHARD_LOCK, *PRB_SHARD_LOCK;
+
+FORCEINLINE
+VOID
+RbShardLockInit(
+    _Out_ PRB_SHARD_LOCK L
+    )
+{
+    ULONG i;
+    for (i = 0; i < RB_SHARD_COUNT; ++i) {
+        KeInitializeSpinLock(&L->locks[i]);
+    }
+}
+
+FORCEINLINE
+ULONG
+RbShardIndexOf(
+    _In_ const VOID *Key        /* 条目指针；或预先折叠好的 ULONG hash */
+    )
+{
+    ULONG_PTR v = (ULONG_PTR)Key;
+    v ^= v >> 17;
+    v *= (ULONG_PTR)0x9E3779B97F4A7C15ull;
+    return (ULONG)((v >> 24) & (RB_SHARD_COUNT - 1));
+}
+
+FORCEINLINE
+VOID
+RbShardLockAcquire(
+    _Inout_ PRB_SHARD_LOCK L,
+    _In_    const VOID    *Key,
+    _Out_   KIRQL         *OldIrql
+    )
+{
+    KeAcquireSpinLock(&L->locks[RbShardIndexOf(Key)], OldIrql);
+}
+
+FORCEINLINE
+VOID
+RbShardLockRelease(
+    _Inout_ PRB_SHARD_LOCK L,
+    _In_    const VOID    *Key,
+    _In_    KIRQL          OldIrql
+    )
+{
+    KeReleaseSpinLock(&L->locks[RbShardIndexOf(Key)], OldIrql);
+}
+
+#endif /* RB_SHARDLOCK_H */
+
+
+===== 文件: common\rb_wiring.h =====
+/* common/rb_wiring.h — 接线总表（构建期事实，替代注释性"未接线"标注）
+ * 0 = 已实现但未接入调用链（审计 RB-Rev-V10.3.4 WB-1 / 第10章确认的 OFF 状态）
+ * 1 = 已接线。纪律：一格 commit 只允许翻转一个开关。 */
+#ifndef RB_WIRING_H
+#define RB_WIRING_H
+
+#define RB_WIRED_WBCOAL        0   /* rbwback.c : RbWbInit/RbWbStop 接挂载/停机 */
+#define RB_WIRED_L2_ON_EVICT   0   /* rbfeat.c  : RbFeatOnEvict 接 core 淘汰路径  */
+
+#if RB_WIRED_WBCOAL && RB_WIRED_L2_ON_EVICT
+#  error "wire ONE feature per commit: finish WBCOAL wiring first"
+#endif
+
+/* 消费点约定（门禁 check_repo.py 强制校验）：
+ *   任何调用 RbWbInit/RbWbStop 的文件，必须含 "#if RB_WIRED_WBCOAL" 守卫；
+ *   任何调用 RbFeatOnEvict 的文件，必须含 "#if RB_WIRED_L2_ON_EVICT" 守卫；
+ *   RB_WIRED_* 只准在本文件定义，他处 #define 视为 FAIL。 */
+#endif /* RB_WIRING_H */
+
+
+===== 文件: core\cache.c (关键段：percpu flush 统计 + evict_victim 锁序) =====
+--- percpu flush 统计（约 :68-88）---
+ * IMPORTANT: this does NOT touch synchronization state — zflush_cnt gate,
+ * flush_active gate, and c->dseq[] version tags remain plain atomic/global. */
+typedef struct _RB_FLUSH_COUNTERS {
+    long long dseq;        /* times a per-sub dirty-generation was bumped */
+    long long sflush;      /* serial flush critical-section entries */
+    long long zflush;      /* zoned flush critical-section entries */
+    long long flush_pass;  /* flush_pass() invocations */
+} RB_FLUSH_COUNTERS;
+#ifdef RB_KERNEL_BUILD
+  #include "../common/rb_percpu.h"   /* driver side provides this header */
+  typedef struct _RB_PCPU_FLUSH {
+      DECLSPEC_ALIGN(RB_CACHELINE) RB_FLUSH_COUNTERS c;
+      unsigned char _pad[RB_CACHELINE - sizeof(RB_FLUSH_COUNTERS)];
+  } RB_PCPU_FLUSH;
+  static RB_PCPU_FLUSH *g_flush_pcpu = NULL;   /* allocated at driver init */
+  static unsigned int   g_flush_pcpu_n = 0;
+  #define RB_FLUSH_STAT_INC(f) do{                                     \
+      unsigned int _i = RbPcpuFlattenIndex(NULL);                      \
+      if(g_flush_pcpu && _i < g_flush_pcpu_n)                           \
+          InterlockedIncrement64(&g_flush_pcpu[_i].c.f);               \
+  }while(0)
+#else
+  static RB_FLUSH_COUNTERS g_flush_stat;   /* one slot == whole sum */
+  #define RB_FLUSH_STAT_INC(f) InterlockedIncrement64(&g_flush_stat.f)
+#endif
+
+--- evict_victim 锁序修正（约 :1392-1410，锁内摘链锁外回调）---
+    }
+    RB_RW_UNLOCK(&s->stripes[k]);
+#if RB_WIRED_L2_ON_EVICT
+    /* 锁内摘链、锁外回调：避免 RbFeatOnEvict 内部再取同层锁导致锁序倒置死锁 */
+    if(have_evict) RbFeatOnEvict(evict_key, evict_seq);
+#endif
+    return r;
+}
+static void stream_reclaim(rb_stream *s)
+{
+    rb_engine *eng=s->eng;
+    rb_u64 ch_,hi_,lo_;
+    struct rb_evict_vic vics[RB_EVICT_BATCH];
+    rb_effective_caps(eng,&ch_,&hi_,&lo_);
+    if(!RC_TRY(s))return;
+    while(RB_ALOAD64(&eng->total_bytes)>lo_){
+        int n=evict_select(s,vics,RB_EVICT_BATCH), i, freed=0;
+        if(n==0)break;
+        for(i=0;i<n;i++) freed += (evict_victim(s,vics[i].start,vics[i].epoch)==1);
+        if(!freed)break;   /* no progress: chunks gone/dirty, avoid livelock */
+    }
+    if(RB_ALOAD64(&eng->total_bytes)>hi_){
+        flush_stream(s,0);
+
+===== 文件: ui\controller\RAMBlockCache.Controller\app.manifest =====
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\App.xaml =====
+<Application x:Class="RAMBlockCache.Controller.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="Theme/Dark.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+            <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\App.xaml.cs =====
+using System.Windows;
+
+namespace RAMBlockCache.Controller;
+
+public partial class App : Application
+{
+    protected override void OnStartup(StartupEventArgs e)
+    {
+        DispatcherUnhandledException += (_, ex) =>
+        {
+            Services.LogService.Error($"未处理异常：{ex.Exception.Message}");
+            ex.Handled = true;
+        };
+        base.OnStartup(e);
+    }
+}
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\MainWindow.xaml =====
+<Window x:Class="RAMBlockCache.Controller.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ctl="clr-namespace:RAMBlockCache.Controller.Controls"
+        Title="RAMBlockCache 控制器" Height="760" Width="1080"
+        Background="{DynamicResource BgBrush}" FontFamily="Segoe UI" FontSize="13">
+<Window.Resources>
+    <SolidColorBrush x:Key="CardBrush" Color="#FF1E1E24"/>
+    <SolidColorBrush x:Key="FgBrush" Color="#FFEDEDF2"/>
+    <SolidColorBrush x:Key="DimBrush" Color="#FF9A9AA5"/>
+    <SolidColorBrush x:Key="AccentBrush" Color="#FF60CDFF"/>
+    <Style TargetType="Button">
+        <Setter Property="Background" Value="#FF2B2B33"/>
+        <Setter Property="Foreground" Value="{StaticResource FgBrush}"/>
+        <Setter Property="Padding" Value="12,6"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="6"
+                            Padding="{TemplateBinding Padding}">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="bd" Property="Background" Value="#FF3A3A45"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="bd" Property="Opacity" Value="0.4"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+</Window.Resources>
+
+<DockPanel>
+    <Border DockPanel.Dock="Top" Background="#FF5A2A2A" Padding="14,8"
+            Visibility="{Binding BannerVisible, Converter={StaticResource BoolToVis}}">
+        <TextBlock Text="{Binding Banner}" Foreground="#FFFFD9D9" TextWrapping="Wrap"/>
+    </Border>
+
+    <DockPanel DockPanel.Dock="Top" Margin="14,10,14,6">
+        <TextBlock Text="{Binding TitleExtra}" Foreground="{StaticResource DimBrush}"
+                   VerticalAlignment="Center" DockPanel.Dock="Right"/>
+        <StackPanel Orientation="Horizontal">
+            <Button Content="全部挂载" Command="{Binding MountAllCommand}" Margin="0,0,8,0"/>
+            <Button Content="全部卸载" Command="{Binding UnmountAllCommand}"/>
+        </StackPanel>
+    </DockPanel>
+
+    <Grid Margin="14,0,14,14">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="200"/>
+            <RowDefinition Height="170"/>
+        </Grid.RowDefinitions>
+
+        <ListBox Grid.Row="0" ItemsSource="{Binding Drives}" Background="Transparent"
+                 BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <Border Background="{StaticResource CardBrush}" CornerRadius="10"
+                            Padding="14" Margin="0,0,0,10">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="220"/><ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0" Margin="0,0,14,0" VerticalAlignment="Center">
+                                <TextBlock Text="{Binding DriveLetter}" FontSize="26" FontWeight="Bold"/>
+                                <TextBlock Text="{Binding VolumeLabel}" Foreground="{StaticResource DimBrush}"/>
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                <TextBlock Text="{Binding StatusText}" Foreground="{StaticResource AccentBrush}"/>
+                                <TextBlock Text="{Binding UsedText}" Foreground="{StaticResource DimBrush}" Margin="0,2,0,6"/>
+                                <ProgressBar Value="{Binding UsedPct, Mode=OneWay}" Maximum="100" Height="6"
+                                             Background="#FF2B2B33" Foreground="{StaticResource AccentBrush}"/>
+                                <TextBlock Text="配额 (MB)" Foreground="{StaticResource DimBrush}" Margin="0,8,0,2"/>
+                                <Slider Minimum="64" Maximum="4096" TickFrequency="64" IsSnapToTickEnabled="True"
+                                        Value="{Binding QuotaMB, Mode=TwoWay}"/>
+                            </StackPanel>
+                            <StackPanel Grid.Column="2" VerticalAlignment="Center">
+                                <ctl:Sparkline Height="48" Value="{Binding ReadMbps, Mode=OneWay}"/>
+                                <TextBlock Foreground="{StaticResource DimBrush}" Margin="0,4,0,0">
+                                    <Run Text="读 "/><Run Text="{Binding ReadMbps, Mode=OneWay, StringFormat=F1}"/><Run Text=" MB/s   命中 "/>
+                                    <Run Text="{Binding HitPct, Mode=OneWay, StringFormat=F1}"/><Run Text="%"/>
+                                </TextBlock>
+                                <ctl:Sparkline Height="48" Value="{Binding WriteMbps, Mode=OneWay}" Stroke="#FF7BD88F"/>
+                            </StackPanel>
+                            <StackPanel Grid.Column="3" VerticalAlignment="Center" Margin="14,0,0,0">
+                                <Button Content="挂载"   Command="{Binding MountCommand}"   Margin="0,0,0,6" Width="86"/>
+                                <Button Content="卸载"   Command="{Binding UnmountCommand}" Margin="0,0,0,6" Width="86"/>
+                                <Button Content="Flush"  Command="{Binding FlushCommand}"   Margin="0,0,0,6" Width="86"/>
+                                <Button Content="暂停/恢复" Command="{Binding PauseResumeCommand}" Width="86"/>
+                            </StackPanel>
+                        </Grid>
+                    </Border>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+
+        <Border Grid.Row="1" Background="#FF141418" CornerRadius="8" Padding="10" Margin="0,10,0,0">
+            <ListBox ItemsSource="{Binding LogLines}" FontFamily="Consolas" FontSize="12"
+                     Background="Transparent" BorderThickness="0"
+                     Foreground="#FFB9B9C6" ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
+        </Border>
+
+        <TextBlock Grid.Row="2" Text="协议 9 · IOCTL 0x222000 · 设备按盘符 · 结构体 Pack=8"
+                   Foreground="{StaticResource DimBrush}" VerticalAlignment="Bottom" HorizontalAlignment="Right"/>
+    </Grid>
+</DockPanel>
+</Window>
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\MainWindow.xaml.cs =====
+using System.Windows;
+using RAMBlockCache.Controller.ViewModels;
+
+namespace RAMBlockCache.Controller;
+
+public partial class MainWindow : Window
+{
+    public MainWindow()
+    {
+        InitializeComponent();
+        DataContext = new MainViewModel();
+        Loaded += (_, _) => (DataContext as MainViewModel)?.RefreshDrives();
+        Closing += (_, _) => Services.StatsService.Instance.Stop();
+    }
+}
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\RAMBlockCache.Controller.csproj =====
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>RAMBlockCache.Controller</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>10.4.1</Version>
+  </PropertyGroup>
+</Project>
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\Controls\Sparkline.cs =====
+using System;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Shapes;
+
+namespace RAMBlockCache.Controller.Controls;
+
+public sealed class Sparkline : FrameworkElement
+{
+    public static readonly DependencyProperty ValueProperty = DependencyProperty.Register(
+        nameof(Value), typeof(double), typeof(Sparkline),
+        new FrameworkPropertyMetadata(0.0, FrameworkPropertyMetadataOptions.AffectsRender));
+    public static readonly DependencyProperty CapacityProperty = DependencyProperty.Register(
+        nameof(Capacity), typeof(int), typeof(Sparkline),
+        new FrameworkPropertyMetadata(30, FrameworkPropertyMetadataOptions.AffectsRender));
+    public static readonly DependencyProperty StrokeProperty = DependencyProperty.Register(
+        nameof(Stroke), typeof(Color), typeof(Sparkline),
+        new FrameworkPropertyMetadata(Color.FromRgb(0x60, 0xCD, 0xFF), FrameworkPropertyMetadataOptions.AffectsRender));
+
+    public double Value { get => (double)GetValue(ValueProperty); set => SetValue(ValueProperty, value); }
+    public int Capacity { get => (int)GetValue(CapacityProperty); set => SetValue(CapacityProperty, value); }
+    public Color Stroke { get => (Color)GetValue(StrokeProperty); set => SetValue(StrokeProperty, value); }
+
+    private readonly double[] _ring = new double[30];
+    private int _head, _count;
+
+    public Sparkline() { Loaded += (_, _) => Push(Value); }
+
+    protected override void OnPropertyChanged(DependencyPropertyChangedEventArgs e)
+    {
+        base.OnPropertyChanged(e);
+        if (e.Property == ValueProperty) Push(Value);
+    }
+
+    private void Push(double v)
+    {
+        _ring[_head] = v;
+        _head = (_head + 1) % _ring.Length;
+        _count = Math.Min(_count + 1, _ring.Length);
+        InvalidateVisual();
+    }
+
+    protected override void OnRender(DrawingContext dc)
+    {
+        if (_count < 2) return;
+        double w = ActualWidth, h = ActualHeight;
+        double max = 1;
+        for (int i = 0; i < _count; i++) max = Math.Max(max, _ring[i]);
+        var pen = new Pen(new SolidColorBrush(Stroke), 1.6);
+        pen.Freeze();
+        var geo = new StreamGeometry();
+        using (var ctx = geo.Open())
+        {
+            bool first = true;
+            for (int i = 0; i < _count; i++)
+            {
+                int idx = (_head - _count + i + _ring.Length) % _ring.Length;
+                double x = w * i / (_count - 1);
+                double y = h - h * (_ring[idx] / max) * 0.92 - 2;
+                if (first) { ctx.BeginFigure(new Point(x, y), false, false); first = false; }
+                else ctx.LineTo(new Point(x, y), true, false);
+            }
+        }
+        geo.Freeze();
+        dc.DrawGeometry(null, pen, geo);
+    }
+}
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\Helpers\RelayCommand.cs =====
+using System;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
+using System.Windows.Input;
+
+namespace RAMBlockCache.Controller.Helpers;
+
+public abstract class ObservableObject : INotifyPropertyChanged
+{
+    public event PropertyChangedEventHandler? PropertyChanged;
+    protected void RaisePropertyChanged([CallerMemberName] string? n = null)
+        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(n));
+    protected bool Set<T>(ref T field, T value, [CallerMemberName] string? n = null)
+    {
+        if (Equals(field, value)) return false;
+        field = value; RaisePropertyChanged(n); return true;
+    }
+}
+
+public sealed class RelayCommand : ICommand
+{
+    private readonly Action _exec;
+    private readonly Func<bool>? _can;
+    public RelayCommand(Action exec, Func<bool>? can = null) { _exec = exec; _can = can; }
+    public bool CanExecute(object? p) => _can?.Invoke() ?? true;
+    public void Execute(object? p) => _exec();
+    public event EventHandler? CanExecuteChanged
+    { add => CommandManager.RequerySuggested += value; remove => CommandManager.RequerySuggested -= value; }
+}
+
+public sealed class AsyncRelayCommand : ICommand
+{
+    private readonly Func<Task> _exec;
+    private readonly Func<bool>? _can;
+    private bool _busy;
+    public AsyncRelayCommand(Func<Task> exec, Func<bool>? can = null) { _exec = exec; _can = can; }
+    public bool CanExecute(object? p) => !_busy && (_can?.Invoke() ?? true);
+    public async void Execute(object? p)
+    {
+        if (!CanExecute(p)) return;
+        _busy = true; CommandManager.InvalidateRequerySuggested();
+        try { await _exec(); }
+        catch (Exception ex) { Services.LogService.Error($"命令执行异常：{ex.Message}"); }
+        finally { _busy = false; CommandManager.InvalidateRequerySuggested(); }
+    }
+    public event EventHandler? CanExecuteChanged
+    { add => CommandManager.RequerySuggested += value; remove => CommandManager.RequerySuggested -= value; }
+}
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\Models\DriverException.cs =====
+using System;
+
+namespace RAMBlockCache.Controller.Models;
+
+public sealed class DriverException : Exception
+{
+    public int Win32Error { get; }
+
+    public DriverException(int win32Error, string context)
+        : base($"{context}（{Describe(win32Error)}）") => Win32Error = win32Error;
+
+    private static string Describe(int e) => e switch
+    {
+        2    => "设备未就绪，驱动未加载或该卷未挂载",
+        5    => "拒绝访问，请以管理员身份运行控制器",
+        31   => "驱动侧设备故障，请检查驱动日志",
+        87   => "参数非法，控制器与驱动协议版本不一致",
+        170  => "驱动忙，正在重试",
+        1219 => "多次凭据冲突",
+        _    => $"Win32 错误 {e}"
+    };
+}
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\Models\Models.cs =====
+using System;
+using System.Runtime.InteropServices;
+
+namespace RAMBlockCache.Controller.Models;
+
+// ============================================================================
+// 真实协议层（ctl/rb_proto.h, Protocol 9）—— 单一 IOCTL 0x222000 + RB_MSG.Type 分发。
+// 旧 ui/wpf/RbClient 已验证此布局能连上正在运行的 Build 17 驱动，逐字段对齐照抄。
+//   消息头: Type@0(u32) / Size@4(u32) / Status@8(i32, NTSTATUS) / Reserved@12(u32)
+//   联合体 Data@16，整块 RbMsgSize = 7704 字节。
+// ============================================================================
+public static class RbP
+{
+    public const uint IOCTL_RB_REQUEST = 0x00222000;
+
+    public const uint GET_STATS = 1;
+    public const uint SET_CONFIG = 2;
+    public const uint FLUSH = 3;
+    public const uint GET_CONFIG = 4;
+    public const uint EXIT_SAFE_MODE = 5;
+    public const uint SET_VOLUME = 6;
+    public const uint GET_VOLUMES = 7;
+    public const uint ATTACH_VOLUME = 8;
+    public const uint GET_LOG = 9;
+    public const uint GET_VERSION = 10;
+    public const uint PANIC = 11;
+    public const uint PANIC_CLEAR = 12;
+
+    public const int DataOffset = 16;
+    public const int MsgSize = 7704;
+
+    public const int MaxVolumes = 8;
+    public const int Stripes = 64;
+    public const int NameLen = 16;
+
+    public const uint WM_THROUGH = 0;
+    public const uint WM_BACK = 1;
+    public const uint WM_GLOBAL = 2;
+}
+
+// ---------------- 真实内核结构（Pack=8，逐字段对齐） ----------------
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbStats
+{
+    public ulong ReadReq, ReadHit, ReadBytes, ReadHitBytes;
+    public ulong WriteReq, WriteBytes, WriteCached, WbFlush, WbBytes, EvictBytes;
+    public ulong CurBytes, DirtyBytes, ChunkCount;
+    public uint InstanceCount, CacheSizeMB, EffectiveCacheMB, WriteBackMode, Enabled, SafeMode, RmwReads, TrimCount;
+    public ulong IdleReclaimBytes, LostDirtyBytes;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbP.Stripes)] public ulong[] StripeRead;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbP.Stripes)] public ulong[] StripeWrite;
+    public uint StripeCount;
+    public uint PressureLevel, DynamicLimitMB;
+    public ulong AvailablePhysMB, PeakBytes, ReadaheadBytes, ReadaheadHitBytes, PressureShrinkBytes;
+    public uint ReadaheadActive;
+    public uint PanicActive, BootFails, DirtySnapshotMB;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbVolumeInfo
+{
+    public ushort Letter;
+    public uint Attached, ReadEnabled, WriteEnabled, IsSystem;
+    public ulong CapacityMB, FreeMB;
+    public uint Bound, WriteMode, LogicalSectorBytes, PhysicalSectorBytes;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbVolumeList
+{
+    public uint Count;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbP.MaxVolumes)] public RbVolumeInfo[] Items;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbVolumeAttach
+{
+    public ushort Letter;
+    public uint Attach, ReadEnabled, WriteEnabled, WriteMode;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbConfigNative
+{
+    public uint Enabled, ReadCacheEnabled, WriteCacheEnabled, WriteBack;
+    public uint CacheSizeMB, FlushIntervalMs, DirtyHighPct, DirtyLowPct;
+    public uint SystemVolumeCached, IdleReclaimEnabled, IdleReclaimSec, ParallelFlush;
+    public uint CachePagingIo, WriteRelease, Frozen, IdleFlush;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbP.MaxVolumes * 4)] public ushort[] VolumeFilter;
+    public uint ReadaheadEnabled, ReadaheadWindowKB, AutoMemory, MemReserveMB, AutoUsePct, BlockSize;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbVersionNative
+{
+    public uint ProtocolVersion, Major, Minor, Build, IsBlockFilter, Reserved;
+    public ulong DriverFlags;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = RbP.NameLen)] public ushort[] Name;
+}
+
+// ---------------- UI 展示 DTO（ViewModel/XAML 绑定用，保持字段名不变） ----------------
+
+public struct RbVersion
+{
+    public uint ProtocolVersion, Major, Minor, Patch, Build;
+}
+
+public struct RbGlobalStats
+{
+    public ulong TotalCacheBytes, MaxCacheBytes;
+    public ulong ReadBytesTotal, WriteBytesTotal;
+    public ulong ReadHits, ReadMisses, WriteHits, WriteMisses;
+    public uint ActiveVolumes, MountedVolumeMask, FlushCount, EvictCount;
+}
+
+public struct RbVolumeStats
+{
+    public uint DriveLetter;     // ASCII 'A'..'Z'
+    public uint Mounted;
+    public uint CacheBytes;
+    public ulong UsedBytes;
+    public ulong ReadBytes, WriteBytes;
+    public ulong ReadHits, ReadMisses, WriteHits, WriteMisses;
+    public ulong Flushes, Evictions;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct RbVolumeStatsOut
+{
+    public uint Count;
+    public uint Reserved;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 26)] public RbVolumeStats[] V;
+}
+
+/// <summary>CachePage 提交的小配置（只映射驱动支持的 WriteBack / FlushIntervalMs）。</summary>
+public struct RbConfig
+{
+    public uint DefaultCacheMB;
+    public uint FlushIntervalMs;
+    public uint WriteMode;       // 1=回写 2=直写
+    public uint EvictPolicy;
+    public uint MaxTotalCacheMB;
+}
+
+public static class Conv
+{
+    public const ulong KB = 1024, MB = 1024 * 1024, GB = 1024UL * 1024 * 1024;
+
+    public static string Size(ulong b)
+    {
+        return b >= GB ? $"{(double)b / GB:F2} GB"
+             : b >= MB ? $"{(double)b / MB:F1} MB"
+             : b >= KB ? $"{(double)b / KB:F1} KB"
+             : $"{b} B";
+    }
+    public static string Rate(double bytesPerSec) => bytesPerSec <= 0 ? "0 B/s" : Size((ulong)bytesPerSec) + "/s";
+}
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\Services\DriverService.cs =====
+using System;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+using Microsoft.Win32.SafeHandles;
+using RAMBlockCache.Controller.Models;
+
+namespace RAMBlockCache.Controller.Services;
+
+// 写模式常量（与文档 ViewModel 引用一致）
+internal static class Rb
+{
+    public const uint ModeWriteThrough = 0;
+    public const uint ModeWriteBack    = 1;
+}
+
+// —— 真实驱动 ctl/rb_proto.h 的 C# 镜像（Pack=8，偏移冻结）——
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+internal struct RbVersion
+{
+    public uint ProtocolVersion, Major, Minor, Build, IsBlockFilter, Reserved;
+    public ulong DriverFlags;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public char[] Name;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+internal struct RbStats
+{
+    public ulong ReadReq, ReadHit, ReadBytes, ReadHitBytes;
+    public ulong WriteReq, WriteBytes, WriteCached, WbFlush, WbBytes;
+    public ulong EvictBytes, CurBytes, DirtyBytes, ChunkCount;
+    public uint InstanceCount, CacheSizeMB, EffectiveCacheMB, WriteBackMode;
+    public uint Enabled, SafeMode, RmwReads, TrimCount;
+    public ulong IdleReclaimBytes, LostDirtyBytes;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 64)] public ulong[] StripeRead;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 64)] public ulong[] StripeWrite;
+    public uint StripeCount, PressureLevel, DynamicLimitMB;
+    public ulong AvailablePhysMB, PeakBytes, ReadaheadBytes, ReadaheadHitBytes, PressureShrinkBytes;
+    public uint ReadaheadActive, PanicActive, BootFails, DirtySnapshotMB;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+internal struct RbVolumeItem
+{
+    public char Letter;
+    public uint Attached, ReadEnabled, WriteEnabled, IsSystem;
+    public ulong CapacityMB, FreeMB;
+    public uint Bound, WriteMode, LogicalSectorBytes, PhysicalSectorBytes;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+internal struct RbVolumeList
+{
+    public uint Count;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)] public RbVolumeItem[] Items;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+internal struct RbAttach
+{
+    public char Letter;
+    public uint Attach, ReadEnabled, WriteEnabled, WriteMode;
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+internal struct RbVolumeSet
+{
+    public char Letter;
+    public uint ReadEnabled, WriteEnabled, WriteMode;
+}
+
+/// <summary>每卷状态快照（供文档 StatsService 消费）。</summary>
+public struct StatusOutput
+{
+    public ulong DeviceKey;
+    public ulong ReadHits, ReadMisses, WriteHits, WriteMisses;
+    public ulong BytesFromCache, BytesFromDisk;
+    public ulong DirtyBlocks, Evictions, FlushErrors;
+    public ulong CacheBytesUsed, CacheBytesTotal;
+    public uint Mounted, Mode, Paused;
+}
+
+public sealed class DriverService : IDisposable
+{
+    public static DriverService Instance { get; } = new();
+    private DriverService() { }
+
+    // FIX-4：与驱动 version.h 对齐的编译期契约
+    private const int ExpectedProtocol    = 9;
+    private const string ExpectedDriverVer = "V10.3.4 Build 17";
+    /// <summary>驱动读回版本，供 UI 展示。</summary>
+    public string DriverVersion { get; private set; } = "unknown";
+
+    private const string DevicePath = @"\\.\RAMBlockCache";
+    private const uint IOCTL_RB_REQUEST = 0x00222000;
+    private const int BufSize = 7704;
+
+    // 消息号（ctl/rb_proto.h）
+    private const uint MSG_GET_STATS = 1, MSG_SET_CONFIG = 2, MSG_FLUSH = 3,
+        MSG_GET_CONFIG = 4, MSG_SET_VOLUME = 6, MSG_GET_VOLUMES = 7,
+        MSG_ATTACH_VOLUME = 8, MSG_GET_VERSION = 10;
+
+    private SafeFileHandle? _h;
+    private readonly object _gate = new();
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+        IntPtr security, uint disposition, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeviceIoControl(SafeFileHandle h, uint ioctl,
+        IntPtr inBuf, uint inSize, IntPtr outBuf, uint outSize, out uint returned, IntPtr overlap);
+
+    private SafeFileHandle Handle
+    {
+        get
+        {
+            lock (_gate)
+            {
+                if (_h is { IsInvalid: false, IsClosed: false }) return _h;
+                var h = CreateFileW(DevicePath, 0x80000000 /*GENERIC_READ*/, 3,
+                    IntPtr.Zero, 3 /*OPEN_EXISTING*/, 0, IntPtr.Zero);
+                if (h.IsInvalid)
+                    throw new DriverException(Marshal.GetLastWin32Error(), "无法打开设备 \\\\.\\RAMBlockCache（驱动未加载或未以管理员运行）");
+                _h = h;
+                return h;
+            }
+        }
+    }
+
+    private void Roundtrip(uint type, object? payload, IntPtr p)
+    {
+        Marshal.WriteInt32(p, 0, (int)type);
+        Marshal.WriteInt32(p, 4, BufSize);
+        Marshal.WriteInt32(p, 8, 0);
+        Marshal.WriteInt32(p, 12, 0);
+        if (payload != null) Marshal.StructureToPtr(payload, p + 16, false);
+        if (!DeviceIoControl(Handle, IOCTL_RB_REQUEST, p, (uint)BufSize, p, (uint)BufSize, out _, IntPtr.Zero))
+            throw new DriverException(Marshal.GetLastWin32Error(), $"IOCTL 0x{IOCTL_RB_REQUEST:X} 消息 {type} 失败");
+        int st = Marshal.ReadInt32(p, 8);
+        if (st < 0) throw new DriverException(st, $"驱动返回错误 0x{(uint)st:X8}（消息 {type}）");
+    }
+
+    private TOut Query<TOut>(uint type, object? payload) where TOut : struct
+    {
+        IntPtr p = Marshal.AllocHGlobal(BufSize);
+        try
+        {
+            Roundtrip(type, payload, p);
+            return Marshal.PtrToStructure<TOut>(p + 16)!;
+        }
+        finally { Marshal.FreeHGlobal(p); }
+    }
+
+    public (uint protocol, uint build) Negotiate()
+    {
+        var ver = Query<RbVersion>(MSG_GET_VERSION, null);
+        DriverVersion = $"{ver.Major}.{ver.Minor} Build{ver.Build}";
+        LogService.Info($"驱动版本 {DriverVersion} Protocol{ver.ProtocolVersion}");
+        if (ver.ProtocolVersion != ExpectedProtocol)
+            throw new DriverException(87, $"协议不匹配：驱动 v{ver.ProtocolVersion}，控制台 v{ExpectedProtocol}，拒绝连接");
+        if (DriverVersion != ExpectedDriverVer)
+            LogService.Warn($"驱动版本 {DriverVersion} 与 UI 期望 {ExpectedDriverVer} 不同（协议一致，软校验放行）");
+        return (ver.ProtocolVersion, ver.Build);
+    }
+
+    public async Task<ulong> MountAsync(ulong deviceKey, uint cacheBytes, uint mode)
+    {
+        char letter = SystemService.LetterFromKey(deviceKey);
+        var att = new RbAttach { Letter = letter, Attach = 1, ReadEnabled = 1, WriteEnabled = 1, WriteMode = mode };
+        for (int attempt = 0; ; attempt++)
+        {
+            try { Query<RbAttach>(MSG_ATTACH_VOLUME, att); return cacheBytes; }
+            catch (DriverException ex) when (IsTransientAttach(ex) && attempt < 3)
+            { await Task.Delay(300 * (attempt + 1)).ConfigureAwait(false); }
+            catch (DriverException ex)
+            {
+                // FIX-4b：确定性拒绝（0x5 ACCESS_DENIED / panic / L2 / 负 NTSTATUS）不重试
+                if (ex.Win32Error == 5 || ex.Win32Error < 0)
+                    LogService.Error($"{letter}: 驱动确定性拒绝 attach（{ex.Win32Error}），不再重试，请检查 panic/保护状态");
+                throw;
+            }
+        }
+    }
+
+    public void Unmount(ulong deviceKey)
+    {
+        char letter = SystemService.LetterFromKey(deviceKey);
+        try { Query<RbAttach>(MSG_FLUSH, null); } catch { }
+        Query<RbAttach>(MSG_ATTACH_VOLUME, new RbAttach { Letter = letter, Attach = 0, ReadEnabled = 1, WriteEnabled = 1, WriteMode = 2 });
+    }
+
+    public StatusOutput QueryStats(ulong deviceKey)
+    {
+        char letter = SystemService.LetterFromKey(deviceKey);
+        var s = Query<RbStats>(MSG_GET_STATS, null);
+        var list = Query<RbVolumeList>(MSG_GET_VOLUMES, null);
+        uint attached = 0, wmode = 0;
+        for (int i = 0; i < list.Count && i < 8; i++)
+        {
+            if (char.ToUpperInvariant(list.Items[i].Letter) == char.ToUpperInvariant(letter))
+            { attached = list.Items[i].Attached; wmode = list.Items[i].WriteMode; break; }
+        }
+        ulong miss = s.ReadReq > s.ReadHit ? s.ReadReq - s.ReadHit : 0;
+        ulong wmiss = s.WriteReq > s.WriteCached ? s.WriteReq - s.WriteCached : 0;
+        ulong diskBytes = s.ReadBytes > s.ReadHitBytes ? s.ReadBytes - s.ReadHitBytes : 0;
+        return new StatusOutput
+        {
+            DeviceKey = deviceKey,
+            ReadHits = s.ReadHit, ReadMisses = miss,
+            WriteHits = s.WriteCached, WriteMisses = wmiss,
+            BytesFromCache = s.ReadHitBytes, BytesFromDisk = diskBytes,
+            DirtyBlocks = s.DirtyBytes / 4096, Evictions = s.EvictBytes / 4096, FlushErrors = 0,
+            CacheBytesUsed = s.CurBytes,
+            CacheBytesTotal = (ulong)s.EffectiveCacheMB * 1048576,
+            Mounted = attached, Mode = wmode, Paused = 0
+        };
+    }
+
+    public ulong SetQuota(ulong deviceKey, ulong cacheBytes)
+    {
+        // 真实驱动无逐卷配额；全局缓存为动态自适应，这里回读为期望值。
+        LogService.Info($"{SystemService.LetterFromKey(deviceKey)} 配额（驱动动态自适应，不下发）");
+        return cacheBytes;
+    }
+
+    public void Flush(ulong deviceKey) { Query<RbAttach>(MSG_FLUSH, null); }
+
+    public void Pause(ulong deviceKey)  { LogService.Warn("驱动不支持逐卷暂停，已忽略"); }
+    public void Resume(ulong deviceKey) { LogService.Warn("驱动不支持逐卷暂停，已忽略"); }
+
+    public void SetMode(ulong deviceKey, uint mode)
+    {
+        char letter = SystemService.LetterFromKey(deviceKey);
+        Query<RbVolumeSet>(MSG_SET_VOLUME,
+            new RbVolumeSet { Letter = letter, ReadEnabled = 1, WriteEnabled = 1, WriteMode = mode });
+    }
+
+    // 仅"瞬时冲突"才退避重试；0x5 与负 NTSTATUS(驱动 Status)为确定性拒绝
+    private static bool IsTransientAttach(DriverException ex) =>
+        ex.Win32Error == 170 /*BUSY*/ || ex.Win32Error == 2 /*未就绪*/;
+
+    public void Dispose() { lock (_gate) { _h?.Dispose(); _h = null; } }
+}
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\Services\LogService.cs =====
+using System;
+using System.Collections.Generic;
+using System.IO;
+
+namespace RAMBlockCache.Controller.Services;
+
+public static class LogService
+{
+    private static readonly object Gate = new();
+    private static readonly string Dir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "RAMBlockCache", "logs");
+    private const int RingSize = 500;
+    private static readonly Queue<string> Ring = new(RingSize);
+
+    public static event Action<string>? Appended;
+
+    public static void Info(string msg)  => Write("INFO ", msg);
+    public static void Warn(string msg)  => Write("WARN ", msg);
+    public static void Error(string msg) => Write("ERROR", msg);
+
+    private static void Write(string lvl, string msg)
+    {
+        var line = $"{DateTime.Now:HH:mm:ss.fff} [{lvl}] {msg}";
+        lock (Gate)
+        {
+            Ring.Enqueue(line);
+            while (Ring.Count > RingSize) Ring.Dequeue();
+        }
+        Appended?.Invoke(line);
+        try
+        {
+            Directory.CreateDirectory(Dir);
+            System.IO.File.AppendAllText(Path.Combine(Dir, $"ctrl-{DateTime.Now:yyyyMMdd}.log"), line + Environment.NewLine);
+        }
+        catch { }
+    }
+
+    public static IReadOnlyCollection<string> Snapshot()
+    { lock (Gate) return Ring.ToArray(); }
+}
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\Services\SettingsService.cs =====
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text.Json;
+
+namespace RAMBlockCache.Controller.Services;
+
+public sealed class AppSettings
+{
+    public Dictionary<string, ulong> QuotaByVolume { get; set; } = new();
+    public Dictionary<string, uint> ModeByVolume { get; set; } = new();
+    public bool AutoStartWithVolumes { get; set; } = true;
+    public bool LaunchOnBoot { get; set; }
+}
+
+public static class SettingsService
+{
+    private static readonly string Dir =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RAMBlockCache");
+    private static readonly string File = Path.Combine(Dir, "settings.json");
+    private static readonly JsonSerializerOptions Opt = new() { WriteIndented = true };
+
+    public static AppSettings Load()
+    {
+        try { return JsonSerializer.Deserialize<AppSettings>(System.IO.File.ReadAllText(File), Opt) ?? new(); }
+        catch { return new(); }
+    }
+
+    public static void Save(AppSettings s)
+    {
+        Directory.CreateDirectory(Dir);
+        System.IO.File.WriteAllText(File, JsonSerializer.Serialize(s, Opt));
+    }
+}
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\Services\StatsService.cs =====
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using RAMBlockCache.Controller.Models;
+
+namespace RAMBlockCache.Controller.Services;
+
+public sealed class StatsSnapshot
+{
+    public ulong DeviceKey { get; init; }
+    public double ReadMbps, WriteMbps, HitPct;
+    public ulong CacheBytesUsed, CacheBytesTotal;
+    public bool Mounted, Paused;
+    public uint Mode;
+}
+
+public sealed class StatsService : IDisposable
+{
+    public static StatsService Instance { get; } = new();
+    private StatsService() { }
+
+    private static readonly TimeSpan Period = TimeSpan.FromSeconds(1);
+    private PeriodicTimer? _timer;
+    private Task? _loop;
+    private CancellationTokenSource? _cts;
+    private readonly object _gate = new();
+    private readonly Dictionary<ulong, (ulong hits, ulong disk, DateTime at)> _last = new();
+
+    public event Action<StatsSnapshot>? Sampled;
+    public event Action<ulong>? DriverReportedUnmounted;
+
+    public void Start(IEnumerable<ulong> deviceKeys)
+    {
+        lock (_gate)
+        {
+            StopCore();
+            _cts = new CancellationTokenSource();
+            _timer = new PeriodicTimer(Period);
+            _loop = Task.Run(() => LoopAsync(deviceKeys, _timer, _cts.Token));
+        }
+    }
+
+    private async Task LoopAsync(IEnumerable<ulong> keys, PeriodicTimer timer, CancellationToken ct)
+    {
+        while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+        {
+            foreach (var key in keys)
+            {
+                StatsSnapshot? snap = null;
+                try { snap = BuildSnapshot(key); }
+                catch (DriverException ex) when (ex.Win32Error == 2)
+                { DriverReportedUnmounted?.Invoke(key); }
+                catch { }
+                if (snap != null) Sampled?.Invoke(snap);
+            }
+        }
+    }
+
+    private StatsSnapshot BuildSnapshot(ulong key)
+    {
+        var s = DriverService.Instance.QueryStats(key);
+        var now = DateTime.UtcNow;
+        double rMbps = 0, wMbps = 0;
+        lock (_gate)
+        {
+            if (_last.TryGetValue(key, out var prev) && now > prev.at)
+            {
+                var dt = (now - prev.at).TotalSeconds;
+                ulong dDisk = s.BytesFromDisk >= prev.disk ? s.BytesFromDisk - prev.disk : 0;
+                rMbps = Math.Max(0, dDisk / dt / 1048576.0);
+            }
+            _last[key] = (s.ReadHits, s.BytesFromDisk, now);
+        }
+        ulong totalReads = s.ReadHits + s.ReadMisses;
+        return new StatsSnapshot
+        {
+            DeviceKey = key,
+            ReadMbps = rMbps, WriteMbps = wMbps,
+            HitPct = totalReads == 0 ? 0 : s.ReadHits * 100.0 / totalReads,
+            CacheBytesUsed = s.CacheBytesUsed, CacheBytesTotal = s.CacheBytesTotal,
+            Mounted = s.Mounted != 0, Paused = s.Paused != 0, Mode = s.Mode
+        };
+    }
+
+    public void Stop() { lock (_gate) StopCore(); }
+    private void StopCore()
+    {
+        _cts?.Cancel();
+        _timer?.Dispose(); _timer = null;
+        try { _loop?.Wait(500); } catch { }
+        _loop = null; _cts?.Dispose(); _cts = null;
+        _last.Clear();
+    }
+    public void Dispose() => Stop();
+}
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\Services\SystemService.cs =====
+using System;
+using System.IO;
+using System.Linq;
+using System.Security.Principal;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace RAMBlockCache.Controller.Services;
+
+public static class SystemService
+{
+    public static bool IsElevated =>
+        new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
+
+    // 真实驱动按盘符识别卷：把盘符 A-Z 编码为稳定 ulong 设备键（替代文档假设的 FNV-GUID）。
+    public static ulong DeviceKeyFromVolumeGuid(string driveOrRoot)
+    {
+        if (string.IsNullOrEmpty(driveOrRoot)) return 0;
+        char c = char.ToUpperInvariant(driveOrRoot.FirstOrDefault(char.IsLetter));
+        return c == default ? 0 : (ulong)c;
+    }
+
+    public static char LetterFromKey(ulong deviceKey) => (char)(ushort)(deviceKey & 0xFFFF);
+
+    /// <summary>枚举固定磁盘卷（盘符根，如 "C:\"）。</summary>
+    public static string[] EnumerateFixedVolumes() =>
+        DriveInfo.GetDrives()
+            .Where(d => d.DriveType == DriveType.Fixed && d.IsReady)
+            .Select(d => d.Name)
+            .ToArray();
+
+    public static string LabelFromRoot(string root)
+    {
+        try
+        {
+            var di = new DriveInfo(root);
+            return !string.IsNullOrEmpty(di.VolumeLabel) ? di.VolumeLabel : "本地磁盘";
+        }
+        catch { return "本地磁盘"; }
+    }
+
+    public static void SetLaunchOnBoot(bool enable)
+    {
+        const string keyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        const string name = "RAMBlockCache.Controller";
+        using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(keyPath, writable: true)
+                        ?? Microsoft.Win32.Registry.CurrentUser.CreateSubKey(keyPath);
+        if (enable)
+            key.SetValue(name, Environment.ProcessPath ?? "", Microsoft.Win32.RegistryValueKind.String);
+        else
+            key.DeleteValue(name, throwOnMissingValue: false);
+    }
+}
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\Theme\Dark.xaml =====
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <SolidColorBrush x:Key="BgBrush"     Color="#FF16161B"/>
+    <SolidColorBrush x:Key="CardBrush"   Color="#FF1E1E24"/>
+    <SolidColorBrush x:Key="FgBrush"     Color="#FFEDEDF2"/>
+    <SolidColorBrush x:Key="DimBrush"    Color="#FF9A9AA5"/>
+    <SolidColorBrush x:Key="AccentBrush" Color="#FF60CDFF"/>
+</ResourceDictionary>
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\ViewModels\DriveItemViewModel.cs =====
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Input;
+using RAMBlockCache.Controller.Helpers;
+using RAMBlockCache.Controller.Models;
+using RAMBlockCache.Controller.Services;
+
+namespace RAMBlockCache.Controller.ViewModels;
+
+public sealed class DriveItemViewModel : ObservableObject
+{
+    private readonly SynchronizationContext? _ui = SynchronizationContext.Current;
+
+    public ulong DeviceKey { get; }
+    public string DriveLetter { get; }
+    public string VolumeLabel { get; }
+
+    private bool _mounted;
+    public bool Mounted
+    {
+        get => _mounted;
+        private set { if (Set(ref _mounted, value)) RaisePropertyChanged(nameof(StatusText)); }
+    }
+
+    private bool _paused;
+    public bool Paused { get => _paused; private set { if (Set(ref _paused, value)) RaisePropertyChanged(nameof(StatusText)); } }
+
+    public string StatusText => !Mounted ? "未挂载"
+        : Paused ? "已暂停" : _mode == Rb.ModeWriteBack ? "已挂载 · WriteBack" : "已挂载 · WriteThrough";
+
+    private ulong _quotaBytes;
+    public ulong QuotaBytes
+    {
+        get => _quotaBytes;
+        set
+        {
+            if (_quotaBytes == value || value == 0) return;
+            var old = _quotaBytes;
+            _quotaBytes = value;
+            RaisePropertyChanged();
+            _ = ApplyQuotaAsync(old);
+        }
+    }
+
+    public double QuotaMB
+    {
+        get => _quotaBytes / 1048576.0;
+        set => QuotaBytes = (ulong)Math.Max(64, Math.Round(value)) * 1048576UL;
+    }
+
+    private uint _mode = Rb.ModeWriteBack;
+    public uint Mode
+    {
+        get => _mode;
+        set
+        {
+            if (_mode == value) return;
+            try
+            {
+                DriverService.Instance.SetMode(DeviceKey, value);
+                _mode = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(StatusText));
+                LogService.Info($"{DriveLetter} 缓存模式 → {(value == Rb.ModeWriteBack ? "WriteBack" : "WriteThrough")}");
+            }
+            catch (DriverException ex) { LogService.Error($"{DriveLetter} 模式切换失败：{ex.Message}"); }
+        }
+    }
+
+    private double _hitPct;
+    public double HitPct { get => _hitPct; private set => Set(ref _hitPct, value); }
+    private double _readMbps;
+    public double ReadMbps { get => _readMbps; private set => Set(ref _readMbps, value); }
+    private double _writeMbps;
+    public double WriteMbps { get => _writeMbps; private set => Set(ref _writeMbps, value); }
+    private string _usedText = "—";
+    public string UsedText { get => _usedText; private set => Set(ref _usedText, value); }
+    private double _usedPct;
+    public double UsedPct { get => _usedPct; private set => Set(ref _usedPct, value); }
+
+    public ICommand MountCommand { get; }
+    public ICommand UnmountCommand { get; }
+    public ICommand FlushCommand { get; }
+    public ICommand PauseResumeCommand { get; }
+
+    public DriveItemViewModel(string driveRoot, string driveLetter, string label, ulong defaultQuota)
+    {
+        DeviceKey = SystemService.DeviceKeyFromVolumeGuid(driveRoot);
+        DriveLetter = driveLetter;
+        VolumeLabel = label;
+        _quotaBytes = defaultQuota;
+
+        MountCommand     = new AsyncRelayCommand(() => MountAsync((uint)Math.Min(_quotaBytes, uint.MaxValue)));
+        UnmountCommand   = new AsyncRelayCommand(() => Task.Run(() => DoUnmount()));
+        FlushCommand     = new AsyncRelayCommand(() => Task.Run(() =>
+        {
+            DriverService.Instance.Flush(DeviceKey);
+            LogService.Info($"{DriveLetter} 已下发 Flush");
+        }));
+        PauseResumeCommand = new AsyncRelayCommand(() => Task.Run(() =>
+        {
+            if (Paused) { DriverService.Instance.Resume(DeviceKey); Paused = false; }
+            else        { DriverService.Instance.Pause(DeviceKey);  Paused = true;  }
+        }));
+
+        StatsService.Instance.Sampled += OnSample;
+    }
+
+    public async Task MountAsync(uint quotaBytes, uint mode = Rb.ModeWriteBack)
+    {
+        try
+        {
+            ulong applied = await DriverService.Instance.MountAsync(DeviceKey, quotaBytes, mode).ConfigureAwait(false);
+            void Ui()
+            {
+                Mounted = true; Paused = false; _mode = mode;
+                _quotaBytes = applied;
+                RaisePropertyChanged(nameof(QuotaBytes)); RaisePropertyChanged(nameof(QuotaMB));
+                RaisePropertyChanged(nameof(StatusText));
+            }
+            Post(Ui);
+            LogService.Info($"{DriveLetter} 挂载成功，配额 {applied / 1048576} MB");
+        }
+        catch (DriverException ex)
+        {
+            Post(() => Mounted = false);
+            LogService.Error($"{DriveLetter} 挂载失败：{ex.Message}");
+        }
+    }
+
+    private void DoUnmount()
+    {
+        try
+        {
+            DriverService.Instance.Unmount(DeviceKey);
+            Post(() => { Mounted = false; Paused = false; RaisePropertyChanged(nameof(StatusText)); });
+            LogService.Info($"{DriveLetter} 已卸载");
+        }
+        catch (DriverException ex) { LogService.Error($"{DriveLetter} 卸载失败：{ex.Message}"); }
+    }
+
+    private async Task ApplyQuotaAsync(ulong fallback)
+    {
+        ulong want = _quotaBytes;
+        try
+        {
+            ulong applied = await Task.Run(() => DriverService.Instance.SetQuota(DeviceKey, want)).ConfigureAwait(false);
+            Post(() => { _quotaBytes = applied; RaisePropertyChanged(nameof(QuotaBytes)); });
+        }
+        catch (DriverException ex)
+        {
+            LogService.Error($"{DriveLetter} 配额下发失败：{ex.Message}，回滚 UI");
+            Post(() => { _quotaBytes = fallback; RaisePropertyChanged(nameof(QuotaBytes)); });
+        }
+    }
+
+    private void OnSample(StatsSnapshot s)
+    {
+        if (s.DeviceKey != DeviceKey) return;
+        Post(() =>
+        {
+            HitPct = s.HitPct; ReadMbps = s.ReadMbps; WriteMbps = s.WriteMbps;
+            UsedPct = s.CacheBytesTotal == 0 ? 0 : s.CacheBytesUsed * 100.0 / s.CacheBytesTotal;
+            UsedText = $"{s.CacheBytesUsed / 1048576} / {s.CacheBytesTotal / 1048576} MB";
+            if (!s.Mounted && Mounted) { Mounted = false; LogService.Warn($"{DriveLetter} 驱动上报未挂载，UI 已同步"); }
+            else if (s.Mounted && !Mounted) Mounted = true;
+            if (s.Paused != Paused) Paused = s.Paused;
+        });
+    }
+
+    private void Post(Action a) { if (_ui != null) _ui.Post(_ => a(), null); else a(); }
+    public void Unsubscribe() => StatsService.Instance.Sampled -= OnSample;
+}
+
+
+===== 文件: ui\controller\RAMBlockCache.Controller\ViewModels\MainViewModel.cs =====
+using System;
+using System.Collections.ObjectModel;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Input;
+using RAMBlockCache.Controller.Helpers;
+using RAMBlockCache.Controller.Models;
+using RAMBlockCache.Controller.Services;
+
+namespace RAMBlockCache.Controller.ViewModels;
+
+public sealed class MainViewModel : ObservableObject
+{
+    private readonly SynchronizationContext? _ui = SynchronizationContext.Current;
+    private readonly AppSettings _settings = SettingsService.Load();
+
+    public ObservableCollection<DriveItemViewModel> Drives { get; } = new();
+    public ObservableCollection<string> LogLines { get; } = new();
+
+    private string _banner = "";
+    public string Banner { get => _banner; private set { Set(ref _banner, value); RaisePropertyChanged(nameof(BannerVisible)); } }
+    public bool BannerVisible => !string.IsNullOrEmpty(Banner);
+
+    private uint _driverBuild;
+    public string TitleExtra => _driverBuild == 0 ? "（驱动未连接）" : $"（驱动 {DriverService.Instance.DriverVersion} · Protocol 9）";
+
+    public ICommand MountAllCommand { get; }
+    public ICommand UnmountAllCommand { get; }
+
+    public MainViewModel()
+    {
+        if (!SystemService.IsElevated)
+        {
+            Banner = "未以管理员身份运行：IOCTL 将被拒绝，请右键“以管理员身份运行”。";
+            LogService.Error(Banner);
+        }
+
+        MountAllCommand   = new AsyncRelayCommand(() => Task.WhenAll(Drives.Select(d => d.MountAsync((uint)Math.Min(d.QuotaBytes, uint.MaxValue)))));
+        UnmountAllCommand = new AsyncRelayCommand(() => Task.Run(() =>
+            Drives.Where(d => d.Mounted).ToList().ForEach(d => d.UnmountCommand.Execute(null))));
+
+        LogService.Appended += line => Post(() => { LogLines.Insert(0, line); while (LogLines.Count > 200) LogLines.RemoveAt(LogLines.Count - 1); });
+
+        StatsService.Instance.DriverReportedUnmounted += key =>
+        {
+            var vm = Drives.FirstOrDefault(d => d.DeviceKey == key);
+            Post(() => { }); // 挂载状态由每秒统计回写同步
+            LogService.Warn($"设备键 0x{key:X} 已从驱动侧消失");
+        };
+
+        _ = InitializeAsync();
+    }
+
+    private async Task InitializeAsync()
+    {
+        try
+        {
+            var (proto, build) = await Task.Run(() => DriverService.Instance.Negotiate()).ConfigureAwait(true);
+            _driverBuild = build;
+            RaisePropertyChanged(nameof(TitleExtra));
+            Banner = "";
+            LogService.Info($"驱动握手成功：Protocol {proto}，Build {build}");
+            RefreshDrives();
+            StatsService.Instance.Start(Drives.Select(d => d.DeviceKey));
+        }
+        catch (DriverException ex)
+        {
+            Banner = ex.Message;
+            LogService.Error($"驱动握手失败：{ex.Message}");
+        }
+    }
+
+    public void RefreshDrives()
+    {
+        foreach (var root in SystemService.EnumerateFixedVolumes())
+        {
+            char letter = root.Length > 0 ? char.ToUpperInvariant(root[0]) : '?';
+            string drv = letter + ":";
+            if (Drives.Any(d => d.DriveLetter == drv)) continue;
+            string label = SystemService.LabelFromRoot(root);
+            ulong quota = 512UL * 1048576;
+            uint mode = Rb.ModeWriteBack;
+            var vm = new DriveItemViewModel(root, drv, label, quota);
+            Drives.Add(vm);
+            if (_settings.AutoStartWithVolumes && letter != 'C')
+                _ = vm.MountAsync((uint)Math.Min(quota, uint.MaxValue), mode);
+        }
+    }
+
+    private void Post(Action a) { if (_ui != null) _ui.Post(_ => a(), null); else a(); }
+}
+
+附：核对覆盖与偏差小结
+================================================================================
+逐字核对覆盖：
+  Build 16 新增 5 个 common 头：rb_percpu.h（3849B）、rb_shard.h（2880B）、
+    rb_alloc.h（498B）、rb_threadsched.h（4341B）、rb_shardlock.h（1635B）。
+  version.h：RB_VERSION_BUILD=16。
+  RbWbStop BSOD 级重写：rbwback.c:77-97（PAGED_CODE :86、InterlockedExchange
+    :88、6000 步循环 :96）；RbWbInit s_Stop=0/s_Run=0（:71）。
+  worker 绑核：rb_common.h:111-112（AuxGa/AuxValid）。
+  core per-cpu flush 统计：core/cache.c:68-78（RB_FLUSH_COUNTERS + RB_CACHELINE
+    对齐 + _pad）；用户态回退 :88（g_flush_stat 单 slot）。
+  evict_victim 锁序：core/cache.c:1392（锁内摘链锁外回调）；:1407,:1530 锁外循环。
+  编译/签名：build_drv.log 0 error/0 warning；sys 94,432B；
+    SHA256=19231AEDB092C914B5513ED6F3167FB24D8579951E18B11EB7EFA8CFCE4CADAB。
+  真机冒烟：DeploySeq=6==DeployAck=6 / LastBootHealthy=1 / BootFailCount=0 /
+    FilterArmed=0 / Flags=0 / UpperFilters=volsnap+RAMBlockCache / F attached=1 /
+    RUNNING/BOOT_START/System Bus Extender / 无蓝屏。
+偏差清单条数：2（D-4 V10.4.1 UI 退化；D-5 FIX-2 跳过 + FIX-3 落点偏差）。
+  偏差 D-4：V10.4.0 为 5 页 Fluent 深色界面（总览/磁盘/缓存引擎/设置/日志侧栏导航），
+  V10.4.1 整目录重写后退化为单页卡片列表（每盘一张卡：盘符徽章+状态+配额滑块+
+  挂载/卸载/Flush/暂停恢复按钮堆叠）。功能正常（握手/挂载/卸载/配额/日志均工作），
+  但视觉复杂度与导航结构下降。已按用户要求落地，保留。
+  偏差 D-5：V10.4.2 审计母本假设 rb_ioctl.h 存在并要求 C_ASSERT 校验结构体尺寸，
+  实际工程里无 rb_ioctl.h（IOCTL 定义在 driver/rb_common2.h/rbctl.c），FIX-2 跳过；
+  FIX-3 attach 串行锁文档说落在 core/，实际落地在 driver/rbattach.c（s_AttachMutex
+  FastMutex）。两处偏差均编译通过 + 真机验证，功能等价。
+真机观察（V10.4.1 截图）：
+  · 顶栏："全部挂载/全部卸载"按钮 + 右侧"（驱动 Build 16 · Protocol 9）"。
+  · C: 卡：未挂载，2/39716 MB，配额滑块，按钮堆叠。
+  · D: 卡：未挂载，"普通软件"标注。
+  · 日志区：驱动握手成功 Protocol 9 Build 16；F: 挂载成功 配额512MB；
+    E: 挂载成功 配额512MB；D: 挂载失败 IOCTL 0x222000 消息 8 失败（拒绝访问）——
+    注意：控制器本身是管理员（manifest requireAdministrator），这个"拒绝访问"
+    是驱动侧并发 attach 时的瞬时拒绝（ERROR_BUSY/0x5 竞争），不是权限问题；
+    E/F 成功说明退避逻辑部分生效，D 卷瞬时竞争未退避成功，下一轮统计反映。
+  · 驱动版本 1.1 Build16 Protocol9。
+真机验证项：冒烟 3 项已验证（R-01 服务六值+Flags=0+F attached+无蓝屏；R-02 编译/
+  签名指纹一致；R-03 check_repo PASS）；待接手人 17 项（R-04~R-20）。
+证据指纹（Build 16 当前，全文唯一有效）：RAMBlockCache.sys 94,432B，
+  SHA256=19231AEDB092C914B5513ED6F3167FB24D8579951E18B11EB7EFA8CFCE4CADAB
+  （实测 Get-FileHash 与声明逐字一致；build_drv.log 0 error/0 warning）。
+  （被取代的历史指纹仅作留痕：V10.3.5 wiring guard = 93,920B/79DCD2FB…393A；
+   V10.3.5 cleanup = 93,920B/C1E9C0BA…2DAF1；V10.3.4 Build=15 = 93,920B/
+   6A677A9F…3E7E。）
+================================================================================
+（终版报告完）

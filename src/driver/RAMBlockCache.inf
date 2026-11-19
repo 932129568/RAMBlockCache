@@ -1,0 +1,26 @@
+; RAMBlockCache 驱动信息文件（INF）——【纯参考文档，不可用于安装】
+;
+; [88 H-1 2026-11-07] 本文件原先带默认安装节、服务安装节、目录文件声明与
+; 引导启动节，右键「安装」会绕过 Setup.exe 的 WinVerifyTrust 验签、根证书
+; 自动导入、testsigning 开启与 boot_guard 看门，在新机器上直接造成 0x7B。
+; 现已移除全部可安装段，仅保留 [Version] 供版本单一事实源门禁
+; （check_proto_sync.py）与人工核对使用。
+;
+; 分发安装【只能】走 dist\RAMBlockCache-Setup.exe（GUI 安装器）：
+;   验签 fail-closed -> 根证书 -> Secure Boot / testsigning 预检 ->
+;   注册 DEMAND_START 服务 -> UpperFilters -> boot_guard 双计划任务。
+; 开发者/脚本链请走 src\scripts\deploy.ps1；不要 reg add / 右键安装本 INF。
+;
+; 保留的 DriverVer 与 src\common\version.h 的机器版本串一致，
+; 由 check_proto_sync.py --strict 校验，请勿改动。
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Volume
+ClassGuid   = {71a27cdd-812a-11d0-bec7-08002be2092f}
+Provider    = %ProviderName%
+DriverVer   = 10/19/2026,10.4.1.19
+
+[Strings]
+ProviderName       = "RAMBlockCache"
+ServiceDescription = "RAMBlockCache RAM Disk Cache"

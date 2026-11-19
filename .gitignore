@@ -1,0 +1,108 @@
+# Build artifacts
+*.obj
+*.err
+*.out
+*.log
+*.pdb
+[Bb]in/
+[Oo]bj/
+x64/
+.vs/
+*_wpftmp*
+
+# Local tooling / memory
+.workbuddy/
+
+# Local package / tooling caches (machine-local, 500MB+)
+.nuget/
+.mimosa/
+.workbuddy-ai/
+
+# Distribution intermediates & backups (keep dist/RAMBlockCache.sys like remote)
+dist/backup-*
+dist/wpf/
+dist/RAMBlockCache-Setup.exe
+
+# Local QA scratch (build intermediates). NOT the build configuration.
+# build/ holds exactly four files and all four are build INPUT: deleting the
+# directory never produces them again, and Gate16 (src/scripts/check_build_manifest.py)
+# exits 1 when sources.manifest.json is unreadable - so a clean CI checkout used
+# to fail Gate16 by construction. Tracked explicitly below; use `build/*` rather
+# than `build/` because git cannot re-include a file whose parent dir is excluded.
+build/*
+!build/sources.manifest.json
+!build/build.ps1
+!build/paths.ps1
+!build/RAMBlockCache.sln
+
+# Chinese-named docs whose paths git-on-Windows rejects (invalid path)
+src/docs/
+
+# Web frontend build artifacts (P3.13 2026-11-06)
+# NOTE: the web app moved to src/ui/web - the old bare "web/" patterns no longer
+# matched anything, which is why node_modules/ and dist/ showed up as untracked
+# in `git status` (2026-11-12). Both locations are covered now.
+web/node_modules/
+web/dist/
+web/coverage/
+web/.vite/
+src/ui/web/node_modules/
+src/ui/web/dist/
+src/ui/web/coverage/
+src/ui/web/.vite/
+src/ui/web/bridge/native/build/
+src/ui/web/bridge/native/target/
+
+# Python bytecode / per-target build dirs
+**/__pycache__/
+src/core/build/
+tests/core/build/
+
+# e2e oracle binary (built locally into C:\Users\Public\o9, not a source file)
+tests/support/*.exe
+
+# OS junk
+Thumbs.db
+Desktop.ini
+
+# Installer 工程源码入库（2026-11-06 重估：已是分发核心，撤销历史「整目录排除」）。
+# 只排除构建产物；46 个 .cs/.xaml/.csproj/.sln 留在版本控制内。
+src/ui/installer/**/bin/
+src/ui/installer/**/obj/
+src/ui/installer/**/*.user
+# 运行时载荷由 build_setup.ps1 从 src/scripts 生成（zip 合计 130MB+，不入库）
+src/ui/installer/**/Assets/payload/
+
+# Rust/napi native 编译产物
+web/bridge/native/target/
+
+# 已完成的历史交付文档 / 恢复快照 / 本地备份（用户确认：远端不需要保留）
+deliverables/archive/
+deliverables/recovery-candidate-*/
+deliverables/ui-recovery-*/
+deliverables/*.zip
+deliverables/*.tar.gz
+# 本地 pin 状态（记录上次登记的源码指纹与产物哈希，逐机不同，不入库）
+deliverables/.deploy-pin-state.json
+# 源码快照备份（894K，一次性，入库无意义且会与 src/ 重复）
+deliverables/backup-driver-src-*/
+docs/legacy-wpf-ui/
+outputs/render-*/
+# 归档的构建/渲染产物与 QA 留档（3.5MB，二进制为主；需要时从本机取，不入库）
+archive/outputs/
+archive/qa-artifacts/
+
+# IDE 本地配置
+.zcode/
+
+# 一次性 QA / 历史构建产物（远端已有 tracked exe 基线不受影响）
+src/ctl/*_w*.exe
+src/ctl/*_qa*.exe
+src/ctl/test_*.exe
+
+# 误创建的 0 字节中文名临时文件（git-on-Windows 路径转义不可靠）
+调试库
+
+# P1 前基线快照的构建产物（一次性 asan/test exe，同目录的 .c/.patch 源码基线仍入库）
+deliverables/c-plan-baseline/**/*.exe
+deliverables/c-plan-baseline/**/*.pdb

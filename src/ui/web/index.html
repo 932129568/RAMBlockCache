@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <!-- [A9 2026-11-11] color-scheme：告知 UA 本页只有亮色形态。
+         不加会被系统深色偏好拉出原生控件（select/scrollbar）的深色皮肤，
+         与亮色令牌混搭。同时让表单控件继承亮色渲染。 -->
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#f3f5f9" />
+    <title>RAMBlockCache 控制台</title>
+    <!-- 首帧防闪：样式与 JS 之间约 1 帧的空白期会用 UA 默认白底+黑字，
+         与 --rbc-bg-app (#f3f5f9) 和渐变背景不一致，表现为"闪一下"。 
+         这里用与令牌同源的底色铺底，JS 挂载后由 .rbc-app-bg 接管。 -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #f3f5f9;
+      }
+      /* 减弱动效偏好下也保证首帧无动画（此段为内联，先于 tokens.css 生效） */
+      @media (prefers-reduced-motion: reduce) {
+        * {
+          animation-duration: 1ms !important;
+          transition-duration: 1ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

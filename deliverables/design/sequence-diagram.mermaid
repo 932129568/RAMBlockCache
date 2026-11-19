@@ -1,0 +1,30 @@
+sequenceDiagram
+    participant U as 操作者
+    participant D as deploy.ps1
+    participant B as $backup 快照
+    participant V as verify_deploy_signature.ps1
+    participant P as pfro_pending.ps1
+    participant OS as 系统状态
+    U->>D: deploy.cmd（提权）启动
+    D->>D: Pre-flight gate：源解析→SHA256→Authenticode→signtool /pa
+    D->>B: 采集备份：UpperFilters/服务/PFRO/Parameters/Features + svcRoot/featKey/sys32/pdDir/守卫存在性/任务XML
+    D->>OS: 变异1：清理陈旧 PFRO（RAMBlockCache.sys 条目）
+    D->>B: sys32 旧文件内容备份（覆盖前一刻）
+    D->>OS: 变异2：Copy-Item sys→System32（锁定则 MoveFileEx 排队）
+    D->>OS: 变异2b/2c：服务 BOOT_START + UpperFilters 追加
+    D->>OS: 变异3/3b：armed 基线四属性 + Features\Flags=0
+    D->>B: 守卫脚本内容备份（覆盖前一刻）
+    D->>OS: 变异4/5：安装守卫脚本 + 注册 BootGuard/LogonDisarm 任务
+    D->>V: 变异6：子进程验证（-AllowPendingReplace）
+    V->>P: Test-PfroPendingReplace(源,目标) 成对匹配
+    P-->>V: false（陈旧队列/空队列）
+    V-->>D: exit 2（旧实现：文件名 -like 即放行→假 PASS）
+    D->>D: catch → Invoke-Rollback（五类状态二分）
+    D->>OS: ① UpperFilters：存在→恢复 / 不存在→删属性
+    D->>OS: ② 服务：存在→sc config 恢复（查退出码）/ 不存在→Stop+sc delete（10s 轮询）
+    D->>OS: ③ Parameters：svcRoot 不存在→整键删 / 存在→恢复备份值+删部署新建属性
+    D->>OS: ④ Features\Flags：键不存在→整键删 / Flags 不存在→删属性 / 存在→恢复
+    D->>OS: ⑤ 计划任务：存在→Register -Xml 还原 / 不存在→Unregister
+    D->>OS: ⑥ 文件：sys32 还原或删除 + 守卫还原或删除 + pdDir（新建则删）
+    D->>OS: ⑦ PFRO：恢复或删除 + 回滚后一致性断言
+    D-->>U: exit 1（完整回滚 [ok] / INCOMPLETE→offline_rollback.cmd 提示）

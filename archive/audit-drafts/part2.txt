@@ -1,0 +1,233 @@
+================================================================================
+第 2 章  系统架构设计
+================================================================================
+
+2.1 分层架构总览
+--------------------------------------------------------------------------------
+Windows 存储 I/O 栈（自上而下，简化）：
+
+  应用程序 / 游戏 / 系统服务
+        │  ReadFile / WriteFile（cached / non-cached / paging）
+        ▼
+  文件系统驱动 NTFS ── 缓存管理器 Cc ── 内存管理器（paging）
+        │  构造块级 IRP_MJ_READ / IRP_MJ_WRITE / IRP_MJ_FLUSH_BUFFERS
+        ▼
+  ┌─────────────────────────────────────────────┐
+  │  RAMBlockCache（本驱动，卷块设备上层过滤）   │  ← 在这里拦截块 I/O
+  │   AddDevice + IoAttachDeviceToDeviceStack   │
+  └─────────────────────────────────────────────┘
+        │  未命中 / 直写 / 回写
+        ▼
+  卷设备（volmgr / 分区管理）→ 磁盘类驱动 → 端口/Miniport → 物理磁盘
+
+关键点：
+  - 本驱动是【普通 WDM PnP 过滤驱动】，不依赖 FltMgr、不需要 Altitude；
+  - 通过 AddDevice 对【卷设备类（Volume class）】实例化过滤设备对象，并用
+    IoAttachDeviceToDeviceStack 挂到卷设备栈最上方；
+  - 工作在 NTFS / Cc 之下，因此对上层透明，且能拦截所有类型的块 I/O；
+  - 每个被过滤卷对应一个设备扩展 RB_DEV_EXT 和一个缓存流 rb_stream。
+
+2.2 驱动组件划分
+--------------------------------------------------------------------------------
+driver/rbdriver.c  驱动骨架
+    - DriverEntry：初始化全局 g_Rb、控制设备、日志环、I/O worker 池、回写线程；
+      注册 AddDevice 与各 MajorFunction 的分发函数；读取注册表配置/AutoAttach；
+    - RbAddDevice：创建过滤设备、初始化扩展、挂载设备栈、识别卷盘符与是否系统卷、
+      读取扇区大小；根据 AutoAttach 决定是否立即入缓存（系统卷除外）；
+    - PnP（IRP_MJ_PNP）：处理 START / QUERY_REMOVE / REMOVE / QUERY_STOP 等；
+      REMOVE 时先标记 Removed、等待在途 I/O 排空（引用计数 + RemoveEvent）再 detach；
+    - Power（IRP_MJ_POWER）：处理休眠/唤醒/关机，落盘脏数据；
+    - Unload：停止 worker/回写线程、刷全部脏数据、删除控制设备与符号链接。
+
+driver/rbio.c      数据路径
+    - RbDispatchReadWrite：拦截读/写 IRP，按卷热开关与读写使能决定缓存或透传；
+      缓存路径调用核心 rb_read / rb_write，把 miss/direct 区间组织成同步下盘；
+    - RbDispatchFlush：拦截 FLUSH_BUFFERS，先强制回写本卷脏数据再下发；
+    - RbSyncIo：对下层设备发起【同步】块 I/O（内部建 IRP + 完成事件）；
+    - RbWritebackCb / RbReadbackCb：核心要求的落盘/补读回调；
+    - per-CPU I/O worker 池与 zone 并行回写器的启停与处理函数；
+    - RbFlushAllDirty：关机/卸载/安全切换时全量落盘。
+
+driver/rbctl.c      控制面
+    - 控制设备的 IRP_MJ_CREATE / CLOSE / DEVICE_CONTROL 分发；
+    - 单一 METHOD_BUFFERED IOCTL 承载 RB_MSG，解析消息号并执行：
+      取统计 / 取配置 / 改配置 / 强制刷盘 / 退出安全模式 / 卷写模式 /
+      卷枚举 / 卷热挂载 / 取日志 / 取版本；
+    - RbApplyEngineConfig：把控制配置应用到运行中的引擎；
+    - RbClampConfig：对所有配置字段做合法性钳制（统一入口，防止越界值）。
+
+driver/rb_common.h 驱动内部公共定义（设备扩展、上下文、worker、全局 g_Rb、原型）。
+
+core/cache.c/.h    平台无关缓存核心（用户态与内核态共用同一份源码）
+    - 内核编译时定义 RB_KERNEL_BUILD，原子/内存分配映射到内核原语；
+    - 用户态编译时映射到 MSVC Interlocked* / malloc（测试用）。
+
+ctl/ramboostctl.c  控制程序（可选的 HTTP/网页后端 + 命令行），通过控制设备 IOCTL
+                  与驱动通信，提供 HTML 控制页面与本地 HTTP 服务。
+
+ui/wpf             WPF（.NET 8）原生控制台，MVVM 架构，直接通过
+                  CreateFile("\\\\.\\RAMBlockCache") + DeviceIoControl 通信。
+
+setup/ramboostsetup.c  双击安装器（可选）：封装签名、服务注册、挂卷、启动。
+
+2.3 控制通道契约（冻结）
+--------------------------------------------------------------------------------
+控制设备：
+    内核名  \Device\RAMBlockCache
+    符号链接 \??\RAMBlockCache
+    用户态路径 \\.\RAMBlockCache
+通信方式：
+    单一 IOCTL：IOCTL_RB_REQUEST = 0x222000
+        CTL_CODE(DeviceType=0x22, Function=0x800,
+                 Method=METHOD_BUFFERED, RequiredAccess=FILE_ANY_ACCESS)
+    使用统一请求/响应结构 RB_MSG（Pack=8），布局：
+        偏移 0   Type     (UINT32)  消息号
+        偏移 4   Size     (UINT32)  Data 有效字节数
+        偏移 8   Status   (INT32)   返回状态（响应时由内核填写）
+        偏移 12  Reserved (UINT32)
+        偏移 16  Data[]   (BYTE[])  负载（RB_CONFIG / RB_STATS / RB_VOLUME 等）
+消息号：
+    GET_STATS=1  SET_CONFIG=2  FLUSH=3  GET_CONFIG=4  EXIT_SAFE_MODE=5
+    SET_VOLUME=6  GET_VOLUMES=7  ATTACH_VOLUME=8  GET_LOG=9  GET_VERSION=10
+安全要点（第 4 章 C1）：
+    - IOCTL 处理对【输入/输出缓冲长度】做严格校验，长度不足直接失败，杜绝越界；
+    - 写类操作（SET_CONFIG/ATTACH_VOLUME 等）要求适当访问权限并做字段钳制。
+
+2.4 缓存核心数据结构
+--------------------------------------------------------------------------------
+几何（与 4KB 强相关）：
+    block（子块） = 4KB（block_size，默认且推荐；合法集见 3.3）
+    chunk（大块） = 64KB = 16 个 4KB 子块（RB_CHUNK_SIZE / RB_SUBS_PER_CHUNK）
+    缓存以 chunk 为分配/哈希/LRU 单位，以 4KB 子块为命中/脏标记最小单位。
+rb_chunk（每个 64KB 块一个）：
+    - data：64KB 数据缓冲（内核为非分页池，4KB 对齐）；
+    - start：该块起始字节偏移（chunk 对齐）；
+    - loaded（16-bit 位图）：哪些 4KB 子块已加载（有效）；
+    - dirty （16-bit 位图）：哪些 4KB 子块已被写脏（待回写）；
+    - epoch：块代数（每次重建递增），用于并发校验，识别"洞期间被重建"的竞争；
+    - LRU 链节点 + 脏链节点；
+    - 访问时间戳（用于空闲回收与冷热判定）。
+rb_stream（每个卷一个）：
+    - 哈希表（chunk 按 start 哈希）+ 64 分片条纹锁；
+    - LRU 链（回收用）、脏链（回写用），各自独立锁；
+    - 每流统计（cur_bytes / dirty_bytes / chunk_count，均原子）；
+    - io_users：在途 I/O 引用计数（REMOVE/flush 快照安全）。
+rb_engine（全局一个）：
+    - 流表（streams 链表 + streams_lock）；
+    - 全局配置（在线可变字段全部原子读写）；
+    - 全局统计、64 分片吞吐计数（可视化用）；
+    - 动态容量预算 dynamic_limit（由驱动按可用内存实时下发）。
+
+2.5 读写数据流
+--------------------------------------------------------------------------------
+写（write-back 模式，卷已 attach、写使能）：
+  1) 驱动拦截写 IRP，按 [offset,end) 锁定相关分片；
+  2) 对【整块覆盖】的 4KB 子块：直接写入缓存 chunk、置脏，写请求被"吸收"；
+  3) 对【部分覆盖】且子块未加载：在 pass1 仅记 RMW 待办（不持锁碰盘），
+     pass2 在锁外调用 readback 回调补读整 4KB（成功返回 0），再短锁合并：
+       - 补读到的旧数据 + 本次写入字节 → 整子块缓存、置脏；
+       - 补读失败（盘错）→ 该段降级直写，绝不把未初始化数据入缓存；
+  4) 应用写 IRP 在数据入内存后即可完成（写延迟极低）；
+  5) 后台周期性 / 脏水位触发 / 空闲 / 关机时，由回写线程把脏子块落盘，
+     落盘成功后清脏（write-release 时进一步释放块）。
+  写透传（write-through / 系统卷 / 缓存关闭 / 硬满且无法新建）：
+     直接下发下层，保证正确性，绝不丢数据。
+
+读（卷已 attach、读使能）：
+  1) 驱动拦截读 IRP，锁定分片，在缓存中查找；
+  2) 命中（子块 loaded）：直接从内存拷贝完成，不访问磁盘；
+  3) 未命中：把【整块对齐】的 miss 区间返回，驱动对下层同步读盘，
+     再通过 rb_read_commit 把整块回填缓存（full-cover 才并入），并完成原请求；
+     —— miss 区间整块对齐是关键，保证非对齐读也能在第二次命中（修复读加速失效）；
+  4) 若读路径同时覆盖脏子块，脏内容（内存权威）优先于盘读。
+
+一致性铁律：
+  - 缓存子块一旦 loaded，任何使盘上对应数据变化的路径（直写/截断/失效）都必须
+    同步合并或失效该子块，杜绝"盘新缓存旧"的陈旧读（第 4 章 V1 即此类）；
+  - 原写 IRP 若【失败】，已被吸收的子块必须通过 rb_stream_invalidate_range 回滚
+    到磁盘状态，避免持久化"应用以为没写成功"的数据。
+
+2.6 锁体系与锁序（防死锁/防竞争核心）
+--------------------------------------------------------------------------------
+锁清单：
+    streams_lock   保护流表（引擎级）
+    stripe[64]     每分片一把（内核 FAST_MUTEX；用户态映射 CRITICAL_SECTION）
+    chain          保护 LRU 链与脏链（每流一把）
+    配置字段       在线可变字段全部原子（无锁读写）
+    引用计数       Refs / io_users 原子
+严格锁序（只允许按此顺序获取，禁止反向）：
+    streams_lock → stripe（多片时按分片号【升序】，两阶段加锁 2PL）→ chain
+设计要点：
+  - 所有磁盘 I/O（readback/writeback）都在 stripe 锁【外】发起，避免单个慢盘
+    I/O（最坏可达秒级）把 1/64 分片长期独占、串行化全部 I/O；
+  - 多核同文件不同分片：互不阻塞、真正并行；
+  - FAST_MUTEX 不可重入，代码中严格保证不重复获取；
+  - flush 与 zoned-flush 每流互斥（sflush/zflush 状态 + 排空等待），分片互不重叠，
+    保证任一子块没有两个写者。
+
+2.7 动态内存管理（按需占用、不固定预占、不拖垮系统）★用户重点
+--------------------------------------------------------------------------------
+目标行为：
+  - CacheSizeMB = 0（自动/动态）时，缓存不预分配、不固定占用，随实际命中数据
+    按需增长；
+  - 驱动周期性探测系统可用内存，计算"安全预算"并下发给核心 dynamic_limit：
+        安全预算 = (可用内存 − MemReserveMB) × AutoUsePct%
+    其中 MemReserveMB（默认 4096MB）是始终留给系统/其他程序的保底，
+    AutoUsePct（默认 80%）是只使用"可借用空闲"的比例（双保险，不把空闲吃满）；
+  - 统一容量水位函数 rb_effective_caps（消除各处水位散落、互相打架）：
+        动态模式（dynamic_limit>0）：
+            hard = dynamic_limit        （硬顶=安全预算，可随空闲涨落）
+            hi   = dynamic_limit × 90%  （超过即触发后台回收）
+            lo   = dynamic_limit × 75%  （回收目标）
+        固定模式（dynamic_limit=0，用户显式指定 CacheSizeMB）：
+            使用基于 max_bytes 的 hard/evict_high/evict_low（95%/80%/60%）；
+  - 当其他程序申请内存、可用内存下降时，下一周期安全预算随之缩小，核心按压力
+    等级（NONE/MOD/HIGH/CRIT）主动丢弃干净冷块、回写并释放脏块，缓存"能加速
+    的部分"自动变小，始终保留保底内存，保证系统与软件正常、不崩溃；
+  - 打开多个本软件/控制程序实例：用户态程序自身占用很小且不重复分配缓存
+    （缓存只存在于内核驱动一份），并以可用内存为预算，不会因多开而耗尽。
+写满保护：
+  - 任何新建 chunk 前用 can_create() 判断（total + chunk_size ≤ hard）；
+  - 达到 hi 触发回收，达到 hard 只拒绝【新分配】，但【已加载子块的写合并永远
+    允许】（否则会出现"硬满早退直写、已加载子块不合并→陈旧读"，第 4 章 V1）；
+  - 实在无法缓存的范围一律安全直写，数据正确性不受影响。
+
+2.8 多核优化（针对 i7-12700H 等现代多核）★用户重点
+--------------------------------------------------------------------------------
+问题背景：系统内置 DelayedWorkQueue 工作线程数量有限，把拦截的 I/O 全丢进去会
+出现"少数核心拉满、多数核心闲置"，是性能瓶颈之一。
+V8.1 方案：
+  (1) per-CPU I/O worker 池：按【逻辑 CPU 数】（含超线程，上限 32）创建常驻
+      worker，各自有 FIFO 队列（自旋锁 + 唤醒事件），拦截的 I/O 以轮询/就近方式
+      分发，多核心并行处理缓存命中与异步落盘；池未启动时自动回退系统工作队列；
+  (2) zone 并行回写：核心本就具备 rb_stream_flush_zoned（按不重叠分区并行），
+      V8.1 用 RB_FLUSH_WORKERS（4）个回写线程并行处理不同 zone，每线程独立
+      workspace（stage 缓冲不共享）；串行 flush 与 zoned flush 互斥；
+  (3) 分片条纹锁（64）保证同文件不同区域无锁竞争并行；
+  (4) 线程数在驱动加载时按 KeQueryActiveProcessorCount 动态确定，换机自适应。
+
+2.9 关机 / 休眠 / 异常重启 / 安全模式
+--------------------------------------------------------------------------------
+正常关机/重启或驱动卸载：
+  - 电源/卸载路径调用 RbFlushAllDirty，把所有脏子块落盘（带超时预算，避免
+    无限等待），完成后再放行关机；
+休眠/唤醒：
+  - 休眠前落盘脏数据（休眠镜像本身也会保留内存，但落盘更稳妥）；唤醒后重新
+    校准时钟（处理时间戳大跳变，单调向前，不误伤）；
+异常重启识别（SafeMode 状态机）：
+  - 每次正常关机/卸载落盘完成后写注册表 LastCleanShutdown=1；
+  - 驱动加载时读取：若上次不是干净关闭（蓝屏/断电/强杀），置 SafeMode=1，
+    本轮【强制 write-through 直写】，不读取可能不一致的旧缓存（块缓存本为
+    易失内存，重启后为空，SafeMode 主要用于保守运行并提示用户）；
+  - 用户确认后可通过 EXIT_SAFE_MODE 退出，恢复回写；
+防蓝屏机制：
+  - 写满保护、补读失败直写、锁外盘 I/O、在途 I/O 引用计数、REMOVE 排空、
+    对齐缓冲、IRQL 守卫、超时兜底等共同构成（逐条见第 4 章）。
+
+2.10 配置持久化
+--------------------------------------------------------------------------------
+  - 驱动在注册表 \Services\RAMBlockCache\Parameters 持久化 RB_CONFIG 与
+    AutoAttach；SET_CONFIG 应用到引擎的同时落盘；
+  - 启动时先填默认值，再用注册表值覆盖（RbLoadConfig）；
+  - 所有字段经 RbClampConfig 合法性钳制，异常值安全回落默认。
+

@@ -1,0 +1,13 @@
+﻿VSTART 2026-11-08T22:55:38.9587075+08:00
+BASE pool=5.591GB cur=4GB trim=0 peak=4GB
+RD1 [done] 20480 MiB across 1 file(s), 327680 blocks, 187078 ms (109 MB/s) | pool=22.905GB cur=17.44GB trim=107456 peak=19.7GB
+RD1 [done] 16000 MiB across 1 file(s), 256000 blocks, 180719 ms (89 MB/s) | pool=22.955GB cur=17.32GB trim=365376 peak=19.7GB
+RD1 [done] 4900 MiB across 1 file(s), 78400 blocks, 45797 ms (107 MB/s) | pool=21.32GB cur=16.03GB trim=464960 peak=19.7GB
+RD1 [done] 6300 MiB across 1 file(s), 100800 blocks, 60484 ms (104 MB/s) | pool=21.393GB cur=16.18GB trim=563392 peak=19.7GB
+RD1 [done] 4900 MiB across 1 file(s), 78400 blocks, 43422 ms (113 MB/s) | pool=23.677GB cur=17.96GB trim=612608 peak=19.7GB
+RD2 [done] 20480 MiB across 1 file(s), 327680 blocks, 182656 ms (112 MB/s) | pool=22.38GB cur=16.97GB trim=956416 peak=19.7GB
+RD2 [done] 16000 MiB across 1 file(s), 256000 blocks, 138219 ms (116 MB/s) | pool=19.88GB cur=14.83GB trim=1247488 peak=19.7GB
+RD2 [done] 4900 MiB across 1 file(s), 78400 blocks, 42218 ms (116 MB/s) | pool=22.013GB cur=16.66GB trim=1296000 peak=19.7GB
+RD2 [done] 6300 MiB across 1 file(s), 100800 blocks, 55438 ms (114 MB/s) | pool=22.309GB cur=16.89GB trim=1393024 peak=19.7GB
+RD2 [done] 4900 MiB across 1 file(s), 78400 blocks, 42297 ms (116 MB/s) | pool=20.918GB cur=15.75GB trim=1490048 peak=19.7GB
+VDONE 2026-11-08T23:12:05.9040437+08:00

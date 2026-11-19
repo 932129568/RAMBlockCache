@@ -1,0 +1,214 @@
+================================================================================
+ RAMBlockCache V10.4.3  Build 19  ——  专业审计报告
+ 0xA (IRQL_NOT_LESS_OR_EQUAL) 三处 IRQL/UAF 修复 + 5 页 Fluent 深色 UI
+================================================================================
+审计日期 : 2026-10-14
+基线版本 : V10.4.2 Build 18
+本版版本: V10.4.3 Build 19 （version.h 已改 19）
+审计依据: 《ramblockcache_修复版_v10.4.3_build19_完整交付.txt》§3 / §4 / §5.1
+审计范围: driver/rbattach.c、common/version.h、ui/controller/RAMBlockCache.Controller/*
+================================================================================
+
+【执行摘要】
+--------------------------------------------------------------------------------
+本轮针对一次 0xA (IRQL_NOT_LESS_OR_EQUAL / ntoskrnl.exe) 随机蓝屏，定位到 PnP
+Start/Remove 完成例程跑在 DISPATCH_LEVEL，却直接调用了要求 PASSIVE_LEVEL 的拆除/
+探测函数。共修复 5 处（NEW-01~NEW-05），全部为 IRQL 契约与生命周期顺序问题：
+
+  NEW-01  RbEnsureSystemVolumeInfo 的 PAGED_CODE() 被提前 return 绕过（第二次开机起）
+  NEW-02  RbPnpRemoveComplete 在 DISPATCH_LEVEL 直接调 RbVolumeRemove（含 FastMutex）
+  NEW-03  RbVolumeRemove 先毁流再等 worker 排空 → 在途 worker 解引用已释放 Stream = UAF
+  NEW-04  DevCount-- 在节点未链入表时也执行 → 计数负漂移
+  NEW-05  文件头 IRQL 契约注释更新（防后续回归）
+
+结果：
+  · 驱动编译 0 警告 0 错误；RAMBlockCache.sys = 93,408 字节；签名 verify 通过。
+  · WPF 编译 0 警告 0 错误。
+  · core 用户态引擎：Release 16/16 + ASan 16/16 编译全过；Release 运行 16/16 exit=0。
+  · 系统侧当前处于安全回滚态（UpperFilters=volsnap、服务 demand-start），下次开机不会蓝屏。
+
+【本版尚未在真机加载新驱动】：本机无法在不重启的情况下验证内核运行时行为。
+真机项（0x7B 闸门、数据命中、hash 完整性、熔断恢复、拆除循环）见第 7 章"待真机验证"，
+全部如实标注"未验证"，不得视为已通过。
+
+================================================================================
+第 1 章  改动总览
+================================================================================
+文件改动清单（相对 Build 18）：
+
+  driver/rbattach.c        修改（补丁 A/B/C/D，共 4 处）
+  common/version.h         修改（RB_VERSION_BUILD 18 → 19）
+  ui/.../ViewModels/MainViewModel.cs      重写（加侧边导航/总览汇总/设置开关）
+  ui/.../ViewModels/DriveItemViewModel.cs 追加 CacheUsedBytes 属性
+  ui/.../MainWindow.xaml                  重写（侧边导航 5 页 Fluent 深色）
+
+未改动：core/cache.c、rbio.c、rbdriver.c、rbctl.c、协议头、IOCTL 契约。
+因此 core 引擎行为与 Build 18 完全一致（这也是 core 自测零回归的原因）。
+
+备份：RAMBoostFS-V8.bak-1014-2107-preV1043（robocopy 全量，排除 obj/bin/x64）。
+
+================================================================================
+第 2 章  驱动补丁逐字核对（P / D / R / E）
+================================================================================
+
+----------------------------------------------------------------------
+[BUG-NEW-01]  PAGED_CODE 被提前 return 绕过 → DISPATCH 下取 FastMutex
+----------------------------------------------------------------------
+P (现象)：系统启动第二次起（SystemVolumeProbed=TRUE 分支），若 RbEnsureSystemVolumeInfo
+         的调用方链落在 DISPATCH_LEVEL（PnP completion），则函数末尾 ExAcquireFastMutex
+         在错误 IRQL 触发 0xA。首次开机探测时不复发，故极难稳定复现。
+D (根因)：原代码顺序为
+             if (g_Rb.SystemVolumeProbed) return;   // 提前 return
+             PAGED_CODE();                          // 自检在 return 之后，缓存分支永不触发
+         PAGED_CODE() 是 DEBUG 自检宏（KeGetCurrentIrql>PASSIVE 即断言），位置在 return
+         之后等于对已探测分支完全失效。
+R (修复)：把 PAGED_CODE() 提到任何 return 之前：
+             PAGED_CODE();
+             if (g_Rb.SystemVolumeProbed) return;
+E (证据)：rbattach.c RbEnsureSystemVolumeInfo，已落地；驱动 Rebuild 0 警告。
+
+----------------------------------------------------------------------
+[BUG-NEW-02]  PnP Remove 完成例程在 DISPATCH_LEVEL 直接拆设备
+----------------------------------------------------------------------
+P (现象)：卷被拔出/禁用（PnP IRP_MN_REMOVE_DEVICE 完成）时随机 0xA / 0xC4。
+D (根因)：RbPnpRemoveComplete 是 IoSetCompletionRoutine 回调，运行在 DISPATCH_LEVEL。
+         它原本直接 RbVolumeRemove(ext)，而 RbVolumeRemove 内含：
+             ExAcquireFastMutex（需 APC_LEVEL 及以下）
+             KeDelayExecutionThread（PASSIVE）
+             同步路径等待
+         在 DISPATCH_LEVEL 上取 FastMutex = IRQL 违规。
+R (修复)：改为"DISPATCH 只排队，PASSIVE 才拆除"：
+           1) RbPnpRemoveComplete 内 IoAllocateWorkItem + IoQueueWorkItem(DelayedWorkQueue)
+           2) 排队前 InterlockedIncrement(&ext->Refs) 保活，工作项末尾 RbDerefExt 释放
+           3) RbRemoveWorkRoutine 在 PASSIVE 里调 RbVolumeRemove
+           4) 给 RbVolumeRemove 加 PAGED_CODE()（置于函数首句、任何 return 之前）
+           5) 分配失败兜底：仅当 KeGetCurrentIrql()<=APC_LEVEL 才就地拆除
+E (证据)：rbattach.c RbPnpRemoveComplete / RbRemoveWorkRoutine / RbVolumeRemove。
+         保活/释放范式与同文件 RbPnpStartComplete/RbGeoWorkRoutine 完全一致。
+         注：交付文档示例漏了 IoFreeWorkItem，本实现按 RbGeoWorkRoutine 范式补齐，
+             避免 work item 泄漏。
+
+----------------------------------------------------------------------
+[BUG-NEW-03]  拆除顺序颠倒：先毁流再等 worker → UAF
+----------------------------------------------------------------------
+P (现象)：拆除卷时随机 0xA / 0x50 / 链表损坏；在途 worker 仍在解引用 ext->Stream。
+D (根因)：原顺序为
+           (a) Removed=1; IsAttached=FALSE
+           (b) rb_stream_destroy(ext->Stream)   // 先毁流
+           (c) 再等 Refs 排空 60s
+         问题：(b) 之后、(c) 之前，仍持 ext 引用的在途 worker 会解引用已被释放的
+         ext->Stream = use-after-free。
+R (修复)：调整为
+           (a) Removed=1; IsAttached=FALSE（新 I/O 从此透传，不再引用 Stream）
+           (b) 先等在途 worker 排空（Refs 回落 ≤1，宽限 60s）
+           (b') 超时 → 僵尸队列，直接 return（不毁流，留僵尸收尾）
+           (c) 排空完成后才 rb_stream_destroy(ext->Stream)
+         即"先停新活、再等老活干完、最后销毁资源"。
+E (证据)：rbattach.c RbVolumeRemove 第 2/3/3b 步；超时僵尸分支不毁流。
+
+----------------------------------------------------------------------
+[BUG-NEW-04]  DevCount 负漂移
+----------------------------------------------------------------------
+P (现象)：未链入全局表的 ext（如 AddDevice 早期失败路径）也走到 RemoveEntryList 之后的
+         InterlockedDecrement(&g_Rb.DevCount)，计数被多减，长期负漂移。
+D (根因)：原 Decrement 在 if(已链入) 判断之外。
+R (修复)：把 InterlockedDecrement 移进 if(Flink!=NULL && Blink!=NULL) 块内，
+         仅当确实从表中摘除时才减。
+E (证据)：rbattach.c RbVolumeRemove "1) 从全局表摘除" 段。
+
+----------------------------------------------------------------------
+[BUG-NEW-05]  文件头 IRQL 契约注释
+----------------------------------------------------------------------
+R：rbattach.c 顶部"本文件所有例程均在 PASSIVE_LEVEL"改为明确契约：
+   PnP Start/Remove 完成例程跑 DISPATCH_LEVEL，仅取指针+加引用+排队 workitem，
+   一切阻塞/拆除落到 PASSIVE 工作项。防止后续维护者再次在 completion 里直接拆设备。
+
+================================================================================
+第 3 章  版本号
+================================================================================
+common/version.h：
+    RB_VERSION_MAJOR 10 / MINOR 3 / PATCH 4 / BUILD 19
+    版本字符串 10.3.4.19
+（DriverService.cs 的 ExpectedDriverVer 为软校验：协议一致即放行，仅告警。）
+
+================================================================================
+第 4 章  UI 改造（5 页 Fluent 深色）
+================================================================================
+说明：交付文档 §4 给出的整文件代码基于另一套命名骨架（DeviceService / DriveItem /
+ObservableBase / Views\*）。本工程实际骨架为 DriverService / DriveItemViewModel /
+ObservableObject（已真实对接驱动 IOCTL）。为不破坏现有驱动对接，本轮在保留真实
+MVVM 的前提下，把单页 MainWindow 重构成侧边导航 5 页：
+
+  · 总览：大数字卡片（已挂载 X/Y 卷、平均命中率、缓存占用）+ 全部挂载/卸载 + 状态说明
+  · 磁盘：逐卷卡片（盘符/标签/状态/用量进度/配额滑条/读写 Sparkline/挂载卸载Flush暂停）
+  · 缓存：逐卷缓存占用只读进度条
+  · 日志：Consolas 实时日志流
+  · 设置：开机随卷挂载、随 Windows 启动两个开关（写 settings.json）+ 关于
+
+导航：左侧 ListBox 双向绑定 MainViewModel.SelectedPage，DataTrigger 切页。
+视觉：Dark.xaml 主题（Bg #16161B / Card #1E1E24 / Accent #60CDFF），圆角卡片，
+      导航选中高亮。编译 0 警告 0 错误。
+
+================================================================================
+第 5 章  签名 / 工具链 / 部署链路
+================================================================================
+编译：
+  · 驱动 driver\_build_drv.cmd → MSBuild Release|x64 Rebuild
+    结果：0 错误 0 警告；产物 driver\x64\Release\RAMBlockCache.sys = 93,408 字节
+  · WPF dotnet build -c Release → 0 错误 0 警告
+签名（管理员）：
+  · signtool sign /sm /s My /sha1 DF1A0ADA2F2CD6E5778EA937C079CB0A035BA431 /fd SHA256
+  · signtool verify /pa → Successfully verified（0 错误）
+  · 证书 CN=RAMBoostFS Root，本地 CNG，有效期至 2126
+系统当前安全态（重要）：
+  · 卷类 UpperFilters = volsnap（RAMBlockCache 已移除，不会在引导卷挂栈）
+  · 服务 Start = 3 (demand-start)
+  · 故"现在重启"不会触发 0x7B。新 sys 已就绪但尚未部署。
+
+================================================================================
+第 6 章  自测结果（本机云环境可做的全部）
+================================================================================
+驱动编译      : Release|x64 Rebuild，0 error / 0 warning
+驱动签名      : sign OK + verify /pa OK
+WPF 编译      : Release，0 error / 0 warning
+core 引擎编译: build_all.bat → 16 Release + 16 ASan 全部 [OK]
+core 引擎运行: run_rel.bat → 16/16 exit=0，stderr 全 0 字节
+  （test_cache/test_counter/test_geom/test_mixed/test_parflush/test_regress/
+    test_release/test_v5/test_v6/test_bigread/test_flush_many/edge_v3/edge_v4/
+    stress_v3/stress_v4/bench_readhit）
+
+边界（如实声明）：
+  · 本机无 clang/gcc，UBSan/TSan 未执行；ASan 用 MSVC /fsanitize=address。
+  · bench_5g.c 依赖 POSIX，MSVC 不编译（与 Build 18 相同，非本轮回归）。
+  · 内核驱动行为（加载、attach、IRQL、并发）无法在用户态沙箱验证，见第 7 章。
+
+================================================================================
+第 7 章  待真机验证项（全部"未验证"，切勿视为已通过）
+================================================================================
+T1  连续多次开机正常进桌面，不触发 0x7B（INACCESSIBLE_BOOT_DEVICE）。
+    —— 关键：本驱动 demand-start，且 UpperFilters 当前=volsnap 未挂 RAMBlockCache。
+T2  attach 数据卷 F: 后，diskspd 读速显著高于裸盘 292 MiB/s（证明拦截真的生效）。
+T3  数据完整性：写已知模式 → 命中读 → flush → detach → 下盘逐字节 hash 一致。
+T4  0xA 不复现：开启 Driver Verifier 跑 PnP 拔出/禁用/睡眠唤醒循环数小时。
+T5  RbPnpRemoveComplete 排队路径：反复 attach/detach 数百次，无 0xA/0x50/挂死。
+T6  panic 熔断=裸盘、脏量归零；panic-clear 恢复后数据正确。
+T7  动态内存：设置 0 自动时，占用随系统压力升降，不一次性占满。
+T8  UI：5 页导航切换正常、管理员 banner、settings.json 读写持久。
+
+部署提示：新 sys 已签名但未注册 UpperFilters。若要真机验证 T2~T8，需用
+提权部署脚本注册并重启一次；重启前系统保持安全回滚态。是否部署由用户决定。
+
+================================================================================
+第 8 章  已知边界 / 不做项
+================================================================================
+  · GPU 显存做缓存：RTX4070 经 PCIe 往返比内存慢 4 倍以上、内核无法直接用 CUDA，
+    空闲借用收益为负，明确不做。
+  · 不逆向 PrimoCache；不隐藏 testsigning 水印（Valorant/Vanguard 走 game_mode 双模式）。
+  · 换机自适应：路径/盘符/设备枚举全部运行时探测，无硬编码机器特征。
+
+================================================================================
+结论
+================================================================================
+V10.4.3 Build 19 的 5 处 IRQL/UAF 修复已全部落地、编译零警告、签名通过、core 引擎
+零回归。系统当前安全。真机内核行为待用户决定是否部署后按 T1~T8 验收。
+================================================================================

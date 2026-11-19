@@ -1,0 +1,212 @@
+/* rbpools.c —— 组感知 worker 池：每组 N 线程固定核亲和，信号量作业队列
+ *
+ * 例程 IRQL 契约：Rb2PoolInit / Rb2PoolShutdown 仅 PASSIVE_LEVEL（建线程 /
+ *   join 等待，内部 t.QuadPart 30s 有界）；Rb2PoolSubmit 实现为非分页池分配 +
+ *   自旋锁入队 + KeReleaseSemaphore 唤醒，无阻塞调用——dispatch-safe（≤DISPATCH
+ *   可调）。调用方合同仍建议 PASSIVE_LEVEL；>PASSIVE 仅限淘汰排队（rbfeat.c
+ *   [D5] RbFeatOnEvict 高 IRQL 分支）这类"非阻塞提交、作业内自行回落 PASSIVE"的用法。
+ *   s_Lock 自旋锁只保护作业链表 s_Q，锁外以 KeReleaseSemaphore 唤醒；
+ *   worker 线程只绑核（KeSetSystemGroupAffinityThread），不绑 DPC。
+ */
+#include "rb_common.h"
+#include "rb_common2.h"
+
+typedef struct _RB2_JOB { LIST_ENTRY Le; VOID (*Fn)(PVOID); PVOID Ctx; } RB2_JOB;
+static KSPIN_LOCK s_Lock; static LIST_ENTRY s_Q; static KSEMAPHORE s_Sem;
+static LONG s_Stop; static ULONG s_N;
+static PVOID    s_Obj[64]; static HANDLE s_Hnd[64];
+
+static BOOLEAN Rb2FnAllowed(VOID (*Fn)(PVOID))
+{
+    return Fn == RbHotPrewarmJob || Fn == RbPrefIssueJob || Fn == RbEvictJob;
+}
+
+static VOID Rb2Worker(PVOID Ctx)
+{
+    PPROCESSOR_NUMBER pn = Ctx; GROUP_AFFINITY ga, old; KIRQL irql; LARGE_INTEGER t1;
+    RtlZeroMemory(&ga, sizeof(ga)); ga.Group = pn->Group; ga.Mask = (KAFFINITY)1 << pn->Number;
+    KeSetSystemGroupAffinityThread(&ga, &old); Rb2Free(pn);
+    t1.QuadPart = -10000000LL;                                  /* 1s */
+    for (;;) {
+        RB2_JOB *j = NULL; PLIST_ENTRY le;
+        KeWaitForSingleObject(&s_Sem, Executive, KernelMode, FALSE, &t1);
+        /* 持 s_Lock 摘作业：与 Rb2PoolSubmit(DISPATCH-safe 入队) 互斥，防链表损坏 */
+        KeAcquireSpinLock(&s_Lock, &irql);
+        if (!IsListEmpty(&s_Q)) { le = RemoveHeadList(&s_Q); j = CONTAINING_RECORD(le, RB2_JOB, Le); }
+        KeReleaseSpinLock(&s_Lock, irql);
+        if (!j) { if (InterlockedCompareExchange(&s_Stop, 0, 0)) break; continue; }
+        {
+            BOOLEAN allowed = Rb2FnAllowed(j->Fn);
+            RbDiagRecord(RB_DIAG_KIND_RB2_JOB, RB_DIAG_PHASE_FN_CHECK,
+                         allowed ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER,
+                         allowed ? RB_DIAG_FLAG_ALLOWED : RB_DIAG_FLAG_REJECTED,
+                         j, NULL, NULL, NULL, NULL, j->Fn);
+            if (allowed) {
+                RbDiagRecord(RB_DIAG_KIND_RB2_JOB, RB_DIAG_PHASE_EXECUTE, STATUS_SUCCESS,
+                             RB_DIAG_FLAG_ALLOWED, j, NULL, NULL, NULL, NULL, j->Fn);
+                j->Fn(j->Ctx);
+            } else {
+                /* 非法间接目标不执行；常量文本进既有安全熔断，地址仅留诊断环。 */
+                RbSetPanic(L"RB2 job Fn rejected by whitelist");
+            }
+            Rb2Free(j);
+        }
+        if (InterlockedCompareExchange(&s_Stop, 0, 0)) {
+            /* [FIX W5] 空表判定与摘取同锁：无锁读链表头在并发入队时可读到撕裂指针 */
+            BOOLEAN empty;
+            KeAcquireSpinLock(&s_Lock, &irql);
+            empty = IsListEmpty(&s_Q);
+            KeReleaseSpinLock(&s_Lock, irql);
+            if (empty) break;
+        }
+    }
+    KeRevertToUserGroupAffinityThread(&old); PsTerminateSystemThread(STATUS_SUCCESS);
+}
+NTSTATUS Rb2PoolSubmit(VOID (*Fn)(PVOID), PVOID Ctx)
+{
+    KIRQL irql; RB2_JOB *j;
+    if (InterlockedCompareExchange(&s_Stop, 0, 0)) return STATUS_SHUTDOWN_IN_PROGRESS;
+    j = (RB2_JOB *)Rb2Alloc(sizeof(*j)); if (!j) return STATUS_INSUFFICIENT_RESOURCES;
+    j->Fn = Fn; j->Ctx = Ctx;
+    /* 持 s_Lock 入队：与 Rb2Worker 摘取互斥；锁外信号量唤醒 */
+    KeAcquireSpinLock(&s_Lock, &irql);
+    /* [FIX R6-04] 锁内复验 s_Stop：原实现入队前检查、入队后不复验——Shutdown 在
+     * "检查通过→入队前"窗口完成全部 join（彼时队空）后，本作业入队+释放信号量
+     * 后永无 worker 拾取 = j(24B) 与 Ctx（淘汰作业含 ≤64KB 非分页）泄漏。
+     * 复验命中则摘除并释放，返回关闭中。 */
+    if (InterlockedCompareExchange(&s_Stop, 0, 0)) {
+        KeReleaseSpinLock(&s_Lock, irql);
+        Rb2Free(j);
+        return STATUS_SHUTDOWN_IN_PROGRESS;
+    }
+    InsertTailList(&s_Q, &j->Le);
+    KeReleaseSpinLock(&s_Lock, irql);
+    KeReleaseSemaphore(&s_Sem, IO_NO_INCREMENT, 1, FALSE);
+    RbDiagRecord(RB_DIAG_KIND_RB2_JOB, RB_DIAG_PHASE_ENQUEUE, STATUS_SUCCESS,
+                 Rb2FnAllowed(Fn) ? RB_DIAG_FLAG_ALLOWED : RB_DIAG_FLAG_REJECTED,
+                 j, NULL, NULL, NULL, NULL, Fn);
+    return STATUS_SUCCESS;
+}
+/* [FIX S-telelemetry] 导出实际 worker 数（STATS2.Workers 原恒 0，误导性遥测） */
+ULONG Rb2PoolWorkerCount(VOID)
+{
+    return s_N;
+}
+
+NTSTATUS Rb2PoolInit(VOID)
+{
+    ULONG g, ng = KeQueryActiveGroupCount(), per, i, n, k; NTSTATUS st;
+    KeInitializeSpinLock(&s_Lock); InitializeListHead(&s_Q);
+    KeInitializeSemaphore(&s_Sem, 0, 0x7FFFFFFF);
+    /* [FIX A-11] 世代重置：上次 Init→Shutdown 超时路径（STATUS_TIMEOUT）不复位
+     * s_N（leak-by-design 保留幽灵句柄在表中）。不复零则本次以陈旧 s_N 为基：
+     * 满载(64)时建线程循环零执行却 return STATUS_SUCCESS = init 假成功
+     * （池零线程而调用方继续建 Rb2Tick 报成功，淘汰/L2 作业永无 worker 消费）。
+     * 幽灵线程本就不可 join（超时即选定泄漏），此处仅断开表登记。 */
+    if (s_N != 0) {
+        RbLog(2, __LINE__, 0, L"pool: stale worker registry reset (previous shutdown timed out)");
+        for (k = 0; k < s_N; k++) { s_Hnd[k] = NULL; s_Obj[k] = NULL; }
+        s_N = 0;
+    }
+    InterlockedExchange(&s_Stop, 0);            /* [FIX W5] init→shutdown→init 后再初始化必须解除停止闩 */
+    Rb2GetDW(NULL, L"WorkersPerGroup", 4, &per); if (per < 1) per = 1; if (per > 8) per = 8;
+    for (g = 0; g < ng && s_N < 64; g++) {
+        n = KeQueryActiveProcessorCountEx((USHORT)g); if (n > per) n = per;
+        for (i = 0; i < n && s_N < 64; i++) {
+            PPROCESSOR_NUMBER pn = (PPROCESSOR_NUMBER)Rb2Alloc(sizeof(*pn)); HANDLE h; PVOID o;
+            OBJECT_ATTRIBUTES oa;
+            if (!pn) { (void)Rb2PoolShutdown(); return STATUS_INSUFFICIENT_RESOURCES; }
+            pn->Group = (USHORT)g; pn->Number = (UCHAR)i;
+            /* [FIX O9-OBREF2 2026-11-09] 同 rbfeat.c/rbio.c：必须传
+             * OBJ_KERNEL_HANDLE 的 &oa，否则下面的 ObReferenceObjectByHandle
+             * (..., KernelMode) 引用的是进程句柄表里的用户态句柄 →
+             * Verifier 0xC4/0xF6 或内核 0x93 bad handle detection。 */
+            InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+            st = PsCreateSystemThread(&h, 0, &oa, NULL, NULL, Rb2Worker, pn);
+            /* [P1-6] 中途失败先收尾已建线程（join+关句柄），否则 shutdown
+             * join 不到、卸载后线程继续引用驱动代码映像（0xC4/0x1）。 */
+            if (!NT_SUCCESS(st)) { Rb2Free(pn); (void)Rb2PoolShutdown(); return st; }
+            /* [FIX W5] ObReferenceObjectByHandle 返回值必检：失败则句柄留不住对象，
+             * shutdown 失去 join 能力——按线程创建失败同等处理（收尾已建线程）。
+             * [FIX R2-M2] 不得 Rb2Free(pn)：PsCreateSystemThread 已成功，线程入口
+             * （Rb2Worker 首行）自行释放启动参数 pn（全函数唯一释放点，已核实），
+             * 此处再释放=双重释放（0x19）。线程未登记无法 join——leak-by-design：
+             * Rb2PoolShutdown 会置 s_Stop 闩，幽灵线程唤醒后即自退且不再拾取作业
+             * （重试 Init 由解闩前 s_Stop 拒收新作业，见 Rb2PoolSubmit 入口检查）。 */
+            st = ObReferenceObjectByHandle(h, 0, *PsThreadType, KernelMode, &o, NULL);
+            if (!NT_SUCCESS(st)) {
+                RbLog(2, __LINE__, st, L"pool: thread ref failed, ghost thread exits on stop latch");
+                ZwClose(h);
+                (void)Rb2PoolShutdown();
+                return st;
+            }
+            s_Hnd[s_N] = h; s_Obj[s_N++] = o;
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+/* [85 B4/B15] 池闩复活：Rb2PoolRevive() 是重建回滚(B4)与卸载中止完整复活(B15)
+ * 唯一共用的 helper。Rb2PoolInit() 自身也可能失败——其 :117/:122/:135 三条
+ * 失败分支都回调 Rb2PoolShutdown() 把 rbpools.c:16 的 s_Stop 闩重新置回 1，
+ * 单次 Init 不足以解闩，故有界重试 1 次（共 2 次尝试）。返回最终 NTSTATUS：
+ * 非成功即「池闩仍为 1、Rb2PoolSubmit 永久 STATUS_SHUTDOWN_IN_PROGRESS」，
+ * 调用方必须据此写 LastStatus / PANIC 日志、禁止再宣称 service recovered。 */
+NTSTATUS Rb2PoolRevive(VOID)
+{
+    NTSTATUS st = Rb2PoolInit();
+    if (!NT_SUCCESS(st)) st = Rb2PoolInit();   /* 有界重试 1 次 */
+    if (!NT_SUCCESS(st))
+        RbLog(2, __LINE__, st, L"pool revive failed after bounded retry (latch still set)");
+    return st;
+}
+
+/* 只读池闩状态，供 RbFeatRecover/RbFeatFullRecover 日志如实化（不宣称 recovered）。 */
+LONG Rb2PoolLatch(VOID)
+{
+    return InterlockedCompareExchange(&s_Stop, 0, 0);
+}
+
+NTSTATUS RbFeatQuiesce(VOID)
+{
+    NTSTATUS st;
+    PAGED_CODE();
+    /* [83 2026-11-07] 重建窗口的「排空 + 恢复」配对原语。
+     * 只做 Rb2PoolShutdown（30s 有界 join 排空在途预取/淘汰/预热作业，这些
+     * 作业 rbpref.c:119 直接解引用 g_Rb.Engine，不排空会在引擎销毁后 UAF），
+     * 然后必须 Rb2PoolInit() 解 s_Stop 闩并重建线程——否则 Rb2PoolSubmit
+     * 入口（:68）永久返回 STATUS_SHUTDOWN_IN_PROGRESS，特性层静默死亡。
+     * 与 RbFeatShutdown 的区别：不 RbL2Close()、不 RbEtwShutdown()、不动
+     * s_Init/s_TickObj/s_Stop(feat)，Rb2Tick 线程全程存活。
+     * 前置：调用方已置 Unloading=1 挡新 IO、Recreating=1 挡旁路作业入队。 */
+    st = Rb2PoolShutdown();
+    if (!NT_SUCCESS(st)) return st;      /* 超时：leak-by-design，调用方必须回滚 */
+    st = Rb2PoolInit();                  /* 解闩 + 重建 worker */
+    if (!NT_SUCCESS(st)) {
+        RbLog(2, __LINE__, st, L"rebuild: feat pool re-init failed after quiesce");
+        return st;
+    }
+    return STATUS_SUCCESS;
+}
+
+/* [FIX C5] 返回 NTSTATUS：join 超时（线程仍在途）如实上报，
+ * RbFeatShutdown/RbUnload 据此中止卸载——原 VOID 吞掉超时，
+ * 卸载继续删设备/毁引擎/卸映像，驻留线程执行已卸载代码（0xC4/0x1） */
+NTSTATUS Rb2PoolShutdown(VOID)
+{
+    ULONG i; LARGE_INTEGER t; BOOLEAN allGone = TRUE;
+    InterlockedExchange(&s_Stop, 1);
+    for (i = 0; i < s_N; i++) KeReleaseSemaphore(&s_Sem, IO_NO_INCREMENT, 1, FALSE);
+    for (i = 0; i < s_N; i++) {
+        t.QuadPart = -300000000LL;              /* [V10.3.1] P2: 每线程 30s join */
+        if (KeWaitForSingleObject(s_Obj[i], Executive, KernelMode, FALSE, &t) != STATUS_SUCCESS)
+            allGone = FALSE;                    /* 超时仍在跑 → 标记，宁泄漏勿崩溃 */
+    }
+    if (!allGone) {
+        RbLog(2, __LINE__, 0, L"feat shutdown: workers alive, leak-by-design, skip teardown");
+        return STATUS_TIMEOUT;                  /* [FIX C5] 调用方必须中止卸载 */
+    }
+    for (i = 0; i < s_N; i++) { ZwClose(s_Hnd[i]); ObDereferenceObject(s_Obj[i]); }
+    s_N = 0;
+    return STATUS_SUCCESS;
+}

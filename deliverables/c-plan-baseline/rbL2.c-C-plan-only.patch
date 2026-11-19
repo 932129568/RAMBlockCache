@@ -1,0 +1,213 @@
+--- deliverables/c-plan-baseline/rbL2.c-P1-before.c	2026-11-12 18:41:27.997167700 +0800
++++ src/driver/rbL2.c	2026-11-12 18:43:32.991654700 +0800
+@@ -10,7 +10,7 @@
+  *   · 容器格式 v2：4096B 头 + N*(16B 记录头 + 64KB 数据)，Store 单 IO 原子写整记录；
+  *     记录头 {Lba,Stamp,Crc32(数据)} —— 探测命中时逐条校验，索引与容器不一致一律
+  *     回退下盘：掉电撕裂/旧容器/索引错位物理上不可能给出错数据，只可能 MISS。
+- *   · 索引持久化 RAMBoostL2.idx（仅是重建内存索引的加速器，安全性不依赖它）：
++ *   · 索引持久化 RAMBoostL2c.idx（仅是重建内存索引的加速器，安全性不依赖它）：
+  *     Store 置脏 -> Rb2Tick 每 60s 与 RbL2Close 落盘；LazyOpen 加载重建。
+  *
+  * 例程 IRQL 契约：本模块全部例程仅 PASSIVE_LEVEL（Zw* 文件 IO 限制）。
+@@ -140,11 +140,24 @@
+     return c ^ 0xFFFFFFFFu;
+ }
+ 
+-/* [172/A.1] 块号 -> 槽号的乘数：RbL2Hash 与 RbL2DropRange（局部槽数快照版）
+- * 必须用同一个常量，改一处等于换哈希。 */
++/* [172/A.1] 块号 -> 槽号的乘数：RbL2Hash* 与 RbL2DropRange（局部槽数快照版）
++ * 必须用同一个常量，改一处等于换哈希。
++ *
++ * [C-PLAN / 203] 直映射不变式 slot == Hash(blk) 是索引层与容器层唯一的耦合点：
++ *   · 容器记录放在 4096 + slot*RB2_L2REC；
++ *   · 内存索引 idx[slot] 记 Lba=blk<<16；
++ *   · IdxSave 写 (Lba,Stamp,Slot=i)，IdxLoad 用 Hash(Lba>>16) 还原槽号（忽略 Slot）。
++ * 因此 v1 **不得**改 RB2_L2HASH_MUL、不得引入线性探测/组相联；否则 IdxLoad 会把
++ * 多条 es 重算到同槽、被 !Use 静默丢弃且 CRC 仍自洽（错数据方向）。
++ * RbL2HashWith 让新增调用点用局部 slots 快照计算，避免 s_Slots 被 Close 并发归零
++ * 时的 #DE；RbL2Hash 保留给既有调用点并补 0 哨兵（纵深防御）。 */
+ #define RB2_L2HASH_MUL  2654435761ull
+ 
+-static ULONG RbL2Hash(ULONG64 blk) { return (ULONG)((blk * RB2_L2HASH_MUL) % s_Slots); }
++static ULONG RbL2HashWith(ULONG64 blk, ULONG slots)
++{
++    return slots ? (ULONG)((blk * RB2_L2HASH_MUL) % slots) : 0;
++}
++static ULONG RbL2Hash(ULONG64 blk) { return RbL2HashWith(blk, s_Slots); }
+ 
+ /* ---- [172/A.1] 失效数据面：L2 索引条目的 drop 入口 ----
+  * 纪律（三条，改动前必读）：
+@@ -157,7 +170,7 @@
+  *     不是扇区号；块键 = off>>16（64KB 记录粒度）。 */
+ VOID RbL2DropRange(ULONG64 off, ULONG64 len)
+ {
+-    ULONG64 b, b0, b1, end; ULONG i, slots;
++    ULONG64 end, lo, hi, recOff; ULONG s, slots;
+     if (len == 0) return;
+     /* [174/P0-1] 在飞计数：与 RbL2ProbeFill(:662)/RbL2Store(:735) 同款。
+      * RbL2CloseIntEx 先排空 s_Ops(:575) 再摘指针 free s_Idx(:588-589)，
+@@ -175,13 +188,20 @@
+      * Close 在循环中途把 s_Slots 归零，本地快照也不会让下面的取模除零（#DE）。 */
+     slots = s_Slots;
+     if (!s_Idx || !slots) goto cleanup;
+-    /* off+len 溢出钳到 64 位上界再换算块号；末块不足 64KB 时 +1 覆盖跨块尾 */
+-    end = (off > (ULONG64)-1 - len) ? (ULONG64)-1 : off + len;
+-    b0 = off >> 16; b1 = (end >> 16) + ((end & 0xFFFF) ? 1 : 0);
+-    if (b1 > slots) b1 = slots;                    /* 钳到容量：越界块天然无条目 */
+-    for (b = b0; b < b1; b++) {
+-        i = (ULONG)((b * RB2_L2HASH_MUL) % slots); /* 与 RbL2Hash 同式（见上） */
+-        if (L2Idx()[i].Use && L2Idx()[i].Lba == (b << 16)) L2Idx()[i].Use = 0;
++    /* [C-PLAN / 203 §1 P0-4, 204 §4.5] 旧实现把「块号」钳到「槽数」
++     * (if (b1 > slots) b1 = slots)，在哈希槽寻址下会让 blk > s_Slots 的失效
++     * 遍历不到 ⇒ 对应槽里的旧条目不清 ⇒ 写后读到写前内容（静默给错数据）。
++     * 直接删钳位又会让循环跨整个卷（931GB ≈ 1420 万个块）持 s_Ops。
++     * 改为**遍历槽表、按字节偏移反查**：Lba 存的是 blk<<16（字节单位），
++     * lo/hi 也用字节单位，避开 b1<<16 在 end==2^64-1 时的 64 位回绕。
++     * 复杂度 O(s_Slots)，且与哈希/冲突/探测策略无关。 */
++    end = (off > (ULONG64)-1 - len) ? (ULONG64)-1 : off + len;  /* :179 溢出钳位，必须保留 */
++    lo  = off & ~(ULONG64)0xFFFF;    /* 区间首块首字节：字节单位，与 Lba 同量纲 */
++    hi  = end;                       /* 字节单位；不用 b1<<16，避开 2^64 回绕 */
++    for (s = 0; s < slots; s++) {
++        if (!L2Idx()[s].Use) continue;
++        recOff = L2Idx()[s].Lba;    /* blk<<16，字节偏移 */
++        if (recOff >= lo && recOff < hi) L2Idx()[s].Use = 0;
+     }
+ cleanup:
+     InterlockedDecrement(&s_Ops);
+@@ -262,7 +282,7 @@
+ {
+     UNICODE_STRING u; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK ib; WCHAR path[96]; NTSTATUS st;
+     if (s_IdxFile) return;
+-    RbL2Path(path, RTL_NUMBER_OF(path), L"RAMBoostL2.idx");
++    RbL2Path(path, RTL_NUMBER_OF(path), L"RAMBoostL2c.idx");
+     RtlInitUnicodeString(&u, path);
+     InitializeObjectAttributes(&oa, &u, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+     st = ZwCreateFile(&s_IdxFile, FILE_READ_DATA | FILE_WRITE_DATA, &oa, &ib, NULL,
+@@ -394,7 +414,7 @@
+      * s_Letter 只被 RbL2Path 消费，且 LazyOpenInt 稍后会用同一个注册表值重设，
+      * 此处写入不改变任何既有语义。 */
+     s_Letter = (WCHAR)v;
+-    RbL2Path(path, RTL_NUMBER_OF(path), L"RAMBoostL2.idx");
++    RbL2Path(path, RTL_NUMBER_OF(path), L"RAMBoostL2c.idx");
+     RtlInitUnicodeString(&u, path);
+     InitializeObjectAttributes(&oa, &u, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+     /* FILE_OPEN（不是 FILE_OPEN_IF）：不存在就是"没有索引"，绝不凭空建文件。
+@@ -686,7 +706,7 @@
+         return;
+     }
+ 
+-    RbL2Path(path, RTL_NUMBER_OF(path), L"RAMBoostL2.bin");
++    RbL2Path(path, RTL_NUMBER_OF(path), L"RAMBoostL2c.bin");
+     RtlInitUnicodeString(&u, path);
+     InitializeObjectAttributes(&oa, &u, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+     st = ZwCreateFile(&s_File, FILE_READ_DATA | FILE_WRITE_DATA, &oa, &ib, NULL,
+@@ -937,17 +957,20 @@
+     return RbL2CountAttached() >= 1 ? TRUE : FALSE;
+ }
+ 
+-static BOOLEAN RbL2IdxProbe(ULONG64 blk)
++/* [C-PLAN / 205 G7] 接收调用方的 slots 快照，而不是读全局 s_Slots 重算：
++ * 与 ProbeFill 的容器偏移计算使用同一个局部快照，从根上消除不对称。
++ * 直映射不变式：i == RbL2HashWith(blk, slots) == 容器内记录所在槽。 */
++static BOOLEAN RbL2IdxProbe(ULONG64 blk, ULONG slots)
+ {
+     ULONG i; PRB2_L2E idx;
+-    if (!s_Idx || !s_Slots) return FALSE;
+-    i = RbL2Hash(blk); idx = L2Idx();
++    if (!s_Idx || !slots) return FALSE;
++    i = RbL2HashWith(blk, slots); idx = L2Idx();
+     return (idx[i].Use && idx[i].Lba == (blk << 16)) ? TRUE : FALSE;
+ }
+ 
+ NTSTATUS RbL2ProbeFill(PVOID Extp, ULONG64 lba, ULONG len, PVOID dst)
+ {
+-    PRB2_L2HDR rec; ULONG64 blk; ULONG off; NTSTATUS st;
++    PRB2_L2HDR rec; ULONG64 blk; ULONG off, slots, slot; NTSTATUS st;
+ 
+     if ((g_Rb2Flags & RB2F_L2) == 0)               return STATUS_NOT_FOUND;
+     if (RbPanicActive())                           return STATUS_NOT_FOUND;
+@@ -970,16 +993,21 @@
+     blk = lba / RB2_L2BLK;
+     off = (ULONG)(lba % RB2_L2BLK);
+     if ((ULONG64)off + len > RB2_L2BLK) goto cleanup;   /* 跨槽拒绝 */
+-    /* [FIX R6-08] 与 Store 的 [F4] 守卫对称：损坏/伪造的索引文件可注入越界键
+-     * （IdxLoad 只校验 slot<s_Slots，不校验 Lba>>16<s_Slots）。探测读偏移
+-     * 4096+blk*RB2_L2REC 在极端 blk 下 64 位乘加可回绕成小偏移。 */
+-    if (blk >= s_Slots) goto cleanup;
++    /* [C-PLAN / 203 §1 P0-3] 删掉原 `if (blk >= s_Slots) goto cleanup`：
++     * 那是「容器按块号直接寻址」时代的越界守卫，会把大卷上所有块判出窗口。
++     * 现在容器记录放在哈希槽，slot 恒 < slots ⇒ 结构性地保证偏移不越界
++     * （原 [FIX R6-08] 的 64 位乘加回绕风险由此接替）。
++     * 局部快照 + !slots 守卫是确定性必需：RbL2LazyOpenInt(FALSE) 失败时
++     * s_Slots 可能为 0 ⇒ 取模 %0 ⇒ #DE（不依赖竞态）。 */
++    slots = s_Slots;
++    if (!s_Idx || !slots) goto cleanup;
++    slot = RbL2HashWith(blk, slots);
+ 
+-    if (!RbL2IdxProbe(blk)) { Rb2Count(9, 1); goto cleanup; }
++    if (!RbL2IdxProbe(blk, slots)) { Rb2Count(9, 1); goto cleanup; }
+ 
+     rec = (PRB2_L2HDR)Rb2Alloc(RB2_L2REC);
+     if (!rec) goto cleanup;
+-    st = RbL2Io(s_File, FALSE, 4096 + blk * RB2_L2REC, rec, RB2_L2REC);
++    st = RbL2Io(s_File, FALSE, 4096 + (ULONG64)slot * RB2_L2REC, rec, RB2_L2REC);
+     if (NT_SUCCESS(st) &&
+         rec->Lba == (blk << 16) &&                 /* 记录头校验：索引错/撕裂/旧容器 -> MISS */
+         rec->VolId == InterlockedOr64(&s_VolId, 0) &&   /* [FIX R6-01] 记录卷身份 */
+@@ -1006,7 +1034,7 @@
+  * 最坏结果只是"多丢一次 Store"（安全方向）；绝不出现"drop 之后 Use 仍为 1"。 */
+ VOID RbL2Store(PVOID Extp, ULONG64 lba, ULONG len, PVOID src, ULONG64 Gen)
+ {
+-    PRB2_L2HDR rec; ULONG i; ULONG64 blk; PRB2_L2E idx;
++    PRB2_L2HDR rec; ULONG i, slots, slot; ULONG64 blk; PRB2_L2E idx;
+     /* [O9-DIAG 2026-11-09] 存储链路诊断：每 4096 次同因拒绝记一行（洪泛不刷屏），
+      * IO 失败必记。l2m 有计数而 l2s 恒 0 的现场用此定位断点。 */
+     if ((g_Rb2Flags & RB2F_L2) == 0) return;
+@@ -1042,11 +1070,23 @@
+     if (!s_File) goto cleanup;
+ 
+     blk = lba / RB2_L2BLK;
+-    if (blk >= s_Slots) {                          /* [F4] 超容量 LBA：拒绝写出名义长度（重启即全废） */
+-        static volatile LONG s_RejOow = 0;
+-        if ((InterlockedIncrement(&s_RejOow) & 0xFFF) == 1)
+-            RbLog(1, __LINE__, 0, L"l2: store rejected (out of window) [diag O9]");
+-        goto cleanup;
++    /* [C-PLAN / 203 §1 P0-3] 删掉原 [F4] `if (blk >= s_Slots)` 与其
++     * "store rejected (out of window)" 诊断：容器已改哈希槽寻址，任意 blk
++     * 都可缓存。改为局部快照守卫（防 RbL2LazyOpenInt 失败时 %0 ⇒ #DE）。 */
++    slots = s_Slots;
++    if (!s_Idx || !slots) goto cleanup;
++    slot = RbL2HashWith(blk, slots);
++    {
++        /* [C-PLAN / 203 §1 P1-2] 哈希冲突观测：v1 采用简单覆盖。
++         * 正确性由 rec->Lba==(blk<<16) + VolId + Crc 三重校验保证：
++         * 旧 blk 的 Probe 会因 idx[slot].Lba 不匹配而 MISS，绝不给错数据。
++         * 这里只计数/打日志（1/4096 节流），供真机量化冲突率。 */
++        static volatile LONG s_Collisions = 0;
++        PRB2_L2E cur = &((PRB2_L2E)s_Idx)[slot];
++        if (cur->Use && cur->Lba != (blk << 16)) {
++            if ((InterlockedIncrement(&s_Collisions) & 0xFFF) == 1)
++                RbLog(1, __LINE__, 0, L"l2: hash slot collision (overwrite) [diag C]");
++        }
+     }
+     rec = (PRB2_L2HDR)Rb2Alloc(RB2_L2REC);
+     if (!rec) goto cleanup;
+@@ -1056,13 +1096,16 @@
+     rec->Crc = RbCrc32((PCHAR)(rec + 1), RB2_L2BLK);
+ 
+     {
+-        NTSTATUS stw = RbL2Io(s_File, TRUE, 4096 + blk * RB2_L2REC, rec, RB2_L2REC);
++        NTSTATUS stw = RbL2Io(s_File, TRUE, 4096 + (ULONG64)slot * RB2_L2REC, rec, RB2_L2REC);
+         if (NT_SUCCESS(stw)) {
+             if (Gen == (ULONG64)InterlockedOr64(&s_Gen, 0)) {              /* ② IO 期间无 drop */
+                 /* [F1] 索引守卫（双保险）：持计数期间 Close 无法回收，正常不可达；
+                  * 万一将来计数契约被破坏，此处保证不写野指针而非静默损坏。 */
+                 if (s_Idx && s_Slots) {
+-                    i = RbL2Hash(blk); idx = L2Idx();
++                    /* [C-PLAN / 203 P1-1] 复用同一个局部 slot，不再调 RbL2Hash(blk)：
++                     * 保证「容器记录所在槽」==「内存索引 idx[slot]」== IdxLoad
++                     * 用 Hash(Lba>>16) 还原的槽，直映射不变式不可破坏。 */
++                    i = slot; idx = L2Idx();
+                     idx[i].Lba = blk << 16; idx[i].Stamp = rec->Stamp; idx[i].Use = 1;
+                     /* ③ 赋值窗口复核：drop 若恰好落在上面三行之间，其"清 Use"会被
+                      * 我们的 Use=1 覆盖——这里把它再压回 0（容器记录留着无害：索引

@@ -1,0 +1,829 @@
+/* ============================================================================
+ * src/ui/web/src/styles/liquid-glass.css
+ * Non-destructive optical augmentation for .rbc-section (tokens.css:804-829)
+ * Strictly preserves display:flex; flex-direction:column; gap:10px;
+ * Avoids contain:paint so tooltips/dropdowns/charts never clip.
+ * Consumes 18/18 --rbc-lg-* tokens added in tokens.css.
+ * ============================================================================ */
+
+/* Layer 0 host: the existing .rbc-app-bg has an opaque var(--rbc-bg-app) base.
+ * Giving it a stacking context makes the z-index:-1 desktop-bleed canvas paint
+ * above that gradient but below all content. Only position/z-index are added;
+ * display:flex / flex-direction / gap / overflow are untouched. */
+.rbc-app-bg {
+  position: relative;
+  z-index: 0;
+}
+
+/* Layer 0: 透光透色桌面色彩流光基底 */
+.rbc-desktop-bleed-canvas {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(
+      circle at 16% 20%,
+      hsl(var(--rbc-lg-desktop-h1) / var(--rbc-lg-desktop-alpha)) 0%,
+      transparent 52%
+    ),
+    radial-gradient(
+      circle at 84% 76%,
+      hsl(var(--rbc-lg-desktop-h2) / var(--rbc-lg-desktop-alpha)) 0%,
+      transparent 54%
+    ),
+    var(--rbc-bg-app);
+}
+
+/* 在保留 tokens.css:804-808 (.rbc-section { display:flex; flex-direction:column; gap:10px; }) 的前提下，
+ * 仅追加液态玻璃光学属性，不触碰 display / flex-direction / gap / overflow */
+.rbc-section {
+  position: relative;
+  z-index: 1;
+  isolation: isolate;
+  background: linear-gradient(
+    135deg,
+    var(--rbc-lg-fill-top) 0%,
+    var(--rbc-lg-fill-mid) 52%,
+    var(--rbc-lg-fill-bot) 100%
+  );
+  /* 修 BUG-NEW-08：
+   * 1) -webkit-backdrop-filter 必须写在 backdrop-filter 之前，防止 Blink/WebView2 后者覆盖前者导致丢弃 SVG 滤镜；
+   * 2) 将 url(#rbc-liquid-refract) 置于 blur() 之后，先柔化背景再执行边缘折射与 0.75px 微色散。 */
+  -webkit-backdrop-filter:
+    blur(var(--rbc-lg-blur))
+    saturate(var(--rbc-lg-saturate))
+    brightness(var(--rbc-lg-brightness));
+  backdrop-filter:
+    blur(var(--rbc-lg-blur))
+    saturate(var(--rbc-lg-saturate))
+    brightness(var(--rbc-lg-brightness))
+    url(#rbc-liquid-refract);
+  box-shadow:
+    var(--rbc-lg-fresnel-inset),
+    var(--rbc-lg-shadow-elev);
+  transition:
+    transform var(--rbc-lg-dur-morph) var(--rbc-lg-ease-spring),
+    box-shadow var(--rbc-lg-dur-morph) var(--rbc-lg-ease-spring),
+    background var(--rbc-lg-dur-morph) var(--rbc-lg-ease-spring);
+}
+
+/* 修 BUG-NEW-09：悬浮或内部控件聚焦时抬升 z-index，避免内部下拉框被后续兄弟 .rbc-section 遮挡 */
+.rbc-section:hover,
+.rbc-section:focus-within,
+.rbc-liquid-surface--active {
+  z-index: 10;
+  box-shadow:
+    var(--rbc-lg-fresnel-inset),
+    var(--rbc-lg-shadow-active);
+}
+
+/* Layer 4-A: 45° 左上入射光 1px 渐变镜面切割边框 */
+.rbc-section::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(
+    135deg,
+    var(--rbc-lg-rim-hi) 0%,
+    rgba(255, 255, 255, 0.35) 45%,
+    var(--rbc-lg-rim-lo) 100%
+  );
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Layer 4-B: 鼠标实时跟随的径向水波光泽斑（修 BUG-NEW-09：z-index: -1 置于正文下方，绝不遮挡文字） */
+.rbc-section::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(
+    280px circle at var(--rbc-lg-ptr-x) var(--rbc-lg-ptr-y),
+    rgba(255, 255, 255, 0.38) 0%,
+    rgba(15, 134, 224, 0.08) 42%,
+    transparent 72%
+  );
+  opacity: 0;
+  transition: opacity var(--rbc-lg-dur-morph) var(--rbc-lg-ease-spring);
+  pointer-events: none;
+  z-index: -1;
+}
+
+.rbc-section:hover::after {
+  opacity: 1;
+}
+
+/* 液态胶囊与页签滑块 */
+.rbc-liquid-pill {
+  transition:
+    transform var(--rbc-lg-dur-morph) var(--rbc-lg-ease-spring),
+    box-shadow var(--rbc-lg-dur-morph) var(--rbc-lg-ease-spring);
+}
+
+/* [QA finding #5 closure] rbc-liquid-gooey was defined in LiquidGlassFilter.tsx
+ * but never referenced by CSS. Apply it to a decorative pseudo-element only:
+ * text stays crisp, and the filter really participates in rendering. */
+.rbc-liquid-pill {
+  position: relative;
+  isolation: isolate;
+}
+.rbc-liquid-pill::before {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  background: var(--rbc-lg-rim-hi);
+  -webkit-filter: url(#rbc-liquid-gooey);
+  filter: url(#rbc-liquid-gooey);
+  opacity: 0.45;
+  z-index: -1;
+  pointer-events: none;
+}
+
+/* ============================================================================
+ * [239 APPEND ONLY] Deep-sea Liquid Glass optical layer.
+ * The 148 lines above are the contract-checked base and are NOT modified:
+ * 18 --rbc-lg-* tokens, both SVG filter URLs, webkit-first backdrop-filter,
+ * and the pointer gloss pseudo-element kept below the text.
+ * This block only ADDS a light-theme-safe thickness/caustic enhancement and an
+ * opt-in deep-sea canvas. The dark canvas remaps the existing optical tokens
+ * instead of redefining the section skeleton, so light theme stays untouched.
+ * Every --rbc-glass-* token declared in tokens.css is consumed below.
+ * ============================================================================ */
+
+/* Default state: glass thickness + depth shadow. The hover rule is restated so
+ * the later cascade does not swallow the elevated interactive shadow. */
+.rbc-section {
+  box-shadow:
+    var(--rbc-glass-shadow-thickness),
+    var(--rbc-glass-shadow-depth),
+    var(--rbc-lg-fresnel-inset),
+    var(--rbc-lg-shadow-elev);
+}
+
+.rbc-section:hover,
+.rbc-section:focus-within,
+.rbc-liquid-surface--active {
+  box-shadow:
+    var(--rbc-glass-shadow-thickness),
+    var(--rbc-glass-shadow-depth),
+    var(--rbc-lg-fresnel-inset),
+    var(--rbc-lg-shadow-active);
+}
+
+/* Opt-in deep-sea canvas. Kept explicit (not tied to the OS colour scheme):
+ * flipping the whole six-page console to an unverified dark theme would put
+ * the existing dark text tokens on a near-black canvas. */
+.rbc-glass-deep {
+  --rbc-bg-app: var(--rbc-glass-canvas-bg);
+  --rbc-text-primary: #f1f5f9;
+  --rbc-text-secondary: #cbd5e1;
+  --rbc-text-tertiary: #94a3b8;
+  --rbc-lg-fill-top: rgba(255, 255, 255, 0.12);
+  --rbc-lg-fill-mid: rgba(255, 255, 255, 0.04);
+  --rbc-lg-fill-bot: rgba(125, 211, 252, 0.08);
+  --rbc-lg-rim-hi: rgba(255, 255, 255, 0.58);
+  --rbc-lg-rim-lo: rgba(186, 230, 253, 0.44);
+  --rbc-lg-shadow-elev: var(--rbc-glass-shadow-depth);
+}
+
+.rbc-glass-deep .rbc-desktop-bleed-canvas {
+  inset: -12%;
+  background:
+    radial-gradient(circle at 18% 22%, var(--rbc-glass-orb-cyan) 0%, transparent 46%),
+    radial-gradient(circle at 82% 28%, var(--rbc-glass-orb-indigo) 0%, transparent 48%),
+    radial-gradient(circle at 52% 84%, var(--rbc-glass-orb-teal) 0%, transparent 50%),
+    var(--rbc-glass-canvas-bg);
+  animation: rbcGlassAmbientDrift var(--rbc-glass-ambient-cycle) ease-in-out infinite alternate;
+}
+
+@keyframes rbcGlassAmbientDrift {
+  0% { transform: translate3d(-2%, -1.5%, 0) scale(1); }
+  50% { transform: translate3d(2.5%, 2%, 0) scale(1.05); }
+  100% { transform: translate3d(-1%, 3%, 0) scale(1.02); }
+}
+
+/* Specular pointer gloss + caustic beam reuse the REAL pointer coordinates
+ * (--rbc-lg-ptr-x / --rbc-lg-ptr-y written by useLiquidGlassPointer.ts). */
+.rbc-glass-deep .rbc-section {
+  -webkit-backdrop-filter:
+    blur(var(--rbc-glass-blur-card))
+    saturate(var(--rbc-glass-saturate))
+    contrast(var(--rbc-glass-contrast))
+    url(#rbc-liquid-refract);
+  backdrop-filter:
+    blur(var(--rbc-glass-blur-card))
+    saturate(var(--rbc-glass-saturate))
+    contrast(var(--rbc-glass-contrast));
+  background:
+    radial-gradient(
+      340px circle at var(--rbc-lg-ptr-x) var(--rbc-lg-ptr-y),
+      var(--rbc-glass-specular-core) 0%,
+      var(--rbc-glass-specular-halo) 36%,
+      transparent 72%
+    ),
+    linear-gradient(135deg, var(--rbc-glass-caustic-beam) 0%, transparent 46%),
+    var(--rbc-glass-card-fill);
+}
+
+.rbc-glass-deep .rbc-section:hover,
+.rbc-glass-deep .rbc-section:focus-within {
+  background:
+    radial-gradient(
+      340px circle at var(--rbc-lg-ptr-x) var(--rbc-lg-ptr-y),
+      var(--rbc-glass-specular-core) 0%,
+      var(--rbc-glass-specular-halo) 36%,
+      transparent 72%
+    ),
+    linear-gradient(135deg, var(--rbc-glass-caustic-beam) 0%, transparent 46%),
+    var(--rbc-glass-card-fill-hover);
+}
+
+.rbc-glass-deep .rbc-section::before {
+  background: var(--rbc-glass-fresnel-rim);
+}
+
+.rbc-glass-deep .rbc-liquid-pill {
+  -webkit-backdrop-filter:
+    blur(var(--rbc-glass-blur-pill)) saturate(var(--rbc-glass-saturate));
+  backdrop-filter:
+    blur(var(--rbc-glass-blur-pill)) saturate(var(--rbc-glass-saturate));
+  background: var(--rbc-glass-pill-fill);
+  border: 1px solid rgba(255, 255, 255, 0.24);
+}
+
+/* Consumption point for the third SVG filter (no dead filter definitions). */
+.rbc-glass-deep .rbc-liquid-pill::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: inherit;
+  background: radial-gradient(
+    120% 90% at 30% 10%,
+    rgba(255, 255, 255, 0.34) 0%,
+    rgba(56, 189, 248, 0.18) 52%,
+    transparent 85%
+  );
+  filter: url(#rbc-glass-specular);
+  opacity: 0.72;
+  pointer-events: none;
+  z-index: -1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rbc-glass-deep .rbc-desktop-bleed-canvas { animation: none; }
+  .rbc-glass-deep .rbc-section:hover,
+  .rbc-glass-deep .rbc-liquid-pill:hover { transform: none; }
+}
+
+/* ============================================================================
+ * [APPEND 2026-11-15] iOS 26 full-surface Liquid Glass layer.
+ * Origin: deliverables/243-ios26-liquid-glass-and-fullstack-wiring-2026-11-15.md 3.2
+ *
+ * The 284 lines above are the contract-checked base and stay byte-identical.
+ * Four deliberate adjustments (all evidenced in the verification receipt):
+ *   a) no overflow:hidden on the card surfaces - the baseline avoids
+ *      containment on purpose so chart tooltips and dropdowns never clip;
+ *   b) the light mesh rides on .rbc-desktop-bleed-canvas::after instead of
+ *      body::before - a body pseudo-element at z-index 0 either sits behind
+ *      the opaque .rbc-app-bg or paints over the SPA content;
+ *   c) .rbc-card surface overrides skip .rbc-card-accent / .rbc-card-danger so
+ *      the semantic tint and the 2px severity bar survive;
+ *   d) .rbc-btn keeps its variant background - a white glass pill would erase
+ *      the primary blue gradient and leave white text on white.
+ * Zero !important, zero dead selectors, every contract assertion intact.
+ * ============================================================================ */
+
+/* 1. Static app base colour (the sky field itself lives on the Layer-0 canvas) */
+body {
+  background-color: var(--rbc-bg-app);
+}
+
+/* 2. Layer-0 sky field: three drifting saturated orbs behind all content.
+ *    .rbc-desktop-bleed-canvas is the real Layer-0 node (App.tsx:96) and is
+ *    already pinned at z-index -1 inside the .rbc-app-bg stacking context. */
+.rbc-desktop-bleed-canvas::after {
+  content: "";
+  position: absolute;
+  inset: -16%;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 14% 18%, var(--rbc-ios-mesh-primary) 0%, transparent 45%),
+    radial-gradient(circle at 86% 22%, var(--rbc-ios-mesh-secondary) 0%, transparent 46%),
+    radial-gradient(circle at 48% 88%, var(--rbc-ios-mesh-tertiary) 0%, transparent 48%);
+  filter: blur(48px);
+  animation: rbcIosCausticFloat 20s ease-in-out infinite alternate;
+}
+
+@keyframes rbcIosCausticFloat {
+  0% {
+    transform: translate3d(-2%, -1.5%, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(2%, 1.5%, 0) scale(1.04);
+  }
+  100% {
+    transform: translate3d(-1%, 2.5%, 0) scale(1.02);
+  }
+}
+
+/* 3. Primary glass surfaces: 26px superellipse, 24px blur, fresnel rim. */
+.rbc-section,
+.rbc-card:not(.rbc-card-accent):not(.rbc-card-danger) {
+  position: relative;
+  isolation: isolate;
+  border-radius: var(--rbc-ios-radius-card);
+  background-color: var(--rbc-surface-card);
+  background-image: var(--rbc-ios-card-bg);
+  -webkit-backdrop-filter: blur(24px) saturate(195%) contrast(104%);
+  backdrop-filter: blur(24px) saturate(195%) contrast(104%);
+  box-shadow:
+    var(--rbc-ios-glass-shadow),
+    var(--rbc-glass-shadow-thickness),
+    var(--rbc-glass-shadow-depth);
+  border: 1px solid var(--rbc-border-subtle);
+  transition:
+    transform var(--rbc-dur-normal) var(--rbc-ios-spring),
+    box-shadow var(--rbc-dur-normal) ease-out;
+}
+
+/* .rbc-card already ships its own padding; .rbc-section is a bare flex
+ * skeleton, so the card treatment needs the same inset to look intentional. */
+.rbc-section {
+  padding: var(--rbc-pad-card);
+}
+
+/* 4. 1px vector-masked fresnel edge (paints above the fill, 1px only). */
+.rbc-section::before,
+.rbc-card:not(.rbc-card-accent):not(.rbc-card-danger)::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: var(--rbc-ios-fresnel-edge);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* 5. Pointer-following specular spot. z-index -1 keeps it under the text;
+ *    isolation:isolate on the host keeps it inside the card. Hidden by
+ *    default so idle surfaces stay calm. */
+.rbc-section::after,
+.rbc-card:not(.rbc-card-accent):not(.rbc-card-danger)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--rbc-ios-specular-spot);
+  opacity: 0;
+  pointer-events: none;
+  z-index: -1;
+  transition: opacity var(--rbc-dur-fast) ease-out;
+}
+
+.rbc-section:hover,
+.rbc-card:hover {
+  transform: translateY(-2px);
+}
+
+.rbc-section:hover::after,
+.rbc-card:hover::after {
+  opacity: 1;
+}
+
+/* 6. Nested metric wells: no second blur (avoids glass-on-glass haze). */
+.rbc-section .rbc-card:not(.rbc-card-accent):not(.rbc-card-danger) {
+  border-radius: var(--rbc-ios-radius-well);
+  background-image: var(--rbc-ios-card-well);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow:
+    inset 0 1px 1px 0 rgba(255, 255, 255, 0.85),
+    0 4px 12px -4px rgba(15, 23, 42, 0.06);
+}
+
+/* 7. Capsule controls: 999px pill + spring rebound. The variant background
+ *    (primary/secondary/ghost/danger) is deliberately NOT overridden. */
+.rbc-btn {
+  border-radius: var(--rbc-ios-radius-pill);
+  transition:
+    transform var(--rbc-dur-fast) var(--rbc-ios-spring),
+    box-shadow var(--rbc-dur-fast) ease-out;
+}
+
+.rbc-btn:hover:not(:disabled) {
+  transform: translateY(-1px) scale(1.022);
+}
+
+.rbc-btn:active:not(:disabled) {
+  transform: scale(0.955);
+}
+
+.rbc-btn::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: -1;
+}
+
+/* Decorative-only specular pass; never displaces the label glyphs, and never
+ * touches .rbc-liquid-pill::before (that one owns the gooey filter). */
+.rbc-btn:active::before {
+  filter: url(#rbc-glass-specular);
+}
+
+.rbc-liquid-pill {
+  position: relative;
+  border-radius: var(--rbc-ios-radius-pill);
+  background-image: var(--rbc-ios-pill-bg);
+  -webkit-backdrop-filter: blur(18px) saturate(190%);
+  backdrop-filter: blur(18px) saturate(190%);
+  border: 1px solid rgba(255, 255, 255, 0.82);
+  box-shadow:
+    0 6px 16px -6px rgba(15, 23, 42, 0.14),
+    inset 0 1.5px 1px 0 rgba(255, 255, 255, 0.95),
+    inset 0 -1px 1px 0 rgba(56, 189, 248, 0.25);
+  transition:
+    transform var(--rbc-dur-fast) var(--rbc-ios-spring),
+    box-shadow var(--rbc-dur-fast) ease-out;
+}
+
+.rbc-liquid-pill:hover {
+  transform: translateY(-1px) scale(1.022);
+}
+
+.rbc-liquid-pill:active {
+  transform: scale(0.955);
+}
+
+/* 8. iOS water-droplet switch. The real control is the Radix-style
+ *    button[role="switch"] in components/ui/controls.tsx:79. */
+button[role="switch"] {
+  border-radius: var(--rbc-ios-radius-pill);
+  -webkit-backdrop-filter: blur(14px) saturate(180%);
+  backdrop-filter: blur(14px) saturate(180%);
+  box-shadow:
+    inset 0 1.5px 3px rgba(15, 23, 42, 0.16),
+    0 1px 0 rgba(255, 255, 255, 0.85);
+  transition:
+    background-color var(--rbc-dur-normal) ease,
+    transform var(--rbc-dur-normal) var(--rbc-ios-spring);
+}
+
+button[role="switch"]:active {
+  transform: scaleX(1.08) scaleY(0.94);
+}
+
+button[role="switch"] > span {
+  border-radius: var(--rbc-ios-radius-pill);
+  box-shadow:
+    0 3px 8px rgba(15, 23, 42, 0.22),
+    inset 0 1px 1px rgba(255, 255, 255, 0.98);
+  transition:
+    transform var(--rbc-dur-normal) var(--rbc-ios-spring),
+    width var(--rbc-dur-fast) ease;
+}
+
+/* 9. Input wells: 16px soft crystal recess. */
+.rbc-input {
+  border-radius: 16px;
+  background-color: var(--rbc-surface-elevated);
+  -webkit-backdrop-filter: blur(14px) saturate(175%);
+  backdrop-filter: blur(14px) saturate(175%);
+  border: 1px solid rgba(255, 255, 255, 0.85);
+  box-shadow:
+    inset 0 1.5px 3px rgba(15, 23, 42, 0.08),
+    0 1px 0 rgba(255, 255, 255, 0.9);
+  transition:
+    box-shadow var(--rbc-dur-fast) ease,
+    border-color var(--rbc-dur-fast) ease;
+}
+
+.rbc-input:focus {
+  outline: none;
+  border-color: rgba(14, 165, 233, 0.72);
+  box-shadow:
+    0 0 0 3px rgba(56, 189, 248, 0.22),
+    inset 0 1px 2px rgba(15, 23, 42, 0.05);
+}
+
+/* 10. Reduced-motion fallback: durations already resolve to 0ms through the
+ *     --rbc-dur-fast/normal aliases; kill the travelling sky and the rebound. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --rbc-ios-spring: ease;
+  }
+
+  .rbc-desktop-bleed-canvas::after {
+    animation: none;
+  }
+
+  .rbc-section:hover,
+  .rbc-card:hover,
+  .rbc-btn:hover,
+  .rbc-btn:active,
+  .rbc-liquid-pill:hover,
+  .rbc-liquid-pill:active,
+  button[role="switch"]:active {
+    transform: none;
+  }
+}
+
+/* ============================================================================
+ * U3 分层液态玻璃 + 宿主真透色开闸（v22）
+ *
+ * 三条硬约束（均由 host-mode.contract.test.ts 机器校验）：
+ *   1) 本区块零 display / flex-direction / gap / contain: paint —— 不碰 flex 骨架；
+ *   2) 本区块零 url() —— 既有 url(#rbc-liquid-refract) 经 Edge 157 实测是零效果死层
+ *      （sd 恒为 127.5），新倒角必须用纯渐变实现，不允许再叠一张 SVG 滤镜；
+ *   3) 三个由 hook 写入的交互变量（--rbc-impact-glow / --rbc-impact-x/y /
+ *      --rbc-rim-angle）在本区块**第一次**获得读取方。
+ *      U2 时期它们只有写入方、没有读取方 ⇒ 碰撞高光与指针偏转色散在画面上
+ *      根本不存在（属性整条失效、不报错）。这是本节存在的主要理由。
+ * ========================================================================= */
+
+/* --- 1. 宿主真透色开闸：解除 body / .rbc-app-bg 的不透明底色遮挡 ---
+ * 只有 WPF 宿主推送 rbc-desktop-accent 后 <html> 才带这个类；
+ * 浏览器直开网页时永不命中，因此不影响 Web 兜底形态。
+ *
+ * [284 2026-11-19] 第一行 html 规则是这次"还是蓝白板"的真因，必须单独说明：
+ *   index.html 的内联 <style> 给 **html 和 body 两者** 都写了
+ *   `background: #f3f5f9`（首帧防闪用）。此前这里只重置了 body 与 .rbc-app-bg，
+ *   从未重置 html 元素本身。CSS 画布传播规则：body 背景为 transparent 时，
+ *   画布底色回退到 html 的背景色 ⇒ html 的 #f3f5f9 从透明的 body 下方透出来，
+ *   把整窗糊成浅蓝白。
+ *   于是出现"类挂上了、DWM 亚克力也开了（extend/backdrop HRESULT 全 0x0）、
+ *   但肉眼还是白底"的矛盾现象 —— 挡住的不是 DWM，是 html 自己。
+ *   特异性 (0,1,1) > 内联的 (0,0,1)，所以这条规则能压过 index.html 的内联样式。 */
+html.rbc-host-transparent,
+html.rbc-host-transparent body,
+html.rbc-host-transparent .rbc-app-bg {
+  background: transparent;
+  background-color: transparent;
+}
+
+/* 桌面透色底：把不透明 #f3f5f9 换成对比度守护 scrim。
+ * 桌面模糊由 DWM 亚克力负责，页面只负责"不漏底、不糊字"。
+ * 想要完全透明透出桌面：把 --rbc-layer-host-scrim 设为 transparent（单点可调）。 */
+html.rbc-host-transparent .rbc-desktop-bleed-canvas {
+  background: var(--rbc-layer-host-scrim);
+  background-image: none;
+}
+
+/* --- 1.5 桌面主色微光 ---
+ * v22 在这里直接 background:none 把整层流光了 —— 理由是「会污染桌面观感、耗一层合成」。
+ * 那条理由在 scrim=0.62 时成立（反正什么都看不见，留着纯浪费），
+ * scrim 降到 0.14 之后必须把它请回来：底层玻璃面板如果只剩一层均匀白纱，
+ * 读起来是「一块磨砂塑料」；有极低透明度的桌面主色在玻璃内部缓慢流动，
+ * 才是「液态」。
+ *
+ * 两个偏离手册的细节：
+ *   a) 手册写 var(--rbc-lg-desktop-h1, rgba(...)) —— 该令牌的值是
+ *      "206 88% 54%" 这样的 HSL 分量，不是颜色，直接当颜色用整条属性失效。
+ *      必须套 hsl(... / alpha)，与 :19 的既有消费方式一致。
+ *   b) alpha 用 0.22 而不是 0.18，且 animation 保持关闭：这两层是 fixed 全屏
+ *      渐变，动画会持续触发整页合成；在宿主模式下 DWM 已经在做亚克力，
+ *      再加一条常驻动画只会换帧率。静止的微光足够表达「有色玻璃」。 */
+html.rbc-host-transparent .rbc-desktop-bleed-canvas::after {
+  background-image:
+    radial-gradient(
+      circle at 16% 20%,
+      hsl(var(--rbc-lg-desktop-h1, 206 88% 54%) / 0.22) 0%,
+      transparent 52%
+    ),
+    radial-gradient(
+      circle at 84% 76%,
+      hsl(var(--rbc-lg-desktop-h2, 262 60% 62%) / 0.16) 0%,
+      transparent 54%
+    );
+  animation: none;
+}
+
+/* --- 2. 底层薄玻璃：细双边高光 ---
+ * 追加 --rbc-lg-shadow-elev 而不是替换：只留 rim 会让底板失去悬浮纵深，
+ * 与"分层"目标相反（对 v22 手册的一处主动偏离，理由见 288 回执）。 */
+.rbc-section {
+  box-shadow:
+    var(--rbc-layer-section-rim),
+    var(--rbc-lg-shadow-elev);
+}
+
+html.rbc-host-transparent .rbc-section {
+  background-color: transparent;
+  background-image: var(--rbc-layer-section-fill);
+  /* scrim 降到 0.14 之后没有白纱垫底，正文必须靠这层极浅的文字光晕托住笔画。
+   * 继承式 text-shadow 而不是给每个文字节点加规则：卡片里的数字、表格、
+   * 图表都跟着一起兜住对比度，且零选择器面扩张。 */
+  text-shadow: var(--rbc-layer-text-halo);
+  /* [284 2026-11-19] 液态玻璃的"物理厚度"。
+   *
+   * 用户第三条抱怨是「底层大容器看起来只是一个扁平淡青框」。查下来不是缺滤镜，
+   * 而是缺**内阴影**：透色生效后 section 内部只剩一层极淡的渐变填充（alpha
+   * 0.08~0.12），没有上下明暗差，于是读起来是一块**贴纸**而不是一块玻璃。
+   *
+   * 玻璃的厚度感来自两个方向相反的内阴影：
+   *   inset 0 1px 0  — 顶边内侧被上方光源照亮（亮线）
+   *   inset 0 -1px 0 — 底边内侧退回暗部（暗线）
+   * 再加上一圈 24px 的内发光把边界从"刀切"软化成"折射过渡"。
+   * 全部用 inset，不产生任何外部投影，因此不会改变布局或遮挡下层。
+   * backdrop-filter 在这里不用：section 会把整块区域模糊一次，26px 的重活
+   * 留给上面的卡片层，避免嵌套两层大半径模糊把帧率吃掉。 */
+  box-shadow:
+    var(--rbc-layer-section-rim),
+    var(--rbc-lg-shadow-elev),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.55),
+    inset 0 -1px 0 0 rgba(15, 23, 42, 0.06),
+    inset 0 0 24px 0 rgba(255, 255, 255, 0.18);
+
+  /* [292 2026-11-19] section 只吃 saturate，**不加 blur**。
+   *
+   * 这里差点写错，记录一下推理过程，避免下次再走一遍：
+   * 第一版给 section 加了 blur(10px)，理由是"让液态感来自页面可调参数"。
+   * 但 section 的背后已经是 DWM Desktop Acrylic 的重磨砂（30px 量级）。
+   * 在已经糊掉的底上再 blur 10px，只会把剩下那点形状信息也抹平 ——
+   * 与"透形"的目标正好相反。用户说"只能透色一点"，加 blur 是加重这个症状。
+   *
+   * 所以 blur 必须留空：透形只能靠**减少遮挡**（三层白纱 0.59 -> 0.17，见 tokens.css），
+   * 不能靠再加一层滤镜。DWM 那一层的模糊是系统给的、不可调的，它就是这个方案的
+   * 物理地板 —— 想要更清晰只能整体不用系统材料（DWMSBT_NONE + 页面自理模糊），
+   * 那是另一个量级的改动，不在本次范围。
+   *
+   * 保留 saturate(112%) 是因为它做的是另一件事：Desktop Acrylic 会给背后内容
+   * 掺入系统色调并降低饱和度，表现为"蒙了一层灰膜"。补一点饱和度是把颜色
+   * 拉回原状，不涉及模糊，因此不冲突。数值刻意低于 card 的 130%，
+   * 让"外层淡、内层略浓"的层次差成立。 */
+  -webkit-backdrop-filter:
+    saturate(112%);
+  backdrop-filter:
+    saturate(112%);
+}
+
+/* --- 3. 顶层厚玻璃：z-index 抬到波纹画布(0)之上 + 26px 折射模糊 ---
+ * (0,4,0) 与既有 :406 同权，靠源序在后取胜，覆盖其 `backdrop-filter: none`。
+ * F25 的真因是那句 none；F24 的真因是 card 没有 z-index（U2 两者都是 3）。 */
+.rbc-section .rbc-card {
+  z-index: 1;
+  /* 时长仍走令牌：reduced-motion 时 --rbc-dur-* 归零，动效自动消失。
+   * 手册此处写死 0.22s，会绕过减弱动效策略，故改回令牌。 */
+  transition:
+    transform var(--rbc-dur-normal) var(--rbc-ios-spring),
+    box-shadow var(--rbc-dur-normal) ease-out;
+}
+
+.rbc-section .rbc-card:not(.rbc-card-accent):not(.rbc-card-danger) {
+  background-color: transparent;
+  background-image: var(--rbc-layer-card-fill);
+  box-shadow:
+    var(--rbc-layer-card-rim),
+    var(--rbc-layer-card-shadow);
+  -webkit-backdrop-filter:
+    blur(var(--rbc-layer-card-blur))
+    saturate(var(--rbc-layer-card-saturate))
+    brightness(var(--rbc-layer-card-brightness));
+  backdrop-filter:
+    blur(var(--rbc-layer-card-blur))
+    saturate(var(--rbc-layer-card-saturate))
+    brightness(var(--rbc-layer-card-brightness));
+}
+
+/* --- 4. 双色散菲涅尔倒角 + 碰撞边缘闪光 ---
+ * (0,4,1) > 既有 (0,3,1)：padding 从 1px 提到 1.25px，并第一次消费
+ * --rbc-impact-glow / --rbc-impact-x / --rbc-impact-y / --rbc-rim-angle。 */
+.rbc-section .rbc-card:not(.rbc-card-accent):not(.rbc-card-danger)::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1.25px;
+  pointer-events: none;
+  z-index: 2;
+  background:
+    radial-gradient(
+      115px circle at var(--rbc-impact-x, 50%) var(--rbc-impact-y, 50%),
+      rgba(255, 255, 255, calc(var(--rbc-impact-glow, 0) * 0.96)) 0%,
+      rgba(125, 211, 252, calc(var(--rbc-impact-glow, 0) * 0.58)) 40%,
+      transparent 75%
+    ),
+    var(--rbc-layer-bevel-gradient);
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+}
+
+/* --- 5. 玻璃按压微下沉：液体表面被按下 0.5px 的触感 --- */
+.rbc-section .rbc-card:active {
+  transform: translateY(0.5px) scale(0.994);
+}
+
+@media (forced-colors: active) {
+  html.rbc-host-transparent body {
+    background-color: Canvas;
+  }
+
+  /* 高对比度下画布与倒角层全部退场，只留系统色边框 */
+  .rbc-section .rbc-card:not(.rbc-card-accent):not(.rbc-card-danger)::before {
+    background: none;
+    -webkit-mask: none;
+    mask: none;
+    padding: 0;
+  }
+}
+
+/* ==========================================================================
+ * [295 2026-11-19] DComp 原生宿主共存态
+ *
+ * 适用条件：宿主是原生 D3D11 + DirectComposition（发 engine="d3d11-dcomp"），
+ * 由 Visual 0 在页面**下方**画出折射后的真桌面。此时页面这一层必须"让路"：
+ * 所有原本用来模拟玻璃的自绘背景/模糊/投影全部退场，否则它们会盖在
+ * Visual 0 之上，把真玻璃重新糊成一块塑料 —— 也就是 293 证实的那个物理地板。
+ *
+ * 为什么用 `html.rbc-host-dcomp` 而**不是**替换既有 `html.rbc-host-transparent`：
+ *   · host-mode.contract.test.ts 用 U3 锚点切片校验 10 个 --rbc-layer-* 令牌
+ *     必须被 var() 消费、且块内严禁 url()。替换会破那批判据（142 用例之一）。
+ *   · WPF 宿主仍走 rbc-host-transparent 老路（DWM Acrylic + 页面 scrim），
+ *     双宿主共存期两条路径必须互不干扰 ⇒ 新类叠在老类之上，只在真 DComp 时出现。
+ *
+ * 极性翻字：宿主按背景亮度判 polarity。这里只覆盖**真实存在**的令牌
+ * （--rbc-text-primary / --rbc-text-secondary，见 tokens.css:78-79）。
+ * 方案原文还写了一个 --rbc-text-muted，全仓零定义 —— 那是一条永不被消费的死令牌，
+ * 不引进（判据纪律：不制造零消费的声明）。
+ * ========================================================================== */
+html.rbc-host-dcomp,
+html.rbc-host-dcomp body,
+html.rbc-host-dcomp .rbc-app-bg,
+html.rbc-host-dcomp .rbc-desktop-bleed-canvas {
+  /* 页面这一层完全透明：背景由 Visual 0 提供，不叠第二层。 */
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+}
+
+/* 桌面微光层在 DComp 模式下必须退场：Visual 0 已经画了真桌面，
+ * 再叠一层模拟微光等于给真桌面蒙一块有色玻璃。 */
+html.rbc-host-dcomp .rbc-desktop-bleed-canvas::after {
+  background-image: none !important;
+  animation: none !important;
+}
+
+html.rbc-host-dcomp .rbc-section,
+html.rbc-host-dcomp .rbc-card {
+  /* 自绘玻璃退场：折射、色散、焦散、边缘描边全部由 HLSL 在 Visual 0 上做。 */
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  box-shadow: none !important;
+}
+
+/* 倒角层（::before 的 mask 术）同样退场：它画的是假边缘，
+ * 与 HLSL 的 rimStroke 叠在一起会出现双描边。 */
+html.rbc-host-dcomp .rbc-section .rbc-card::before,
+html.rbc-host-dcomp .rbc-section::before,
+html.rbc-host-dcomp .rbc-section::after {
+  opacity: 0 !important;
+}
+
+/* 文字保底：真桌面透上来后，正文必须自带一层极轻的描边光，
+ * 否则深色文字压在中灰壁纸上会掉到 WCAG 以下。
+ * 这一层与极性翻字互补：极性管色相，这里管笔画边缘。 */
+html.rbc-host-dcomp .rbc-section {
+  text-shadow: var(--rbc-layer-text-halo);
+}
+
+/* --- APCA 极性：宿主判出背景偏亮 → 深色文字；偏暗 → 浅色文字 --- */
+html.rbc-host-dcomp[data-rbc-apca-polarity='light-text'] {
+  --rbc-text-primary: #f4f7fb;
+  --rbc-text-secondary: rgba(236, 242, 250, 0.78);
+}
+
+html.rbc-host-dcomp[data-rbc-apca-polarity='dark-text'] {
+  --rbc-text-primary: #10192b;
+  --rbc-text-secondary: rgba(23, 35, 60, 0.8);
+}
+
+/* 高对比度模式下 DComp 也不得吃字：把页面底退回系统画布。 */
+@media (forced-colors: active) {
+  html.rbc-host-dcomp,
+  html.rbc-host-dcomp body {
+    background-color: Canvas !important;
+  }
+}

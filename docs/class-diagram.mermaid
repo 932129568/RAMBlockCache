@@ -1,0 +1,85 @@
+classDiagram
+    class rb_write_pre {
+        +uint8_t* mask
+        +uint32_t* dseq
+        +int max_bits
+        +rb_u64 base
+        +int bits
+    }
+    class rb_chunk {
+        +rb_u64 start
+        +unsigned char* data
+        +uint16_t loaded
+        +uint16_t dirty
+        +uint16_t restoring
+        +rb_u64 last_access
+        +uint32_t hits
+        +rb_u64 epoch
+        +uint32_t dseq[16]
+        +hash_next/lru_prev/lru_next/d_prev/d_next
+    }
+    class rb_stream {
+        +rb_rwlock* stripes[64]
+        +rb_mutex chain[16]
+        +rb_chunk** buckets[16384]
+        +rb_chunk* lru_head[16]
+        +rb_chunk* lru_tail[16]
+        +rb_chunk* d_head[16]
+        +rb_chunk* d_tail[16]
+        +volatile rb_u64 cur_bytes/dirty_bytes
+        +rb_flushws* ws
+    }
+    class rb_engine {
+        +rb_config cfg
+        +volatile rb_u64 total_bytes/total_dirty
+        +volatile rb_u64 chunk_epoch
+        +rb_stats stats
+    }
+    class rb_write_ex {
+        +rb_write_ex(s, offset, buf, len, direct, dcount, max_direct, pre) int
+    }
+    class rb_write {
+        +rb_write(s, offset, buf, len, direct, dcount, max_direct) int
+    }
+    class rb_write_pass1 {
+        -rb_write_pass1(s, offset, end, in, rmw, rmw_n, direct, dcount, max_direct, cached, pre) void
+    }
+    class rb_stream_dirty_mask {
+        +rb_stream_dirty_mask(s, offset, len, mask, max_bits, base_out, dseq_out) int
+    }
+    class RB_GLOB {
+        +RB_CONFIG Config
+        +NPAGED_LOOKASIDE_LIST IoCtxLa
+        +NPAGED_LOOKASIDE_LIST SyncCtxLa
+        +volatile ULONG MaxCacheIoKB
+        +RB_IOWORKER IoWorkers[32]
+        +UCHAR IoWorkerByCpu[64]
+        +volatile LONG IoRR
+    }
+    class RB_IOWORKER {
+        +LIST_ENTRY QueueHead
+        +KSPIN_LOCK Lock
+        +KEVENT Wake
+        +ULONG CpuIndex
+        +PULONG DseqBuf
+        +PVOID Stage
+        +GROUP_AFFINITY AuxGa
+        +UCHAR AuxValid
+    }
+    class RbSubmitIo {
+        -RbSubmitIo(ctx) void
+    }
+    class RbWriteWorker {
+        +RbWriteWorker(ctx, w) void
+    }
+    rb_write_ex ..> rb_write_pass1 : pre 采集并入同一持锁期
+    rb_write ..> rb_write_ex : pre=NULL 包装
+    rb_write_pre <.. rb_write_ex : 输出写前脏掩码/dseq
+    rb_stream "1" *-- "16" rb_mutex : chain 分片
+    rb_stream "1" *-- "16" rb_chunk : 分片 LRU/dirty 链表
+    rb_chunk "0..n" --o rb_stream : buckets/stripes 保护
+    rb_engine "1" *-- "0..n" rb_stream
+    RbWriteWorker ..> rb_write_ex : 每 8MB 块一次调用
+    RbWriteWorker ..> rb_stream_dirty_mask : 热路径不再调用（仅测试/备用）
+    RbSubmitIo ..> RB_GLOB : IoWorkerByCpu O(1) 查表
+    RB_GLOB *-- RB_IOWORKER : IoWorkers

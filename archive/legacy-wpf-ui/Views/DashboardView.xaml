@@ -1,0 +1,152 @@
+﻿<UserControl x:Class="RamBoostFS.Wpf.Views.DashboardView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:RamBoostFS.Wpf.Controls"
+             mc:Ignorable="d" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             d:DesignHeight="600" d:DesignWidth="900">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- 第一行: 命中指标大卡 (WrapPanel 自适应换行) -->
+        <WrapPanel Grid.Row="0" Margin="0,0,0,14">
+            <Border Style="{StaticResource Card}" Margin="0,0,7,7" MinWidth="200" Width="200">
+                <StackPanel>
+                    <TextBlock Text="读命中率(请求)" Style="{StaticResource MetricLabelText}"/>
+                    <TextBlock x:Name="hitReqText" Text="--" Style="{StaticResource MetricValueText}"/>
+                    <TextBlock x:Name="hitReqSub" Text="0 / 0 次" Style="{StaticResource CaptionText}" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource Card}" Margin="7,0,7,7" MinWidth="200" Width="200">
+                <StackPanel>
+                    <TextBlock Text="读命中率(字节)" Style="{StaticResource MetricLabelText}"/>
+                    <TextBlock x:Name="hitByteText" Text="--" Style="{StaticResource MetricValueText}"/>
+                    <TextBlock x:Name="hitByteSub" Text="0 GB" Style="{StaticResource CaptionText}" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource Card}" Margin="7,0,7,7" MinWidth="200" Width="200">
+                <StackPanel>
+                    <TextBlock Text="写吸收比例" Style="{StaticResource MetricLabelText}"/>
+                    <TextBlock x:Name="writeAbsorbText" Text="--" Style="{StaticResource MetricValueText}"/>
+                    <TextBlock x:Name="writeAbsorbSub" Text="缓存吸收 0 GB" Style="{StaticResource CaptionText}" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource Card}" Margin="7,0,0,7" MinWidth="200" Width="200">
+                <StackPanel>
+                    <TextBlock Text="内存压力" Style="{StaticResource MetricLabelText}"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,2,0,0">
+                        <Ellipse x:Name="pressureDot" Width="14" Height="14" Fill="{StaticResource PressureNormalBrush}" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="pressureText" Text="正常" Style="{StaticResource MetricValueText}" Margin="10,0,0,0"/>
+                    </StackPanel>
+                    <TextBlock x:Name="pressureSub" Text="可用内存 -- GB" Style="{StaticResource CaptionText}" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Border>
+        </WrapPanel>
+
+        <!-- 第二行: 缓存占用 / 脏数据 / 动态上限 (WrapPanel 自适应换行) -->
+        <WrapPanel Grid.Row="1" Margin="0,0,0,14">
+            <Border Style="{StaticResource Card}" Margin="0,0,7,7" MinWidth="200" Width="200">
+                <StackPanel>
+                    <TextBlock Text="当前缓存占用" Style="{StaticResource MetricLabelText}"/>
+                    <TextBlock x:Name="curCacheText" Text="--" Style="{StaticResource MetricValueText}"/>
+                    <TextBlock x:Name="curCacheSub" Text="峰值 --" Style="{StaticResource CaptionText}" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource Card}" Margin="7,0,7,7" MinWidth="200" Width="200">
+                <StackPanel>
+                    <TextBlock Text="脏数据 (待回写)" Style="{StaticResource MetricLabelText}"/>
+                    <TextBlock x:Name="dirtyText" Text="--" Style="{StaticResource MetricValueText}"/>
+                    <TextBlock x:Name="dirtySub" Text="回写周期 --" Style="{StaticResource CaptionText}" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource Card}" Margin="7,0,0,7" MinWidth="200" Width="200">
+                <StackPanel>
+                    <TextBlock Text="动态上限 / 可用物理内存" Style="{StaticResource MetricLabelText}"/>
+                    <TextBlock x:Name="limitText" Text="--" Style="{StaticResource MetricValueText}"/>
+                    <TextBlock x:Name="limitSub" Text="系统保留 -- MB" Style="{StaticResource CaptionText}" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Border>
+
+            <!-- V8 块层驱动信息条 -->
+            <Border Style="{StaticResource Card}" Margin="0,7,0,0" MinWidth="460" Width="460">
+                <StackPanel>
+                    <TextBlock Text="驱动 / 块层" Style="{StaticResource MetricLabelText}"/>
+                    <TextBlock x:Name="drvVersionText" Text="--" Style="{StaticResource SubtitleText}" Margin="0,4,0,0"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                        <TextBlock x:Name="drvBlockText" Text="块大小 --" Style="{StaticResource CaptionText}" Margin="0,0,24,0"/>
+                        <TextBlock x:Name="drvLayerText" Text="块层命中率 --" Style="{StaticResource CaptionText}"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </WrapPanel>
+
+        <!-- 第三行: 开关 + 折线图 -->
+        <Grid Grid.Row="2" Margin="0,0,0,14">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="300"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <Border Grid.Column="0" Style="{StaticResource Card}" Margin="0,0,7,0">
+                <StackPanel>
+                    <TextBlock Text="运行时开关" Style="{StaticResource SubtitleText}" Margin="0,0,0,12"/>
+
+                    <Grid Margin="0,0,0,10">
+                        <TextBlock Text="读缓存" Style="{StaticResource BodyText}" VerticalAlignment="Center"/>
+                        <controls:RbToggleSwitch x:Name="readToggle" HorizontalAlignment="Right" Toggled="ReadToggle_Toggled"/>
+                    </Grid>
+                    <Grid Margin="0,0,0,10">
+                        <TextBlock Text="写缓存" Style="{StaticResource BodyText}" VerticalAlignment="Center"/>
+                        <controls:RbToggleSwitch x:Name="writeToggle" HorizontalAlignment="Right" Toggled="WriteToggle_Toggled"/>
+                    </Grid>
+                    <Grid Margin="0,0,0,10">
+                        <TextBlock Text="回写模式 (write-back)" Style="{StaticResource BodyText}" VerticalAlignment="Center"/>
+                        <controls:RbToggleSwitch x:Name="wbToggle" HorizontalAlignment="Right" Toggled="WbToggle_Toggled"/>
+                    </Grid>
+                    <Border x:Name="wbHint" Background="#22FFB900" CornerRadius="6" Padding="10,8" Margin="0,6,0,0">
+                        <TextBlock x:Name="wbHintText" Text="回写模式: 脏数据先存内存，按周期刷盘" Style="{StaticResource CaptionText}"/>
+                    </Border>
+                </StackPanel>
+            </Border>
+
+            <Border Grid.Column="1" Style="{StaticResource Card}" Margin="7,0,0,0">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock Text="缓存占用趋势 (MB)" Style="{StaticResource SubtitleText}"/>
+                        <TextBlock Text="近 60 秒" Style="{StaticResource CaptionText}" Margin="12,4,0,0"/>
+                    </StackPanel>
+                    <controls:LineChart x:Name="historyChart" Grid.Row="1" Series="{Binding CacheHistoryMB}"/>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- 第四行: 64 分片吞吐 -->
+        <Border Grid.Row="3" Style="{StaticResource Card}" MinHeight="180">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                    <TextBlock Text="多核 64 分片实时吞吐" Style="{StaticResource SubtitleText}"/>
+                    <Ellipse Width="10" Height="10" Fill="#FF4FC3F7" Margin="16,2,4,0"/>
+                    <TextBlock Text="读 MB/s" Style="{StaticResource CaptionText}" VerticalAlignment="Center"/>
+                    <Ellipse Width="10" Height="10" Fill="{StaticResource AccentBrush}" Margin="12,2,4,0"/>
+                    <TextBlock Text="写 MB/s" Style="{StaticResource CaptionText}" VerticalAlignment="Center"/>
+                </StackPanel>
+                <controls:StripeGrid x:Name="stripeGrid" Grid.Row="1"/>
+            </Grid>
+        </Border>
+    </Grid>
+</UserControl>
+
+

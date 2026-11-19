@@ -1,0 +1,9 @@
+# crates.io 走 USTC sparse 镜像（本机到 static.rust-lang.org 直连约 16KB/s，不可用）
+[source.crates-io]
+replace-with = 'ustc-sparse'
+
+[source.ustc-sparse]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+
+[net]
+retry = 3

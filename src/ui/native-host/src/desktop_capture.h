@@ -77,6 +77,11 @@ public:
 
     Backend backend()        const { return backend_; }
     bool    isDeviceLost()   const { return deviceLost_; }
+    // [299] 捕获纹理的物理尺寸。渲染器算 captureInvSize（桌面像素 → 归一化 UV）
+    // 必须用它，不能用窗口尺寸 —— 两者在多显示器 / DPI 缩放 / 桌面分辨率大于
+    // 窗口时完全不同，用错的表现是「折射采样整体偏移一段」。
+    uint32_t texWidth()      const { return texWidth_; }
+    uint32_t texHeight()     const { return texHeight_; }
     // DRM 保护内容会返回纯黑帧。连续黑帧占比 >85% ⇒ 着色器把折射权重归零，
     // 否则整块玻璃变成一个黑洞（方案 RT-U8）。
     float   blackRatio()     const { return blackRatio_; }

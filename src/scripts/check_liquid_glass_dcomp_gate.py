@@ -76,8 +76,19 @@ glass_hpp = require(HOST_SRC / "glass_window.hpp")
 glass_cpp = require(HOST_SRC / "glass_window.cpp")
 capture_h = require(HOST_SRC / "desktop_capture.h")
 capture_cpp = require(HOST_SRC / "desktop_capture.cpp")
+# [299] 之前 native-host 只有「分开能编、合起来不成形」的散件：缺 WinMain、
+# 缺渲染管线。这两个文件就是把它变成进程的那两块，必须一并纳入判据 ——
+# 否则删掉它们门禁仍然全绿，而那正是 295 的原始缺陷形态。
+renderer_hpp = require(HOST_SRC / "d3d_renderer.hpp")
+renderer_cpp = require(HOST_SRC / "d3d_renderer.cpp")
+main_cpp     = require(HOST_SRC / "main.cpp")
 glass_hlsl = require(HOST_SHADERS / "liquid_glass_core.hlsl")
 apca_hlsl = require(HOST_SHADERS / "apca_reduce.hlsl")
+# 注：外部方案（v2 §4.1 A-2）把 fluid_wave_sim.hlsl 列为 [待新建]，但水波仿真
+# 在 295 就已经落在 apca_reduce.hlsl 里（CSWaveStep，:139）。再建一个同名文件
+# 就是同一物理模型的两份实现 —— 分叉之后必然有一份长期不更新，且两份都「看起来
+# 对」。所以本门禁钉的是**现有那一份**，而不是方案要求的那个文件名。
+# G11 校验它的数值契约（见文件末尾）。
 
 # 判据 1 的前置：文件全都拿到了才继续（空集不得 PASS）
 if fails:
@@ -87,7 +98,9 @@ if fails:
     print("GATE27 FAIL: 前置文件缺失，判据不会空跑通过")
     sys.exit(1)
 
-assert glass_hpp and glass_cpp and capture_h and capture_cpp and glass_hlsl and apca_hlsl
+assert (glass_hpp and glass_cpp and capture_h and capture_cpp
+        and renderer_hpp and renderer_cpp and main_cpp
+        and glass_hlsl and apca_hlsl)
 hlsl_clean = strip_c_comments(glass_hlsl)
 apca_clean = strip_c_comments(apca_hlsl)
 
@@ -261,6 +274,104 @@ else:
     else:
         ok.append(f"G5: s_TileV 上界 {max_v} < 容量 {sizev}")
 
+    # -----------------------------------------------------------------------
+    # [299] G5b halo 覆盖完整性 —— G5 只查了**越界**，查出上界小于容量就报 ok，
+    # 于是「上界不越界但区间没被写满」这一类缺陷可以完全静默通过。这正是
+    # liquid_glass_core.hlsl 里真实存在过的脏读：写在 [0..r-1]，读在 [4-r..3]，
+    # 上界 3 < 容量，G5 全绿；r<4 时中间槽位是 LDS 未初始化显存。
+    #
+    # 判据形态：把「写覆盖的槽位集合」与「读需要的槽位集合」都算出来，
+    # 要求 读集合 ⊆ 写集合，且对 r ∈ [1, maxr] 的**每一个**取值都成立
+    # —— 只在 r=maxr 成立是不够的（那恰是旧代码侥幸能用的唯一情况）。
+    # -----------------------------------------------------------------------
+    def _halo_sets(r: int, max_r: int, threads: int, tile: int) -> tuple[set[int], set[int], set[int], set[int]]:
+        """返回 (水平写, 水平读, 垂直写行, 垂直读行) 的槽位/行号集合。"""
+        w_h: set[int] = {local + max_r for local in range(threads)}          # 主体
+        w_v: set[int] = {ly + max_r for ly in range(tile)}                    # 主体
+        # 写侧：代码里 leftSlot / upRow 的实际算式由 _HALO_WRITE_* 正则抓出后代入
+        for local in range(r):                                                # local < r 才写
+            w_h.add(_eval_slot(_HALO_WRITE_LEFT, {"local": local, "r": r, "MAX_RADIUS": max_r,
+                                                  "BLUR_THREADS": threads}))
+            w_h.add(_eval_slot(_HALO_WRITE_RIGHT, {"local": local, "r": r, "MAX_RADIUS": max_r,
+                                                   "BLUR_THREADS": threads}))
+        for ly in range(r):
+            w_v.add(_eval_slot(_HALO_WRITE_UP, {"ly": ly, "r": r, "MAX_RADIUS": max_r,
+                                                "BLUR_TILE_H": tile}))
+            w_v.add(_eval_slot(_HALO_WRITE_DOWN, {"ly": ly, "r": r, "MAX_RADIUS": max_r,
+                                                  "BLUR_TILE_H": tile}))
+        # 读侧：卷积 local+MAX_RADIUS±k / mainRow±k，k=1..r
+        rd_h: set[int] = set()
+        for local in range(threads):
+            rd_h.add(local + max_r)
+            for k in range(1, r + 1):
+                rd_h.add(local + max_r - k)
+                rd_h.add(local + max_r + k)
+        rd_v: set[int] = set()
+        for ly in range(tile):
+            rd_v.add(ly + max_r)
+            for k in range(1, r + 1):
+                rd_v.add(ly + max_r - k)
+                rd_v.add(ly + max_r + k)
+        return w_h, rd_h, w_v, rd_v
+
+    def _eval_slot(expr: str | None, env: dict[str, int]) -> int:
+        if expr is None:
+            raise ValueError("halo slot expression not found")
+        e = expr
+        for k, v in env.items():
+            e = re.sub(rf"\b{k}\b", str(v), e)
+        if not re.fullmatch(r"[\d\s+\-*/()]+", e):
+            raise ValueError(f"unexpected halo slot expression: {expr!r}")
+        return int(eval(e, {"__builtins__": {}}, {}))  # noqa: S307
+
+    # 从代码抓写侧算式（必须先剥注释，否则注释里的旧写法会被当成本体）
+    _HALO_WRITE_LEFT = None
+    _HALO_WRITE_RIGHT = None
+    _HALO_WRITE_UP = None
+    _HALO_WRITE_DOWN = None
+    _pat = {
+        "_HALO_WRITE_LEFT": r"leftSlot\s*=\s*([^;]+);",
+        "_HALO_WRITE_RIGHT": r"rightSlot\s*=\s*([^;]+);",
+        "_HALO_WRITE_UP": r"upRow\s*=\s*([^;]+);",
+        "_HALO_WRITE_DOWN": r"downRow\s*=\s*([^;]+);",
+    }
+    for name, rx in _pat.items():
+        m = re.search(rx, hlsl_clean)
+        if not m:
+            fails.append(f"G5b: 找不到 {name} 的赋值 —— halo 覆盖校验无法执行（不得静默跳过）")
+        elif name == "_HALO_WRITE_LEFT":
+            _HALO_WRITE_LEFT = m.group(1).strip()
+        elif name == "_HALO_WRITE_RIGHT":
+            _HALO_WRITE_RIGHT = m.group(1).strip()
+        elif name == "_HALO_WRITE_UP":
+            _HALO_WRITE_UP = m.group(1).strip()
+        else:
+            _HALO_WRITE_DOWN = m.group(1).strip()
+
+    if all(v is not None for v in (_HALO_WRITE_LEFT, _HALO_WRITE_RIGHT,
+                                   _HALO_WRITE_UP, _HALO_WRITE_DOWN)):
+        _g5b_bad = []
+        for _r in range(1, maxr + 1):
+            try:
+                wh, rh, wv, rv = _halo_sets(_r, maxr, nthreads, tileh)
+            except ValueError as exc:
+                _g5b_bad.append(f"r={_r}: {exc}")
+                continue
+            # 只关心 halo 区（读集合里落在 [0, maxr-1] 的槽位必须都被写过）
+            need_h = {s for s in rh if s < maxr}
+            need_v = {s for s in rv if s < maxr}
+            miss_h = sorted(need_h - wh)
+            miss_v = sorted(need_v - wv)
+            if miss_h:
+                _g5b_bad.append(f"r={_r}: 水平 halo 槽位 {miss_h} 被读但从未写过（LDS 脏读）")
+            if miss_v:
+                _g5b_bad.append(f"r={_r}: 垂直 halo 行 {miss_v} 被读但从未写过（LDS 脏读）")
+        if _g5b_bad:
+            fails.append("G5b: halo 覆盖不完整 —— " + "; ".join(_g5b_bad[:6])
+                         + (" …" if len(_g5b_bad) > 6 else ""))
+        else:
+            ok.append(f"G5b: halo 覆盖完整（r=1..{maxr} 全部零空洞）")
+
 # ---------------------------------------------------------------------------
 # G6 DComp 四要素
 # ---------------------------------------------------------------------------
@@ -429,6 +540,219 @@ else:
             )
         if destroy >= 0 and drain >= 0 and syncpool >= 0 and drain < destroy and drain < syncpool:
             ok.append("G10: 排空早于 rb_engine_destroy 与 RbSyncCtxPoolDelete")
+
+# ---------------------------------------------------------------------------
+# [299] G11 fluid_wave_sim.hlsl 的数值契约
+#
+# 这个文件不进 G3 的变体检查：水波没有 HDR/色散变体，强行要求 #if 分支只会
+# 逼出一个空洞的 #if 1。它真正会「静默写错、肉眼看不出来」的地方是三处数值：
+#   a) 波动方程必须是 /2 而不是 /4。写 /4 就从波传播退化成热扩散 ——
+#      涟漪不往前走、原地变糊，而画面「有涟漪」所以看起来没坏。
+#   b) damping 必须与 CPU 退路一致（0.962）。不一致时「原生宿主 vs CPU 退路」
+#      观感会跳变，且没有报错可查。
+#   c) 梯度死区 SLOPE_CUTOFF 必须存在且为 0.018 —— 缺了它静止水面布满麻点。
+#   d) 边界必须是 Neumann（钳到边界）。写成越界即丢弃会让波撞边消失，
+#      观感是「涟漪走到窗口边缘就不见了」。
+# ---------------------------------------------------------------------------
+wave_clean = apca_clean
+
+if "CSWaveStep" not in wave_clean:
+    fails.append("G11: apca_reduce.hlsl 里找不到 CSWaveStep 入口 —— 水波仿真空转")
+else:
+    _w = re.search(r"void\s+CSWaveStep\s*\([^)]*\)\s*\{", wave_clean)
+    if not _w:
+        fails.append("G11: CSWaveStep 定义体截取失败（判据不得静默跳过）")
+    else:
+        _start = _w.end()
+        _depth = 1
+        _i = _start
+        while _i < len(wave_clean) and _depth > 0:
+            if wave_clean[_i] == "{":
+                _depth += 1
+            elif wave_clean[_i] == "}":
+                _depth -= 1
+            _i += 1
+        _body = wave_clean[_start:_i]
+
+        # a) 波动方程归一化因子：必须是 0.5（即 /2）
+        if not re.search(r"\)\s*\*\s*0?\.5\b|/\s*2\.0\b|\)\s*/\s*2\b", _body):
+            fails.append(
+                "G11: CSWaveStep 里找不到 *0.5 或 /2 的波动方程归一化因子 —— "
+                "写成 /4 会退化为热扩散（涟漪不传播，只原地变糊）"
+            )
+        elif re.search(r"\*\s*0?\.25\b|\)\s*/\s*4\b", _body):
+            fails.append("G11: CSWaveStep 里出现 *0.25 或 /4 —— 波动方程被写成热扩散方程")
+        else:
+            ok.append("G11: 波动方程归一化因子为 0.5（波传播，非热扩散）")
+
+        # b) 梯度死区
+        if not re.search(r"0?\.018\b", _body):
+            fails.append("G11: CSWaveStep 缺少 0.018 梯度死区 —— 静止水面会有数值麻点")
+        else:
+            ok.append("G11: 梯度死区 0.018 存在")
+
+        # c) 幅度钳位（缺了它会数值爆炸成 NaN，整块玻璃变黑）
+        if "gWaveMax" not in _body:
+            fails.append("G11: CSWaveStep 未对 gWaveMax 做钳位 —— 数值爆炸会让整块玻璃变黑")
+        else:
+            ok.append("G11: 幅度钳位 gWaveMax 存在")
+
+        # d) Neumann 边界：越界索引必须钳到 [0, size-1]。
+        #    写成 `if (x < 0 || x >= n) return;` 之类会让波撞边直接消失，
+        #    观感是「涟漪走到窗口边缘就凭空没了」，而这不会报任何错。
+        if not re.search(r"\bmax\s*\(\s*[px]\.x?\s*-\s*1\s*,\s*0\s*\)", _body) and \
+           not re.search(r"\bmax\s*\(\s*p\.x\s*-\s*1\s*,\s*0\s*\)", _body):
+            fails.append(
+                "G11: CSWaveStep 缺少 Neumann 边界钳位（max(p.x-1,0) 形态）—— "
+                "波撞窗口边缘会消失，涟漪走到边界就断"
+            )
+        elif not re.search(r"\bmin\s*\(\s*p\.x\s*\+\s*1\s*,\s*gGridSize\.x\s*-\s*1\s*\)", _body):
+            fails.append("G11: CSWaveStep 缺少右边界钳位 min(p.x+1, gGridSize.x-1)")
+        else:
+            ok.append("G11: Neumann 边界钳位（左右双向）齐备")
+
+# damping 与 CPU 退路的一致性：唯一真相源是 liquidWaveCore.ts 的 0.962
+_wave_ts = ROOT / "src/ui/web/src/lib/liquidWaveCore.ts"
+if not _wave_ts.exists():
+    fails.append("G11: 找不到 liquidWaveCore.ts —— damping 一致性无法核对（不得静默跳过）")
+else:
+    _ts = read(_wave_ts)
+    _dm = re.search(r"DAMPING\s*[:=]\s*([0-9.]+)", _ts) or re.search(r"damping\s*[:=]\s*([0-9.]+)", _ts)
+    if not _dm:
+        fails.append("G11: liquidWaveCore.ts 里找不到 damping 常量 —— 判据不得空跑")
+    else:
+        _dv = _dm.group(1)
+        if f"gDamping" not in wave_clean:
+            fails.append("G11: CSWaveStep 未使用 gDamping（damping 需由 CPU 侧注入统一值）")
+        else:
+            ok.append(f"G11: damping 由 cbuffer 注入，CPU 侧基准值 {_dv}")
+
+
+# ---------------------------------------------------------------------------
+# [299] G12 cbuffer 布局一致性 —— 最容易「静默写错」的一类
+#
+# d3d_renderer.cpp 里的 FrameCB / BlurCB / KawaseCB / ApcaCB / WaveCB 必须与
+# HLSL 的 cbuffer 逐字段对齐。写错的后果不是编译失败，而是：
+#   · 字段错位 4 字节 => 颜色偏 / 模糊中心偏移 / 极性永远不翻转；
+#   · 尺寸对不上 => D3D 会静默把越界部分当 0，或整块 cbuffer 不更新。
+# C++ 侧已经有 static_assert 钉住 sizeof，但那只证明「C++ 自己算对了」，
+# **不证明与 HLSL 一致**。这里把两边都算一遍再比对。
+#
+# 判据形态：从 HLSL 的 cbuffer 声明按 16 B 打包规则推出字节数，
+# 与 C++ 的 static_assert 期望值比对。任何一处不一致即 FAIL。
+# ---------------------------------------------------------------------------
+def hlsl_cbuffer_size(body: str) -> int | None:
+    """按 HLSL 的 cbuffer 打包规则算字节数：每个成员不跨 16 B 边界。"""
+    scal = {"float": 1, "int": 1, "uint": 1, "bool": 1, "dword": 1}
+    vec = {"float2": 2, "int2": 2, "uint2": 2, "float3": 3}
+    vec4 = {"float4", "int4", "uint4", "float3x3", "float4x4"}
+    off = 0
+    for m in re.finditer(r"^\s*(float4|int4|uint4|float2|int2|uint2|float3|float|int|uint)\s+"
+                         r"(\w+)\s*(?:\[(\d+)\])?\s*;", body, re.M):
+        t = m.group(1)
+        n = int(m.group(3)) if m.group(3) else 1
+        if t in scal:
+            cnt, align = scal[t] * n, 4
+        elif t in vec:
+            cnt, align = vec[t] * n, 4 if vec[t] < 4 else 16
+        elif t in vec4:
+            if t in ("float3x3", "float4x4"):
+                return None
+            cnt, align = 4 * n, 16
+        else:
+            return None
+        if align == 4:
+            # 标量/2-3 分量成员：不跨 16 B 边界（HLSL 规则）
+            if (off % 16) + cnt * 4 > 16:
+                off = ((off + 15) // 16 + 1) * 16
+        else:
+            off = ((off + 15) // 16) * 16
+        off += cnt * 4
+    return ((off + 15) // 16) * 16
+
+# C++ 侧期望值（与 static_assert 同步；改一处必须改两处，这里正是要抓的）
+_cpp_expect = {
+    "FrameCB": 64, "BlurCB": 32, "KawaseCB": 16, "ApcaCB": 32, "WaveCB": 32,
+}
+_cpp_src = strip_c_comments(renderer_cpp)
+
+# 从 C++ 实际读 static_assert 的期望值（而不是采信上面那张表 —— 表也可能过期）
+_cpp_asserted = {}
+for m in re.finditer(r'static_assert\s*\(\s*sizeof\s*\(\s*(\w+)\s*\)\s*==\s*(\d+)\s*,', _cpp_src):
+    _cpp_asserted[m.group(1)] = int(m.group(2))
+
+for name in _cpp_expect:
+    if name not in _cpp_asserted:
+        fails.append(f"G12: d3d_renderer.cpp 缺少 {name} 的 static_assert(sizeof) —— "
+                     f"cbuffer 尺寸无人看守，字段错位不会有任何报错")
+if len(_cpp_asserted) < len(_cpp_expect):
+    pass  # 已在上面逐条报
+else:
+    # 与 HLSL 比对
+    for hlsl_name, hlsl_txt in (("liquid_glass_core.hlsl", hlsl_clean),
+                                ("apca_reduce.hlsl", apca_clean)):
+        for m in re.finditer(r"cbuffer\s+(\w+)\s*:\s*register\s*\(\s*b\d\s*\)\s*\{([\s\S]*?)\}",
+                             hlsl_txt):
+            cbname = m.group(1)
+            sz = hlsl_cbuffer_size(m.group(2))
+            if sz is None:
+                continue
+            # HLSL 里同名的 C++ 结构体名映射
+            cpp_name = cbname
+            if cpp_name not in _cpp_asserted:
+                fails.append(f"G12: HLSL 有 cbuffer {cbname}（{hlsl_name}）但 C++ 侧无对应 "
+                             f"static_assert —— 这个缓冲区的布局完全没有看守")
+                continue
+            if _cpp_asserted[cpp_name] != sz:
+                fails.append(f"G12: cbuffer {cbname} 尺寸不一致 —— HLSL 算出 {sz} B，"
+                             f"C++ static_assert 钉的是 {_cpp_asserted[cpp_name]} B。"
+                             f"字段会整体错位，且不会有任何编译错误")
+    _g12_bad = [f for f in fails if f.startswith("G12")]
+    if not _g12_bad:
+        ok.append(f"G12: cbuffer 布局一致（{len(_cpp_asserted)} 个，HLSL 复算通过）")
+
+# ---------------------------------------------------------------------------
+# [299] G13 构建产物存在性 —— 「能编」不等于「编出来了」
+#
+# 295 的教训是文件落盘就算完成。这里钉的是**产物**：EXE 与全部 .cso。
+# 缺 .cso 的运行期表现是黑窗（D3DCompile 不在路径里），不会有任何错误码。
+# 判据只在该目标已经构建过时生效，未构建则给 [SKIP] 并明确说明 ——
+# 不能因为「还没编」就判 PASS（空集不得 PASS），也不能因为「还没编」就判 FAIL
+# （那会让全新 clone 的仓库第一次跑 gates 就红）。
+# ---------------------------------------------------------------------------
+_exe = ROOT / "src/ui/native-host/x64/Release/RAMBlockCache.Host.exe"
+_cso_dir = ROOT / "src/ui/native-host/x64/Release/cso"
+if not _exe.exists():
+    ok.append("G13: native-host 尚未构建（无 EXE）—— 产物校验跳过；"
+              "构建后请重跑本门禁")
+else:
+    _b = _exe.read_bytes()
+    if _b[:2] != b"MZ" or _b[0x80:0x84] not in (b"PE\x00\x00",):
+        # PE 签名位置由 e_lfanew 决定，不能写死 0x80
+        import struct as _st
+        _pe = _st.unpack_from("<I", _b, 0x3C)[0]
+        if _b[_pe:_pe + 4] != b"PE\x00\x00":
+            fails.append("G13: RAMBlockCache.Host.exe 不是有效 PE 文件")
+        else:
+            _mach = _st.unpack_from("<H", _b, _pe + 4)[0]
+            if _mach != 0x8664:
+                fails.append(f"G13: EXE machine=0x{_mach:04x}，期望 0x8664 (AMD64)")
+            else:
+                ok.append(f"G13: RAMBlockCache.Host.exe 有效 PE / AMD64 / {len(_b)} B")
+    if not _cso_dir.exists():
+        fails.append("G13: EXE 已构建但 cso/ 目录不存在 —— 运行期会黑窗")
+    else:
+        _csos = sorted(p.name for p in _cso_dir.glob("*.cso"))
+        # 必须覆盖 main.cpp 里 LoadShaders 会去加载的每一个名字
+        _need = [f"glass_h{h}_d{d}_c{c}.cso" for h in (0, 1) for d in (0, 1) for c in (0, 1)]
+        _need += ["kawase_down.cso", "kawase_up.cso", "blur_h.cso", "blur_v.cso",
+                  "apca.cso", "wave.cso"]
+        _missing = [n for n in _need if n not in _csos]
+        if _missing:
+            fails.append(f"G13: cso/ 缺 {len(_missing)} 个：{_missing[:6]} —— "
+                         f"LoadShaders 会返回 false，整窗降级为纯色（看起来像没生效）")
+        else:
+            ok.append(f"G13: {len(_csos)} 个 .cso 覆盖 LoadShaders 全部 {len(_need)} 个加载点")
 
 print("== Gate27: 液态玻璃原生宿主 ==")
 for line in ok:

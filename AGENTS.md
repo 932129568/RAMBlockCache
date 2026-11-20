@@ -29,7 +29,7 @@
 ### 1.2 落盘动作（四步，缺一不可）
 
 1. **快照归档**：`cp deliverables/HANDOVER-CURRENT.md deliverables/<N>-handover-<YYYY-MM-DD>.md`
-   - `<N>` = `deliverables/` 下最大编号 + 1（当前 295，下一个 296）。
+   - `<N>` = `deliverables/` 下最大编号 + 1（当前 300，下一个 301）。
      **本行由 Gate22 `check_docs_numbering.py` 机器校验**：新增交付物后必须同步更新本行与
      `HANDOVER-CURRENT.md` 的编号行，否则门禁红。
 2. **重写 HANDOVER-CURRENT.md**：按 §1.3 模板全量重写，不写"见上文"、不写"同上"、不留外部引用。
@@ -128,7 +128,7 @@ $pwsh = "C:\Program Files\PowerShell\7\pwsh.exe"
 | 审计/修复报告 | `deliverables/<N>-<slug>-<date>.md` | `<N>` 全局递增 |
 | 设计/规格 | `deliverables/design/` | 不参与编号 |
 
-`<N>` 当前最大 = **295**，下一个 **296**。
+`<N>` 当前最大 = **300**，下一个 **301**。
 
 > Gate22（`src/scripts/check_docs_numbering.py`）会校验本行、§1.2 的同类声明与
 > `HANDOVER-CURRENT.md` 的编号行都必须等于「实际最大 + 1」。2026-11-13 前这处

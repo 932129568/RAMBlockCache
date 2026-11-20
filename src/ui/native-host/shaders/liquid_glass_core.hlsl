@@ -281,7 +281,18 @@ void CSBlurLdsHorizontal(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) 
 
     // halo：每个线程只需负责自己半径内的那一格
     if (local < r) {
-        const int leftSlot  = local;                       // [0 .. r-1]
+        // [299 LDS-HALO] 左 halo 必须右对齐、紧贴主体起点 MAX_RADIUS。
+        //
+        // 原来是 `leftSlot = local`，只写 [0 .. r-1]。而卷积（见下方 k 循环）
+        // 在 local=0 时读槽位 MAX_RADIUS-k，k=1..r ⇒ 读 [4-r .. 3]。
+        //   r=4：写 [0..3]，读 [0..3]  → 碰巧重合，所以旧代码「看起来能用」
+        //   r=3：写 [0..2]，读 [1..3]  → 槽位 3 未初始化
+        //   r=2：写 [0..1]，读 [2..3]  → 槽位 2,3 全未初始化（CARD_GLASS 默认就是 2）
+        //   r=1：写 [0]，   读 [3]     → 槽位 1,2,3 全未初始化
+        // groupshared 未写入即读 = LDS 显存垃圾，在每个 256px 瓦片左边界形成
+        // 竖向噪点条纹。取值 (MAX_RADIUS-r)+local 严格映射 [4-r .. 3]，
+        // 与主体槽位 4 连续、零空洞、且永不越界（最大 4-1=3 < 4）。
+        const int leftSlot  = (MAX_RADIUS - r) + local;    // [4-r .. 3]
         const int rightSlot = BLUR_THREADS + MAX_RADIUS + local;
         const int leftX     = gRoiOrigin.x + baseX - r + local;
         const int rightX    = gRoiOrigin.x + baseX + BLUR_THREADS + local;
@@ -318,7 +329,12 @@ void CSBlurLdsVerticalTile(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID
         gBlurSrc[clamp(int2(x, baseY + ly), gRoiOrigin, maxC)];
 
     if (ly < r) {
-        const int upRow   = ly;                        // [0 .. r-1]
+        // [299 LDS-HALO] 同 CSBlurLdsHorizontal 的论证：上 halo 必须下对齐、
+        // 紧贴主体首行 mainRow = MAX_RADIUS。旧写 `upRow = ly` 只覆盖 [0..r-1]，
+        // 而 (mainRow - k) 在 k=1..r 时读 [4-r .. 3]。r<4 时 [r..3] 未初始化
+        // ⇒ 每个 16px 水平瓦片顶边出现横向花纹。取值 (MAX_RADIUS-r)+ly 严格
+        // 映射 [4-r .. 3]，与 mainRow 连续、零空洞、上界 3 < TILEV_ROWS。
+        const int upRow   = (MAX_RADIUS - r) + ly;          // [4-r .. 3]
         const int downRow = BLUR_TILE_H + MAX_RADIUS + ly;
         const int upY     = baseY - r + ly;
         const int downY   = baseY + BLUR_TILE_H + ly;

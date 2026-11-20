@@ -32,7 +32,7 @@ $ErrorActionPreference = 'Continue'
 # anchors; if this literal is not moved too, C1/C1b fail with a misleading
 # "image mismatch" even though live==dist==anchors and Authenticode is Valid.
 # C0 (below) fails closed on any future drift instead of blaming the image.
-$PIN  = '2dce9d720e5708ed3486df9dec6b0dce72d4d1fc9d6c35d5b66fab387a8aed05'
+$PIN  = '3c696e140f6ef8a045ed6bcc391298d16f17d57b0929d4282eda3759c08c6fd0'
 $CLS  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{71a27cdd-812a-11d0-bec7-08002be2092f}'
 $SVC  = 'HKLM:\SYSTEM\CurrentControlSet\Services\RAMBlockCache'
 $SM   = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
@@ -499,7 +499,35 @@ if ($null -eq $whyPrev -and $null -eq $skipPrev) {
     $zh   = '落盘成功且干净'
 } elseif (($whyPrev -eq $W_DIRTY) -and ($skipPrev -eq $S_DIRTY)) {
     $code = 'DIRTY'
-    $zh   = '刷完仍有脏页'
+    # NOTE: this comment must stay BELOW the `$code =` line. Gate24's ROW regex
+    # is `\{\s*\$code\s*=\s*'(\w+)'` and `\s*` does not match a comment, so a
+    # comment between the brace and the assignment silently drops this row from
+    # the gate's view and G2 reports a missing (0x01, 0x00000007) row.
+    #
+    # WHY_DIRTY(1) encodes THREE distinct states, and this reading cannot tell
+    # them apart. The old text said only "刷完仍有脏页" (flushed but dirty pages
+    # remained), which is a real claim that can be FALSE. Traced to the single
+    # write point rbmsg.c:725-743:
+    #     cleanNow = (g_Rb.Engine != NULL) && (rb_engine_has_dirty(...) == 0)
+    #   (a) Engine != NULL and total_dirty > 0  -> dirty pages really did remain
+    #   (b) g_Rb.Engine == NULL                 -> NO engine at all. Conjunctive
+    #       first term false => WHY_DIRTY, yet rb_engine_has_dirty() answers 0
+    #       (cache_stats.c:49-50 `eng ? ... : 0`), so there may be zero dirty
+    #       pages anywhere. Saying "dirty pages remained" would send an operator
+    #       looking for data loss when the real meaning is "the driver never
+    #       attached this volume".
+    #   (c) the flush itself was SKIPPED -> dirty pages remain because nothing
+    #       was flushed, not because flushing failed. RbFlushAllDirty ->
+    #       rb_engine_flush(force=1) -> flush_stream -> flush_acquire() returns
+    #       FALSE after ~2s (cache_flush.c:396-398, RB_FLUSH_ACQUIRE_SPINS at
+    #       :367) and the stream is skipped for this round. The driver's own
+    #       comment on this very return path says so: rbmsg.c:738-740 "flush
+    #       可能因 flush_acquire 2s 超时被跳过". "刷完" (after flushing) is wrong
+    #       for this arm too -- the rounds were attempted, not completed.
+    # So this annotation must not pick a side. The verdict VALUE stays DIRTY:
+    # the pair (1,7) is the unique C mapping (rbmsg.c:83) and all three states
+    # are legitimately DEGRADED. Fixing the wording, not the judgement.
+    $zh   = '持久化以 why=1 退出（三种状态不可区分：① 刷完确有脏页残留 ② 根本没有引擎、一个脏页都没有 ③ flush 因 2s 争用超时被整轮跳过、并未真正刷过；见 rbmsg.c:725-743）'
 } elseif (($whyPrev -eq $W_FROZEN) -and ($skipPrev -eq $S_FROZEN)) {
     $code = 'FROZEN'
     $zh   = '数据路径冻结，持久化入口即返回'

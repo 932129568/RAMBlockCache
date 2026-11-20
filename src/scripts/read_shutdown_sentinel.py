@@ -26,9 +26,20 @@ Record layout (little-endian, 6 x ULONG = 24 B, no padding):
 Stage-B RECEIPT layout -- same file, same 24-byte stride, different magic:
   [0] Magic 0x52424434 ('RBD4')
   [1] seq  -- the SAME DiagShutdownSeq value the matching 'RBD3' carries
-  [2] why  -- RbShutdownPersist() return code; 0xFF means "this branch never
-              wrote ShutdownPersistWhy", i.e. one of the three fallback exits
-  [3] skip -- RB_SKIP_* reason code (0 == RB_SKIP_NONE)
+  [2] why  -- RbShutdownPersist() return code, or 0xFF. 0xFF IS A MERGED CODE,
+              NOT ONE MEANING. It appears whenever ShutdownPersistWhy was not
+              written this branch, and rbmsg.c has TWO such situations:
+                (i)  the dispatch never reached persistence at all; and
+                (ii) the stop-tick FAILED, the fallback branch ran instead, and
+                     that branch writes SkipReason only -- rbmsg.c:264 declares
+                     whyOut=0xFF, :367/:372/:377 set skipOut, and :397/:398
+                     persist BOTH fields on either exit.
+              Only [3] can tell these apart: for (ii) skip is one of
+              STOPTICK_FAIL(8) / CFG_CLEAN(6) / FROZEN(2); for (i) it stays
+              SKIP_NONE(0xFFFFFFFF).
+  [3] skip -- RB_SKIP_* reason code. RB_SKIP_NONE is 0xFFFFFFFF, NOT 0
+              (rb_common.h:437) -- an earlier version of this comment said 0,
+              which would have made "none" and "unreadable" look equal.
   [4] boot epoch, low 32 bits of g_RbBootEpoch
   [5] stop_tick_status -- NTSTATUS of RbFeatStopTick()
 
@@ -82,7 +93,15 @@ the C switch in rbmsg.c by check_sup01_tables.py (Gate24):
   (0x05, 0x00000005)      ALREADY                 DEGRADED      rc 4
   (0x06, 0x00000006)      CFG_CLEAN               DEGRADED      rc 4
   (0xFF, 0xFFFFFFFF)      NO_EVIDENCE             NOT_REACHED   rc 3
+                        -- dispatched but never persisted, OR took the
+                           IRQL>PASSIVE early return, OR power cut. Skip stayed
+                           at its reset value so nothing distinguishes them.
   (0xFF, 8 / 6 / 2)       FALLBACK_*              DEGRADED      rc 4
+                        -- REACHABLE per rbmsg.c:367/:372/:377 but NEVER
+                           OBSERVED on this machine. whyOut is only assigned in
+                           the stop-tick-SUCCESS branch (:314), so the failing
+                           branch persists (0xFF, <named skip>) from :397/:398.
+                           Only the skip code separates these three.
   (0xFF, anything else)   FALLBACK_OTHER          DEGRADED      rc 4
   both Prev keys absent   KEY_ABSENT              DEGRADED      rc 4
   exactly one absent      UNKNOWN                 DEGRADED      rc 4
@@ -212,8 +231,28 @@ CODE_TEXT = {
                 "attached this boot) -- not a data fault, only 'not declared'. "
                 "After A4-d this can also come from the stale-latch sticky "
                 "read on a hiberfile resume",
-    "DIRTY": "flushed but dirty pages remained; clean was deliberately "
-             "not written",
+    # WHY_DIRTY(1) does NOT mean "dirty pages remained". The single write point
+    # rbmsg.c:725-743 is
+    #     cleanNow = (g_Rb.Engine != NULL) && (rb_engine_has_dirty(...) == 0)
+    # so why=1 is emitted for THREE distinct states this pair cannot separate:
+    #   (a) an engine existed and total_dirty was > 0  -> pages really remained;
+    #   (b) g_Rb.Engine == NULL -> no engine at all. The conjunct's first term
+    #       fails, so why=1 is returned even though rb_engine_has_dirty() reports
+    #       0 (cache_stats.c:49-50 `eng ? ... : 0`). There may be no dirty page
+    #       anywhere; the operator must be told "no engine attached", not "data
+    #       at risk";
+    #   (c) the flush was SKIPPED rather than failing: RbFlushAllDirty calls
+    #       rb_engine_flush(force=1), flush_stream then calls flush_acquire(),
+    #       which gives up after ~2s of contention (cache_flush.c:396-398,
+    #       RB_FLUSH_ACQUIRE_SPINS at :367) and skips that stream this round.
+    #       rbmsg.c:738-740 documents exactly this on the return path.
+    # The text therefore branches instead of asserting one meaning. The CODE and
+    # its DEGRADED rc are unchanged -- only the sentence was wrong.
+    "DIRTY": "persist exited with why=1; three states are indistinguishable here: "
+             "(a) dirty pages really remained after a completed flush, "
+             "(b) no engine was attached at all (so possibly zero dirty pages), "
+             "(c) the flush was skipped after ~2s of acquirer contention rather "
+             "than failing. See rbmsg.c:725-743 and cache_flush.c:396-398",
     "FROZEN": "data path frozen (rebuild/unload window); persist returned "
               "immediately",
     "BUSY": "another thread was already persisting (CAS lost); not redone",
@@ -230,19 +269,31 @@ CODE_TEXT = {
                   "ran RbBootFailLoad",
     "UNKNOWN": "pair incomplete or not in the table; both raw values are "
                "printed for manual reading",
-    "FALLBACK_STOPTICK_FAIL": "stop-tick failed, so Why was never written; "
-                              "only the fallback flush ran",
-    "FALLBACK_CFG_CLEAN": "stop-tick failed AND mode=2, so even the fallback "
-                          "flush was skipped (configuration, not a failure). "
-                          "Can also mean the Why write itself failed "
-                          "(RbRegSetDW is VOID, rbdriver.c:79-87) while the "
-                          "Skip write succeeded",
-    "FALLBACK_FROZEN": "stop-tick failed and the data path was frozen; the "
-                       "fallback flush was skipped (engine may be torn down). "
-                       "Can also mean the Why write itself failed while the "
-                       "Skip write succeeded",
-    "FALLBACK_OTHER": "fallback branch, but the skip code is outside the "
-                      "expected set -- suspicious",
+    # The four FALLBACK_* texts describe states that the CODE can reach but that
+    # have NEVER been observed on this machine (all four real RBD4 receipts so
+    # far were (0,0xFFFFFFFF) and (1,7)). They are therefore written as
+    # "reachable per <line>", never as "this is what happened". A future reader
+    # must not mistake a fallback code for evidence of a fallback event.
+    "FALLBACK_STOPTICK_FAIL": "REACHABLE per rbmsg.c:367 (reachable, not yet "
+                              "observed): stop-tick failed, so Why was never "
+                              "written (whyOut stays 0xFF); only the fallback "
+                              "flush ran. The shutdown receipt was still "
+                              "written because :393 is after the if/else",
+    "FALLBACK_CFG_CLEAN": "REACHABLE per rbmsg.c:372 (reachable, not yet "
+                          "observed): stop-tick failed AND ShutdownPersistMode "
+                          "is 2 (IDX_ONLY), so even the fallback flush was "
+                          "skipped -- configuration, not a failure. Can also "
+                          "mean the Why write itself failed (RbRegSetDW is "
+                          "VOID, rbdriver.c:79-87) while the Skip write landed",
+    "FALLBACK_FROZEN": "REACHABLE per rbmsg.c:377 (reachable, not yet "
+                       "observed): stop-tick failed and the data path was "
+                       "frozen, so the fallback flush was skipped (the engine "
+                       "may be torn down). Can also mean the Why write itself "
+                       "failed while the Skip write landed",
+    "FALLBACK_OTHER": "why==0xFF with a skip value outside {8,6,2}: not "
+                      "reachable through rbmsg.c's three named fallback exits, "
+                      "so either a newer write path exists or the registry was "
+                      "edited -- suspicious, read both raw values",
 }
 
 
@@ -252,10 +303,22 @@ def classify_pair(why, skip):
     if hit is not None:
         return hit
     if why == WHY_NONE:
-        # Why==0xFF means the success path never wrote it, i.e. one of the
-        # three fallback exits ran (rbmsg.c:366/371/376 writes Skip only).
-        # These must be matched BEFORE anything else, or (0xFF, 6) would be
-        # read as CFG_CLEAN.
+        # WHY==0xFF is a MERGED code covering at least two situations, and [3]
+        # (skip) is the ONLY field that separates them. Traced in rbmsg.c:
+        #   :264 declares whyOut=0xFF and it is assigned in exactly one place,
+        #        :314, inside the `if (NT_SUCCESS(qst))` branch. The else branch
+        #        (:330 onwards, stop-tick FAILED) never assigns whyOut.
+        #   :367/:372/:377 set skipOut=STOPTICK_FAIL(8)/CFG_CLEAN(6)/FROZEN(2)
+        #        inside that else branch.
+        #   :397/:398 write rec2[2]=whyOut and rec2[3]=skipOut, and the RBD4
+        #        block at :393 sits AFTER the if/else -- so BOTH exits persist a
+        #        receipt, which is why (0xFF, 8) can reach the reader at all.
+        # So: (0xFF, SKIP_NONE) = the dispatch never reached persistence OR took
+        # the IRQL>PASSIVE early return (:258-261, before the whyOut declaration);
+        #     (0xFF, 8/6/2)     = stop-tick failed, receipt written anyway.
+        # These three must be matched BEFORE the table, or (0xFF, 6) would be
+        # read as CFG_CLEAN -- a pair whose why is 6, i.e. a completely different
+        # event. Do not ever collapse this back to "0xFF means not reached".
         if skip == SKIP_STOPTICK:
             return "FALLBACK_STOPTICK_FAIL"
         if skip == SKIP_CFG_CLEAN:

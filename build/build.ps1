@@ -8,6 +8,7 @@
 #   setup      ramboostsetup.exe to temp (never overwrites the signed one)
 #   ui         dotnet solution build/RAMBlockCache.sln
 #   web        npm run build in src/ui/web
+#   native-host RAMBlockCache.Host.exe (D3D11+DComp glass host, shaders -> .cso)
 #   gates      Gate1..Gate22 + models (local, strict signature)
 #   all        driver + core + ctl + setup + ui + web
 #   clean      remove intermediate build outputs (never dist/, never signed exes)
@@ -20,7 +21,7 @@
 # ASCII only (PS 5.1 GBK console lesson). Requires PowerShell 5.1+.
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'driver', 'core', 'core-asan', 'ctl', 'setup', 'ui', 'web', 'gates', 'clean')]
+    [ValidateSet('all', 'driver', 'core', 'core-asan', 'ctl', 'setup', 'ui', 'web', 'native-host', 'gates', 'clean')]
     [string]$Target = 'all',
     [switch]$NoRun,
     [string]$OutFile = ''
@@ -124,6 +125,20 @@ function Build-Driver {
         $sys = Join-Path $outRel $t.output
         if (-not (Test-Path -LiteralPath $sys)) { Fail "link produced no $($t.output)" }
         Write-Host "  BUILD OK"
+        # [Gate28 2026-11-19] Post-link stack frame budget. This is where the
+        # .sys definitely exists, unlike CI (no WDK, no image). The two 0x7F
+        # bugchecks came from a 1480 B union frame in RbDispatchDeviceControl
+        # that /O2 created by inlining every RbMsg* handler; the failing path
+        # (call RbForward) needed no locals at all. Nothing else stops that
+        # from coming back silently, so fail the BUILD, not just gates.
+        $frameGate = Join-Path $RepoRoot 'src/scripts/check_stack_frame_budget.py'
+        if (-not (Test-Path -LiteralPath $frameGate)) { Fail "frame gate missing: $frameGate" }
+        $rc = Invoke-Native 'python' @($frameGate, '--sys', $sys) (Join-Path $outRel 'frame.log')
+        if ($rc -ne 0) {
+            Get-Content -LiteralPath (Join-Path $outRel 'frame.log') -ErrorAction SilentlyContinue | Select-Object -Last 20
+            Fail "stack frame budget violated -- see docblock in check_stack_frame_budget.py"
+        }
+        Write-Host "  [ok] stack frame budget (dispatch <= 230 B, no [1400,1600] frame)"
         $h = Write-Sha256 $sys
         Write-Host "  NOTE: UNSIGNED. Sign before deploy; then re-sync the anchors:"
         foreach ($a in $t.deployAnchors) { Write-Host "        $a" }
@@ -429,7 +444,24 @@ function Invoke-Gates {
             # window messages, DWMSBT_NONE, RbL2Periodic must not seal .idx, and
             # RbUnload must drain PersistInFlight before engine destroy (259 F10).
             # 10 mutations, all KILL, each verified against its OWN failure text.
-            @('src/scripts/check_liquid_glass_dcomp_gate.py', @())
+            @('src/scripts/check_liquid_glass_dcomp_gate.py', @()),
+            # [Gate28 2026-11-19] Kernel stack frame budget -- the 0x7F/Arg1=8 fence.
+            # Two bugchecks on the same Arg4 low bits (f6a6): RbDispatchDeviceControl
+            # allocated 1480 B at entry because /O2 inlined 14 RbMsg* handlers and
+            # merged their locals into one 1424 B union frame (1304 B of it was a
+            # single RB_STATS local inside RbMsgGetStats), while the failing path was
+            # `call RbForward` -- a passthrough that needs no locals at all. Short
+            # by exactly 32 B. Fixed with __declspec(noinline) + direct fill, but
+            # until now NOTHING stopped a refactor from inlining it all back and
+            # silently restoring a 1400+ frame with every gate green.
+            # S1 entry frame <= 230 B; S2 no frame in [1400,1600]; S3 parser
+            # self-check must be 100% on ntoskrnl; S4 signature string must resolve
+            # uniquely (an empty match set must never pass). 7 mutations, all KILL
+            # (S1/S2/S4, S5 same-source, S5 cross-source, S5 self-comparison in both
+            #  require and skip modes -- the last two exist because disabling the
+            #  self-comparison guard must turn --self-test red, or that branch is
+            #  untested code pretending to be a check).
+            @('src/scripts/check_stack_frame_budget.py', @())
         )
         foreach ($g in $py) {
             if (-not (Test-Path -LiteralPath $g[0])) { Fail "gate script missing: $($g[0])" }
@@ -474,6 +506,123 @@ function Invoke-Clean {
     Write-Host '  NOTE: dist/, signed .sys, CLI exes and node_modules are preserved.'
 }
 
+# --------------------------------------------------------------------------
+# native-host: RAMBlockCache.Host.exe (D3D11 + DirectComposition glass host)
+# --------------------------------------------------------------------------
+# Two hard facts this function exists to encode, both measured on this host:
+#   1. wrl/client.h ships under the Windows SDK's winrt/ folder, NOT under the
+#      MSVC include dir. WebView2.h ships in the WebView2 NuGet package. Without
+#      both, glass_window.cpp fails at its very first include.
+#   2. The SDK um/ libs cannot resolve WebView2LoaderStatic's EventRegister /
+#      RegOpenKeyExW / OpenProcessToken imports. advapi32 + psapi must be linked
+#      explicitly, otherwise LNK2019 x12.
+# Shaders are compiled HERE, not at runtime: loading a .cso that was never built
+# is a silent black window, and D3DCompile at first frame costs 200ms+.
+function Build-NativeHost {
+    Step 'native-host: RAMBlockCache.Host.exe'
+    # A hyphenated key cannot be reached with dots ($x.native-host parses as
+    # subtraction) NOR with a string index on a PSCustomObject in PS7 (that form
+    # only ever worked on PS5.1). PSObject.Properties is the one portable route.
+    $t = $Manifest.targets.PSObject.Properties['native-host'].Value
+    $workRel = ($t.workDir -replace '/', '\')
+    $wd = Join-Path $RepoRoot $workRel
+    $outRel = ($t.outDir -replace '/', '\')
+    $od = Join-Path $RepoRoot $outRel
+    New-Item -ItemType Directory -Force -Path $od | Out-Null
+
+    Set-ToolchainEnv 'user'
+    $sdkInc = Join-Path $WinSdk "Include\$SdkVer"
+    $winrtInc = Join-Path $sdkInc 'winrt'
+    Assert-Path $winrtInc 'Windows SDK winrt include (wrl/)'
+    # wrl/client.h must be reachable; an empty dir would let the build "succeed"
+    # on a machine that merely has a differently-broken SDK.
+    Assert-Path (Join-Path $winrtInc 'wrl\client.h') 'wrl/client.h'
+
+    $p = $t.products[0]
+    foreach ($s in $p.sources) {
+        Assert-Path (Join-Path $wd ($s -replace '/', '\')) "native-host source $s"
+    }
+
+    Push-Location $wd
+    try {
+        $inc = @()
+        foreach ($d in $t.compile.includes) { $inc += '/I' + (Join-Path $RepoRoot ($d -replace '/', '\')) }
+        $inc += '/I' + $winrtInc
+        $wds = @()
+        foreach ($w in $t.compile.disabledWarnings) { $wds += "/wd$w" }
+        $common = @($t.compile.flags) + @($t.compile.standard) + $wds + $inc
+
+        # ---- shaders ----
+        $fxc = Join-Path $WinSdk "bin\$SdkVer\x64\fxc.exe"
+        Assert-Path $fxc 'fxc.exe'
+        $csoDir = Join-Path $od 'cso'
+        New-Item -ItemType Directory -Force -Path $csoDir | Out-Null
+        $shaderRoot = Join-Path $RepoRoot ($t.shaderDir -replace '/', '\')
+        $shaderIdx = 0
+        foreach ($sh in $p.shaders) {
+            $entry = $sh[0]; $csoName = $sh[1]; $defs = @($sh[2])
+            $shaderIdx++
+            # every PSLiquidGlass variant comes from liquid_glass_core.hlsl;
+            # CS* from apca_reduce.hlsl. Resolve by entry name, not by guess.
+            $src = if ($entry -like 'PSLiquidGlass*') { 'liquid_glass_core.hlsl' }
+                   elseif ($entry -like 'PSKawase*') { 'liquid_glass_core.hlsl' }
+                   elseif ($entry -like 'CSBlur*') { 'liquid_glass_core.hlsl' }
+                   else { 'apca_reduce.hlsl' }
+            $profile = if ($entry -like 'PS*') { 'ps_5_0' } else { 'cs_5_0' }
+            $shSrc = Join-Path $shaderRoot $src
+            Assert-Path $shSrc "shader source $src"
+            $shLog = Join-Path $env:TEMP ("rbc-fxc-" + $shaderIdx + ".log")
+            $fxcArgs = @('/T', $profile, '/E', $entry, '/O3', '/Zpr') + $defs +
+                       @(("/Fo" + (Join-Path $csoDir $csoName)), $shSrc)
+            $rc = Invoke-Native $fxc $fxcArgs $shLog
+            if ($rc -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $csoDir $csoName))) {
+                Get-Content -LiteralPath $shLog -ErrorAction SilentlyContinue | Select-Object -First 8
+                Fail "fxc failed for entry '$entry' -> $csoName (a missing .cso is a silent black window at runtime)"
+            }
+        }
+        Write-Host ("  shaders: {0} .cso -> {1}" -f $p.shaders.Count, $csoDir)
+
+        # ---- compile + link ----
+        $objs = @()
+        foreach ($s in $p.sources) {
+            $stem = Get-Stem $s
+            $obj = Join-Path $od "$stem.obj"
+            $log = Join-Path $env:TEMP ("rbc-nh-" + $stem + ".log")
+            $rc = Invoke-Native (Join-Path $Msvc 'bin\Hostx64\x64\cl.exe') `
+                  ($common + @(("/Fo" + $obj), ($s -replace '/', '\'))) $log
+            if ($rc -ne 0) {
+                Write-Host "  [X] $s (exit $rc)" -ForegroundColor Red
+                Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Select-Object -First 12
+                Fail "native-host compile failed: $s"
+            }
+            if (-not (Test-Path -LiteralPath $obj)) { Fail "compiler produced no object for $s" }
+            $objs += $obj
+        }
+
+        $exe = Join-Path $od $p.output
+        $libs = @()
+        foreach ($l in $p.libs) { $libs += $l }
+        $linkLog = Join-Path $env:TEMP 'rbc-nh-link.log'
+        $linkArgs = @(("/OUT:" + $exe), ("/SUBSYSTEM:" + $p.subsystem),
+                      ("/ENTRY:" + $p.entry), '/MACHINE:X64', '/OPT:REF', '/OPT:ICF') +
+                    $objs + $libs
+        if (-not (Test-Path -LiteralPath (Join-Path $od 'WebView2LoaderStatic.lib'))) {
+            # WebView2 SDK's lib dir is not on LIB for the user toolchain env
+            $env:LIB = "$(Join-Path $RepoRoot '.nuget\packages\microsoft.web.webview2\1.0.4314.35\build\native\x64');$env:LIB"
+        }
+        $rc = Invoke-Native (Join-Path $Msvc 'bin\Hostx64\x64\link.exe') $linkArgs $linkLog
+        if ($rc -ne 0 -or -not (Test-Path -LiteralPath $exe)) {
+            Get-Content -LiteralPath $linkLog -ErrorAction SilentlyContinue | Select-Object -First 15
+            Fail 'native-host link failed'
+        }
+        foreach ($o in $objs) { Remove-Item -LiteralPath $o -Force -ErrorAction SilentlyContinue }
+        Write-Sha256 $exe | Out-Null
+        Write-Host "  OUT=$exe"
+        Write-Host '  NATIVE-HOST BUILD OK'
+    }
+    finally { Pop-Location }
+}
+
 switch ($Target) {
     'driver'    { Build-Driver | Out-Null }
     'core'      { Build-Core 'both' }
@@ -482,6 +631,7 @@ switch ($Target) {
     'setup'     { Build-Setup }
     'ui'        { Build-Ui }
     'web'       { Build-Web }
+    'native-host' { Build-NativeHost }
     'gates'     { Invoke-Gates }
     'clean'     { Invoke-Clean }
     'all' {
@@ -490,6 +640,7 @@ switch ($Target) {
         Build-Ctl
         Build-Ui
         Build-Web
+        Build-NativeHost
         Build-Setup
     }
 }

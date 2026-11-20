@@ -59,6 +59,21 @@ import {
 export const DEFAULT_SELECTOR = '.rbc-section, .rbc-card';
 
 /**
+ * [299] 原生 D3D11+DComp 宿主是否已开闸。
+ *
+ * 唯一的判定依据是 useNativeGlassSync 在收到 rbc-dcomp-caps 后给 <html> 加的
+ * 那个类 —— 不另设全局标志位，避免出现「两份状态不同步」。
+ *
+ * 为什么要退让：原生宿主在显存里做 GPU Ping-Pong 水波并把它叠加到玻璃法线上，
+ * 产生的是真正的折射位移；本 hook 的 CPU 版只能把白色光斑 putImageData 盖在
+ * 卡片上。两者同时开着 = 同一处出现两层波纹，一层在弯光、一层在贴白斑，
+ * 观感是「波纹重影」，而且白烧一份 CPU + 每帧一次跨 PCIe 位图上传。
+ */
+const isNativeDcompHost = (): boolean =>
+  typeof document !== 'undefined' &&
+  document.documentElement.classList.contains('rbc-host-dcomp');
+
+/**
  * 空闲休眠窗口。两个条件必须同时成立才强杀：空闲超时 **且** 画面已无可见像素。
  *
  * [v23] 旧实现只有 `now - lastActive > 1200` 一个条件，于是「画面还在、却被判定
@@ -396,6 +411,28 @@ export function useLiquidWave(options: UseLiquidWaveOptions = {}): void {
         return;
       }
 
+      // [299] 原生宿主开闸 => 全面退让：不步进、不上传、连 rAF 一起停。
+      // 放在 document.hidden 之后、一切计算之前：省掉的不只是 putImageData，
+      // 还有 stepWave 的物理演进（这才是 CPU 成本的大头）。
+      // rafId 置 null 而不是继续排队 —— 由 pointermove 里的 ensureLoop 重新唤醒，
+      // 而 pointermove 本身也已提前 return，所以不会出现「退了又醒」的抖动。
+      if (isNativeDcompHost()) {
+        rafId = null;
+        for (const surf of Array.from(surfacesByHost.values())) {
+          if (!surf.sleeping) sleepSurface(surf);
+        }
+        window.__RBC_WAVE_PERF__ = {
+          awakeCount: 0,
+          visibleCount: 0,
+          lastTickMs: 0,
+          skippedUploads,
+          hop2Disabled,
+          maxSkippedFrames: globalMaxSkipped,
+          borderCollisions,
+        };
+        return;
+      }
+
       const t0 = performance.now();
       frameCounter += 1;
       const awake: Surface[] = [];
@@ -550,6 +587,10 @@ export function useLiquidWave(options: UseLiquidWaveOptions = {}): void {
 
     const attachSurface = (host: HTMLElement, slotIndex: number): void => {
       if (surfacesByHost.has(host)) return;
+      // [299] 原生宿主下不挂 canvas 本身，而不是挂上去再隐藏 ——
+      // 每块玻璃多一个绝对定位的 canvas 就是多一个合成层，哪怕 opacity:0
+      // 也仍然占着显存中的图层，与「GPU 预算」这条设计原则正面冲突。
+      if (isNativeDcompHost()) return;
       if (typeof host.getBoundingClientRect !== 'function') return;
 
       const layer: SurfaceLayer = host.classList.contains('rbc-card') ? 'card' : 'section';
@@ -627,6 +668,9 @@ export function useLiquidWave(options: UseLiquidWaveOptions = {}): void {
       ro?.observe(host);
 
       const onPointerMove = (ev: PointerEvent): void => {
+        // [299] 原生宿主下不进注波通道：注入进去也不会有人 stepWave（tick 已退让），
+        // 只会让 field 里堆一批永不演进的脏高度值。
+        if (isNativeDcompHost()) return;
         const meta = getSharedEventMeta(ev);
         const now = meta.now;
         const rect = getSurfaceBox(surf, now);
@@ -698,6 +742,7 @@ export function useLiquidWave(options: UseLiquidWaveOptions = {}): void {
       };
 
       const onPointerDown = (ev: PointerEvent): void => {
+        if (isNativeDcompHost()) return;
         const meta = getSharedEventMeta(ev);
         const now = meta.now;
         const rect = getSurfaceBox(surf, now);
@@ -723,6 +768,7 @@ export function useLiquidWave(options: UseLiquidWaveOptions = {}): void {
       // 「卡片边缘凭空爆开一个涟漪」，而不是「指针从哪儿进来、水就从哪儿凹下去」。
       // 弯月面湿润感改由「入场幅度略低于移动幅度」表达，位置必须诚实。
       const onPointerEnter = (ev: PointerEvent): void => {
+        if (isNativeDcompHost()) return;
         if (layer !== 'card') return;
         const meta = getSharedEventMeta(ev);
         const now = meta.now;
@@ -748,6 +794,7 @@ export function useLiquidWave(options: UseLiquidWaveOptions = {}): void {
 
       // 跨界离场：沿离场速度矢量把动量甩给父容器与邻近卡片。
       const onPointerLeave = (ev: PointerEvent): void => {
+        if (isNativeDcompHost()) return;
         const meta = getSharedEventMeta(ev);
         const now = meta.now;
         const rect = getSurfaceBox(surf, now);
@@ -855,6 +902,62 @@ export function useLiquidWave(options: UseLiquidWaveOptions = {}): void {
       }
     };
 
+    /**
+     * [299] 原生宿主开闸时把已挂载的 CPU 波全部拆掉。
+     *
+     * 这个函数存在的理由：.rbc-host-dcomp 是**异步**加的（等宿主回 rbc-dcomp-caps）。
+     * 如果只在 effect 入口判一次，那么「页面先起来、宿主稍后才握手」这条真实时序
+     * 下，上面所有 isNativeDcompHost() 守卫都会读到 false，退让一次都不会发生 ——
+     * 这恰好是「判据在消费点上失效」的同族缺陷：判断写对了，但判据被跳过了。
+     * 所以额外监听 <html> 的 class 变化，命中就立刻清扫。
+     */
+    let dcompObserver: MutationObserver | null = null;
+    /**
+     * [299] 宿主能力位变化时的收尾/恢复。
+     *
+     * 两个方向都要管，缺一不可：
+     *   开闸 → 拆掉所有 CPU 波（否则同一处两层波纹 + 白烧 CPU/PCIe）；
+     *   关闸 → 重新 scan 把 CPU 波装回去。只拆不装的话，宿主降级
+     *   （DComp 初始化失败退回 WPF 壳 / 用户关掉硬件加速）之后整个页面
+     *   就永久没有指针水波了，而且不会有任何报错 —— 观感上就是
+     *   「玻璃变哑了」。第一版只写了拆，被 R3 抓出来（退让不是单向自毁）。
+     */
+    const syncCapability = (): void => {
+      if (isNativeDcompHost()) {
+        if (rafId !== null) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+        for (const surf of Array.from(surfacesByHost.values())) surf.detach();
+        surfacesById.clear();
+        // 把遥测归零：否则上一次 tick 留下的 awakeCount > 0 会被读成
+        // 「还在跑」，而实际上一条 rAF 都不在了 —— 又一处假读数。
+        window.__RBC_WAVE_PERF__ = {
+          awakeCount: 0,
+          visibleCount: 0,
+          lastTickMs: 0,
+          skippedUploads,
+          hop2Disabled,
+          maxSkippedFrames: globalMaxSkipped,
+          borderCollisions,
+        };
+      } else {
+        // 关闸：重扫一次。attachSurface 自己的 isNativeDcompHost() 守卫此时
+        // 读到 false，会把 canvas 正常挂回去；scan 内部还会重建 graph。
+        scan();
+      }
+    };
+    if (typeof MutationObserver !== 'undefined') {
+      dcompObserver = new MutationObserver(syncCapability);
+      dcompObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class'],
+      });
+      // 挂上观察器后立刻判一次：可能握手已经完成（effect 晚于 caps 到达）。
+      // 只判一次不做 scan —— 此刻 scan() 已经在下面走过一遍了。
+      if (isNativeDcompHost()) syncCapability();
+    }
+
     const onVisibilityChange = (): void => {
       if (document.hidden && rafId !== null) {
         cancelAnimationFrame(rafId);
@@ -867,6 +970,7 @@ export function useLiquidWave(options: UseLiquidWaveOptions = {}): void {
 
     return () => {
       if (rafId !== null) cancelAnimationFrame(rafId);
+      dcompObserver?.disconnect();
       io?.disconnect();
       ro?.disconnect();
       observer.disconnect();

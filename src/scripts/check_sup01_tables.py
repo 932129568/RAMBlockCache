@@ -58,6 +58,36 @@ the repo rule "空匹配集不得判 PASS" applies here as everywhere else)
       FALLBACK_OTHER. These are nested ifs, not elseif rows, so ROW cannot see
       them -- without G6 the three fallback codes would have no pinned meaning
       and flipping `-ne` to `-eq` would silently reroute every fallback row.
+  G7  the DRIVER-side shape that makes (0xFF, skip) separable at all.
+      `skipOut` must declare exactly once (`ULONG skipOut = RB_SKIP_NONE;`)
+      before `if (NT_SUCCESS(qst))`, be assigned exactly ONCE inside that if's
+      then-block -- and there as `RbPersistSkipReasonOf(why)`, the why image --
+      and exactly THREE times inside its else-block, one per arm of the
+      `if (flushOk && !frozen) / else if (!flushOk) / else` chain, each arm
+      writing its own literal RB_SKIP_* in the order STOPTICK_FAIL, CFG_CLEAN,
+      FROZEN. `whyOut` must likewise declare once (`= 0xFFu`) and be assigned
+      only in the then-block.
+      Why this exists: the reader splits why==0xFF four ways
+      (0xFFFFFFFF / 8 / 6 / 2), and that split is TRUE ONLY WHILE this shape
+      holds. Route one fallback arm through RbPersistSkipReasonOf and
+      whyOut/skipOut stop being independent on that path, so skip no longer
+      distinguishes "tick not stopped but flushed" from "did not reach
+      persist"; move the `!flushOk` test out of the chain and the three
+      outcomes collapse into one. Both are SILENT: not a single value changes,
+      only the information content of the pair. G1-G6 read only the two
+      READERS, so none of them can see this -- G7 is the one that reads the
+      driver.
+      The line numbers are NOT asserted. They are computed and printed with an
+      [INFO] prefix so a human can find the code, and inserting or deleting
+      unrelated lines above them does not turn this gate red. What gates is
+      block/arm membership from brace matching, plus the declaration pair
+      (whyOut immediately followed by skipOut, both before the anchor).
+      This was changed after review: the first version pinned :265/:315/:367/
+      :372/:377/:314 and FAILed when they moved, so a three-comment-line edit
+      with zero semantic change demanded a constant edit -- and the person
+      editing the constant is the person this gate checks. A gate in the most
+      frequently edited file of the project must not be repairable by the
+      party it is judging.
 
 Deliberately NOT checked (say so instead of implying coverage)
 -------------------------------------------------------------
@@ -67,7 +97,14 @@ Deliberately NOT checked (say so instead of implying coverage)
     failure) is indistinguishable from a fresh one. Registered as R-d in 275;
     gating on it needs the epoch in rec2[4], which no reader uses yet.
   * nothing here proves the C switch is REACHED; reachability is 274's
-    ('RBD4' receipt + rbmsg.c call site) territory.
+    ('RBD4' receipt + rbmsg.c call site) territory. G7 pins the SHAPE that
+    makes the pair informative, not that any arm ever executes: a build where
+    every arm is dead code passes G1-G7.
+  * G7 cannot pin the VALUE of the three fallback literals against
+    rb_common.h: it checks that each arm carries SOME RB_SKIP_* name and that
+    the three names are exactly STOPTICK_FAIL/CFG_CLEAN/FROZEN, but "the arm
+    that flushes writes 8" is a semantics claim only the reader-side probes
+    in G5 can corroborate.
   * the values are read from #define literals only: a value produced by a macro
     expression (e.g. #define X (BASE+1)) would be unresolvable and is FAILed
     explicitly rather than skipped.
@@ -115,6 +152,74 @@ def cval(tok):
         return int(t, 0)
     except ValueError:
         return None
+
+
+def mask_c(src):
+    """Blank comments and string bodies while PRESERVING byte offsets.
+
+    G7 has to brace-match rbmsg.c, whose comment blocks contain braces,
+    colons and the word `if`. Blanking instead of deleting keeps every
+    surviving position identical to the real one, so a line number computed
+    on the masked text is the file's real line number. Newlines inside a
+    comment or a literal are kept, so a multi-line comment cannot shift the
+    lines below it.
+
+    Consequence worth knowing: because no comment survives into the masked
+    text, a "[ ]*" / "\\s*" in a pattern applied to it can never be swallowed
+    by a trailing comment. That is the failure the PS-side ROW regex has and
+    this file does not.
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        pair = src[i:i + 2]
+        if pair == "//":
+            while i < n and src[i] != "\n":
+                out[i] = " "
+                i += 1
+        elif pair == "/*":
+            end = src.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            for k in range(i, end):
+                if src[k] != "\n":
+                    out[k] = " "
+            i = end
+        elif src[i] in "\"'":
+            quote = src[i]
+            i += 1
+            while i < n:
+                if src[i] == "\\":
+                    out[i] = " "
+                    if i + 1 < n and src[i + 1] != "\n":
+                        out[i + 1] = " "
+                    i += 2
+                elif src[i] == quote:
+                    i += 1
+                    break
+                else:
+                    if src[i] != "\n":
+                        out[i] = " "
+                    i += 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def brace_span(text, open_brace):
+    """Index of the "}" matching text[open_brace] (which is "{"), or None."""
+    depth = 0
+    for i in range(open_brace, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
 
 
 # --------------------------------------------------------------------------
@@ -208,6 +313,78 @@ ROW = re.compile(r"\(\$whyPrev\s+-eq\s+\$W_(\w+)\)\s*-and\s*"
 CODE_ASSIGN = re.compile(r"\$code\s*=\s*['\"](\w+)['\"]")
 
 ps = read(PS1)
+
+
+def mask_ps(src):
+    """Blank PS comments while PRESERVING byte offsets.
+
+    Why this is needed and not merely tidy: ROW is built from
+    `($whyPrev -eq $W_x)\\s*-and\\s*($skipPrev -eq $S_y))\\s*\\{\\s*$code = 'X'`
+    and `\\s*` does not match a comment. Put ANY comment between the row's
+    opening brace and its `$code = 'X'` and the row vanishes from the gate's
+    view entirely -- G2 then reports a missing row, or worse, if every row were
+    written that way, the empty-match-set guard fires and the gate still fails
+    but for the wrong reason, having never looked at a single row. The same
+    shape bites FB_ARM/FB_ELSE/G6. Masking first makes `\\s*` safe by
+    construction: in the masked text there is nothing for it to trip over.
+
+    Comments only -- not string contents. A '#' inside '...' is a literal, and
+    PS escapes a quote by doubling it, so both forms are skipped over verbatim
+    rather than risk blanking the tail of a $zh line. (The ROW gap this gate
+    straddles cannot contain a string literal, so string handling here is
+    about not corrupting the rest of the file, not about the match itself.)
+
+    Here-strings (@' ... '@ / @" ... "@) are honoured so that a line inside one
+    is not mistaken for a comment. <# ... #> block comments are blanked too.
+
+    Both scoping rules were added by a self-test that failed on the first
+    version: it saw `a<# c #>` blanked only to end-of-line, and
+    `$zh = 'a # b'` blanked from the '#' onward, eating the closing quote.
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        if src[i] == "<" and src.startswith("<#", i):
+            end = src.find("#>", i + 2)
+            end = n if end < 0 else end + 2
+            for k in range(i, end):
+                if src[k] != "\n":
+                    out[k] = " "
+            i = end
+            continue
+        if src[i] == "@" and i + 1 < n and src[i + 1] in "'\"":
+            q = src[i + 1]
+            nl = src.find("\n", i)
+            # A here-string terminator only counts at the START of a line.
+            start = n if nl < 0 else nl
+            end = src.find("\n" + q + "@", start)
+            i = n if end < 0 else end + 3
+            continue
+        if src[i] in "'\"":
+            q = src[i]
+            i += 1
+            while i < n:
+                if src[i] == q:
+                    if i + 1 < n and src[i + 1] == q:
+                        i += 2          # doubled quote = escaped quote
+                        continue
+                    i += 1
+                    break
+                if q == '"' and src[i] == "`":
+                    i += 2              # backtick escape in a double-quoted
+                    continue        # string; do not inspect the escaped char
+                i += 1
+            continue
+        if src[i] == "#":
+            while i < n and src[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
+PM = mask_ps(ps)
 ps_w, ps_s = {}, {}
 for name, tok in PS_W.findall(ps):
     ps_w[name] = int(tok, 0)
@@ -222,7 +399,7 @@ if not ps_s:
                  "PASS" % PS1.relative_to(ROOT).as_posix())
 
 ps_pairs = {}
-for wname, sname, code in ROW.findall(ps):
+for wname, sname, code in ROW.findall(PM):
     if wname not in ps_w:
         fails.append("G2: row uses $W_%s which is not defined in the file" % wname)
         continue
@@ -297,7 +474,7 @@ if mod is not None:
         # ------------------------------------------------------------------
         # G4: reverse direction
         # ------------------------------------------------------------------
-        assigned = set(CODE_ASSIGN.findall(ps))
+        assigned = set(CODE_ASSIGN.findall(PM))
         if not assigned:
             fails.append("G4: found 0 \"$code = 'X'\" assignments in the PS "
                          "file -- empty match set, cannot PASS")
@@ -397,13 +574,13 @@ FB_ARM = re.compile(r"(?:if|elseif)\s*\(\s*\$skipPrev\s+-eq\s+\$S_(\w+)\s*\)"
                     r"\s*\{\s*\$code\s*=\s*['\"](\w+)['\"]")
 FB_ELSE = re.compile(r"\}\s*else\s*\{\s*\$code\s*=\s*['\"](\w+)['\"]")
 
-if len(FB_GATE.findall(ps)) != 1:
+if len(FB_GATE.findall(PM)) != 1:
     fails.append("G6: the 0xFF fallback gate is not exactly one "
                  "`($whyPrev -eq $W_NONE) -and ($skipPrev -ne $S_NONE)` -- if the "
                  "`-ne` becomes `-eq`, every fallback row is swallowed by "
                  "NO_EVIDENCE; if the gate disappears entirely, the three "
                  "FALLBACK_* codes become unreachable")
-arms = dict(FB_ARM.findall(ps))
+arms = dict(FB_ARM.findall(PM))
 want = {"STOPTICK": "FALLBACK_STOPTICK_FAIL",
         "CFG_CLEAN": "FALLBACK_CFG_CLEAN",
         "FROZEN": "FALLBACK_FROZEN"}
@@ -419,11 +596,410 @@ else:
     # The FIRST `} else { $code = ... }` after the fallback gate is the
     # FALLBACK_OTHER arm. Do not scan the whole file: the outer chain ends with
     # its own `} else { $code = 'UNKNOWN' }`, which is a different else.
-    mg = FB_GATE.search(ps)
-    got_else = FB_ELSE.search(ps[mg.start():]) if mg else None
+    mg = FB_GATE.search(PM)
+    got_else = FB_ELSE.search(PM[mg.start():]) if mg else None
     if not got_else or got_else.group(1) != "FALLBACK_OTHER":
         fails.append("G6: the fallback else arm is %r, expected 'FALLBACK_OTHER'"
                      % (got_else.group(1) if got_else else None,))
+
+# --------------------------------------------------------------------------
+# G7: the driver-side shape that makes (0xFF, skip) carry information
+#
+# Everything above reads the two READERS and asks whether they agree with each
+# other and with the macro table. None of it reads the driver's control flow.
+# The readers' four-way split of why==0xFF is only MEANINGFUL while rbmsg.c
+# keeps skipOut and whyOut independent on the else path:
+#
+#   :264  ULONG whyOut  = 0xFFu;              one declaration, kept 0xFF unless
+#   :314      whyOut  = why;                  the then-block runs
+#   :265  ULONG skipOut = RB_SKIP_NONE;       one declaration
+#   :315      skipOut = RbPersistSkipReasonOf(why);      then-block: image of why
+#   :367      skipOut = RB_SKIP_STOPTICK_FAIL;   else arm 1 (flush WAS done)
+#   :372      skipOut = RB_SKIP_CFG_CLEAN;       else arm 2 (mode 2)
+#   :377      skipOut = RB_SKIP_FROZEN;          else arm 3 (frozen)
+#
+# On the then path skip is a pure image of why, so it adds nothing. On the
+# else path whyOut stays 0xFF while skip names which of the three things
+# happened -- skip is the ONLY field that can. Two edits destroy that and
+# neither moves a single value in the tables G1-G6 read:
+#   * send an else arm through RbPersistSkipReasonOf(why) -- why is not even
+#     the same quantity there, and skip stops being independent;
+#   * hoist an arm out of the else block (or the flushOk/frozen test out of
+#     the chain) -- two outcomes merge into one code.
+# Hence: shape, not values. This is the only check in the gate that looks at
+# rbmsg.c's braces.
+#
+# NO ABSOLUTE LINE NUMBERS DECIDE PASS/FAIL (changed 2026-11-20 after review).
+# The first version pinned :265/:315/:367/:372/:377/:314 as constants and FAILed
+# when they moved. A review inserted three comment-only lines above :263 -- zero
+# semantic change -- and got 4 FAILs, i.e. the check said "re-pin the constants".
+# That is the wrong shape for a gate in the most-edited file of the project:
+# every unrelated edit would demand a constant edit, and the person editing the
+# constant is the person the gate is checking. Silent-repair-by-the-accused.
+# So the line numbers are now computed and PRINTED as information only. What
+# decides PASS/FAIL is position-independent:
+#   * the two declarations are the ones before the `if (NT_SUCCESS(qst))` anchor,
+#     in the order whyOut then skipOut, with nothing but whitespace (or a comment,
+#     which masking turns into whitespace) between them;
+#   * each assignment's block/arm membership, from brace matching;
+#   * rec2[2]/rec2[3] by expression.
+# Verified both directions: inserting comment lines now PASSes, while moving an
+# assignment to another arm, out of the chain, or under a nested `if` still FAILs.
+# --------------------------------------------------------------------------
+EXPECTED_SKIP_ARMS = ("RB_SKIP_STOPTICK_FAIL", "RB_SKIP_CFG_CLEAN", "RB_SKIP_FROZEN")
+
+# Recorded source positions. KEPT, not deleted. An earlier revision dropped them
+# and they came back on review request: they are useful to a human diffing
+# rbmsg.c, and a constant that only prints cannot hurt. Nothing below is an
+# assertion -- no comparison against these four values can append to `fails`.
+#
+# The names still say EXPECTED, from before this was downgraded. Read them as
+# last-observed, not as required: a mismatch is drift to note, never a failure.
+#
+# The constants are inert. Proven with the right variable in each run:
+#   * rbmsg.c moves, constants held  -> M-G: three pure-comment lines above
+#     `NT_SUCCESS(qst)`; rc=0, the [INFO] line reports the drift, verdict unchanged.
+#   * constants move, rbmsg.c held   -> E-1a (values rewritten to nonsense) and
+#     M-META (4/4 tampered, run independently) both give rc=0.
+#   * both move, with a real breakage -> E-1b: the bogus constants plus `:367` made
+#     to copy `why` instead of naming a skip; rc=1. So the constants are not hiding
+#     a failure either -- they are inert, not silent.
+#
+# As of the last edit these match rbmsg.c exactly (whyOut :264, skipOut :265,
+# writes :315/:367/:372/:377, why :314); the [INFO] line re-checks this on every
+# run, so divergence surfaces in the log rather than in a stale comment. If you
+# edit rbmsg.c above these lines, updating them is a courtesy to the next reader,
+# never a requirement of this build. The numbers in this paragraph are for humans;
+# they are compared with nothing.
+EXPECTED_SKIPOUT_DECL_LINE = 265
+EXPECTED_SKIPOUT_LINES = (315, 367, 372, 377)   # assignments, not the decl
+EXPECTED_WHYOUT_DECL_LINE = 264
+EXPECTED_WHYOUT_LINES = (314,)                  # assignments, not the decl
+
+CM = mask_c(msg)
+
+
+DECL_SKIP = re.compile(r"\bULONG\s+skipOut\s*=\s*(RB_SKIP_\w+)\s*;")
+DECL_WHY = re.compile(r"\bULONG\s+whyOut\s*=\s*(\w+)\s*;")
+ASSIGN_SKIP = re.compile(r"(?<![\w>.])skipOut\s*=\s*([^;]+);")
+ASSIGN_WHY = re.compile(r"(?<![\w>.])whyOut\s*=\s*([^;]+);")
+NTS = re.compile(r"\bif\s*\(\s*NT_SUCCESS\s*\(\s*qst\s*\)\s*\)\s*\{")
+
+# 1) exactly one declaration each, and both take the documented sentinel value
+skip_decl = list(DECL_SKIP.finditer(CM))
+if len(skip_decl) != 1:
+    fails.append("G7: `ULONG skipOut = RB_SKIP_NONE;` appears %d times, expected "
+                 "exactly 1 -- zero means the receipt field was renamed or the "
+                 "initialiser moved; two means an append-only field grew a "
+                 "second starting value" % len(skip_decl))
+elif skip_decl[0].group(1) != "RB_SKIP_NONE":
+    fails.append("G7: skipOut is initialised to %s, expected RB_SKIP_NONE "
+                 "(0xFFFFFFFF): a named skip as the starting value makes "
+                 "'nothing skipped' indistinguishable from that step"
+                 % skip_decl[0].group(1))
+
+why_decl = list(DECL_WHY.finditer(CM))
+if len(why_decl) != 1:
+    fails.append("G7: `ULONG whyOut = 0xFFu;` appears %d times, expected exactly 1"
+                 % len(why_decl))
+elif cval(why_decl[0].group(1)) != 0xFF:
+    fails.append("G7: whyOut is initialised to %r, expected 0xFF -- 0xFF is the "
+                 "'never written' code; any other starting value would read as a "
+                 "real why to both readers"
+                 % (why_decl[0].group(1),))
+
+# 2) the if/else skeleton must be the one the readers assume
+nts = list(NTS.finditer(CM))
+if len(nts) != 1:
+    fails.append("G7: `if (NT_SUCCESS(qst)) {` appears %d times (masked for "
+                 "comments/literals), expected exactly 1 -- if it is gone the "
+                 "then/else attribution below has no anchor; if it is duplicated "
+                 "the gate cannot tell which one owns the why image" % len(nts))
+    then_lo = then_hi = els_lo = els_hi = -1
+else:
+    then_open = nts[0].end() - 1
+    then_close = brace_span(CM, then_open)
+    if then_close is None:
+        fails.append("G7: the `if (NT_SUCCESS(qst))` block never closes -- brace "
+                     "match failed, so then/else attribution is unknowable")
+        then_lo = then_hi = els_lo = els_hi = -1
+    else:
+        then_lo, then_hi = then_open, then_close
+        tail = CM[then_close + 1:]
+        m_else = re.match(r"\s*else\s*\{", tail)
+        if m_else is None:
+            fails.append("G7: `if (NT_SUCCESS(qst))` has no `else {` arm -- both "
+                         "the single skipOut image assignment and the three "
+                         "fallback literal arms live one level below this brace; "
+                         "without the else block there is nowhere for the "
+                         "stop-tick-failed path to record anything")
+            els_lo = els_hi = -1
+        else:
+            els_open = then_close + 1 + m_else.end() - 1
+            els_close = brace_span(CM, els_open)
+            if els_close is None:
+                fails.append("G7: the `else` block of `if (NT_SUCCESS(qst))` never "
+                             "closes -- brace match failed")
+                els_lo = els_hi = -1
+            else:
+                els_lo, els_hi = els_open, els_close
+
+# 3) the two declarations must be the pair that precedes the anchor, why first.
+#    "Nothing but whitespace between them" is what makes this position-free:
+#    masking turns a comment into spaces, so inserting or deleting comment lines
+#    cannot break it, while inserting or deleting CODE does.
+if len(why_decl) == 1 and len(skip_decl) == 1:
+    if why_decl[0].start() > skip_decl[0].start():
+        fails.append("G7: skipOut is declared BEFORE whyOut. The receipt tuple "
+                     "rec2[2]=whyOut, rec2[3]=skipOut is filled by name, so the "
+                     "order is not what makes it work -- but this check exists to "
+                     "pin the pair that belongs to the stop-tick branch, and a "
+                     "reordered pair usually means the declarations were moved "
+                     "into different scopes")
+    if skip_decl[0].start() < why_decl[0].end():
+        fails.append("G7: the two declarations overlap -- cannot be the pair")
+    else:
+        gap = CM[why_decl[0].end():skip_decl[0].start()]
+        leftover = gap.replace(" ", "").replace("\n", "").replace("\t", "")
+        if leftover:
+            fails.append("G7: there is code between the whyOut and skipOut "
+                         "declarations (%r). They must be declared as a pair; "
+                         "anything between them is either a third declaration or "
+                         "statements that would run before skipOut exists"
+                         % leftover[:60])
+    if then_lo >= 0:
+        for nm, d in (("whyOut", why_decl[0]), ("skipOut", skip_decl[0])):
+            if not (d.start() < then_lo):
+                fails.append("G7: %s is declared AFTER the `if (NT_SUCCESS(qst))` "
+                             "anchor -- the receipt fields must exist before the "
+                             "branch that decides both exits writes into them"
+                             % nm)
+
+in_then = lambda p: then_lo < p < then_hi
+in_else = lambda p: els_lo < p < els_hi
+
+# 3) skipOut: 4 assignments total, 1 in then (as the why image), 3 in else
+skip_asg = list(ASSIGN_SKIP.finditer(CM))
+if len(skip_decl) == 1:
+    skip_asg = [m for m in skip_asg if m.start() > skip_decl[0].end()]
+skip_lines = sorted(line_of(CM, m.start()) for m in skip_asg)
+the_then = [m for m in skip_asg if in_then(m.start())]
+the_else = [m for m in skip_asg if in_else(m.start())]
+the_orphan = [m for m in skip_asg if not in_then(m.start()) and not in_else(m.start())]
+
+# NOTE: no absolute-line assertion here any more. `skip_lines` is printed as
+# information at the end of the gate; what gates is block/arm membership below.
+if len(the_then) != 1:
+    fails.append("G7: skipOut is assigned %d times inside the `NT_SUCCESS(qst)` "
+                 "then-block, expected exactly 1 (`= RbPersistSkipReasonOf(why)`). "
+                 "Two assignments there means skip is computed twice from why and "
+                 "one of them is dead; zero means the success path no longer "
+                 "records a skip code at all" % len(the_then))
+elif the_then[0].group(1).strip() != "RbPersistSkipReasonOf(why)":
+    fails.append("G7: the then-block does `skipOut = %s;`, expected "
+                 "`RbPersistSkipReasonOf(why)` -- on the success path skip must be "
+                 "a pure image of why (the single mapping point, rbmsg.c:79)"
+                 % the_then[0].group(1).strip())
+if len(the_else) != 3:
+    fails.append("G7: skipOut is assigned %d times inside the `else` (qst failed) "
+                 "block, expected exactly 3. The reader splits why==0xFF into "
+                 "0xFFFFFFFF / 8 / 6 / 2 precisely because three distinct exits "
+                 "write three distinct skip literals here; one arm fewer and two "
+                 "of those outcomes become indistinguishable"
+                 % len(the_else))
+if the_orphan:
+    fails.append("G7: skipOut is assigned outside both the then and the else block "
+                 "(masked line(s) %s). Branch attribution is then unknowable: the "
+                 "reader's four-way split assumes the only writes are :315 (then) "
+                 "and the three named arms (else)"
+                 % sorted(line_of(CM, m.start()) for m in the_orphan))
+
+# 4) the three else arms must be the three literals, in source order
+else_vals = [m.group(1).strip() for m in the_else]
+if len(else_vals) == 3 and tuple(else_vals) != EXPECTED_SKIP_ARMS:
+    fails.append("G7: the three else-block skipOut literals are %s, expected %s in "
+                 "that order (the chain is `flushOk && !frozen` / `!flushOk` / "
+                 "else, i.e. flushed-then-uncertain / configured-off / frozen). "
+                 "A swap keeps every count right while telling the operator the "
+                 "opposite thing about what happened"
+                 % (else_vals, list(EXPECTED_SKIP_ARMS)))
+for m in the_else:
+    val = m.group(1).strip()
+    if not re.match(r"^RB_SKIP_\w+$", val):
+        fails.append("G7: an else-block skipOut assignment is `%s`, not a plain "
+                     "RB_SKIP_* macro. On the qst-failed path `why` does NOT hold "
+                     "a why code (RbFeatStopTick returns NTSTATUS), so routing it "
+                     "through RbPersistSkipReasonOf() would map a status value "
+                     "through the why switch and land in `default: RB_SKIP_NONE` "
+                     "-- the pair would then read as 'not reached', destroying the "
+                     "only field that distinguishes the three fallback exits"
+                     % val)
+    elif val not in skip_val:
+        fails.append("G7: else-block skipOut uses %s, which rb_common.h does not "
+                     "define" % val)
+
+# 5) whyOut: 1 declaration + 1 assignment, and that assignment is in then only
+why_asg = list(ASSIGN_WHY.finditer(CM))
+if len(why_decl) == 1:
+    why_asg = [m for m in why_asg if m.start() > why_decl[0].end()]
+why_lines = sorted(line_of(CM, m.start()) for m in why_asg)
+# Same as skipOut above: `why_lines` is an [INFO] value, not a gate. The gate is
+# "exactly one write, and it is inside the then-block" -- both position-free.
+if len(why_asg) != 1:
+    fails.append("G7: whyOut is assigned %d times, expected exactly 1 -- the "
+                 "receipt's why field must stay 0xFF unless RbShutdownPersist "
+                 "returned a real why code" % len(why_asg))
+elif not in_then(why_asg[0].start()):
+    fails.append("G7: the single whyOut assignment is NOT inside the "
+                 "`NT_SUCCESS(qst)` then-block (currently :%d); the else path must "
+                 "leave whyOut at 0xFF" % line_of(CM, why_asg[0].start()))
+elif why_asg[0].group(1).strip() != "why":
+    fails.append("G7: the then-block does `whyOut = %s;`, expected `whyOut = why;` "
+                 "-- whyOut must carry RbShutdownPersist()'s own return value, "
+                 "not an expression derived from it, or the two readers' fixed "
+                 "(why, skip) tuple decodes to something the driver never wrote"
+                 % why_asg[0].group(1).strip())
+
+# 6) the two receipt fields must still be written into the same record
+rec2 = {}
+for idx, field in re.findall(r"rec2\[(\d)\]\s*=\s*(\w+)\s*;", CM):
+    rec2.setdefault(int(idx), []).append(field)
+for idx, field, want in ((2, "whyOut", "whyOut"), (3, "skipOut", "skipOut")):
+    got = rec2.get(idx)
+    if got != [want]:
+        fails.append("G7: rec2[%d] is %r, expected ['%s'] -- the (why, skip) pair "
+                     "must reach the 'RBD4' receipt in these two slots; a swap "
+                     "makes every reader interpret the why as the skip"
+                     % (idx, got, want))
+why_slot = [i for i, fs in rec2.items() if fs == ["whyOut"]]
+skip_slot = [i for i, fs in rec2.items() if fs == ["skipOut"]]
+if why_slot and skip_slot and max(why_slot) > min(skip_slot):
+    fails.append("G7: whyOut is written to rec2[%d] but skipOut to rec2[%d] -- why "
+                 "must occupy the LOWER slot (2) and skip the higher (3), because "
+                 "both readers decode a fixed (why, skip) tuple in that order"
+                 % (max(why_slot), min(skip_slot)))
+
+def top_level_arms(text, lo, hi):
+    """The if / else-if / else chain sitting directly in the block (lo, hi).
+
+    Returns [(kind, cond_text, open_brace, close_brace)] in source order.
+    Only depth-0 statements of that block are considered, so a nested retry
+    loop inside an arm does not get mistaken for another arm of the chain.
+    """
+    arms = []
+    i, depth = lo + 1, 0
+    while i < hi:
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+            i += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0:
+            m = re.compile(r"(?:\belse\s+)?\bif\s*\(").match(text, i)
+            if m is None:
+                m = re.compile(r"\belse\s*\{").match(text, i)
+                if m is not None:
+                    k = m.end() - 1
+                    close = brace_span(text, k)
+                    arms.append(("else", "else", k, close))
+                    i = (close + 1) if close is not None else hi
+                    continue
+                i += 1
+                continue
+            j, pd = m.end() - 1, 0
+            while j < hi:
+                if text[j] == "(":
+                    pd += 1
+                elif text[j] == ")":
+                    pd -= 1
+                    if pd == 0:
+                        j += 1
+                        break
+                j += 1
+            k = j
+            while k < hi and text[k] in " \t\n":
+                k += 1
+            if k < hi and text[k] == "{":
+                close = brace_span(text, k)
+                kind = "else-if" if m.group(0).startswith("else") else "if"
+                arms.append((kind, " ".join(text[i:k].split()), k, close))
+                i = (close + 1) if close is not None else hi
+                continue
+            i = k
+            continue
+        i += 1
+    return [a for a in arms if a[3] is not None]
+
+
+def depth_inside(text, open_brace, pos):
+    """Brace nesting of `pos` relative to `open_brace` (1 == direct child)."""
+    d = 0
+    for i in range(open_brace, pos):
+        if text[i] == "{":
+            d += 1
+        elif text[i] == "}":
+            d -= 1
+    return d
+
+
+# 4b) the three writes must sit in the three arms of the SAME chain, one each,
+#     unconditionally -- not merely "somewhere inside the else block". Without
+#     this, hoisting one write past the chain's closing brace still leaves the
+#     count at 3 and the literals in source order, and only the line-number
+#     re-pin above would notice.
+else_arms = top_level_arms(CM, els_lo, els_hi) if els_hi > 0 else []
+if els_hi > 0:
+    if len(else_arms) != 3:
+        fails.append("G7: the `else` (qst failed) block holds %d top-level if/else "
+                     "arms, expected 3 (`flushOk && !frozen` / `!flushOk` / else). "
+                     "A nested if instead of a chain means the three outcomes are "
+                     "no longer mutually exclusive at the same level, so one exit "
+                     "can start writing two different skip literals"
+                     % len(else_arms))
+    else:
+        conds = [a[1] for a in else_arms]
+        for frag, idx in (("flushOk", 0), ("Frozen", 0), ("!flushOk", 1)):
+            if frag not in conds[idx].replace("flushOk", "flushOk"):
+                fails.append("G7: arm %d of the fallback chain is `%s`, which does "
+                             "not contain %r. The arm order IS the meaning: arm 1 "
+                             "flushed and the pair must read 8, arm 2 is mode=2 "
+                             "(6), arm 3 is the frozen engine (2). Reordering them "
+                             "silently repoints every fallback value"
+                             % (idx + 1, conds[idx], frag))
+        if else_arms[2][0] != "else":
+            fails.append("G7: arm 3 of the fallback chain is `%s`, not a bare "
+                         "`else` -- a residual condition there leaves an exit with "
+                         "no skipOut write at all, i.e. the pair would keep "
+                         "RB_SKIP_NONE and read as 'persist never reached'"
+                         % conds[2])
+    if len(else_arms) == 3:
+        arm_of = []
+        for m in the_else:
+            hit = [i for i, a in enumerate(else_arms) if a[2] < m.start() < a[3]]
+            if not hit:
+                fails.append("G7: the skipOut write at masked line %d is inside the "
+                             "else block but NOT inside any arm of the fallback "
+                             "chain -- it would run on more than one exit (or after "
+                             "the chain, on all three), so the single value it "
+                             "stores is no longer evidence of which exit was taken"
+                             % line_of(CM, m.start()))
+                continue
+            arm_of.append(hit[0])
+            if depth_inside(CM, else_arms[hit[0]][2], m.start()) != 1:
+                fails.append("G7: the skipOut write at masked line %d is nested "
+                             "inside a further `if` within arm %d, so it does not "
+                             "run on every pass through that arm -- the pair then "
+                             "reads RB_SKIP_NONE (\"never reached\") on the other "
+                             "passes and the exit becomes invisible"
+                             % (line_of(CM, m.start()), hit[0] + 1))
+        if arm_of and arm_of != [0, 1, 2]:
+            fails.append("G7: the three skipOut writes land in fallback-chain arms "
+                         "%s, expected [0, 1, 2] -- each arm must own exactly one "
+                         "write, in source order" % arm_of)
 
 # --------------------------------------------------------------------------
 # report
@@ -442,10 +1018,37 @@ print("[OK] G2: PS table has exactly %d rows == C pairs + the (0xFF, 0xFFFFFFFF)
 print("[OK] G3: PAIR_CODES matches the PS table key-for-key and code-for-code; "
       "all %d code names appear in the PS file" % len(mod.ALL_CODES))
 print("[OK] G4: every PS '$code' assignment (%d) is a member of ALL_CODES"
-      % len(set(CODE_ASSIGN.findall(ps))))
+      % len(set(CODE_ASSIGN.findall(PM))))
 print("[OK] G5: CODE_VERDICT pins rc (only CLEAN == 0, WITHHELD == 6, "
       "NO_EVIDENCE == 3) and classify_pair() reproduces every PAIR_CODES entry "
       "plus the five fallback/sentinel probes")
 print("[OK] G6: the three FALLBACK_* arms sit under `-ne $S_NONE` and map to "
       "STOPTICK/CFG_CLEAN/FROZEN, with FALLBACK_OTHER as the first else")
+print("[OK] G7: rbmsg.c keeps skipOut and whyOut separable -- skipOut declared "
+      "once (= RB_SKIP_NONE) and assigned exactly 4x, the single then-block write "
+      "is RbPersistSkipReasonOf(why), the three else-block writes are %s (one per "
+      "arm, unnested, in chain order), whyOut declared once (= 0xFF) with its only "
+      "write `= why` inside the then-block, and rec2[2]/rec2[3] carry them in that "
+      "order. No absolute line number gates this check; the numbers below are for "
+      "a human reading the source, not for the verdict."
+      % (list(EXPECTED_SKIP_ARMS),))
+pos_now = (line_of(CM, why_decl[0].start()), line_of(CM, skip_decl[0].start()),
+           tuple(skip_lines), tuple(why_lines))
+pos_rec = (EXPECTED_WHYOUT_DECL_LINE, EXPECTED_SKIPOUT_DECL_LINE,
+           EXPECTED_SKIPOUT_LINES, EXPECTED_WHYOUT_LINES)
+print("[INFO] G7 source positions (informational only, NOT gating): "
+      "whyOut decl :%d, skipOut decl :%d, skipOut writes %s, whyOut write %s"
+      % (pos_now[0], pos_now[1], list(pos_now[2]), list(pos_now[3])))
+if pos_now != pos_rec:
+    # A note, never a failure. Movement above rbmsg.c is what happens on every
+    # unrelated edit; making it red would mean the gate demands a constant edit
+    # -- and the person editing the constant is the person the gate checks.
+    print("[INFO] G7 positions differ from the last recorded layout "
+           "(whyOut %d/%d, skipOut %d/%d, writes %s/%s, why %s/%s). The SHAPE "
+           "checks above passed, so this is drift, not breakage: update "
+           "EXPECTED_*_LINE if you touched rbmsg.c above these lines, otherwise "
+           "leave it."
+           % (pos_now[0], pos_rec[0], pos_now[1], pos_rec[1],
+              list(pos_now[2]), list(pos_rec[2]),
+              list(pos_now[3]), list(pos_rec[3])))
 print("result: PASS (0 fail, 0 warn)")

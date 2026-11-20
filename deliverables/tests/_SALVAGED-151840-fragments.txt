@@ -1,0 +1,83 @@
+# SALVAGED FRAGMENTS of RB-write-load_20261120_151840.log
+#
+# THIS IS NOT THE ORIGINAL FILE.
+# The original (487 lines) was DELETED on 2026-11-20 by a test-harness
+# Remove-Item glob inside _cmd-rc-stub-test-rwl.ps1 that matched the
+# product's own log name. It was the only record of the single elevated
+# run; the user's one UAC opportunity is spent, so it cannot be re-created.
+#
+# These 67 lines were recovered from the assistant session transcript,
+# which had echoed them through Read tool output. 420 of 487 lines are
+# gone for good.
+#
+# Every line below is verbatim and may be cited. But this is a FRAGMENT
+# SET: do not feed it to a parser that expects contiguous output, and do
+# not describe it as "the log".
+#========================================================================
+  44 15:18:40   [ok]   P4 dWrite >= 90% of this load's write bytes               -> IRP crossed the filter
+  45 15:18:40   [ok]      (dWrite=0 = FAIL; 0<dWrite<90% = WARN; unreadable = MISSING, never 0)
+  47 15:18:40   [ok]   P0 MISS COUNTER READ-PATH-ONLY CONTROL (read-only, same session):
+  50 15:18:40   [ok]      (rbio_worker.c:256 / :289) and both are on the READ path. So dMisses here
+  56 15:18:40   [ok]        dMisses intervals can only be explained by dMisses*131072 read bytes.
+  61 15:18:40   [ok]        enumeration, the unaligned tail of each copy. 14,400 is the expected
+  66 15:18:40   [ok]      dMisses = 0                -> ZERO-AS-EXPECTED
+  67 15:18:40   [ok]      0 < dMisses <= 28,800      -> LOW-AS-EXPECTED  (copies + metadata)
+  68 15:18:40   [ok]      dMisses > 28,800           -> HIGH-UNEXPECTED (WARN only, never gates rc)
+  75 15:18:40   [ok]      script). P0 never changes rc; it is reported, not gated.
+  84 15:18:41   waiting for the elevated child to report TERMINAL (up to 20 min) ...
+ 128 15:18:42   [ok]   P4 dWrite >= 90% of this load's write bytes               -> IRP crossed the filter
+ 129 15:18:42   [ok]      (dWrite=0 = FAIL; 0<dWrite<90% = WARN; unreadable = MISSING, never 0)
+ 131 15:18:42   [ok]   P0 MISS COUNTER READ-PATH-ONLY CONTROL (read-only, same session):
+ 134 15:18:42   [ok]      (rbio_worker.c:256 / :289) and both are on the READ path. So dMisses here
+ 140 15:18:42   [ok]        dMisses intervals can only be explained by dMisses*131072 read bytes.
+ 145 15:18:42   [ok]        enumeration, the unaligned tail of each copy. 14,400 is the expected
+ 150 15:18:42   [ok]      dMisses = 0                -> ZERO-AS-EXPECTED
+ 151 15:18:42   [ok]      0 < dMisses <= 28,800      -> LOW-AS-EXPECTED  (copies + metadata)
+ 152 15:18:42   [ok]      dMisses > 28,800           -> HIGH-UNEXPECTED (WARN only, never gates rc)
+ 159 15:18:43   [ok]      script). P0 never changes rc; it is reported, not gated.
+ 206 15:18:52     [PASS] C6 no PendingFileRenameOperations (no replace queued)
+ 239 15:18:52     [info] SUP01 raw        Why=0x000000FF WhyPrev=0x00000001 Skip=0xFFFFFFFF SkipPrev=0x00000007 Seq=7
+ 240 15:18:52     [info] SUP01 pair       (WhyPrev, SkipReasonPrev) = (0x01, 0x00000007)
+ 241 15:18:52     [info] SUP01 verdict    DIRTY — 刷完仍有脏页
+ 242 15:18:52     SUP01-VERDICT: DIRTY
+ 243 15:18:52     [info] SUP01 limit-1    (0xFF, 0xFFFFFFFF) 三义不可分：本次关机 IRP 没派发 / 派发了但 IRQL>PASSIVE / 关机瞬间掉电。DiagShutdownSeq 也分不开 —— 哨兵与 Seq 的推进同在 rbmsg.c 的 PASSIVE 门内，IRQL>PASSIVE 时两者都不动。
+ 244 15:18:52     [info] SUP01 limit-2    RB_SKIP_IRQL(1) 物理不可观测：该路的注册表写点本身在 IRQL>PASSIVE 下静默失败，实际读数退回 (0xFF, 0xFFFFFFFF)。
+ 246 15:18:53     === VERDICT ===
+ 255 15:18:53       读请求: 331322   读命中(次数): 47.78%   读命中(字节): 42.23%
+ 256 15:18:53       写请求: 45296   写字节: 2.75 GB   缓存吸收: 0.00%
+ 280 15:18:53   [ok] P0 before : miss=228209 bm=25089642496 (json) L2state=0 flags=0x0
+ 286 15:18:53       读请求: 331322   读命中(次数): 47.78%   读命中(字节): 42.23%
+ 287 15:18:53       写请求: 45296   写字节: 2.75 GB   缓存吸收: 0.00%
+ 303 15:19:02       读请求: 331322   读命中(次数): 47.78%   读命中(字节): 42.23%
+ 304 15:19:02       写请求: 56914   写字节: 4.57 GB   缓存吸收: 0.00%
+ 309 15:19:02   [ok] R1 P4 dWrite=1,863.68 MB vs expected 1,800.00 MB (ratio 104%)
+ 318 15:19:02       读请求: 331322   读命中(次数): 47.78%   读命中(字节): 42.23%
+ 319 15:19:02       写请求: 56914   写字节: 4.57 GB   缓存吸收: 0.00%
+ 340 15:19:02       读请求: 331322   读命中(次数): 47.78%   读命中(字节): 42.23%
+ 341 15:19:02       写请求: 56914   写字节: 4.57 GB   缓存吸收: 0.00%
+ 357 15:19:08       读请求: 331322   读命中(次数): 47.78%   读命中(字节): 42.23%
+ 358 15:19:08       写请求: 58819   写字节: 6.32 GB   缓存吸收: 0.00%
+ 363 15:19:08   [ok] R2 P4 dWrite=1,792.00 MB vs expected 1,800.00 MB (ratio 100%)
+ 372 15:19:08       读请求: 331322   读命中(次数): 47.78%   读命中(字节): 42.23%
+ 373 15:19:08       写请求: 58820   写字节: 6.32 GB   缓存吸收: 0.00%
+ 394 15:19:09       读请求: 331322   读命中(次数): 47.78%   读命中(字节): 42.23%
+ 395 15:19:09       写请求: 58822   写字节: 6.32 GB   缓存吸收: 0.00%
+ 445 15:19:09   [ok] P0 after : miss=228209 bm=25089642496 (json) L2state=0 flags=0x0
+ 447 15:19:09   P0 dMisses    : 0   (before 228,209 -> after 228,209)
+ 448 15:19:09   P0 dBytesMiss : 0.0 MB
+ 449 15:19:09   P0 anchor     : copyread/131072 = 1,887,436,800/131072 = 14,400  (legitimate READ bytes = 2 rounds x 900 MB copied; this is the EXPECTED ceiling)
+ 450 15:19:09   P0 gate       : anchor x2 = 28,800  (room for unmodelled normal reads: NTFS metadata, dir enumeration, unaligned copy tails)
+ 451 15:19:09   [ok] P0 L2 gate    : L2state=0 both samples
+ 452 15:19:09   [ok] P0 dMisses    : 0 -> ZERO-AS-EXPECTED (write load produced no read-path miss at all; the copies did not register either - worth a glance)
+ 453 15:19:09   [WARN] P0 N2         : dBytesMiss=0 -> cannot test (MISSING, not PASS)
+ 454 15:19:09   P0 state      : ZERO-AS-EXPECTED
+ 455 15:19:09   [WARN] note: P0: dMisses=0. A pure write load SHOULD be quiet, so this is expected; but the copies (which are real reads) also registered nothing -- record it, do not read it as proof of an
+ 456 15:19:09   [WARN] note: P0: N2 untestable (dBytesMiss=0)
+ 465 15:19:09   P4 this load crossed the filter (byte delta): PASS   dWrite=3.57 GB vs expected 1.76 GB (ratio 2.03)
+ 466 15:19:09      dWrite=3,655.68 MB dRead=MISSING expectedWrite=1,800.00 MB
+ 468 15:19:09      P4 precision : one printed step=0.01 GB=10.24 MB; worst dWrite error=+-10.24 MB; per round=900 MB -> noise=1.14% of a round (0.57% of the run)
+ 469 15:19:09      raw counter  : pre=[写请求: 45296   写字节: 2.75 GB   缓存吸收: 0.00%] post=[写请求: 58822   写字节: 6.32 GB   缓存吸收: 0.00%]"},"rawResponse":{"exitCode":0,"signal":null,"interrupted":false,"sandboxDenied":false,"safeDeleteEvents":[],"stderrBytesTruncated":0,"stdoutBytesTruncated":0,"tool_error_code":"0"}}},"sessionId":"62729162-d02a-45d2-8761-f4d28c61906b","cwd":"c:
+ 472 15:19:09        R1 dWrite=1,863.68 MB / expected 1,800.00 MB (ratio 104%)
+ 473 15:19:09        R2 dWrite=1,792.00 MB / expected 1,800.00 MB (ratio 100%)
+ 478 15:19:09   write rate per round: 289.7, 282.9 MB/s (avg 286.3) - LOW, recorded as observed, not normalised away
+ 487 15:19:12   child reported: TERMINAL rc=0 crash=False P1=True P2=True P3=True P4=PASS P5=True P0=ZERO-AS-EXPECTED dMisses=0 metaFlush=True wall=0.4min

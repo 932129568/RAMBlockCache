@@ -39,7 +39,7 @@ $ErrorActionPreference = 'Stop'
 
 # Build19 delivered driver pin. Override with -ExpectedSha256 or a <sys>.sha256
 # sidecar file next to the source sys. If none is available the gate FAILS CLOSED.
-$DefaultExpectedSha256 = '2dce9d720e5708ed3486df9dec6b0dce72d4d1fc9d6c35d5b66fab387a8aed05'
+$DefaultExpectedSha256 = '3c696e140f6ef8a045ed6bcc391298d16f17d57b0929d4282eda3759c08c6fd0'
 
 Write-Host '== RAMBlockCache V10.4.3 deploy (verify-before-change) =='
 # [FIX G1 2026-11-15] 记录引擎身份：门禁失败时必须能区分"文件不对"和"宿主编译器退化"。
@@ -204,6 +204,41 @@ if ($LASTEXITCODE -ne 0) {
     Fail "signtool verify FAILED (exit $LASTEXITCODE). DO NOT deploy / DO NOT reboot." 3
 }
 Write-Host '[ok] Authenticode signature verified (signtool /pa).'
+
+# ======================================================================
+#  STACK FRAME BUDGET GATE  [298d 2026-11-19]
+# ======================================================================
+# WHY: the two 0x7F / Arg1=8 bugchecks came from a 1480 B union frame in
+# RbDispatchDeviceControl (/O2 inlined every RbMsg* handler; 1304 B of it was
+# one RB_STATS local) while the failing path (call RbForward) needed no locals.
+# The Authenticode check above CANNOT catch that class: the crashing binary in
+# dist\ is itself Valid-signed, and deploy.ps1 had zero frame checks -- so a
+# six-step all-[ok] run would happily replace System32 with the crashing image.
+# Signature proves WHO built it, not that it still fits in a 12 KB kernel stack.
+$frameGate = Join-Path $PSScriptRoot 'check_stack_frame_budget.py'
+if (-not (Test-Path -LiteralPath $frameGate)) {
+    Fail "stack frame gate missing: $frameGate. Refusing to deploy a binary whose kernel stack frame budget was never checked." 5
+}
+# No S5 flags here, both deliberate:
+#   * $srcSys IS dist\ by default, so S5 would compare the file with itself.
+#     That self-comparison is now detected automatically (samefile) and reported
+#     as [SKIP] -- it is never reported as [ok]. There used to be a
+#     --no-dist-check switch to say this out loud, but it could override
+#     --require-dist-match on the same command line (QA F1): a soft flag silently
+#     disabling the hard one. Deleted (298f). Callers no longer declare it.
+#   * (no --require-dist-match) : $srcSys may legitimately differ from x64\Release
+#     (rebuilt on another host). What decides THIS deploy is the frame budget of
+#     $srcSys itself. The dist<->Release binding is closed separately, after
+#     signing, by RB-sign-driver.cmd with --require-dist-match.
+$frameLog = Join-Path $env:TEMP 'rbc-deploy-frame.log'
+& python $frameGate --sys $srcSys *> $frameLog
+$frameRc = $LASTEXITCODE
+if ($frameRc -ne 0) {
+    Get-Content -LiteralPath $frameLog -ErrorAction SilentlyContinue | Select-Object -Last 25 | Out-Host
+    Fail "STACK FRAME BUDGET VIOLATED (exit $frameRc) on $srcSys. A frame in [1400,1600] B, or a dispatch entry frame over 230 B, means the 0x7F double-fault surface is back. DO NOT deploy / DO NOT reboot." 5
+}
+Get-Content -LiteralPath $frameLog -ErrorAction SilentlyContinue | Select-String -Pattern 'rsp_alloc|ok\]' | Select-Object -First 3 | Out-Host
+Write-Host '[ok] Stack frame budget holds (dispatch <= 230 B, no frame in [1400,1600]).'
 Write-Host '[ok] Pre-flight gate PASSED - applying changes.'
 
 # =====================================================================

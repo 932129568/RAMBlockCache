@@ -263,7 +263,12 @@ bool LiquidGlassWindow::Create(HINSTANCE hInst, int width, int height, const std
     wc.style         = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc   = &LiquidGlassWindow::WndProc;
     wc.hInstance     = hInst;
-    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+    // IDC_ARROW is MAKEINTRESOURCE(32512), which expands to an LPSTR cast in a
+    // non-UNICODE TU. Passing that to LoadCursorW (A/W-explicit) is a hard
+    // C2664, not a warning. Use the W variant of the macro: this TU is built
+    // without /DUNICODE on purpose (no dependence on the TCHAR mapping), so
+    // every Win32 call here is A/W-explicit and every resource id must match.
+    wc.hCursor       = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));   // IDC_ARROW
     wc.lpszClassName = L"RAMBlockCacheLiquidGlassHost";
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 

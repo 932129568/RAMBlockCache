@@ -13,6 +13,7 @@ import { DUR, EASE, pageEnter, useMotion } from '@lib/motion';
 import { LiquidGlassFilter } from '../components/LiquidGlassFilter';
 import { useLiquidGlassPointer } from '../hooks/useLiquidGlassPointer';
 import { useLiquidWave } from '../hooks/useLiquidWave';
+import { useNativeGlassSync } from '../hooks/useNativeGlassSync';
 import { useVisibilityAwarePoll } from '../hooks/useVisibilityAwarePoll';
 import { useWindowChrome } from '../hooks/useWindowChrome';
 
@@ -48,7 +49,18 @@ export default function App() {
    * 只追加 ref 与两个脱离文档流的装饰节点，绝不改 h-screen / overflow-hidden。 */
   const rootRef = useRef<HTMLDivElement>(null);
   useLiquidGlassPointer(rootRef);
-  /* [U2] 指针划过卡片的浅水波：只在壳内扫描，页面懒加载后由 MutationObserver 补挂。 */
+  /* [299] 原生 D3D11+DComp 宿主的对接层。
+   * 这一行是 295 Wave 1 遗留的「空转孤岛」的闭环：useNativeGlassSync.ts 与它的
+   * 14 条单测在 295 就已落盘，但 App.tsx **一行都没调用过** —— 只有它自己的
+   * .test.ts 在 import 它。结果是「单测全绿、运行期零生效」，属于本仓 R7 明令
+   * 禁止的「没有触发证据的完成」。
+   * 顺序纪律：必须在 useLiquidWave 之前挂。本 hook 收到 rbc-dcomp-caps 后会给
+   * <html> 加 .rbc-host-dcomp，useLiquidWave 的退让守卫正是读这个类；反过来的
+   * 话首帧会白跑一轮 CPU 水波并 putImageData 一次，出现一帧双层波纹。
+   * 非 DComp 宿主（WPF / 浏览器直开）下它全程 inert —— 监听照挂、回调首行 return。 */
+  useNativeGlassSync(rootRef);
+  /* [U2] 指针划过卡片的浅水波：只在壳内扫描，页面懒加载后由 MutationObserver 补挂。
+   * [299] 原生宿主开闸后本 hook 自动退让，不再步进 Float32Array / 不再 putImageData。 */
   useLiquidWave({ root: rootRef });
 
   /* [284] 宿主窗口控制：拖动 / 最小化 / 最大化 / 关闭。

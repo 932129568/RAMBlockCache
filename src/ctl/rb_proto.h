@@ -201,8 +201,15 @@ typedef struct RB_STATS_T {
      * 数据源：驱动 RbLatNote 1/64 采样入 RB_GLOB.ReadLatHist[2][32]
      * （slot0=全命中读 / slot1=含 miss 下盘读），GET_STATS 时从累计桶计数
      * 求分位、取桶下界（2^b us 近似）。0=尚无样本（与 EWMA 字段同语义）。
-     * 兼容纪律：结构追加不升 ProtocolVersion（B-12 先例）；驱动回拷按调用方
-     * 缓冲容量截断（RbMsgGetStats local+min 模式），老客户端不受影响。 */
+     * 兼容纪律：结构追加不升 ProtocolVersion（B-12 先例）。
+     * [298 2026-11-19] 原注称"驱动回拷按调用方缓冲容量截断（local+min 模式）"，
+     * 该模式已删除（0x7F 栈溢出修复：1304 B 栈上 RB_STATS 是 dispatch 1424 B
+     * 并集帧的 91.6%）。现驱动**要求**完整 RB_STATS 容量：分发器在
+     * RbDispatchDeviceControl 体内的 `outLen < sizeof(RB_MSG)`(8224) 门
+     * 拒绝更短的请求，远大于本结构所需 1320；容量不足时 rbctl.c 的
+     * RbMsgGetStats 回 STATUS_BUFFER_TOO_SMALL 且不填。
+     * （用符号锚点而非行号：行号会随注释增删漂移。）
+     * 老客户端若仍按 8224 请求（本仓全部调用点如此）不受影响。 */
     uint32_t CacheReadLatP50Us;    /* 偏移 1256：全命中读 P50 */
     uint32_t CacheReadLatP95Us;    /* 1260 */
     uint32_t CacheReadLatP99Us;    /* 1264 */
@@ -210,8 +217,8 @@ typedef struct RB_STATS_T {
     uint32_t DiskReadLatP95Us;     /* 1272 */
     uint32_t DiskReadLatP99Us;     /* 1276 */
     /* ---- [83 2026-11-07] 运行期几何重建统计（末尾纯追加；不升 ProtocolVersion）----
-     * 兼容纪律同 U1：驱动回拷按调用方缓冲容量截断（rbctl.c RbMsgGetStats
-     * local+min 模式），老客户端收到短回包不受影响；桥接 decodeStats 对
+     * 兼容纪律同 U1（见上方 298 订正：local+min 已删除，驱动要求完整容量）；
+     * 桥接 decodeStats 对
      * 每个新字段按 p.length 做长度守卫，旧驱动短回包填 0 而非抛 RangeError。
      * Pack=8 实算（check_proto_sync.py --strict）：
      *   EngineBlockSize u32@1280, GeometryRebuildCount u32@1284,

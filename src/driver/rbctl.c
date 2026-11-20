@@ -19,6 +19,18 @@
 /* RbRegSetDW 定义于 rbdriver.c（非 static）；panic-clear 需持久化清计数。 */
 extern VOID RbRegSetDW(PCWSTR name, ULONG v);
 
+/* [298 2026-11-19] 防内联：这些 handler 被 MSVC /O2 内联进
+ * RbDispatchDeviceControl，把各自局部变量合并成 1424 B 的并集帧
+ * （其中 1304 B 只是 RbMsgGetStats 的 RB_STATS local）。
+ * 崩溃帧 SP 证明：透传路径不需要任何局部变量，却全额付掉该帧
+ * （0x7F/Arg1=8 double fault，缺口 32 B）。加 noinline 让各 handler
+ * 拥有独立帧，入口帧降到 <=230 B。
+ * 写法固定为 `RB_NOINLINE static <类型> <函数名>`（declspec 在存储类之前，MSVC
+ * 规范写法）：Gate25 P3（src/scripts/check_ctl_codes.py:548）用字面量
+ * `static\s+NTSTATUS\s+<name>\(` 认"定义行"，宏若夹在类型与函数名之间会让该门
+ * 误判"处理器未定义"（实测 2 条 FAIL）。前置写法对该门零影响。 */
+#define RB_NOINLINE __declspec(noinline)
+
 /* [U1 2026-11-06] 从累计 log2 桶计数求分位数（下界近似）。
  * 桶 b 覆盖 [2^b, 2^(b+1)) us；分位落在桶 b → 报 2^b（log 近似下界）。
  * pct100 = 百分比×100（P50=5000 / P95=9500 / P99=9900）；
@@ -193,7 +205,7 @@ VOID RbClampConfig(RB_CONFIG *c)
 
 /* 统一错误回包：Status=st、Information=0、完成 IRP，返回同一 st。
  * 收敛旧版两处结构完全相同的错误出口（INVALID_PARAMETER / BUFFER_TOO_SMALL）。 */
-static NTSTATUS RbCtlFail(PIRP irp, NTSTATUS st)
+RB_NOINLINE static NTSTATUS RbCtlFail(PIRP irp, NTSTATUS st)
 {
     irp->IoStatus.Status = st;
     irp->IoStatus.Information = 0;
@@ -202,7 +214,7 @@ static NTSTATUS RbCtlFail(PIRP irp, NTSTATUS st)
 }
 
 /* C1: 按消息类型计算输出缓冲下限（switch 分支顺序与旧版 C1 块逐项一致）。 */
-static ULONG RbCtlMinBuffer(const RB_MSG *msg)
+RB_NOINLINE static ULONG RbCtlMinBuffer(const RB_MSG *msg)
 {
     switch (msg->Type) {
     case RB_MSG_GET_STATS:      return offsetof(RB_MSG, Data) + sizeof(RB_STATS);
@@ -223,25 +235,55 @@ static ULONG RbCtlMinBuffer(const RB_MSG *msg)
  * STATUS_SUCCESS，仅失败分支改写）；pinfo=Information 出参（仅写本消息回包长度）。
  * 旧版 switch 中对应 case 体的每条语句原样搬运于此（s→*pst、info→*pinfo）。 */
 
-static VOID RbMsgGetStats(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo, ULONG outLen)
+RB_NOINLINE static VOID RbMsgGetStats(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo, ULONG outLen)
 {
-    RB_STATS local;
     ULONG avail;
-    UNREFERENCED_PARAMETER(pst);
-    RbFillStats(&local);
-    /* [U1/兼容 2026-11-06] 容量钳位回拷：老客户端（旧 RB_STATS 尺寸）遇新驱动
-     * 不得溢写 SystemBuffer——先填局部结构，再按调用方容量截断拷贝；回包长度=
-     * 实际拷贝字节数。原实现直接 fill 调用方缓冲（尺寸不符即池溢写——结构性
-     * 隐患，正是历史崩溃类别），本批修复；未来任何协议结构追加都必须沿用本
-     * local+min 模式。信息长度截断（出口 info>outLen 钳位）保持不变。 */
+    /* [298c] 原此处有 UNREFERENCED_PARAMETER(pst)：那时本函数恒成功、
+     * 从不写 *pst。298b 加了失败出口后 pst 真的被使用，该宏已成误导
+     * （读者会以为 pst 无人用），故删除。 */
+    /* [298 2026-11-19] 原实现用 1,304 B 栈上 RB_STATS 做"先填局部再按容量截断
+     * 回拷"。该对象占 RbDispatchDeviceControl 帧 1424 B 的 91.6%，且与分支无关
+     * 地一次性付掉 —— 0x7F/Arg1=8 的击穿点就在同一条栈上（缺口 32 B）。
+     * 容量实际由**两道**门共同保证，任一道单独成立即够：
+     *   ① RbDispatchDeviceControl 体内的 `outLen < sizeof(RB_MSG)`(=8224) ——
+     *      更强的在前，它使 avail >= 8224-16 = 8208 > 1304，1320 门被完全覆盖；
+     *   ② RbCtlMinBuffer 对 RB_MSG_GET_STATS 返回 1320
+     *      （= offsetof(RB_MSG,Data)+sizeof(RB_STATS)）。
+     * 用符号锚点而非行号：本文件已因反复增删注释使行号引用漂移两次。
+     * 旧注释只提 ②并写成"容量已由 RbCtlMinBuffer 门保证"，会让下一个人以为
+     * 删掉 ① 是安全的 —— 因果链必须写全。
+     * 故直填 SystemBuffer 与旧 local+min 结果逐字节等价。
+     * 承重判据：若 avail != sizeof(RB_STATS) 则不填，并且**报错**——
+     * *pst=STATUS_BUFFER_TOO_SMALL、*pinfo 只回 offsetof(RB_MSG,Data)=16
+     * （即 payload 长度 0）。门若将来被改宽也不会越界写，更不会假成功。
+     * 注意：这里不写成"只回长度 0"—— 长度字段是 16 不是 0，措辞会误导。
+     * 新纪律：本消息不再需要 local+min；若将来要恢复短缓冲兼容，必须同时
+     * 放宽 RbCtlMinBuffer 的门并改回 local 模式，二者不可只改一边。 */
     avail = (outLen > (ULONG)offsetof(RB_MSG, Data))
           ? (outLen - (ULONG)offsetof(RB_MSG, Data)) : 0;
     if (avail > sizeof(RB_STATS)) avail = (ULONG)sizeof(RB_STATS);
-    RtlCopyMemory(&msg->Data.Stats, &local, avail);
+    if (avail == sizeof(RB_STATS)) {
+        RbFillStats(&msg->Data.Stats);                  /* 直填，零栈分配 */
+    } else {
+        /* [298b 2026-11-19] 红队 B 建议：不填时必须让调用方**知道**没填。
+         * 缺这一行的后果是"假成功"：Status=SUCCESS + 统计全零，而用户态
+         * ctl_conn.c:99 只看 Status、:120 无条件读满 1304 B ⇒ 无法区分
+         * "真的是 0"与"没填"，运维会把全零误判成"缓存没生效"。
+         * 本仓已被同型误诊咬过一次（rbctl.c:88 的 [147/N-147-5]：引擎 NULL
+         * 时字段读 0，控制台把"已挂栈"显示成"驱动没接管"，排查方向跑偏）。
+         * 当前该分支**不可达**（分发器体内的 8224 门使 avail 恒 1304），
+         * 但一旦有人同时放宽两道门，这行把"静默全零"降级为"显式报错"。 */
+        /* [298c] 与其它 handler（如 RbMsgSetConfig 的 `if (pst)`）保持
+         * 同一防御姿态。当前唯一调用点恒传 &st（非空），但 handler 是
+         * 可被独立复用的静态函数，不该把"调用方一定非空"当契约。 */
+        if (pst) *pst = STATUS_BUFFER_TOO_SMALL;
+        *pinfo = (ULONG)offsetof(RB_MSG, Data);
+        return;
+    }
     *pinfo = (ULONG)offsetof(RB_MSG, Data) + avail;
 }
 
-static VOID RbMsgGetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgGetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     UNREFERENCED_PARAMETER(pst);
     /* [P2-3] 与 SET_CONFIG 共用 CfgLock：杜绝读到半写结构 */
@@ -251,7 +293,7 @@ static VOID RbMsgGetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_CONFIG);
 }
 
-static VOID RbMsgSetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgSetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     ULONG newBs;
     BOOLEAN isRebuildRequest = FALSE;
@@ -362,7 +404,7 @@ static VOID RbMsgSetConfig(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_CONFIG);
 }
 
-static VOID RbMsgFlush(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgFlush(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     UNREFERENCED_PARAMETER(msg);
     UNREFERENCED_PARAMETER(pst);
@@ -370,7 +412,7 @@ static VOID RbMsgFlush(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     *pinfo = offsetof(RB_MSG, Data);   /* FIX[P9]: payload-less 消息也要回填头长 */
 }
 
-static VOID RbMsgExitSafeMode(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgExitSafeMode(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     UNREFERENCED_PARAMETER(msg);
     UNREFERENCED_PARAMETER(pst);
@@ -381,7 +423,7 @@ static VOID RbMsgExitSafeMode(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     *pinfo = offsetof(RB_MSG, Data);
 }
 
-static VOID RbMsgPanic(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgPanic(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     UNREFERENCED_PARAMETER(msg);
     UNREFERENCED_PARAMETER(pst);
@@ -389,7 +431,7 @@ static VOID RbMsgPanic(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     *pinfo = offsetof(RB_MSG, Data);
 }
 
-static VOID RbMsgPanicClear(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgPanicClear(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     UNREFERENCED_PARAMETER(msg);
     /* [P0-1] 恢复前置条件：熔断期间缓存视图已被 flush 线程清空、脏数据已
@@ -450,7 +492,7 @@ static VOID RbMsgPanicClear(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     *pinfo = offsetof(RB_MSG, Data);
 }
 
-static VOID RbMsgSetVolume(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgSetVolume(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     PRB_DEV_EXT ext;
     UNREFERENCED_PARAMETER(pinfo);
@@ -492,7 +534,7 @@ static VOID RbMsgSetVolume(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     } else *pst = STATUS_NOT_FOUND;
 }
 
-static VOID RbMsgGetVolumes(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgGetVolumes(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     UNREFERENCED_PARAMETER(pst);
     /* V9：枚举所有卷盘符并合并已绑定状态（默认无设备挂栈，须能列出全部卷） */
@@ -500,7 +542,7 @@ static VOID RbMsgGetVolumes(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_VOLUME_LIST);
 }
 
-static VOID RbMsgAttachVolume(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgAttachVolume(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     WCHAR letter;
     UNREFERENCED_PARAMETER(pinfo);
@@ -567,7 +609,7 @@ static VOID RbMsgAttachVolume(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     }
 }
 
-static VOID RbMsgGetLog(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgGetLog(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     UNREFERENCED_PARAMETER(pst);
     RbLogSnapshot(&msg->Data.LogList);
@@ -581,7 +623,7 @@ static VOID RbMsgGetLog(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
  * 覆盖周期时最旧事件被覆盖（游标只保证不漏未覆盖的——消费方按 250ms-1s 轮询）。
  * 无锁：EvSeq 一次读快照 + 逐条拷（事件发布与读取并发的最坏=读到半条，
  * 但 Seq 单调不回退，调用方以下次轮询补齐；展示层可容忍）。 */
-static VOID RbMsgGetEvents(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgGetEvents(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     RB_EVENT_QUERY q;
     RB_EVENT_LIST  *out = &msg->Data.EventList;
@@ -625,7 +667,7 @@ static VOID RbMsgGetEvents(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
  * 阻塞并发 detach 在窗口内销毁 Stream（detach 排空等 Refs 回落）；双引用成对
  * 释放。严禁持 s_AttachMutex 调用（wb_drain 最长 60s，会堵死全部 attach/detach
  * ——[FIX C-5] 同款教训）。 */
-static VOID RbMsgInvalidateRange(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgInvalidateRange(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     RB_INVALIDATE_RANGE *r = &msg->Data.InvalidateRange;
     PRB_DEV_EXT ext;
@@ -699,7 +741,7 @@ static VOID RbMsgInvalidateRange(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
     *pinfo = offsetof(RB_MSG, Data) + sizeof(RB_INVALIDATE_RANGE);
 }
 
-static VOID RbMsgGetVersion(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
+RB_NOINLINE static VOID RbMsgGetVersion(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 {
     RB_VERSION *v;
     UNREFERENCED_PARAMETER(pst);
@@ -729,7 +771,7 @@ static VOID RbMsgGetVersion(RB_MSG *msg, NTSTATUS *pst, ULONG *pinfo)
 typedef char RbExclLayoutCheck[(sizeof(RB_EXCL_ENT)==16 && sizeof(rb_extent)==16
                                 && RB_EXCL_HDR_SIZE==32
                                 && offsetof(RB_EXCL_REQ, Ents)==32) ? 1 : -1];   /* [FIX D1] offsetof 断言补齐（原只断言宏自等） */
-static NTSTATUS RbCtlSetExclude(PIRP irp, ULONG inLen)
+RB_NOINLINE static NTSTATUS RbCtlSetExclude(PIRP irp, ULONG inLen)
 {
     RB_EXCL_REQ *req = (RB_EXCL_REQ *)irp->AssociatedIrp.SystemBuffer;
     PRB_DEV_EXT ext;
@@ -809,7 +851,7 @@ static BOOLEAN RbIsClusterAffectingCode(ULONG code, BOOLEAN fsc)
 }
 
 /* 卷设备上遇到簇重排类请求：先刷该卷脏数据再下传。 */
-static void RbFlushDirtyForVolumeExt(PRB_DEV_EXT ext)
+RB_NOINLINE static void RbFlushDirtyForVolumeExt(PRB_DEV_EXT ext)
 {
     if (ext->Magic == RB_EXT_MAGIC && ext->Stream && !ext->Removed &&
         KeGetCurrentIrql() == PASSIVE_LEVEL)
@@ -842,7 +884,7 @@ typedef struct _RB_DMSA_RANGE {         /* DS_MANAGE_DATA_SET_RANGE */
 #define RB_DMSA_ACTION_TRIM   6         /* DeviceDsmAction_Trim */
 #define RB_DMSA_RANGE_MAX     4096      /* 超过则回退全卷路径（防御异常载荷） */
 
-static BOOLEAN RbTrimRangeInvalidate(PRB_DEV_EXT vext, PVOID sysBuf, ULONG inLen)
+RB_NOINLINE static BOOLEAN RbTrimRangeInvalidate(PRB_DEV_EXT vext, PVOID sysBuf, ULONG inLen)
 {
     RB_DMSA_ATTRS *h;
     RB_DMSA_RANGE *rg;
@@ -943,7 +985,7 @@ NTSTATUS RbDispatchFileSystemControl(PDEVICE_OBJECT dev, PIRP irp)
 #define RB_CTL_WHY_NONE   0xFFUL
 #define RB_CTL_SKIP_NONE  0xFFFFFFFFUL
 
-static NTSTATUS RbCtlShutdownDiag(PIRP Irp, ULONG outLen)
+RB_NOINLINE static NTSTATUS RbCtlShutdownDiag(PIRP Irp, ULONG outLen)
 {
     PRB2_SHUTDOWN_DIAG_OUT o;
     ULONG why = RB_CTL_WHY_NONE, skip = RB_CTL_SKIP_NONE, v = 0;
@@ -995,7 +1037,7 @@ static LONG s_HealthCommitLatch = 0;
  * 顺序纪律（红队 A-B2 / B-B2 修正）：留证 → **回读确认留证已落地** → 清注册表 →
  * 回读确认 → 才提交内存。任何一步失败都「内存未改」，不留「注册表 2 / 内存 0」
  * 这种自相矛盾态，也不出现「清了但没留证」。 */
-static NTSTATUS RbCtlHealthCommit(VOID)
+RB_NOINLINE static NTSTATUS RbCtlHealthCommit(VOID)
 {
     ULONG prevFails, prevGuard, seq = 0, back = 1, v;
     ULONG epochLo = (ULONG)((ULONG64)g_RbBootEpoch & 0xFFFFFFFFULL);
